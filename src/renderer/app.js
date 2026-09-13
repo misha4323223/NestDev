@@ -418,7 +418,7 @@
         // Поле трогаем только если оно есть: чаты без плана не должны менять форму
         // (иначе каждый запуск перезаписывал бы весь файл истории).
         if (c.plan !== undefined) {
-          const pi = c.plan && typeof c.plan === "object" && Array.isArray(c.plan.items) ? normalizePlanTasks(c.plan.items) : [];
+          const pi = c.plan && typeof c.plan === "object" && Array.isArray(c.plan.items) ? AgentCore.normalizePlanTasks(c.plan.items) : [];
           // legacy-планы со source "auto" отбрасываем — панель показывает только план модели.
           if (pi.length && c.plan.source !== "auto") c.plan = { title: String(c.plan.title || ""), source: c.plan.source === "text" ? "text" : "model", items: pi, updatedAt: Number(c.plan.updatedAt) || Date.now() };
           else c.plan = null;
@@ -606,7 +606,7 @@
   // вернёт пустой список, и такой «план» просто не появится.
   function planFromModel(chat, ev) {
     if (!chat) return false;
-    const items = normalizePlanTasks(ev && ev.tasks);
+    const items = AgentCore.normalizePlanTasks(ev && ev.tasks);
     if (!items.length) return false;
     // Заменяя план модели, предыдущий убираем в историю (не теряем контекст).
     if (chat.plan && chat.plan.source !== "auto") planArchive(chat, chat.plan);
@@ -698,7 +698,7 @@
     if (chat.plan && chat.plan.source === "model") return false;
     const lines = planLinesFromText(text);
     if (lines.length < 2) return false;
-    const items = normalizePlanTasks(lines);
+    const items = AgentCore.normalizePlanTasks(lines);
     if (items.length < 2) return false; // один пункт — это фраза, а не план
     if (chat.plan && chat.plan.source === "text") {
       const old = chat.plan.items;

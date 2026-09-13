@@ -45,6 +45,9 @@ const {
   describeImageRemote,
   generateImageRemote,
   routeTools,
+  routerTaskText,
+  coldCacheInfo,
+  UNAVAILABLE_MAX,
   searchTools,
   ROUTER_MAX_TOKENS,
   groupOfTool,
@@ -4603,6 +4606,8 @@ async function runAi(settings, messages, win, opts) {
   let contextRetried = false; // при переполнении контекста пробуем ещё раз с меньшим бюджетом
   // Лимит 429: не роняем раунд — ждём столько, сколько просит провайдер, и повторяем.
   let rateRetries = 0;
+  // 5xx и «холодный» отказ пула: тоже повторяем ТОТ ЖЕ раунд, но с растущей паузой.
+  let unavailableRetries = 0;
   const rateLimiter = rateLimiterFor(settings);
   let reportRetried = false; // пустой финальный текст — один раз просим итоговый отчёт
   let planNudges = 0; // «план не закрыт, а модель замолчала» — просим продолжить делом (макс. 2)
@@ -4612,21 +4617,10 @@ async function runAi(settings, messages, win, opts) {
   // (routeTools из agent-core). Состав ЛИПКИЙ на всю задачу: группа, однажды
   // включённая, не исчезает на середине работы. Порядок схем всегда канонический —
   // иначе промахивается кэш префикса промпта (см. 1.5.46).
-  const routerTask = (() => {
-    const parts = [];
-    for (let i = messages.length - 1; i >= 0 && parts.length < 3; i--) {
-      const m = messages[i];
-      if (!m || m.role !== "user") continue;
-      const c = m.content;
-      const txt = typeof c === "string"
-        ? c
-        : Array.isArray(c)
-          ? c.filter((p) => p && p.type === "text").map((p) => p.text || "").join("\n")
-          : "";
-      if (txt) parts.push(txt);
-    }
-    return parts.join("\n").slice(0, 4000);
-  })();
+  // Роутер видит не одну последнюю фразу, а историю работы (см. 1.5.63): в «продолжай»
+  // ключевых слов нет вовсе, и раньше группа прошлой задачи выпадала — набор схем
+  // менялся на ходу, префикс запроса ломался и провайдер отвечал 503 cache_only_cold.
+  const routerTask = routerTaskText(messages);
   // Группа → справочник агента: подключается сам, когда группа активна. Так «диета»
   // промпта ничего не теряет: длинные правила живут в гайдах и приходят ровно тогда,
   // когда нужны (браузер, система, окно приложения, облако).
@@ -4889,7 +4883,10 @@ async function runAi(settings, messages, win, opts) {
       throw new Error("Сетевая ошибка при запросе к " + provider + ": " + e.message);
     }
     roundTtfbMs = Date.now() - roundStartedAt; // заголовки ответа = первый байт
-    if (res.ok) rateRetries = 0;
+    if (res.ok) {
+      rateRetries = 0;
+      unavailableRetries = 0;
+    }
     if (!res.ok) {
       const detail = await readApiError(res);
       // Строгий OpenAI-совместимый сервер может не знать stream_options (мы просили им
@@ -4928,6 +4925,30 @@ async function runAi(settings, messages, win, opts) {
         await new Promise((r) => setTimeout(r, waitMs));
         round--;
         continue;
+      }
+      // 503 и cache_only_cold: пул провайдера отклонил «холодный» запрос (принимает
+      // только попадание в кэш) или перегружен. Раньше это падало сырым JSON провайдера,
+      // хотя лечится повтором того же раунда: историю мы не переписываем, поэтому
+      // повтор уже может попасть в кэш. Смена ключа внутри того же пула не поможет.
+      {
+        const cold = coldCacheInfo(res.status, detail, unavailableRetries + 1);
+        if (cold) {
+          if (unavailableRetries < UNAVAILABLE_MAX) {
+            unavailableRetries++;
+            termEmit({ type: "metrics", text: cold.text });
+            await new Promise((r) => setTimeout(r, cold.waitMs));
+            round--;
+            continue;
+          }
+          throw new Error(
+            cold.cold
+              ? "API error 503 cache_only_cold: провайдер принимает только запрос с готовым кэшем. " +
+                "Повторил " + UNAVAILABLE_MAX + " раза — пул всё ещё отказывает. Подожди 10–30 с и напиши «продолжай» " +
+                "или выбери другую модель/тариф: смена ключа внутри того же бесплатного пула не поможет."
+              : "API error " + res.status + ": провайдер временно недоступен. Повторил " + UNAVAILABLE_MAX +
+                " раза — подожди немного и напиши «продолжай»."
+          );
+        }
       }
       // Переполнение контекста (частая беда локальных моделей Ollama с малым окном):
       // один раз повторяем запрос с резко урезанной историей, чтобы не падать.

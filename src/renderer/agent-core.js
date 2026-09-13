@@ -4116,8 +4116,9 @@
     {
       id: "app",
       title: "управление окном приложения",
-      keywords: ["окно приложени", "интерфейс приложени", "своё прилож", "мое прилож", "в приложении",
-        "скриншот приложени"],
+      keywords: ["окно приложени", "окна приложени", "окном приложени", "интерфейс приложени",
+        "своё прилож", "свою прилож", "наше прилож", "мое прилож", "моё прилож", "в приложении",
+        "скриншот приложени", "панель приложени", "панели приложени"],
       names: ["appRead", "appClick", "appFill", "appSelect", "appPress", "appWait", "appScreenshot",
         "screenshotCapture"],
     },
@@ -4232,6 +4233,62 @@
     });
     out.sort((a, b) => b.score - a.score || a.idx - b.idx);
     return out.slice(0, n);
+  }
+
+  // Текст для роутера: по нему выбираются группы инструментов на задачу.
+  // Раньше сюда попадали ТОЛЬКО последние 3 сообщения пользователя — и на «продолжай»
+  // (где нет ни одного ключевого слова) группа предыдущей работы выпадала. Тогда набор
+  // схем менялся прямо посреди прогона: предохранитель A дотягивал группу на ходу,
+  // префикс запроса становился другим — и бесплатный пул провайдера отвечал
+  // 503 cache_only_cold («принимаю только запрос с готовым кэшем»). Поэтому роутер
+  // обязан видеть саму работу: историю реплик, а не одну последнюю фразу.
+  const ROUTER_TASK_MESSAGES = 12;
+  const ROUTER_TASK_CHARS = 6000;
+  const ROUTER_TASK_PER_MESSAGE = 1200;
+  function routerTaskText(messages, opts) {
+    const o = opts || {};
+    const maxMessages = Math.max(1, Number(o.maxMessages) || ROUTER_TASK_MESSAGES);
+    const maxChars = Math.max(200, Number(o.maxChars) || ROUTER_TASK_CHARS);
+    const list = Array.isArray(messages) ? messages : [];
+    const parts = [];
+    // Новейшее — в начало: при обрезке теряется самое старое, а не текущая задача.
+    for (let i = list.length - 1; i >= 0 && parts.length < maxMessages; i--) {
+      const m = list[i];
+      if (!m || (m.role !== "user" && m.role !== "assistant")) continue;
+      const c = m.content;
+      const txt = typeof c === "string"
+        ? c
+        : Array.isArray(c)
+          ? c.filter((p) => p && p.type === "text").map((p) => p.text || "").join("\n")
+          : "";
+      const clean = String(txt || "").replace(/\s+/g, " ").trim();
+      if (clean) parts.push(clean.slice(0, ROUTER_TASK_PER_MESSAGE));
+    }
+    return parts.join("\n").slice(0, maxChars);
+  }
+
+  // Отказ пула провайдера: 503 и «холодный» ответ (cache_only_cold у бесплатных пулов)
+  // — принимается только запрос с готовым кэшем либо пул перегружен. Наша вина тут
+  // косвенная (сменился префикс запроса), и лечится это повтором ТОГО ЖЕ раунда с
+  // паузой: история не переписывается, поэтому повтор уже может попасть в кэш.
+  const UNAVAILABLE_WAITS = [4000, 10000, 20000];
+  const UNAVAILABLE_MAX = UNAVAILABLE_WAITS.length;
+  function coldCacheInfo(status, detail, attempt) {
+    const st = Number(status) || 0;
+    // Ветку берут только 5xx: 429, 402 и 400 разбираются своими правилами.
+    if (st && !(st >= 500 && st <= 599)) return null;
+    const d = String(detail || "");
+    const cold = /cache[ _-]?only/i.test(d);
+    const busy = /overloaded|unavailable|capacity|too many requests|temporarily|try again/i.test(d);
+    if (!cold && !busy && st !== 503 && st !== 502 && st !== 529) return null;
+    const i = Math.max(0, Math.min(UNAVAILABLE_MAX - 1, (Number(attempt) || 1) - 1));
+    const waitMs = UNAVAILABLE_WAITS[i];
+    const text = cold
+      ? "⏳ Пул провайдера принял только запрос с готовым кэшем (cache_only_cold). Жду " +
+        Math.round(waitMs / 1000) + " с и повторяю тот же раунд — история не меняется, шанс попасть в кэш растёт."
+      : "⏳ Провайдер временно недоступен (" + st + "). Жду " + Math.round(waitMs / 1000) +
+        " с и повторяю тот же раунд.";
+    return { cold: cold, waitMs: waitMs, text: text };
   }
 
   // Итоговый набор схем: база + липкие/найденные группы в КАНОНИЧЕСКОМ порядке.
@@ -4643,6 +4700,9 @@
     truncateText,
     selectTools,
     routeTools,
+    routerTaskText,
+    coldCacheInfo,
+    UNAVAILABLE_MAX,
     searchTools,
     TOOL_GROUPS,
     BASE_TOOL_NAMES,

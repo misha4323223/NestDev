@@ -1,6 +1,6 @@
 {
   "name": "ai-agent",
-  "version": "1.5.62",
+  "version": "1.5.64",
   "private": true,
   "description": "AI Developer Agent — чат с AI-агентом (Ollama / Groq / внешние API), файловые операции и git",
   "author": "AI Developer Agent",
@@ -10,7 +10,8 @@
     "preview": "node server.js",
     "dist:win": "electron-builder --win --publish never",
     "dist:win:installer": "electron-builder --win nsis --publish never",
-    "test": "node test/smoke.test.js"
+    "test": "node test/smoke.test.js",
+    "test:live": "node scripts/live-ui.js"
   },
   "devDependencies": {
     "electron": "^33.2.0",

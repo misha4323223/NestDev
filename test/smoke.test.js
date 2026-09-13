@@ -4164,7 +4164,6 @@ async function testPlanPanel() {
     sendMessage: () => {},
     autoResize: () => {},
     persistChatsSoon: () => {},
-    normalizePlanTasks: AgentCore.normalizePlanTasks,
     TOOL_LABEL: { runCommand: "Команда в терминале", writeFile: "Изменение файла", readFile: "Чтение файла" },
     AgentCore,
   };
@@ -4648,10 +4647,10 @@ async function testPlanPanel() {
       if (rawLines[i] === "  }") { endLine = i; break; }
     }
     const fn = new Function(
-      "normalizePlanTasks",
+      "AgentCore",
       "PLAN_ARCHIVE_LIMIT",
       rawLines.slice(0, endLine + 1).join("\n") + "\nreturn sanitizeChats;"
-    )(AgentCore.normalizePlanTasks, AgentCore.PLAN_MAX_ITEMS);
+    )(AgentCore, AgentCore.PLAN_MAX_ITEMS);
     const out = fn({
       activeId: "c1",
       chats: [
@@ -4670,6 +4669,32 @@ async function testPlanPanel() {
     assert.strictEqual(out.chats[3].plan, null, "legacy-план «auto» не убран при загрузке");
     assert.strictEqual(out.chats[4].plan.source, "text", "текстовый план выдан за модельный при загрузке");
     assert.strictEqual(out.chats[4].plan.items.length, 2);
+  });
+
+  await test("интерфейс: функции ядра вызываются только через AgentCore (иначе ReferenceError в живом окне)", () => {
+    // Повод — живой прогон в браузере: normalizePlanTasks вызывался «голым» именем,
+    // разбор плана падал с ReferenceError, а тот молча гас в потоке ответа — панель
+    // плана не появлялась ни разу. В app.js ядро лежит в const AgentCore, поэтому
+    // любое имя из ядра обязано идти с префиксом AgentCore.
+    const coreFns = Object.keys(AgentCore).filter((k) => typeof AgentCore[k] === "function");
+    const defined = new Set();
+    let m;
+    const defRe = /(?:function\s+([A-Za-z_$][\w$]*)|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=)/g;
+    while ((m = defRe.exec(appSrc))) defined.add(m[1] || m[2]);
+    const paramRe = /\(([^()]*)\)\s*(?:=>|\{)/g;
+    while ((m = paramRe.exec(appSrc))) {
+      for (const p of m[1].split(",")) {
+        const n = p.trim().split(/[=:]/)[0].trim().replace(/^\.\.\./, "");
+        if (/^[A-Za-z_$][\w$]*$/.test(n)) defined.add(n);
+      }
+    }
+    const bad = [];
+    for (const name of coreFns) {
+      if (defined.has(name)) continue;
+      if (new RegExp("(^|[^.\\w$])" + name + "\\s*\\(").test(appSrc)) bad.push(name);
+    }
+    assert.deepStrictEqual(bad, [], "голые вызовы функций ядра в app.js — нужно AgentCore.<имя>: " + bad.join(", "));
+    assert.ok(appSrc.indexOf("AgentCore.normalizePlanTasks") !== -1, "нормализация плана не через ядро агента");
   });
 }
 
@@ -6391,6 +6416,87 @@ async function testToolRouter() {
     assert.deepStrictEqual(core.searchTools(""), []);
   });
 
+  await test("роутер: видит историю работы, а не только последнюю фразу («продолжай»)", () => {
+    // Регрессия 1.5.42–1.5.62: роутер смотрел 3 последних фразы пользователя. На
+    // «продолжай» группа app выпадала, схема appRead исчезала из набора — модель звала
+    // её по памяти, предохранитель A дотягивал группу на ходу, префикс запроса менялся
+    // и пул провайдера отвечал 503 cache_only_cold.
+    const history = [
+      { role: "user", content: "посмотри наше окно приложения и нажми в нём кнопку Настройки" },
+      { role: "assistant", content: "Продолжаю — читаю окно приложения" },
+      { role: "user", content: "продолжай" },
+    ];
+    const text = core.routerTaskText(history);
+    assert.ok(/окно приложения/i.test(text), "история не попала в текст роутера: " + text);
+    const r = core.routeTools({ text: text });
+    assert.ok(r.groups.includes("app"), "группа app не включена по истории: " + r.groups.join(","));
+    assert.ok(
+      r.tools.some((t) => t.function.name === "appRead"),
+      "appRead не попал в набор схем"
+    );
+    // Одной последней фразы для этого мало — именно в этом и была ошибка.
+    assert.ok(!core.routeTools({ text: "продолжай" }).groups.includes("app"), "«продолжай» сам включает app");
+    // Тихая история группы не тянет: предохранитель от разрастания схем на месте.
+    const quiet = core.routerTaskText([{ role: "user", content: "привет, как дела" }]);
+    assert.strictEqual(core.routeTools({ text: quiet }).groups.length, 0, "тихая история включила группы");
+    // Пустая история и битые сообщения роутер не ломают.
+    assert.strictEqual(core.routerTaskText([]), "");
+    assert.strictEqual(core.routerTaskText(null), "");
+    assert.strictEqual(core.routerTaskText([null, { role: "user" }, { role: "tool", content: "x" }]), "");
+    // Длинная история обрезается, но остаётся детерминированной, и свежее не теряется.
+    const many = [];
+    for (let i = 0; i < 40; i++) many.push({ role: i % 2 ? "assistant" : "user", content: "сообщение номер " + i });
+    const longText = core.routerTaskText(many);
+    assert.ok(longText.length <= 6000, "роутер не держит потолок символов: " + longText.length);
+    assert.strictEqual(longText, core.routerTaskText(many), "текст роутера не детерминирован");
+    assert.ok(/сообщение номер 39/.test(longText), "в текст роутера не попала последняя фраза");
+    // И это подключено в main.js вместо старого разбора трёх фраз.
+    const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    assert.ok(/const routerTask = routerTaskText\(messages\)/.test(mainSrc), "main.js не берёт текст роутера из истории");
+    assert.ok(
+      !/for \(let i = messages\.length - 1; i >= 0 && parts\.length < 3/.test(mainSrc),
+      "остался старый разбор трёх фраз в роутере"
+    );
+  });
+
+  await test("пул провайдера: 503 cache_only_cold не роняет раунд, а ждёт и повторяет", () => {
+    const detail = JSON.stringify({
+      message: "cache-only admission rejected a cold, unavailable, or overloaded request",
+      type: "Service Unavailable",
+      param: "",
+      code: "cache_only_cold",
+    });
+    const cold = core.coldCacheInfo(503, detail, 1);
+    assert.ok(cold && cold.cold === true, "cache_only_cold не распознан");
+    assert.ok(cold.waitMs >= 3000, "пауза перед повтором подозрительно мала: " + cold.waitMs);
+    assert.ok(/кэш/.test(cold.text), "нет человеческого объяснения: " + cold.text);
+    // Пауза растёт с попытками и не растёт бесконечно.
+    const w = [1, 2, 3, 4, 5].map((n) => core.coldCacheInfo(503, detail, n).waitMs);
+    assert.ok(w[1] > w[0] && w[2] > w[1], "пауза не растёт: " + w.join(","));
+    assert.strictEqual(w[4], w[2], "пауза растёт бесконечно");
+    assert.strictEqual(core.UNAVAILABLE_MAX, 3, "число повторов изменилось — обнови текст подсказки");
+    // Обычный 503 без «кэша» тоже повторяется, но с честной формулировкой.
+    const busy = core.coldCacheInfo(503, "overloaded", 1);
+    assert.ok(busy && busy.cold === false && /временно недоступен/.test(busy.text), "обычный 503 не обработан");
+    assert.ok(core.coldCacheInfo(502, "bad gateway", 1), "502 не считается временным отказом");
+    // Чужие коды не перехватываем: ими занимаются свои ветки.
+    assert.strictEqual(core.coldCacheInfo(429, detail, 1), null, "429 ушёл в ветку «холодного» пула");
+    assert.strictEqual(core.coldCacheInfo(402, detail, 1), null, "402 ушёл в ветку «холодного» пула");
+    assert.strictEqual(core.coldCacheInfo(400, "bad request", 1), null, "400 ушёл в ветку «холодного» пула");
+    // 5xx без признаков «холода» и перегрузки не трогаем — иначе будем ждать зря.
+    assert.strictEqual(core.coldCacheInfo(500, "internal error", 1), null, "любой 500 стал повтором");
+    assert.ok(core.coldCacheInfo(500, "cache_only_cold", 1).cold, "холодный отказ под 500 не распознан");
+    // И это подключено в main.js: повтор ТОГО ЖЕ раунда вместо падения с сырым JSON.
+    const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    assert.ok(/const cold = coldCacheInfo\(res\.status, detail, unavailableRetries \+ 1\)/.test(mainSrc), "503 не обрабатывается");
+    assert.ok(/unavailableRetries\+\+;/.test(mainSrc), "нет счётчика повторов 503");
+    assert.ok(
+      /if \(res\.ok\) \{\s*rateRetries = 0;\s*unavailableRetries = 0;\s*\}/.test(mainSrc),
+      "счётчик повторов 503 не сбрасывается на успешном ответе"
+    );
+    assert.ok(/cache_only_cold: провайдер принимает только запрос с готовым кэшем/.test(mainSrc), "нет понятного сообщения после исчерпания повторов");
+  });
+
   await test("роутер: предохранители подключены в main.js и в настройках", () => {
     const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
     const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
@@ -7131,7 +7237,10 @@ async function testSandboxObstacles() {
     assert.ok(/const paced = await rateLimiter\.take\(\);/.test(mainSrc), "запросы не расставляются по темпу заранее");
     assert.ok(/res\.status === 429 && rateRetries < 3/.test(mainSrc), "429 не повторяется");
     assert.ok(/rateRetries\+\+;/.test(mainSrc) && /round--;\s*\n\s*continue;/.test(mainSrc), "повтор не возвращает раунд на перезапуск");
-    assert.ok(/if \(res\.ok\) rateRetries = 0;/.test(mainSrc), "счётчик повторов не сбрасывается на успехе");
+    assert.ok(
+      /if \(res\.ok\) \{\s*rateRetries = 0;\s*unavailableRetries = 0;\s*\}/.test(mainSrc),
+      "счётчики повторов не сбрасываются на успехе"
+    );
     // Порядок важен: сначала совет по токенному лимиту Groq (повтор там бессмысленен).
     const i = mainSrc.indexOf("const friendly = friendlyRateLimitError(res.status, detail, settings);");
     const j = mainSrc.indexOf("if (res.status === 429 && rateRetries < 3)");
