@@ -585,7 +585,8 @@
           "ИСПОЛЬЗУЙ ЭТО вместо поиска «невидимых» элементов: половина кнопок, пунктов списков и хвостов диалогов не попадает в карту, пока они ниже видимой области. " +
           "how: down (по умолчанию) / up / top / bottom; by — пикселей за раз (по умолчанию ~0.8 экрана); times — сколько раз крутить; " +
           "to — к какому элементу прокрутить (имя, ref или селектор); container — что именно крутить (имя/ref/селектор блока со своим скроллом). " +
-          "Крутит настоящим колесом мыши (ленивые ленты и SPA подгружаются), при необходимости программно; если страница не сдвинулась — скажет, что нужно указать container.",
+          "Крутит настоящим колесом мыши (ленивые ленты и SPA подгружаются), при необходимости программно; если страница не сдвинулась — скажет, что нужно указать container. " +
+          "loadAll: true — ДОГРУЗИТЬ ленивый список или длинную историю: крутит, пока появляется новое содержимое, и сам останавливается (не надо вызывать прокрутку по кругу). read: true — вернуть текст страницы (для чтения истории переписки после догрузки).",
         parameters: {
           type: "object",
           properties: {
@@ -594,6 +595,8 @@
             times: { type: "integer", description: "Сколько раз прокрутить (1–20)" },
             to: { type: "string", description: "Элемент, до которого прокрутить: текст, ref (e5) или CSS-селектор" },
             container: { type: "string", description: "Прокручиваемый блок (список, таблица, меню): текст, ref или селектор" },
+            loadAll: { type: "boolean", description: "Догрузить ленивый список/историю: крутит, пока появляется новое, и сам останавливается (до 40 шагов)" },
+            read: { type: "boolean", description: "В ответ добавить текст страницы целиком (читать догруженную историю переписки)" },
             limit: { type: "integer", description: "Сколько элементов показать из кадра (по умолчанию 10)" },
             tabId: { type: "string", description: "id вкладки (необязательно, по умолчанию активная)" },
           },
@@ -3644,6 +3647,10 @@
             if (obj && obj.error) throw new Error("Ошибка Ollama: " + errText(obj.error));
             const msg = (obj && obj.message) || {};
             if (msg.content && onText) onText(msg.content);
+            // Thinking-модели (qwen3, deepseek-r1, gpt-oss) кладут рассуждения в отдельное
+            // поле message.thinking. Без него размышления локальной модели не видны вовсе,
+            // и план, написанный в них, не попадал ни в блок мыслей, ни в панель плана.
+            if (msg.thinking && onThinking) onThinking(msg.thinking);
             // Финальный чанк (done) несёт счётчики промпта и ответа.
             if (onUsage && obj.done && (obj.prompt_eval_count != null || obj.eval_count != null)) {
               onUsage({ prompt: obj.prompt_eval_count || 0, completion: obj.eval_count || 0, cached: 0 });
@@ -3687,6 +3694,9 @@
             if (delta.content && onText) onText(delta.content);
             // DeepSeek и другие OpenAI-совместимые шлют рассуждения отдельным полем
             if (delta.reasoning_content && onThinking) onThinking(delta.reasoning_content);
+            // Часть провайдеров (OpenRouter, vLLM, некоторые сборки-прокси) называет поле
+            // просто reasoning — раньше такие рассуждения пропадали целиком.
+            else if (delta.reasoning && onThinking) onThinking(delta.reasoning);
             // Gemini может прислать подпись мысли отдельным полем delta.extra_content
             // (до или вместо поля на самом tool-call) — запоминаем и подставляем вызовам без своей.
             if (delta.extra_content && delta.extra_content.google && delta.extra_content.google.thought_signature) {
@@ -3808,6 +3818,67 @@
       );
     }
     return null;
+  }
+
+  // ── Лимиты провайдера: сколько ждать и как не бить в 429 вслепую ─────────
+  // Провайдеры сообщают лимит по-разному: заголовком Retry-After, текстом
+  // («Please retry in 12.3s», «try again in 5 seconds», retryDelay: "12s") или
+  // словами о частоте («8 requests per minute»). Раньше всё это просто
+  // превращалось в ошибку — раунд терялся, и агент ждал вслепую.
+  function rateLimitInfo(status, headers, detail) {
+    const h = headers && typeof headers.get === "function" ? headers : null;
+    let retryMs = 0;
+    if (h) {
+      const ra = parseFloat(h.get("retry-after"));
+      if (isFinite(ra) && ra > 0) retryMs = Math.min(ra * 1000, 120000);
+      if (!retryMs) {
+        const reset = parseFloat(h.get("x-ratelimit-reset-requests") || h.get("x-ratelimit-reset"));
+        if (isFinite(reset) && reset > 0) retryMs = Math.min(reset, 120000);
+      }
+    }
+    const d = String(detail || "");
+    if (!retryMs) {
+      const m = /(?:retry|try again|повтори\w*|через|retryDelay)\D{0,24}?(\d+(?:[.,]\d+)?)\s*(ms|мил\w*|сек\w*|sec\w*|s\b|мин\w*|min\w*)/i.exec(d);
+      if (m) {
+        const v = parseFloat(String(m[1]).replace(",", "."));
+        const unit = String(m[2]).toLowerCase();
+        const mult = /^ms|мил/.test(unit) ? 1 : /^мин|^min/.test(unit) ? 60000 : 1000;
+        if (isFinite(v) && v > 0) retryMs = Math.min(v * mult, 120000);
+      }
+    }
+    let rpm = 0;
+    const r = /(\d+)\s*(?:requests?|queries|rpm|req)\s*(?:per|\/)\s*(?:minute|min|мин)/i.exec(d);
+    if (r) rpm = parseInt(r[1], 10) || 0;
+    return { retryMs: Math.round(retryMs), rpm: rpm };
+  }
+
+  // Держатель темпа: узнали частоту — расставляем запросы по времени сами, чтобы
+  // вообще не получать 429 (каждый 429 — потерянный раунд и ожидание вслепую).
+  function createRateLimiter() {
+    let minIntervalMs = 0;
+    let nextAt = 0;
+    return {
+      pendingMs() {
+        return Math.max(0, nextAt - Date.now());
+      },
+      // Ждёт, если предыдущий запрос был слишком недавно. Возвращает, сколько ждал.
+      async take() {
+        const now = Date.now();
+        const wait = Math.max(0, nextAt - now);
+        nextAt = Math.max(now, nextAt) + minIntervalMs;
+        if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+        return wait;
+      },
+      // Запоминает лимит: частоту (rpm) и паузу после 429.
+      note(info) {
+        const i = info || {};
+        if (i.rpm > 0) {
+          const per = Math.min(Math.ceil(60000 / i.rpm), 30000);
+          if (per > minIntervalMs) minIntervalMs = per;
+        }
+        if (i.retryMs > 0) nextAt = Math.max(nextAt, Date.now() + Math.min(i.retryMs, 120000));
+      },
+    };
   }
 
   // Ошибка → читаемый текст. Отдельно ловим «промис вместо ошибки» (забыт await):
@@ -4417,7 +4488,8 @@
     }
   }
 
-  // Фабрика менеджера контекста: компакция (один раз за запуск) + обрезка хвоста.
+  // Фабрика менеджера контекста: компакция (до 3 раз за запуск, памятки накапливаются)
+  // + обрезка хвоста.
   function createContextManager(opts) {
     const settings = (opts && opts.settings) || {};
     const emit = (opts && opts.emit) || (() => {});
@@ -4426,7 +4498,12 @@
     // сообщения, из которых она свёрнута. main.js пишет по нему локальный дневник
     // (память диалогов по датам). Ошибка хука не должна ломать работу агента.
     const onMemo = (opts && opts.onMemo) || null;
-    let compacted = false;
+    // Сжатий за прогон может быть несколько: на длинной задаче (браузер, обход
+    // страниц, большой рефакторинг) контекст переполняется повторно, а одиночной
+    // памятки не хватало — дальше шла молчаливая обрезка головы, вместе с целью
+    // задачи, и агент бросал работу («напишет что-то и отключается»).
+    let compactCount = 0;
+    const COMPACT_LIMIT = 3;
     let compactMemo = null;
     return {
       async manage(messages, budget) {
@@ -4439,10 +4516,14 @@
         if (total + memoWeight <= budget) {
           return compactMemo ? [compactMemo, ...sanitizeToolPairs(messages)] : sanitizeToolPairs(messages);
         }
-        if (!compacted && !planMode) {
-          compacted = true;
+        if (compactCount < COMPACT_LIMIT && !planMode) {
           try {
-            const memoText = await compactRemote(settings, messages);
+            // Предыдущую памятку скармливаем вместе с новыми сообщениями: иначе
+            // повторное сжатие потеряло бы всё, что уже было свёрнуто в неё.
+            const memoText = await compactRemote(
+              settings,
+              compactMemo ? [compactMemo, ...messages] : messages
+            );
             if (memoText && String(memoText).trim()) {
               compactMemo = {
                 role: "system",
@@ -4450,6 +4531,7 @@
                   "ПАМЯТКА ПРЕДЫДУЩЕГО КОНТЕКСТА (сжато, чтобы экономить токены; это резюме старых шагов):\n" +
                   String(memoText).trim(),
               };
+              compactCount++;
               if (onMemo) {
                 try {
                   onMemo({
@@ -4549,6 +4631,8 @@
     listModels,
     readApiError,
     friendlyRateLimitError,
+    rateLimitInfo,
+    createRateLimiter,
     genCallId,
     // контекст
     estimateTokens,

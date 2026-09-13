@@ -52,6 +52,7 @@ body {
   flex-direction: column;
   padding: 14px 12px;
   gap: 10px;
+  transition: width 0.18s ease, min-width 0.18s ease, padding 0.18s ease;
 }
 .brand { display: flex; align-items: center; gap: 10px; padding: 2px 4px 6px; }
 .brand-logo {
@@ -126,6 +127,49 @@ body {
 }
 .chat-item:hover .chat-del { visibility: visible; }
 .chat-item .chat-del:hover { color: var(--danger); background: rgba(242, 92, 84, 0.12); }
+
+/* ─── Рельса быстрых панелей (как в Replit) ─── */
+#rail {
+  width: 54px; min-width: 54px; flex: 0 0 54px;
+  background: var(--bg-side);
+  border-right: 1px solid var(--border-soft);
+  display: flex; flex-direction: column; align-items: center;
+  gap: 5px; padding: 12px 0;
+}
+.rail-logo {
+  width: 34px; height: 34px; flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--text); color: #0a0a0b;
+  border-radius: 10px; margin-bottom: 4px;
+}
+.rail-sep { width: 22px; height: 1px; flex: 0 0 auto; background: var(--border-soft); margin: 3px 0 5px; }
+.rail-spacer { flex: 1 1 auto; min-height: 8px; }
+.rail-btn {
+  position: relative; flex: 0 0 auto;
+  width: 38px; height: 38px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; color: var(--text-faint);
+  border: 1px solid transparent; border-radius: 11px;
+  cursor: pointer; font-family: inherit;
+  transition: background 0.14s, color 0.14s, border-color 0.14s;
+}
+.rail-btn:hover { background: var(--bg-hover); color: var(--text); }
+.rail-btn.active { background: var(--bg-hover); color: var(--text); border-color: var(--border); }
+.rail-btn.rail-accent { color: var(--text); }
+.rail-btn.rail-accent:hover { background: var(--text); color: #0a0a0b; border-color: transparent; }
+.rail-btn .hd-dot { top: 6px; right: 6px; }
+
+/* Шапка панели чатов */
+.side-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.side-head .brand { flex: 1; min-width: 0; padding: 0; }
+.side-head #btn-side-collapse { width: 30px; height: 30px; flex: 0 0 auto; color: var(--text-faint); }
+.side-head #btn-side-collapse:hover { color: var(--text); }
+
+/* Свёрнутый список чатов: рельса остаётся, панель уезжает */
+#sidebar.collapsed {
+  width: 0; min-width: 0; padding: 14px 0;
+  border-right: none; overflow: hidden;
+}
 
 /* ─── Шапка чата ─── */
 #main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
@@ -2716,6 +2760,13 @@ body::after {
     box-shadow: 0 0 50px rgba(0, 0, 0, 0.6);
   }
   #sidebar.open { transform: translateX(0); }
+  /* На телефоне рельса не нужна: панель и так выезжает по гамбургеру, а
+     «свёрнутость» из широкого окна не должна ломать выезжающий список чатов. */
+  #rail { display: none; }
+  #sidebar.collapsed {
+    width: 276px; min-width: 276px; padding: 14px 12px;
+    overflow: visible; border-right: 1px solid var(--border-soft);
+  }
   #project-panel {
     position: fixed;
     left: 0;

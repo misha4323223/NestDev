@@ -1115,7 +1115,17 @@ function stepQuery(s) {
 
 function normalizeStep(raw) {
   if (typeof raw === "string") {
-    return { kind: "click", args: { name: raw }, label: "клик по «" + raw.slice(0, 40) + "»" };
+    const t = String(raw).trim();
+    if (!t) return null;
+    // Строка-шаг: «Enter»/«Escape» — это клавиша, «goto https://…»/URL — переход,
+    // остальное — клик по видимому тексту (модели шлют и массив строк).
+    if (/^(enter|escape|esc|tab|pagedown|pageup|space|arrowup|arrowdown|arrowleft|arrowright)$/i.test(t)) {
+      return { kind: "press", args: { key: t }, label: "клавиша " + t };
+    }
+    if (/^goto\s+/i.test(t) || /^https?:\/\//i.test(t)) {
+      return { kind: "open", args: { url: t.replace(/^goto\s+/i, "") }, label: "открыть " + t.slice(0, 60) };
+    }
+    return { kind: "click", args: { name: t }, label: "клик по «" + t.slice(0, 40) + "»" };
   }
   const s = raw && typeof raw === "object" ? raw : null;
   if (!s) return null;
@@ -1233,13 +1243,21 @@ async function act(args) {
   args = args || {};
   const t = needTab(args.tabId || args.tab);
   if (t.error) return t.error;
-  let steps = args.steps || args.actions || args.script;
+  let steps = args.steps || args.actions || args.script || args.step || args.commands || args.pipeline;
   if (typeof steps === "string") {
     try { steps = JSON.parse(steps); } catch { steps = null; }
   }
+  // Один шаг без массива — тоже шаг: модель регулярно присылает объект вместо [объект],
+  // и раньше это стоило целого хода («вызов упал»).
+  if (steps && typeof steps === "object" && !Array.isArray(steps)) steps = [steps];
+  if (Array.isArray(steps)) {
+    steps = steps.filter((s) => s != null && (typeof s === "object" || typeof s === "string"));
+  }
   if (!Array.isArray(steps) || !steps.length) {
+    const saw = Object.keys(args).filter((k) => k !== "tabId" && k !== "tab");
     return (
-      "Ошибка browserAct: укажи steps — массив шагов. Пример:\n" +
+      "Ошибка browserAct: укажи steps — массив шагов" +
+      (saw.length ? " (получено: " + saw.join(", ") + ")" : "") + ". Пример:\n" +
       'browserAct { steps: [{ "click": "Войти" }, { "field": "Почта", "text": "a@b.c" }, ' +
       '{ "fill": "•••", "ref": "e5", "submit": true }, { "read": true }] }\n' +
       "Шаги: goto (открыть адрес), click, fill (+submit), press, wait (мс), waitFor (текст), back, scroll, eval, read, snapshot."
@@ -2321,6 +2339,96 @@ async function wheelAt(page, dx, dy, times, box) {
   return { ok: true };
 }
 
+// ── Ленивая подгрузка (ВК, ленты, истории переписки) ────────────────────────
+// Ключ «что изменилось»: позиция прокрутки + счётчик внутреннего контейнера +
+// длина текста страницы. Пока ключ меняется — список догружается.
+function lazyKeyOf(st, textLen) {
+  const s = st || {};
+  const inner = Array.isArray(s.inner) ? s.inner.map((i) => i.max).join(",") : "";
+  // Только СОДЕРЖИМОЕ: высота документа (и внутренних контейнеров) + длина текста.
+  // Позицию прокрутки сюда НЕ берём: пока страница едет по уже загруженному,
+  // «роста» нет — иначе список считался бы растущим до самого низа, и цикл
+  // догрузки никогда не остановился бы сам.
+  return (s.docH || s.max || 0) + "|" + inner + "|" + (textLen || 0);
+}
+
+// Догрузить ленивый список/историю: крутим, пока появляется новое содержимое, и
+// останавливаемся сами. Раньше агент крутил по одному шагу за ход и не понимал,
+// когда хватит (список диалогов ВК: в DOM только ~15 видимых чатов).
+async function loadAllScroll(page, args) {
+  args = args || {};
+  const how = String(args.how || args.direction || "down").toLowerCase();
+  const up = how === "up" || how === "top";
+  const maxSteps = Math.max(1, Math.min(parseInt(args.times, 10) || 12, 40));
+  const dyBase = Math.max(300, Math.round(Number(args.by != null ? args.by : args.dy) || 0) || 700);
+  let box = null;
+  let boxDesc = "";
+  if (args.container) {
+    const cq = queryFromSpec(args.container);
+    const t = cq ? await resolveTarget(page, cq, "click") : { error: "укажи container — имя, ref или селектор" };
+    if (t && t.error) return t.error;
+    box = await boxOf(t.loc);
+    boxDesc = t.desc;
+  }
+  const readState = async () => (await page.evaluate(scrollStateInPage).catch(() => ({}))) || {};
+  const textLen = async () =>
+    page.evaluate(() => String((document.body && document.body.innerText) || "").length).catch(() => 0);
+  const mark = async () => lazyKeyOf(await readState(), await textLen());
+
+  let prev = await mark();
+  let steps = 0;
+  let grew = 0;
+  let sameRuns = 0;
+  for (let i = 0; i < maxSteps; i++) {
+    const dy = up ? -dyBase : dyBase;
+    if (box) {
+      await wheelAt(page, 0, dy, 1, box);
+    } else {
+      const w = await wheelAt(page, 0, dy, 1, null);
+      if (!w.ok || w.error) {
+        await page.evaluate(scrollPageInPage, { how: up ? "up" : "down", dy: dy, dx: 0 }).catch(() => null);
+      }
+    }
+    steps++;
+    // Ждём подгрузку: содержимое или позиция должны измениться (иначе список кончился).
+    await waitUntil(async () => (await mark()) !== prev, 800, 70);
+    await sleep(140);
+    const now = await mark();
+    if (now === prev) {
+      sameRuns++;
+    } else {
+      grew++;
+      sameRuns = 0;
+    }
+    prev = now;
+    if (sameRuns >= 2) break;
+  }
+  const st = await readState();
+  const atEnd = up ? Number(st.y || 0) <= 2 : Number(st.max || 0) - Number(st.y || 0) <= 2;
+  let out =
+    "OK — " + (box ? "догрузил контейнер «" + boxDesc + "» " : "догрузил страницу ") + how + ", шагов: " + steps +
+    ". Новое содержимое появилось на " + grew + " " + (grew === 1 ? "шаге" : "шагах") +
+    (sameRuns >= 2
+      ? ", дальше пусто — это конец списка."
+      : atEnd
+        ? ", похоже, это конец списка."
+        : ", упёрся в предел " + maxSteps + " шагов — вызови ещё раз, если нужно больше.");
+  out += "\n" + posLine(st);
+  if (args.read || args.text) {
+    const txt = await page
+      .evaluate(() => String((document.body && document.body.innerText) || "").replace(/\n{3,}/g, "\n\n"))
+      .catch(() => "");
+    if (txt) {
+      const cap = Math.min(Math.max(parseInt(args.limit, 10) || 4000, 500), 12000);
+      out += "\n\nТекст страницы (начало):\n" + String(txt).slice(0, cap);
+      if (String(txt).length > cap) out += "\n… (текст длиннее — читай нужный кусок через browserText)";
+    }
+  } else {
+    out += "\n" + (await revealText(page, args.limit));
+  }
+  return out;
+}
+
 // browserScroll: страница, внутренние контейнеры, «до элемента» (+ что появилось в кадре).
 async function scroll(args) {
   args = args || {};
@@ -2347,6 +2455,9 @@ async function scroll(args) {
       posLine(st) + "\n" + (await revealText(page, args.limit))
     );
   }
+
+  // Ленивая подгрузка списка/истории: крутим до упора и останавливаемся сами.
+  if (args.loadAll || args.all || args.untilEnd) return await loadAllScroll(page, args);
 
   const how = String(args.how || args.direction || (Number(args.by || args.dy) < 0 ? "up" : "down")).toLowerCase();
   const times = Math.max(1, Math.min(parseInt(args.times, 10) || 1, 20));
@@ -2632,6 +2743,9 @@ module.exports = {
   idleStartInPage,
   idleTakeInPage,
   idleStopInPage,
+  normalizeStep, // тесты: строки в шагах
   queryFromSpec,
+  lazyKeyOf, // тесты: определение «появилось ли новое содержимое»
+  loadAllScroll, // тесты: цикл догрузки ленивого списка
   setPlaywright, // только для тестов: подменить/сбросить кэш playwright
 };

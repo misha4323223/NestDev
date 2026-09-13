@@ -1,5 +1,15 @@
 "use strict";
 
+// Держатели темпа для провайдеров: лимит считается на ключ, но привязка к
+// провайдеру+модели даёт то же поведение и не хранит секрет в ключе карты.
+const rateLimiters = new Map();
+function rateLimiterFor(settings) {
+  const s = settings || {};
+  const key = String(s.provider || "openai") + "|" + String(s.model || "");
+  if (!rateLimiters.has(key)) rateLimiters.set(key, createRateLimiter());
+  return rateLimiters.get(key);
+}
+
 const { app, BrowserWindow, ipcMain, dialog, shell, Notification, clipboard, desktopCapturer } = require("electron");
 const { autoUpdater } = require("electron-updater");
 const path = require("path");
@@ -18,6 +28,8 @@ const {
   listModels,
   readApiError,
   friendlyRateLimitError,
+  rateLimitInfo,
+  createRateLimiter,
   genCallId,
   contextBudget,
   trimConversation,
@@ -3952,6 +3964,7 @@ async function executeTool(name, args, settings) {
         const planTitle = String(args.title || "").trim().slice(0, 80);
         if (activeEmit) activeEmit({ type: "plan", tasks: planTasks, title: planTitle });
         const ps = planSummary(planTasks);
+        activePlanSummary = { total: ps.total, done: ps.done, failed: ps.failed };
         const planRows = planTasks.map((t) =>
           (t.status === "done" ? "✅ " : t.status === "failed" ? "⚠️ " : t.status === "in_progress" ? "🔄 " : "⬜ ") +
           t.text + (t.note ? " — " + t.note : "")
@@ -4470,6 +4483,9 @@ async function fetchModels(settings) {
 // ─────────────────────────── AI: чат с инструментами ───────────────────────────
 let activeAbort = null;
 let activeEmit = null; // отправка ai:event из executeTool (showImage и т.п.)
+// Последний план работ (todoWrite) текущего прогона. Нужен предохранителю,
+// который ловит обрыв: модель ответила текстом, а пункты плана не закрыты.
+let activePlanSummary = null;
 // Роутер инструментов текущего запуска: findTools по нему включает группы на лету.
 let activeToolRouter = null;
 
@@ -4585,7 +4601,12 @@ async function runAi(settings, messages, win, opts) {
     } catch {}
   }
   let contextRetried = false; // при переполнении контекста пробуем ещё раз с меньшим бюджетом
+  // Лимит 429: не роняем раунд — ждём столько, сколько просит провайдер, и повторяем.
+  let rateRetries = 0;
+  const rateLimiter = rateLimiterFor(settings);
   let reportRetried = false; // пустой финальный текст — один раз просим итоговый отчёт
+  let planNudges = 0; // «план не закрыт, а модель замолчала» — просим продолжить делом (макс. 2)
+  activePlanSummary = null; // план прошлого прогона не должен влиять на этот
   // ── Роутер инструментов ──────────────────────────────────────────────────
   // Вместо «все 146 схем в каждом раунде» шлём базу + группы, нужные этой задаче
   // (routeTools из agent-core). Состав ЛИПКИЙ на всю задачу: группа, однажды
@@ -4846,6 +4867,15 @@ async function runAi(settings, messages, win, opts) {
       numCtxBudget: budget,
       modelWindow: modelWin,
     });
+    // Темп: если лимит провайдера уже известен, выдерживаем паузу ЗАРАНЕЕ, а не
+    // после отказа. Это главный выигрыш по времени: 429 — потерянный раунд.
+    const paced = await rateLimiter.take();
+    if (paced > 800) {
+      termEmit({
+        type: "metrics",
+        text: "⏳ Держу темп провайдера: пауза " + Math.round(paced / 1000) + " с перед запросом (лимит уже известен).",
+      });
+    }
     let res;
     try {
       res = await fetch(req.url, {
@@ -4859,6 +4889,7 @@ async function runAi(settings, messages, win, opts) {
       throw new Error("Сетевая ошибка при запросе к " + provider + ": " + e.message);
     }
     roundTtfbMs = Date.now() - roundStartedAt; // заголовки ответа = первый байт
+    if (res.ok) rateRetries = 0;
     if (!res.ok) {
       const detail = await readApiError(res);
       // Строгий OpenAI-совместимый сервер может не знать stream_options (мы просили им
@@ -4878,8 +4909,26 @@ async function runAi(settings, messages, win, opts) {
         continue;
       }
       // Лимиты провайдера (Groq free ~7K токенов/мин): понятное объяснение вместо сырого JSON.
+      // Проверяем ДО повтора: у Groq лимит по токенам, повтор бессмысленен — там свой совет.
       const friendly = friendlyRateLimitError(res.status, detail, settings);
       if (friendly) throw new Error(friendly);
+      // 429 (лимит запросов): ждём столько, сколько просил провайдер, и повторяем ТОТ ЖЕ раунд.
+      // Раньше это падало ошибкой: пользователь терял раунд и ждал вслепую.
+      if (res.status === 429 && rateRetries < 3) {
+        const info = rateLimitInfo(res.status, res.headers, detail);
+        rateRetries++;
+        rateLimiter.note(info);
+        const waitMs = Math.max(1000, Math.min(info.retryMs || 5000, 60000));
+        termEmit({
+          type: "metrics",
+          text:
+            "⏳ Лимит провайдера (429): жду " + Math.round(waitMs / 1000) + " с (" + rateRetries + "/3) и повторяю запрос — раунд не потерян." +
+            (info.rpm ? " Учёл лимит " + info.rpm + " запросов/мин." : ""),
+        });
+        await new Promise((r) => setTimeout(r, waitMs));
+        round--;
+        continue;
+      }
       // Переполнение контекста (частая беда локальных моделей Ollama с малым окном):
       // один раз повторяем запрос с резко урезанной историей, чтобы не падать.
       if (
@@ -4985,6 +5034,37 @@ async function runAi(settings, messages, win, opts) {
         cleaned = cleaned.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
         if (cleaned) emit({ type: "text_override", text: cleaned });
       }
+    }
+
+    // Модель ответила текстом без вызова инструментов, но план работ не закрыт —
+    // это обрыв, а не финал. На выросшем/сжатом контексте слабые модели (особенно
+    // локальные) «забывают» вызвать инструмент и просто описывают, что осталось, —
+    // раньше прогон на этом заканчивался, и агент выглядел отключившимся.
+    if (
+      toolCalls.length === 0 &&
+      !planMode &&
+      !abort.signal.aborted &&
+      planNudges < 2 &&
+      activePlanSummary &&
+      activePlanSummary.total > 0 &&
+      activePlanSummary.done + activePlanSummary.failed < activePlanSummary.total
+    ) {
+      planNudges++;
+      const left = activePlanSummary.total - activePlanSummary.done - activePlanSummary.failed;
+      termEmit({
+        type: "metrics",
+        text: "📋 План не закрыт (" + left + " из " + activePlanSummary.total + " пунктов) — прошу агента продолжить делом (попытка " + planNudges + "/2).",
+      });
+      canonical.push({
+        role: "user",
+        content:
+          "Ты ответил текстом, но план работ не закрыт: " + activePlanSummary.done + " из " + activePlanSummary.total + " готово" +
+          (activePlanSummary.failed ? ", сбоев: " + activePlanSummary.failed : "") +
+          ". Работа не окончена — не описывай, что осталось, а ВЫПОЛНЯЙ: вызови следующий инструмент. " +
+          "Если пункт выполнить нельзя — отметь его failed через todoWrite (с причиной в note) и переходи к следующему. " +
+          "После каждого шага присылай todoWrite с ПОЛНЫМ списком.",
+      });
+      continue;
     }
 
     // Пустой финальный ответ — не молчим. Один раз просим итоговый отчёт.
@@ -5157,7 +5237,13 @@ async function runAi(settings, messages, win, opts) {
     // Остановка во время выполнения инструментов — завершаем без нового раунда.
     if (global.__agentStopRequested) return stopGraceful();
   }
-  throw Object.assign(new Error("Превышено максимальное число раундов вызова инструментов (" + maxRounds + ")."), { fatal: true });
+  throw Object.assign(
+    new Error(
+      "Превышено максимальное число раундов вызова инструментов (" + maxRounds + "). " +
+      "(Действия на диске сохранены.) Напиши «продолжай» — агент получит тот же контекст и продолжит с текущего места."
+    ),
+    { fatal: true }
+  );
   } catch (e) {
     const fatal = (e && e.name === "AbortError") || (e && e.fatal) || global.__agentStopRequested || (e && e.message && /Не выбрана модель/.test(e.message));
     if (fatal || attemptNum > AUTO_RETRY_LIMIT) throw e;

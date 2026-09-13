@@ -625,38 +625,60 @@
   // с галочками нет». Теперь текст тоже становится чеклистом: заголовок («План», «План работ»,
   // «Шаги», «Todo») со списком пунктов или блок строк-чекбоксов (✅/⬜/🔄/⚠️).
   const PLAN_TEXT_MAX = 7;
-  const PLAN_HEAD_RE = /^\s*(?:[>#*_]{0,4}\s*)?(?:\*\*|__)?\s*(план(?:\s+(?:работ|действий|выполнения|задач))?|шаги|порядок\s+действий|todo|to-do)\s*:?\s*(?:\*\*|__)?\s*$/i;
+  const PLAN_HEAD_RE = /^\s*(?:[>#*_+-]{0,4}\s*)?(?:\*\*|__)?\s*(план(?:\s+(?:работ|действий|выполнения|задач))?|шаги|порядок\s+действий|todo|to-do)\s*:?\s*(?:\*\*|__)?\s*$/i;
   // Заголовок в КОНЦЕ фразы, а не отдельной строкой: «План уже составлен. Сейчас нужно:», «Дальше по шагам:».
   // Ключевое слово обязательно: иначе любой абзац «что нужно:» со списком выглядел бы планом.
-  const PLAN_TAIL_RE = /(?:план\w*|шаг\w*|этап\w*|дальше|теперь|нужно|надо|осталось|порядок\s+действий)[^:\n]{0,60}:\s*$/i;
-  const PLAN_ITEM_RE = /^\s*(?:[-*•–—]\s+\S|\[[ xX]\]\s*\S|\d{1,2}[.)]\s+\S|[✅☑✔⬜☐🔄⚠️⬛]\s*\S)/;
+  const PLAN_TAIL_RE = /(?:план\w*|шаг\w*|этап\w*|дальше|теперь|нужно|надо|осталось|порядок\s+действий)[^:\n]{0,60}:\s*(?:\*\*|__)?\s*$/i;
+  const PLAN_ITEM_RE = /^\s*(?:[-*•–—]\s+\S|\[[ xX]\]\s*\S|\d{1,2}[.)]\s+\S|(?:[Шш]аг|[Ээ]тап|[Ss]tep)\s*\d+\s*[:.)]\s*\S|[A-Za-zА-Яа-я]\)\s+\S|[✅☑✔⬜☐🔄⚠️⬛]\s*\S)/;
   const PLAN_TICK_RE = /^\s*[✅☑✔⬜☐🔄⚠️⬛]\s*\S/;
+  // Слова-маркеры для плана без заголовка (см. planLinesFromText).
+  const PLAN_WORD_RE = /(план\w*|шаг\w*|этап\w*|порядок\s+действий|дальше|осталось|todo)/i;
+
+  // Собирает пункты плана, начиная со строки from. Пустые строки ВНУТРИ списка
+  // пропускаем: модели печатают markdown «loose list» (пункты через пустую строку),
+  // и раньше такой план терялся целиком — панель оставалась пустой.
+  function collectPlanItems(lines, from) {
+    const out = [];
+    for (let j = Math.max(0, from); j < lines.length && out.length < PLAN_TEXT_MAX; j++) {
+      const line = lines[j].replace(/\s+$/, "");
+      if (!line.trim()) continue; // пустая строка внутри списка — не конец плана
+      if (!PLAN_ITEM_RE.test(line)) break;
+      out.push(line);
+    }
+    return out;
+  }
 
   // Строки плана из текста ответа. Пусто — если плана в тексте нет (обычный ответ или
   // перечисление в прозе): заголовок обязателен, либо нужен блок чекбоксов из 2+ строк.
   function planLinesFromText(text) {
-    const lines = String(text || "").split(/\r?\n/);
+    const raw = String(text || "");
+    const lines = raw.split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
       if (!PLAN_HEAD_RE.test(lines[i]) && !PLAN_TAIL_RE.test(lines[i])) continue;
-      const out = [];
-      for (let j = i + 1; j < lines.length && out.length < PLAN_TEXT_MAX; j++) {
-        const line = lines[j].replace(/\s+$/, "");
-        if (!line.trim()) { if (out.length) break; continue; }
-        if (!PLAN_ITEM_RE.test(line)) break; // пошёл обычный текст — план закончился
-        out.push(line);
-      }
+      const out = collectPlanItems(lines, i + 1);
       if (out.length >= 2) return out;
     }
     // Заголовка нет, но есть блок строк-чекбоксов — это тоже план (его и ждёт пользователь).
     let block = [];
-    for (const raw of lines) {
-      const line = raw.replace(/\s+$/, "");
+    for (const row of lines) {
+      const line = row.replace(/\s+$/, "");
       if (PLAN_TICK_RE.test(line)) { block.push(line); continue; }
       if (!line.trim() && block.length) continue;
       if (block.length >= 2) break;
       block = [];
     }
-    return block.length >= 2 ? block.slice(0, PLAN_TEXT_MAX) : [];
+    if (block.length >= 2) return block.slice(0, PLAN_TEXT_MAX);
+    // Совсем без заголовка: в тексте есть планирующее слово и нумерованный список из 3+
+    // пунктов — это план («Задача разбивается на этапы: 1. … 2. … 3. …»). Порог в три
+    // пункта и узкий список слов оставляют обычные отчёты со списком вне панели.
+    if (PLAN_WORD_RE.test(raw)) {
+      for (let i = 0; i < lines.length; i++) {
+        if (!PLAN_ITEM_RE.test(lines[i])) continue;
+        const out = collectPlanItems(lines, i);
+        if (out.length >= 3) return out;
+      }
+    }
+    return [];
   }
 
   // Заголовок плана из текста («План работ» и т.п.). Пусто → панель покажет «План работ».
@@ -760,10 +782,14 @@
   function tryPlanFromRunText(chat, aMsg) {
     const text = runTextOf(chat, aMsg);
     if ((text.match(/\n/g) || []).length < 2) return false;
+    const hadPlan = !!(chat && chat.plan);
     if (planFromText(chat, runTextOf(chat, aMsg))) {
       planCollapsed = false; // план только что появился — показываем его развёрнутым
       renderPlanPanel();
       persistChatsSoon();
+      // Панель плана живёт над полем ввода, и её легко не заметить — сообщаем один раз
+      // на план (дальнейшие уточнения плана тост не повторяют).
+      if (!hadPlan) toast("📋 Модель составила план — чеклист над полем ввода");
       return true;
     }
     return false;
@@ -1672,7 +1698,7 @@
     if (!settings.model) {
       // У чипов-действий («Создать файл» и т.п.) не получается выполнить задачу
       // без модели — показываем понятное сообщение в настройках.
-      openSettings();
+      openSettings("model");
       setSettingsMsg(
         "Сначала выбери модель: провайдер → API-ключ (для облака) → кнопка «Проверить подключение» → клик по модели из списка → «Сохранить настройки». Пока модель не выбрана, команды агенту («создай файл…») выполнить нельзя.",
         true
@@ -2096,6 +2122,42 @@
   let termAutostartDone = false;
   let previewLoaded = ""; // последний загруженный URL превью
 
+  // Рельса слева (как в Replit): иконки переиспользуют кнопки шапки, поэтому поведение
+  // ровно то же, а подсветка синхронизируется с состоянием панелей.
+  function syncRail() {
+    const pairs = [
+      ["rail-console", "btn-toggle-console"],
+      ["rail-preview", "btn-toggle-preview"],
+      ["rail-cloud", "btn-toggle-cloud"],
+      ["rail-files", "btn-toggle-panel"],
+    ];
+    for (const [railId, btnId] of pairs) {
+      const r = $(railId);
+      const b = $(btnId);
+      if (r && b) r.classList.toggle("active", b.classList.contains("active"));
+    }
+    const chats = $("rail-chats");
+    const sb = $("sidebar");
+    if (chats && sb) chats.classList.toggle("active", !sb.classList.contains("collapsed"));
+  }
+
+  // Свёрнутый список чатов (рельса остаётся на месте). Состояние запоминается:
+  // привычка «работаю без списка» не должна сбрасываться при каждом запуске.
+  function setSidebarCollapsed(v) {
+    const sb = $("sidebar");
+    if (!sb) return;
+    sb.classList.toggle("collapsed", !!v);
+    try { localStorage.setItem("sidebarCollapsed", v ? "1" : "0"); } catch {}
+    const b = $("btn-side-collapse");
+    if (b) b.title = v ? "Развернуть панель чатов" : "Свернуть панель чатов";
+    syncRail();
+  }
+
+  function toggleSidebarCollapsed() {
+    const sb = $("sidebar");
+    setSidebarCollapsed(!(sb && sb.classList.contains("collapsed")));
+  }
+
   function sidePanelVisible() {
     return !$("side-panel").classList.contains("hidden");
   }
@@ -2124,6 +2186,7 @@
     if (sideTab === "cloud") {
       ycLoadDashboard(false);
     }
+    syncRail();
   }
 
   function closeSidePanel() {
@@ -2131,6 +2194,7 @@
     $("btn-toggle-console").classList.remove("active");
     $("btn-toggle-preview").classList.remove("active");
     if ($("btn-toggle-cloud")) $("btn-toggle-cloud").classList.remove("active");
+    syncRail();
   }
 
   function switchSideTab(tab) {
@@ -3398,10 +3462,99 @@
     renderModelHints(null, null); // подсказки моделей относятся к активному провайдеру
   }
 
-  // Переключение вкладок настроек
+  // Переключение вкладок настроек. Последняя открытая вкладка запоминается на сессию:
+  // кнопка «Настройки» возвращает туда, где ты остановился.
+  let lastSettingsTab = "model";
   function showSettingsTab(name) {
+    name = name || "model";
+    lastSettingsTab = name;
+    if (settingsSearchActive()) settingsSearchReset();
     document.querySelectorAll(".stab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
-    document.querySelectorAll(".settings-tab-body").forEach((b) => b.classList.toggle("hidden", b.dataset.tabBody !== name));
+    document.querySelectorAll(".settings-tab-body").forEach((b) => {
+      b.classList.remove("sfilter-hide");
+      b.classList.toggle("hidden", b.dataset.tabBody !== name);
+    });
+  }
+
+  // ── Поиск по настройкам ──
+  // Прячем поля ТОЛЬКО своим классом sfilter-hide: служебный .hidden приложение
+  // ставит само (например #mobile-fields или #yandex-project-field), снимать его нельзя.
+  function settingsSearchInput() {
+    return $("settings-search");
+  }
+  function settingsSearchActive() {
+    const el = settingsSearchInput();
+    return !!(el && el.value.trim());
+  }
+  function settingsSearchReset() {
+    const el = settingsSearchInput();
+    if (el) el.value = "";
+    settingsSearchApply("");
+  }
+  // Текст поля для поиска: подпись + подсказки + placeholder/title самих контролов,
+  // чтобы «sk-», «пароль», «токен» находились, даже если их нет в подписи.
+  function settingsFieldText(f) {
+    let t = f.textContent || "";
+    f.querySelectorAll("input, textarea, select").forEach((el) => {
+      t += " " + (el.placeholder || "") + " " + (el.title || "");
+    });
+    return t.toLowerCase();
+  }
+  function settingsSearchApply(raw) {
+    const q = String(raw || "").trim().toLowerCase();
+    const clearBtn = $("settings-search-clear");
+    if (clearBtn) clearBtn.classList.toggle("hidden", !q);
+    const bodies = Array.prototype.slice.call(document.querySelectorAll(".settings-tab-body"));
+    const empty = $("settings-empty");
+    const content = document.querySelector(".settings-content");
+    if (content) content.classList.toggle("search-mode", !!q);
+    // Карточки, раскрытые поиском, при выходе из поиска снова сворачиваем.
+    document.querySelectorAll(".sfilter-open").forEach((acc) => acc.classList.remove("open", "sfilter-open"));
+    if (!q) {
+      document.querySelectorAll(".sfilter-hide").forEach((el) => el.classList.remove("sfilter-hide"));
+      bodies.forEach((b) => b.classList.toggle("hidden", b.dataset.tabBody !== lastSettingsTab));
+      if (empty) empty.classList.add("hidden");
+      return;
+    }
+    let hits = 0;
+    bodies.forEach((body) => {
+      let bodyHits = 0;
+      Array.prototype.forEach.call(body.children, (child) => {
+        if (!child.classList) return;
+        // Искать можно и в секциях, и в карточках провайдеров (.acc): в «Модели»
+        // ключ и модель живут именно в карточках, а не в секции.
+        const searchable = child.classList.contains("settings-section") || child.classList.contains("acc");
+        if (searchable) {
+          let blockHits = 0;
+          child.querySelectorAll(".field").forEach((f) => {
+            const on = settingsFieldText(f).indexOf(q) !== -1;
+            f.classList.toggle("sfilter-hide", !on);
+            if (on) blockHits++;
+          });
+          child.classList.toggle("sfilter-hide", blockHits === 0);
+          bodyHits += blockHits;
+        } else {
+          // Всё остальное (подсказки моделей, панель провайдеров G4F) в результатах скрыто.
+          child.classList.add("sfilter-hide");
+        }
+      });
+      body.classList.toggle("hidden", bodyHits === 0);
+      if (bodyHits) {
+        // Совпадение внутри свёрнутой карточки — раскрываем её, иначе результата не видно.
+        // Помечаем только те, что раскрыли мы: открытые до поиска не трогаем.
+        body.querySelectorAll(".acc").forEach((acc) => {
+          if (acc.querySelector(".field:not(.sfilter-hide)") && !acc.classList.contains("open")) {
+            acc.classList.add("open", "sfilter-open");
+          }
+        });
+        // Подписываем результаты категорией, иначе непонятно, из какой вкладки поле.
+        const navBtn = document.querySelector('.stab[data-tab="' + body.dataset.tabBody + '"]');
+        const labelEl = navBtn && navBtn.querySelector(".stab-text b");
+        body.setAttribute("data-search-label", (labelEl && labelEl.textContent) || "");
+      }
+      hits += bodyHits;
+    });
+    if (empty) empty.classList.toggle("hidden", hits > 0);
   }
 
   function setPreset(p) {
@@ -3644,11 +3797,13 @@
     }
   }
 
-  function openSettings() {
+  function openSettings(tab) {
     renderEnvVars();
     renderVault();
     fillSettingsUI();
-    showSettingsTab("model"); // всегда открываем с вкладки «Модель»
+    // Без явной вкладки открываем ту, где остановились в прошлый раз. Вызовы, которым
+    // нужна конкретная вкладка («Настройки: модель», «выбрать модель»), передают её явно.
+    showSettingsTab(tab || lastSettingsTab || "model");
     setProviderUI(settings.provider || "openai");
     setPreset(currentPreset);
     // Определяем пресет по сохранённому URL (если он не пустой и совпадает с известным)
@@ -4531,8 +4686,11 @@
   }
   // Точка у кнопки «☁️» в шапке: зелёная — подключено, жёлтая — нужен каталог/IAM
   function ycSetHeaderDot(state) {
+    const cls = "hd-dot" + (state === "ok" ? " ok" : state === "warn" ? " warn" : "");
     const d = $("btn-toggle-cloud-dot");
-    if (d) d.className = "hd-dot" + (state === "ok" ? " ok" : state === "warn" ? " warn" : "");
+    if (d) d.className = cls;
+    const rd = $("rail-cloud-dot");
+    if (rd) rd.className = cls;
     const b = $("btn-toggle-cloud");
     if (b) {
       b.title =
@@ -4638,10 +4796,7 @@
     ycServicesCache = null;
     ycLoadDashboard(true);
   };
-  $("btn-yc-dash-settings").onclick = () => {
-    openSettings();
-    showSettingsTab("yandex");
-  };
+  $("btn-yc-dash-settings").onclick = () => openSettings("yandex");
   // Кнопка «☁️» в шапке — дашборд Yandex Cloud в правой панели
   if ($("btn-toggle-cloud")) {
     $("btn-toggle-cloud").onclick = () => {
@@ -4658,8 +4813,7 @@
   }
   if ($("btn-yc-onboard-settings")) {
     $("btn-yc-onboard-settings").onclick = () => {
-      openSettings();
-      showSettingsTab("yandex");
+      openSettings("yandex");
     };
   }
   if ($("btn-yc-onboard-token")) $("btn-yc-onboard-token").onclick = ycOpenTokenPage;
@@ -4729,7 +4883,7 @@
     if (u && isElectron) api.openExternal(u);
   };
 
-  $("btn-settings").onclick = openSettings;
+  $("btn-settings").onclick = () => openSettings();
   $("model-badge").onclick = toggleModelPopup;
   $("mp-close").onclick = closeModelPopup;
   $("mp-refresh").onclick = refreshModelsQuick;
@@ -4742,7 +4896,7 @@
     if (popup.classList.contains("hidden")) return;
     if (!popup.contains(e.target) && e.target !== $("model-badge")) closeModelPopup();
   });
-  $("btn-model-needed").onclick = openSettings;
+  $("btn-model-needed").onclick = () => openSettings("model");
 
   // Быстрые действия на приветственном экране (делегирование — работает даже
   // после пересоздания чипов при смене чата)
@@ -4804,6 +4958,23 @@
     }
   });
   $("btn-close-settings").onclick = () => $("settings-overlay").classList.add("hidden");
+  if ($("settings-search")) {
+    $("settings-search").addEventListener("input", (e) => settingsSearchApply(e.target.value));
+    // Esc в поле поиска очищает только поиск, а не закрывает всё окно настроек.
+    $("settings-search").addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && $("settings-search").value) {
+        e.preventDefault();
+        e.stopPropagation();
+        settingsSearchReset();
+      }
+    });
+  }
+  if ($("settings-search-clear")) {
+    $("settings-search-clear").onclick = () => {
+      settingsSearchReset();
+      $("settings-search").focus();
+    };
+  }
   $("settings-overlay").addEventListener("click", (e) => {
     if (e.target === $("settings-overlay")) $("settings-overlay").classList.add("hidden");
   });
@@ -4953,6 +5124,7 @@
     const wasHidden = panel.classList.contains("hidden");
     panel.classList.toggle("hidden", !wasHidden);
     $("btn-toggle-panel").classList.toggle("active", wasHidden);
+    syncRail();
     if (wasHidden) {
       refreshProject();
       refreshProjects();
@@ -5858,8 +6030,7 @@
   if ($("sb-model")) $("sb-model").onclick = () => toggleModelPopup();
   if ($("sb-version"))
     $("sb-version").onclick = () => {
-      openSettings();
-      showSettingsTab("ota");
+      openSettings("ota");
     };
 
   // ── Коммиты ──
@@ -6818,6 +6989,42 @@
     if (sidePanelVisible() && sideTab === "preview") closeSidePanel();
     else openSidePanel("preview");
   };
+
+  // ── Рельса слева: иконки нажимают те же кнопки шапки ──
+  (() => {
+    const proxy = (railId, btnId) => {
+      const r = $(railId);
+      const b = $(btnId);
+      if (!r || !b) return;
+      r.onclick = () => {
+        b.click();
+        syncRail();
+        if (window.innerWidth <= 900) $("sidebar").classList.remove("open");
+      };
+    };
+    proxy("rail-console", "btn-toggle-console");
+    proxy("rail-preview", "btn-toggle-preview");
+    proxy("rail-cloud", "btn-toggle-cloud");
+    proxy("rail-files", "btn-toggle-panel");
+    proxy("rail-new", "btn-new-chat");
+    proxy("rail-settings", "btn-settings");
+
+    const chats = $("rail-chats");
+    if (chats) {
+      chats.onclick = () => {
+        if (window.innerWidth <= 900) $("sidebar").classList.toggle("open");
+        else toggleSidebarCollapsed();
+      };
+    }
+    const collapse = $("btn-side-collapse");
+    if (collapse) collapse.onclick = toggleSidebarCollapsed;
+
+    // Состояние панели восстанавливаем: свёрнутость — часть привычного рабочего места.
+    try {
+      if (localStorage.getItem("sidebarCollapsed") === "1") setSidebarCollapsed(true);
+    } catch {}
+    syncRail();
+  })();
   $("btn-sp-close").onclick = closeSidePanel;
   document.querySelectorAll(".sp-btn").forEach((b) => {
     b.onclick = () => switchSideTab(b.dataset.sp);
@@ -7092,33 +7299,27 @@
       $("btn-yc-deploy").click();
     }, () => isElectron);
 
-    A("🤖", "Настройки: модель", "", "Настройки", () => openSettings());
+    A("🤖", "Настройки: модель", "", "Настройки", () => openSettings("model"));
     A("🔒", "Настройки: секреты и переменные", "", "Настройки", () => {
-      openSettings();
-      showSettingsTab("secrets");
+      openSettings("secrets");
     });
     A("🐙", "Настройки: GitHub и проект", "", "Настройки", () => {
-      openSettings();
-      showSettingsTab("project");
+      openSettings("project");
     });
     A("👁", "Настройки: зрение и картинки", "", "Настройки", () => {
-      openSettings();
-      showSettingsTab("vision");
+      openSettings("vision");
     });
     A("📱", "Настройки: мобильный доступ", "", "Настройки", () => {
-      openSettings();
-      showSettingsTab("mobile");
+      openSettings("mobile");
     });
     A("☁️", "Настройки: Yandex Cloud", "", "Настройки", () => {
-      openSettings();
-      showSettingsTab("yandex");
+      openSettings("yandex");
     });
     A("🔄", "Настройки: self-update (OTA)", "", "Настройки", () => {
-      openSettings();
-      showSettingsTab("ota");
+      openSettings("ota");
     });
     A("🛠", "Проверить подключение к модели", "", "Настройки", () => {
-      openSettings();
+      openSettings("model");
       testConnection();
     });
     return acts;

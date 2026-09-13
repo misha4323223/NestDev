@@ -324,6 +324,57 @@ async function testAgentCore() {
     assert.strictEqual(calls[0].extraContent.google.thought_signature, "SIG123==");
   });
 
+  await test("Ollama: рассуждения из message.thinking доходят до интерфейса", async () => {
+    // Thinking-модели (qwen3, deepseek-r1, gpt-oss) кладут рассуждения отдельным полем.
+    // Раньше их не читали вовсе — план, написанный в размышлениях, пропадал.
+    const ndjson =
+      JSON.stringify({ message: { role: "assistant", thinking: "Размышляю: ", content: "" }, done: false }) + "\n" +
+      JSON.stringify({ message: { role: "assistant", thinking: "план готов", content: "План:\n1. Раз\n2. Два" }, done: false }) + "\n" +
+      JSON.stringify({ message: { role: "assistant", content: "" }, done: true, prompt_eval_count: 10, eval_count: 5 }) + "\n";
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(ndjson));
+        controller.close();
+      },
+    });
+    const think = [];
+    const texts = [];
+    const usage = [];
+    await core.consumeProviderStream({
+      response: { body: stream },
+      provider: "ollama",
+      onText: (t) => texts.push(t),
+      onThinking: (t) => think.push(t),
+      onUsage: (u) => usage.push(u),
+    });
+    assert.strictEqual(think.join(""), "Размышляю: план готов", "рассуждения Ollama потеряны: " + JSON.stringify(think));
+    assert.strictEqual(texts.join(""), "План:\n1. Раз\n2. Два", "текст ответа Ollama потерян: " + JSON.stringify(texts));
+    assert.strictEqual(usage.length, 1, "счётчики Ollama не пришли");
+  });
+
+  await test("OpenAI-совместимые: поле reasoning тоже доходит до интерфейса", async () => {
+    const sse =
+      "data: " + JSON.stringify({ choices: [{ delta: { reasoning: "думаю" } }] }) + "\n" +
+      "data: " + JSON.stringify({ choices: [{ delta: { content: "ответ" } }] }) + "\n" +
+      "data: [DONE]\n";
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(sse));
+        controller.close();
+      },
+    });
+    const think = [];
+    const texts = [];
+    await core.consumeProviderStream({
+      response: { body: stream },
+      provider: "openai",
+      onText: (t) => texts.push(t),
+      onThinking: (t) => think.push(t),
+    });
+    assert.strictEqual(think.join(""), "думаю", "поле reasoning не проброшено: " + JSON.stringify(think));
+    assert.strictEqual(texts.join(""), "ответ");
+  });
+
   await test("Gemini: assistant tool_calls эхуют extra_content в запрос", () => {
     const req = core.buildChatRequest(
       { provider: "openai", openaiUrl: "https://api.openai.com/v1", openaiApiKey: "k" },
@@ -4415,6 +4466,55 @@ async function testPlanPanel() {
     assert.strictEqual(ticks.plan.items[1].status, "pending");
   });
 
+  await test("план текстом: пустые строки, жирный заголовок, «Шаг N» и список без заголовка", () => {
+    // Модели печатают markdown: пункты через пустую строку, заголовок — жирным в конце фразы.
+    assert.strictEqual(
+      mod.planLinesFromText("План работ:\n1. Прочитать package.json\n\n2. Поднять сервер\n\n3. Проверить порт").length,
+      3,
+      "пункты через пустую строку потеряны"
+    );
+    assert.strictEqual(
+      mod.planLinesFromText("Сначала план. **Сейчас нужно:**\n1. Найти конфиг\n2. Поправить порт").length,
+      2,
+      "жирный заголовок в конце фразы не распознан"
+    );
+    assert.strictEqual(
+      mod.planLinesFromText("План:\nШаг 1: Прочитать файл\nШаг 2: Запустить сервер").length,
+      2,
+      "пункты «Шаг N:» не распознаны"
+    );
+    // Регистр не должен решать: модели пишут «Шаг», «Этап», «Step» с большой буквы.
+    assert.strictEqual(
+      mod.planLinesFromText("План:\nЭтап 1. Разобрать\nЭтап 2. Собрать").length,
+      2,
+      "пункты «Этап N.» не распознаны"
+    );
+    assert.strictEqual(
+      mod.planLinesFromText("План:\nА) Прочитать файл\nБ) Запустить сервер").length,
+      2,
+      "буквенные пункты «А)» не распознаны"
+    );
+    assert.strictEqual(
+      mod.planLinesFromText("Задача разбивается на этапы.\n1. Первое\n2. Второе\n3. Третье").length,
+      3,
+      "список с планирующим словом не признан планом"
+    );
+    // Обычный отчёт со списком планом по-прежнему не становится.
+    assert.deepStrictEqual(mod.planLinesFromText("Что сделано:\n1. Первое\n2. Второе\n3. Третье"), [], "отчёт со списком стал планом");
+    assert.deepStrictEqual(mod.planLinesFromText("Вот результаты:\n1. Одно\n2. Два\n3. Три"), [], "перечисление результатов стало планом");
+    // Один пункт планом не считается.
+    assert.deepStrictEqual(mod.planLinesFromText("План:\n1. Единственный"), [], "один пункт признан планом");
+  });
+
+  await test("план: о появлении панели сообщают тостом (один раз на план)", () => {
+    const i = appSrc.indexOf("function tryPlanFromRunText");
+    assert.ok(i > 0, "нет tryPlanFromRunText");
+    const fn = appSrc.slice(i, i + 1200);
+    assert.ok(fn.indexOf("if (!hadPlan) toast(") !== -1, "о появлении плана не сообщается");
+    assert.ok(fn.indexOf("const hadPlan = !!(chat && chat.plan);") !== -1, "нет защиты от повторных тостов");
+    assert.ok(fn.indexOf("planFromText(chat, runTextOf(chat, aMsg))") !== -1, "разбор плана из текста запуска пропал");
+  });
+
   await test("план: настоящий план модели (todoWrite) важнее текстового", () => {
     const chat = { messages: [] };
     mod.planFromText(chat, "План:\n1. Первый шаг\n2. Второй шаг");
@@ -6469,6 +6569,643 @@ async function testChatContextTransfer() {
   });
 }
 
+
+// ── Выросший чат: агент не должен «писать что-то и отключаться» ─────────────
+async function testLongChatRecovery() {
+  const core = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
+  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const GUARD_START = "// Модель ответила текстом без вызова инструментов, но план работ не закрыт";
+  const GUARD_END = "// Пустой финальный ответ — не молчим";
+
+  await test("выросший чат: незакрытый план не даёт прогону закончиться текстом", () => {
+    const i = mainSrc.indexOf(GUARD_START);
+    const j = mainSrc.indexOf(GUARD_END);
+    assert.ok(i > 0 && j > i, "нет предохранителя «план не закрыт»");
+    const block = mainSrc.slice(i, j);
+    assert.ok(block.includes("toolCalls.length === 0"), "предохранитель не привязан к «нет вызовов инструментов»");
+    assert.ok(
+      block.includes("activePlanSummary.done + activePlanSummary.failed < activePlanSummary.total"),
+      "не проверяется, что пункты плана закрыты не все"
+    );
+    assert.ok(block.includes("planNudges < 2"), "нет ограничения повторов — возможен бесконечный цикл");
+    assert.ok(block.includes("canonical.push"), "просьба продолжить не уходит модели");
+    assert.ok(block.includes("continue;"), "прогон всё равно завершается");
+    assert.ok(/failed/.test(block), "нет выхода для невыполнимого пункта (failed)");
+    assert.ok(mainSrc.includes("let planNudges = 0;"), "нет счётчика повторов");
+    assert.ok(mainSrc.includes("activePlanSummary = null; // план прошлого прогона"), "сводка плана не сбрасывается между прогонами");
+  });
+
+  await test("выросший чат: todoWrite отдаёт сводку плана предохранителю", () => {
+    assert.ok(mainSrc.includes("let activePlanSummary = null;"), "нет переменной сводки плана");
+    assert.ok(
+      mainSrc.includes("activePlanSummary = { total: ps.total, done: ps.done, failed: ps.failed };"),
+      "todoWrite не запоминает сводку плана"
+    );
+  });
+
+  await test("выросший чат: в режиме плана предохранитель выключен", () => {
+    const block = mainSrc.slice(mainSrc.indexOf(GUARD_START), mainSrc.indexOf(GUARD_END));
+    assert.ok(block.includes("!planMode"), "в режиме плана агент будет «продолжать делом» вместо ожидания команды");
+  });
+
+  await test("лимит раундов объясняет, как продолжить, а не просто падает", () => {
+    const i = mainSrc.indexOf("Превышено максимальное число раундов вызова инструментов");
+    assert.ok(i > 0, "нет сообщения о лимите раундов");
+    const t = mainSrc.slice(i, i + 400);
+    assert.ok(t.includes("продолжай"), "пользователю не сказано, что делать дальше");
+    assert.ok(/сохранены/.test(t), "не сказано, что работа не потеряна");
+  });
+
+  // Повторное сжатие: перехватываем сеть, чтобы увидеть, сколько раз и с чем сжимаем.
+  const realFetch = global.fetch;
+  const bodies = [];
+  let memoN = 0;
+  global.fetch = async (url, opts) => {
+    memoN++;
+    bodies.push(String((opts && opts.body) || ""));
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ choices: [{ message: { content: "МЕМО" + memoN } }] }),
+    };
+  };
+  try {
+    await test("выросший чат: сжатие срабатывает повторно, и памятка накапливается", async () => {
+      const chunk = "строка старого контекста ".repeat(120);
+      const messages = [];
+      for (let i = 0; i < 12; i++) {
+        messages.push({ role: "user", content: chunk + " u" + i });
+        messages.push({ role: "assistant", content: chunk + " a" + i });
+      }
+      messages.push({ role: "user", content: "текущая задача: дойти до конца" });
+      const settings = { provider: "openai", model: "gpt-4o", openaiUrl: "https://example.invalid/v1", openaiApiKey: "k" };
+      const cm = core.createContextManager({ settings, planMode: false });
+      for (let i = 0; i < 5; i++) await cm.manage(messages, 2000);
+      assert.ok(bodies.length > 1, "сжатие по-прежнему одноразовое: вызовов " + bodies.length);
+      assert.ok(bodies.length <= 3, "сжатий больше лимита: " + bodies.length);
+      assert.ok(bodies[1].includes("МЕМО1"), "повторное сжатие не видит предыдущую памятку — старые шаги потеряются");
+    });
+  } finally {
+    global.fetch = realFetch;
+  }
+}
+
+// ── Настройки: вертикальная навигация, поиск, липкий футер ──────────────────
+async function testSettingsRedesign() {
+  const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+  const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+  const cssSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "monochrome.css"), "utf8");
+
+  await test("настройки: категории в вертикальной колонке слева, содержимое справа", () => {
+    const nav = htmlSrc.indexOf('<nav class="settings-nav">');
+    const content = htmlSrc.indexOf('<div class="settings-content">');
+    const tabs = htmlSrc.indexOf('data-tab-body="model"');
+    assert.ok(nav > 0, "нет вертикальной навигации .settings-nav");
+    assert.ok(content > nav, "область содержимого идёт не после навигации");
+    assert.ok(tabs > content, "вкладки оказались вне области содержимого");
+    const stabs = (htmlSrc.match(/class="stab[" ]/g) || []).length;
+    assert.strictEqual(stabs, 9, "вкладок не 9: " + stabs);
+    const subs = (htmlSrc.match(/class="stab-text"/g) || []).length;
+    assert.strictEqual(subs, 9, "у категорий нет подписей: " + subs);
+    assert.ok(cssSrc.includes("grid-template-columns: 218px minmax(0, 1fr)"), "раскладка настроек не двухколоночная");
+  });
+
+  await test("настройки: футер с «Сохранить» вне прокрутки", () => {
+    const footer = htmlSrc.indexOf('<div class="settings-footer">');
+    const lastBody = htmlSrc.lastIndexOf("data-tab-body=");
+    const msg = htmlSrc.indexOf('id="settings-msg"');
+    assert.ok(footer > lastBody, "футер оказался внутри прокручиваемой области");
+    assert.ok(msg > footer, "сообщение о сохранении вне футера");
+    assert.ok(cssSrc.includes("grid-template-rows: auto minmax(0, 1fr) auto"), "панель не делит высоту на шапку/тело/футер");
+    assert.ok(cssSrc.includes(".settings-footer-btns"), "кнопки сохранения не сгруппированы");
+  });
+
+  await test("настройки: поиск по всем вкладкам и понятная пустота", () => {
+    assert.ok(htmlSrc.includes('id="settings-search"'), "нет поля поиска");
+    assert.ok(htmlSrc.includes('id="settings-empty"'), "нет сообщения «ничего не найдено»");
+    assert.ok(appSrc.includes("function settingsSearchApply"), "поиск не реализован");
+    assert.ok(appSrc.includes('$("settings-search").addEventListener("input"'), "поиск не слушает ввод");
+    assert.ok(appSrc.includes('classList.toggle("sfilter-hide"'), "поле прячется не своим классом");
+    assert.ok(appSrc.includes('"sfilter-open"'), "найденное в свёрнутой карточке не раскрывается");
+    assert.ok(cssSrc.includes(".sfilter-hide { display: none !important; }"), "нет стиля скрытия в поиске");
+    assert.ok(appSrc.includes("el.placeholder"), "поиск не видит placeholder полей");
+    assert.ok(appSrc.includes('classList.contains("acc")'), "карточки провайдеров выпадают из поиска (ключ и модель в «Модели» лежат в .acc)");
+    assert.ok(appSrc.includes("data-search-label"), "результаты не подписаны категорией");
+  });
+
+  await test("настройки: вкладка запоминается, клик по кнопке не передаёт событие", () => {
+    assert.ok(appSrc.includes("let lastSettingsTab"), "вкладка не запоминается");
+    assert.ok(appSrc.includes('showSettingsTab(tab || lastSettingsTab || "model")'), "открытие настроек не восстанавливает вкладку");
+    assert.ok(appSrc.includes('openSettings("model")'), "«выбрать модель» не ведёт на вкладку модели");
+    assert.ok(!appSrc.includes('$("btn-settings").onclick = openSettings;'), "клик по кнопке настроек передаёт событие как вкладку");
+    assert.ok(!appSrc.includes('$("btn-model-needed").onclick = openSettings;'), "кнопка «выбрать модель» передаёт событие как вкладку");
+  });
+}
+
+// ── Настройки: поиск по НАСТОЯЩЕЙ функции на игрушечном DOM ─────────────────
+// Достаём settingsSearchApply из app.js и прогоняем на дереве, повторяющем
+// структуру вкладок. Проверяется сама логика фильтра, а не только наличие строк.
+function miniDom() {
+  const el = (tag, cls, opts) => {
+    const o = opts || {};
+    const e = {
+      tagName: tag,
+      children: [],
+      _classes: new Set(String(cls || "").split(" ").filter(Boolean)),
+      _attrs: Object.create(null),
+      text: o.text || "",
+      value: "",
+      placeholder: o.placeholder || "",
+      title: "",
+      focus() {},
+    };
+    Object.defineProperty(e, "classList", {
+      value: {
+        contains: (c) => e._classes.has(c),
+        add: (...cs) => cs.forEach((c) => e._classes.add(c)),
+        remove: (...cs) => cs.forEach((c) => e._classes.delete(c)),
+        toggle: (c, on) => {
+          const want = on === undefined ? !e._classes.has(c) : !!on;
+          if (want) e._classes.add(c);
+          else e._classes.delete(c);
+          return want;
+        },
+      },
+    });
+    Object.defineProperty(e, "textContent", {
+      get() {
+        return [e.text].concat(e.children.map((c) => c.textContent)).join(" ");
+      },
+    });
+    Object.defineProperty(e, "dataset", {
+      get() {
+        const out = {};
+        for (const k of Object.keys(e._attrs)) {
+          if (k.indexOf("data-") === 0) out[k.slice(5).replace(/-(\w)/g, (_, c) => c.toUpperCase())] = e._attrs[k];
+        }
+        return out;
+      },
+    });
+    e.getAttribute = (n) => (n in e._attrs ? e._attrs[n] : null);
+    e.setAttribute = (n, v) => {
+      e._attrs[n] = String(v);
+    };
+    e.appendChild = (...cs) => {
+      cs.forEach((c) => e.children.push(c));
+      return e;
+    };
+    return e;
+  };
+
+  const desc = (n) => {
+    const out = [];
+    const walk = (x) => {
+      for (const c of x.children) {
+        out.push(c);
+        walk(c);
+      }
+    };
+    walk(n);
+    return out;
+  };
+  const matchSimple = (e, rawSel) => {
+    let rest = rawSel.trim();
+    const not = /:not\(\.([\w-]+)\)/.exec(rest);
+    if (not) {
+      if (e._classes.has(not[1])) return false;
+      rest = rest.replace(not[0], "");
+    }
+    const attr = /\[([\w-]+)="([^"]*)"\]/.exec(rest);
+    if (attr) {
+      if (e.getAttribute(attr[1]) !== attr[2]) return false;
+      rest = rest.replace(attr[0], "");
+    }
+    const tag = /^[a-zA-Z][\w-]*/.exec(rest);
+    if (tag) {
+      if (e.tagName !== tag[0].toLowerCase()) return false;
+      rest = rest.slice(tag[0].length);
+    }
+    for (const c of rest.match(/\.([\w-]+)/g) || []) if (!e._classes.has(c.slice(1))) return false;
+    return true;
+  };
+  const matchIn = (root, sel) => {
+    let cur = [root];
+    for (const part of sel.trim().split(/\s+/)) {
+      const next = [];
+      for (const node of cur) for (const d of desc(node)) if (matchSimple(d, part)) next.push(d);
+      cur = next;
+      if (!cur.length) return [];
+    }
+    return cur;
+  };
+  const queryAll = (root, sel) => {
+    const seen = new Set();
+    const out = [];
+    for (const sub of String(sel).split(",")) {
+      for (const m of matchIn(root, sub)) {
+        if (!seen.has(m)) {
+          seen.add(m);
+          out.push(m);
+        }
+      }
+    }
+    return out;
+  };
+  const attach = (e) => {
+    e.querySelectorAll = (s) => queryAll(e, s);
+    e.querySelector = (s) => queryAll(e, s)[0] || null;
+    return e;
+  };
+
+  // Дерево: навигация + содержимое + поиск (структура как в index.html).
+  const root = attach(el("div", "settings-panel"));
+  const nav = attach(el("nav", "settings-nav"));
+  const mkStab = (tab, name) => {
+    const b = attach(el("button", tab === "model" ? "stab active" : "stab"));
+    b.setAttribute("data-tab", tab);
+    const t = attach(el("span", "stab-text"));
+    t.appendChild(attach(el("b", "", { text: name })));
+    b.appendChild(t);
+    nav.appendChild(b);
+    return b;
+  };
+  mkStab("model", "Модель");
+  mkStab("mail", "Почта");
+
+  const content = attach(el("div", "settings-content"));
+  const empty = attach(el("div", "settings-empty hidden"));
+  content.appendChild(empty);
+
+  const bodyModel = attach(el("div", "settings-tab-body"));
+  bodyModel.setAttribute("data-tab-body", "model");
+  const secProvider = attach(el("div", "settings-section"));
+  const fProvider = attach(el("div", "field", { text: "Активный провайдер" }));
+  fProvider.appendChild(attach(el("select", "select")));
+  secProvider.appendChild(fProvider);
+  const accOllama = attach(el("div", "acc"));
+  accOllama.setAttribute("data-acc", "ollama");
+  const fOllama = attach(el("div", "field", { text: "Ollama URL" }));
+  fOllama.appendChild(attach(el("input", "", { placeholder: "http://localhost:11434" })));
+  accOllama.appendChild(fOllama);
+  const accOpenai = attach(el("div", "acc"));
+  accOpenai.setAttribute("data-acc", "openai");
+  const fKey = attach(el("div", "field", { text: "API-ключ" }));
+  fKey.appendChild(attach(el("input", "", { placeholder: "sk-..." })));
+  accOpenai.appendChild(fKey);
+  const hints = attach(el("div", "model-hints hidden"));
+  bodyModel.appendChild(secProvider, accOllama, accOpenai, hints);
+  content.appendChild(bodyModel);
+
+  const bodyMail = attach(el("div", "settings-tab-body hidden"));
+  bodyMail.setAttribute("data-tab-body", "mail");
+  const secMail = attach(el("div", "settings-section"));
+  const fMail = attach(el("div", "field", { text: "Пароль приложения" }));
+  fMail.appendChild(attach(el("input", "", { placeholder: "пароль приложения" })));
+  secMail.appendChild(fMail);
+  bodyMail.appendChild(secMail);
+  content.appendChild(bodyMail);
+
+  root.appendChild(nav, content);
+
+  const search = attach(el("input", "", { placeholder: "Поиск настроек" }));
+  const clear = attach(el("button", "btn hidden"));
+  const byId = { "settings-search": search, "settings-search-clear": clear, "settings-empty": empty };
+
+  return {
+    root,
+    content,
+    empty,
+    bodyModel,
+    bodyMail,
+    accOllama,
+    accOpenai,
+    secProvider,
+    hints,
+    input: search,
+    document: {
+      querySelectorAll: (s) => queryAll(root, s),
+      querySelector: (s) => queryAll(root, s)[0] || null,
+    },
+    $: (id) => byId[id] || null,
+  };
+}
+
+async function testSettingsSearchLogic() {
+  const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+
+  await test("поиск настроек: фильтрует по всем вкладкам, включая карточки провайдеров", () => {
+    const a = appSrc.indexOf("  // ── Поиск по настройкам ──");
+    const b = appSrc.indexOf("\n  function setPreset(p) {");
+    assert.ok(a > 0 && b > a, "не нашёл функции поиска в app.js");
+    const code = 'let lastSettingsTab = "model";\n' + appSrc.slice(a, b) + "\nreturn settingsSearchApply;";
+    const d = miniDom();
+    const apply = new Function("document", "$", code)(d.document, d.$);
+
+    // 1. Поиск ключа: карточка OpenAI-совместимых должна быть видна, Ollama — нет.
+    d.input.value = "ключ";
+    apply("ключ");
+    assert.ok(!d.bodyModel.classList.contains("hidden"), "вкладка «Модель» пропала из результатов");
+    assert.ok(d.bodyMail.classList.contains("hidden"), "вкладка «Почта» осталась без совпадений");
+    assert.ok(d.accOpenai.classList.contains("sfilter-hide") === false, "карточка с API-ключом скрыта");
+    assert.ok(d.accOllama.classList.contains("sfilter-hide") === true, "карточка без совпадений показана");
+    assert.ok(d.accOpenai.classList.contains("open"), "найденная свёрнутая карточка не раскрылась");
+    assert.ok(d.accOpenai.classList.contains("sfilter-open"), "карточка не помечена как раскрытая поиском");
+    assert.ok(d.secProvider.classList.contains("sfilter-hide"), "секция без совпадений видна");
+    assert.ok(d.hints.classList.contains("sfilter-hide"), "служебный блок (подсказки моделей) виден в результатах");
+    assert.ok(d.empty.classList.contains("hidden"), "«ничего не найдено» показано при совпадениях");
+    assert.ok(d.content.classList.contains("search-mode"), "нет режима результатов");
+    assert.strictEqual(d.bodyModel.getAttribute("data-search-label"), "Модель", "результаты не подписаны категорией");
+
+    // 2. Поиск по другой вкладке: видна «Почта», «Модель» скрыта, подпись своя.
+    apply("пароль");
+    assert.ok(!d.bodyMail.classList.contains("hidden"), "«Почта» не найдена по слову «пароль»");
+    assert.ok(d.bodyMail.getAttribute("data-search-label") === "Почта", "подпись категории не обновилась");
+    assert.ok(d.bodyModel.classList.contains("hidden"), "«Модель» показана без совпадений");
+
+    // 3. Ничего не найдено — честное сообщение, обе вкладки скрыты.
+    apply("нет-такого-слова-вообще");
+    assert.ok(d.empty.classList.contains("hidden") === false, "нет сообщения «ничего не найдено»");
+    assert.ok(d.bodyModel.classList.contains("hidden") && d.bodyMail.classList.contains("hidden"), "вкладки видны без совпадений");
+
+    // 4. Очистка: возвращаемся на запомненную вкладку, чужие классы не тронуты.
+    apply("");
+    assert.ok(!d.bodyModel.classList.contains("hidden"), "после очистки не вернулись на «Модель»");
+    assert.ok(d.bodyMail.classList.contains("hidden"), "после очистки видна чужая вкладка");
+    assert.ok(d.empty.classList.contains("hidden"), "после очистки висит «ничего не найдено»");
+    assert.ok(!d.content.classList.contains("search-mode"), "режим результатов не выключился");
+    assert.ok(!d.accOpenai.classList.contains("sfilter-open") && !d.accOpenai.classList.contains("open"), "карточка осталась раскрытой поиском");
+    assert.ok(!d.secProvider.classList.contains("sfilter-hide"), "после очистки остались скрытые секции");
+    assert.ok(d.hints.classList.contains("hidden"), "служебный .hidden не должен сниматься поиском");
+  });
+}
+
+// ── 4d. Левая рельса (как в Replit): разметка + живая логика ───────────────
+async function testLeftRail() {
+  const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+  const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+  const css = fs.readFileSync(path.join(ROOT, "src", "renderer", "styles.css"), "utf8");
+
+  const RAIL_IDS = ["rail-chats", "rail-console", "rail-preview", "rail-files", "rail-cloud", "rail-new", "rail-settings"];
+
+  await test("рельса: иконки в разметке, цель каждой есть в шапке/панелях", () => {
+    for (const id of RAIL_IDS) assert.ok(html.indexOf('id="' + id + '"') !== -1, "нет иконки " + id);
+    assert.ok(html.indexOf('id="rail-cloud-dot"') !== -1, "у облака на рельсе нет точки состояния");
+    assert.ok(html.indexOf('id="btn-side-collapse"') !== -1, "нет кнопки сворачивания панели чатов");
+    // Рельса должна стоять ДО списка чатов и внутри #app: иначе она уедет под панель.
+    const app = html.indexOf('id="app"');
+    const rail = html.indexOf('id="rail"');
+    const side = html.indexOf('id="sidebar"');
+    assert.ok(app > 0 && rail > app && rail < side, "рельса не между началом #app и списком чатов");
+    // Каждая иконка нажимает реально существующую кнопку: иначе клик уходит в никуда.
+    const targets = ["btn-toggle-console", "btn-toggle-preview", "btn-toggle-cloud", "btn-toggle-panel", "btn-new-chat", "btn-settings"];
+    for (const t of targets) assert.ok(html.indexOf('id="' + t + '"') !== -1, "нет цели нажатия " + t);
+    for (const r of RAIL_IDS.slice(1, 6)) {
+      assert.ok(appSrc.indexOf('proxy("' + r + '"') !== -1, "иконка " + r + " ни на что не нажимает");
+    }
+    assert.ok(appSrc.indexOf('proxy("rail-new", "btn-new-chat")') !== -1, "«новый чат» на рельсе не работает");
+    assert.ok(appSrc.indexOf('proxy("rail-settings", "btn-settings")') !== -1, "«настройки» на рельсе не работают");
+  });
+
+  await test("рельса: панель чатов сворачивается, рельса остаётся", () => {
+    assert.ok(/function setSidebarCollapsed\(/.test(appSrc), "нет сворачивания панели чатов");
+    assert.ok(/localStorage\.setItem\("sidebarCollapsed"/.test(appSrc), "свёрнутость не запоминается");
+    assert.ok(/#sidebar\.collapsed \{[\s\S]*?width: 0;/.test(css), "свёрнутая панель не уезжает");
+    // На телефоне свёрнутость не должна ломать выезжающую панель.
+    const m900 = css.match(/@media \(max-width: 900px\) \{([\s\S]*?)\n\}/);
+    assert.ok(m900, "нет блока max-width: 900px");
+    assert.ok(/#rail \{ display: none; \}/.test(m900[1]), "на телефоне рельса не скрыта");
+    assert.ok(/#sidebar\.collapsed \{[\s\S]*?width: 276px;/.test(m900[1]), "на телефоне свёрнутая панель перестаёт выезжать");
+  });
+
+  await test("рельса: нажатия переключают панели, подсветка синхронна", () => {
+    // Живая логика: берём из app.js синхронизацию и навешивание обработчиков и
+    // прогоняем на игрушечном DOM — проверяем поведение, а не наличие строк.
+    const a1 = appSrc.indexOf("  // Рельса слева (как в Replit): иконки переиспользуют");
+    const a2 = appSrc.indexOf("  function sidePanelVisible() {", a1);
+    const a3 = appSrc.indexOf("  // ── Рельса слева: иконки нажимают те же кнопки шапки ──");
+    const a4 = appSrc.indexOf('  $("btn-sp-close")', a3);
+    assert.ok(a1 > 0 && a2 > a1 && a3 > a2 && a4 > a3, "не нашёл логику рельсы в app.js");
+    const code =
+      appSrc.slice(a1, a2) +
+      appSrc.slice(a3, a4) +
+      "\nreturn { syncRail, setSidebarCollapsed, toggleSidebarCollapsed };";
+
+    const el = () => {
+      const e = { _c: new Set(), title: "", onclick: null };
+      // Как в браузере: click() вызывает обработчик — рельса нажимает кнопки шапки именно так.
+      e.click = () => { if (e.onclick) e.onclick(); };
+      Object.defineProperty(e, "classList", {
+        value: {
+          contains: (c) => e._c.has(c),
+          add: (...cs) => cs.forEach((c) => e._c.add(c)),
+          remove: (...cs) => cs.forEach((c) => e._c.delete(c)),
+          toggle: (c, on) => {
+            const want = on === undefined ? !e._c.has(c) : !!on;
+            if (want) e._c.add(c);
+            else e._c.delete(c);
+            return want;
+          },
+        },
+      });
+      return e;
+    };
+    const ids = RAIL_IDS.concat([
+      "rail-cloud-dot",
+      "sidebar",
+      "btn-side-collapse",
+      "btn-toggle-console",
+      "btn-toggle-preview",
+      "btn-toggle-cloud",
+      "btn-toggle-panel",
+      "btn-new-chat",
+      "btn-settings",
+    ]);
+    const nodes = {};
+    for (const id of ids) nodes[id] = el();
+    // Кнопки шапки ведут себя как настоящие: переключают свою подсветку.
+    nodes["btn-toggle-console"].onclick = () => nodes["btn-toggle-console"].classList.toggle("active");
+    nodes["btn-toggle-preview"].onclick = () => nodes["btn-toggle-preview"].classList.toggle("active");
+    nodes["btn-toggle-cloud"].onclick = () => nodes["btn-toggle-cloud"].classList.toggle("active");
+    nodes["btn-toggle-panel"].onclick = () => nodes["btn-toggle-panel"].classList.toggle("active");
+    let created = 0;
+    nodes["btn-new-chat"].onclick = () => { created++; };
+
+    const store = {};
+    const localStorage = {
+      getItem: (k) => (k in store ? store[k] : null),
+      setItem: (k, v) => { store[k] = String(v); },
+    };
+    const win = { innerWidth: 1280 };
+    const fakeDoc = { getElementById: (id) => nodes[id] || null };
+    const run = new Function("document", "$", "localStorage", "window", code)(fakeDoc, fakeDoc.getElementById, localStorage, win);
+
+    // 1. Старт: панель развёрнута, иконка «Чаты» подсвечена.
+    assert.ok(!nodes.sidebar.classList.contains("collapsed"), "панель чатов свёрнута при старте");
+    assert.ok(nodes["rail-chats"].classList.contains("active"), "«Чаты» не подсвечены при старте");
+
+    // 2. Сворачиваем иконкой: панель уезжает, состояние запоминается, подсветка снята.
+    nodes["rail-chats"].onclick();
+    assert.ok(nodes.sidebar.classList.contains("collapsed"), "клик по «Чаты» не свернул панель");
+    assert.strictEqual(store.sidebarCollapsed, "1", "свёрнутость не запомнилась");
+    assert.ok(!nodes["rail-chats"].classList.contains("active"), "«Чаты» подсвечены у свёрнутой панели");
+
+    // 3. Кнопка в шапке панели разворачивает обратно.
+    nodes["btn-side-collapse"].onclick();
+    assert.ok(!nodes.sidebar.classList.contains("collapsed"), "кнопка в шапке не разворачивает панель");
+    assert.strictEqual(store.sidebarCollapsed, "0", "разворот не запомнился");
+    assert.ok(nodes["rail-chats"].classList.contains("active"), "«Чаты» не подсветились после разворота");
+
+    // 4. Иконка панели нажимает кнопку шапки и подсвечивается вместе с ней.
+    nodes["rail-console"].onclick();
+    assert.ok(nodes["btn-toggle-console"].classList.contains("active"), "иконка консоли не нажала кнопку шапки");
+    assert.ok(nodes["rail-console"].classList.contains("active"), "иконка консоли не подсветилась");
+    nodes["rail-console"].onclick();
+    assert.ok(!nodes["rail-console"].classList.contains("active"), "повторный клик не снял подсветку");
+
+    // 5. Кнопка шапки, нажатая напрямую, тоже обновляет рельсу (syncRail).
+    nodes["btn-toggle-panel"].classList.add("active");
+    run.syncRail();
+    assert.ok(nodes["rail-files"].classList.contains("active"), "рельса не синхронизировалась с панелью файлов");
+
+    // 6. Новый чат и настройки: иконки нажимают настоящие кнопки.
+    nodes["rail-new"].onclick();
+    assert.strictEqual(created, 1, "иконка «новый чат» не создала чат");
+
+    // 7. Свёрнутость восстанавливается при запуске.
+    store.sidebarCollapsed = "1";
+    const nodes2 = {};
+    for (const id of ids) nodes2[id] = el();
+    const fakeDoc2 = { getElementById: (id) => nodes2[id] || null };
+    new Function("document", "$", "localStorage", "window", code)(fakeDoc2, fakeDoc2.getElementById, localStorage, win);
+    assert.ok(nodes2.sidebar.classList.contains("collapsed"), "свёрнутость не восстановилась при запуске");
+
+    // 8. На телефоне рельса прячется, а иконка «Чаты» открывает выезжающую панель.
+    store.sidebarCollapsed = "0";
+    win.innerWidth = 500;
+    const nodes3 = {};
+    for (const id of ids) nodes3[id] = el();
+    const fakeDoc3 = { getElementById: (id) => nodes3[id] || null };
+    new Function("document", "$", "localStorage", "window", code)(fakeDoc3, fakeDoc3.getElementById, localStorage, win);
+    nodes3["rail-chats"].onclick();
+    assert.ok(nodes3.sidebar.classList.contains("open"), "на телефоне «Чаты» не открывают панель");
+    assert.ok(!nodes3.sidebar.classList.contains("collapsed"), "на телефоне панель свернулась вместо выезда");
+  });
+}
+
+// ── 4e. Преграды из отчёта песочницы: лимит 429, ленивые списки, формат шагов ─
+async function testSandboxObstacles() {
+  const core = require("../src/renderer/agent-core");
+  const tools = require("../src/browser-tools");
+  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const toolsSrc = fs.readFileSync(path.join(ROOT, "src", "browser-tools.js"), "utf8");
+
+  await test("лимит 429: пауза читается из заголовка, текста и частоты", () => {
+    const hdr = { get: (k) => (k.toLowerCase() === "retry-after" ? "12" : null) };
+    assert.deepStrictEqual(core.rateLimitInfo(429, hdr, "").retryMs, 12000, "Retry-After не прочитан");
+    const ms = core.rateLimitInfo(429, null, "Please retry in 12.3s").retryMs;
+    assert.ok(Math.abs(ms - 12300) < 50, "«retry in 12.3s» не разобран: " + ms);
+    assert.strictEqual(core.rateLimitInfo(429, null, '{"error":{"retryDelay":"7s"}}').retryMs, 7000, "retryDelay не разобран");
+    assert.strictEqual(core.rateLimitInfo(429, null, "try again in 2 minutes").retryMs, 120000, "минуты не разобраны");
+    assert.strictEqual(core.rateLimitInfo(429, null, "8 requests per minute").rpm, 8, "частота запросов не разобрана");
+    // Ничего лимитного в тексте — не выдумываем паузу.
+    assert.strictEqual(core.rateLimitInfo(500, null, "internal error").retryMs, 0, "пауза придумана из ничего");
+  });
+
+  await test("лимит 429: темп держится заранее, а не после отказа", async () => {
+    const lim = core.createRateLimiter();
+    // Узнали частоту 60/min → интервал 1 с: второй вызов обязан подождать.
+    lim.note({ rpm: 60, retryMs: 0 });
+    const t0 = Date.now();
+    await lim.take();
+    await lim.take();
+    const waited = Date.now() - t0;
+    assert.ok(waited >= 900, "темп не выдержан (ждали " + waited + " мс)");
+    // После 429 пауза от провайдера учитывается: следующий запрос ждёт её целиком.
+    const l2 = core.createRateLimiter();
+    l2.note({ retryMs: 700 });
+    assert.ok(l2.pendingMs() >= 600, "пауза после 429 не запомнена");
+  });
+
+  await test("main.js: 429 больше не роняет раунд (ждём и повторяем)", () => {
+    assert.ok(/rateLimiter = rateLimiterFor\(settings\)/.test(mainSrc), "нет держателя темпа в main.js");
+    assert.ok(/const paced = await rateLimiter\.take\(\);/.test(mainSrc), "запросы не расставляются по темпу заранее");
+    assert.ok(/res\.status === 429 && rateRetries < 3/.test(mainSrc), "429 не повторяется");
+    assert.ok(/rateRetries\+\+;/.test(mainSrc) && /round--;\s*\n\s*continue;/.test(mainSrc), "повтор не возвращает раунд на перезапуск");
+    assert.ok(/if \(res\.ok\) rateRetries = 0;/.test(mainSrc), "счётчик повторов не сбрасывается на успехе");
+    // Порядок важен: сначала совет по токенному лимиту Groq (повтор там бессмысленен).
+    const i = mainSrc.indexOf("const friendly = friendlyRateLimitError(res.status, detail, settings);");
+    const j = mainSrc.indexOf("if (res.status === 429 && rateRetries < 3)");
+    assert.ok(i > 0 && j > i, "повтор 429 стоит раньше совета по токенному лимиту");
+  });
+
+  await test("догрузка ленивого списка: останавливается сама, когда новое кончилось", async () => {
+    assert.strictEqual(tools.lazyKeyOf({ y: 10, max: 100, inner: [] }, 50), tools.lazyKeyOf({ y: 10, max: 100, inner: [] }, 50), "ключ роста не стабилен");
+    assert.notStrictEqual(tools.lazyKeyOf({ y: 10, max: 100, inner: [] }, 50), tools.lazyKeyOf({ y: 10, max: 100, inner: [] }, 51), "рост текста не виден");
+    assert.notStrictEqual(
+      tools.lazyKeyOf({ y: 10, max: 100, inner: [{ top: 0, max: 50 }] }, 50),
+      tools.lazyKeyOf({ y: 10, max: 100, inner: [{ top: 0, max: 90 }] }, 50),
+      "рост внутреннего контейнера не виден"
+    );
+    // Позиция прокрутки — НЕ рост содержимого: иначе догрузка не остановится сама.
+    assert.strictEqual(
+      tools.lazyKeyOf({ y: 10, max: 100, docH: 900 }, 50),
+      tools.lazyKeyOf({ y: 900, max: 100, docH: 900 }, 50),
+      "прокрутка по уже загруженному считается новым содержимым"
+    );
+
+    // Игрушечная страница: текст растёт три прокрутки, потом список кончился.
+    const fakePage = (growUntil) => {
+      const st = { y: 0, max: 5000, text: 1000, scrolls: 0 };
+      const page = {
+        viewportSize: () => ({ width: 1000, height: 800 }),
+        mouse: {
+          move: async () => {},
+          wheel: async (dx, dy) => {
+            st.scrolls++;
+            st.y = Math.max(0, Math.min(st.max, st.y + dy));
+            if (st.scrolls <= growUntil) st.text += 400;
+          },
+        },
+        evaluate: async (fn) => {
+          const s = String(fn);
+          if (fn.name === "scrollStateInPage") return { y: st.y, max: st.max, vh: 800, docH: st.max + 800, inner: [] };
+          if (/scrollingElement/.test(s)) return st.y + ":0";
+          if (/innerText/.test(s)) return st.text;
+          if (fn.name === "scrollPageInPage") return { mode: "page", moved: 700, y: st.y, max: st.max };
+          return null;
+        },
+      };
+      return page;
+    };
+
+    const done = await tools.loadAllScroll(fakePage(3), { times: 12, read: true });
+    assert.ok(/догрузил страницу down/.test(done), "нет строки о догрузке: " + done.slice(0, 120));
+    assert.ok(/конец списка/.test(done), "не понял, что список кончился: " + done.slice(0, 200));
+    assert.ok(/Новое содержимое появилось на 3/.test(done), "неверный счётчик новых шагов: " + done.slice(0, 200));
+
+    const stuck = await tools.loadAllScroll(fakePage(0), { times: 12, read: true });
+    assert.ok(/Новое содержимое появилось на 0/.test(stuck), "при пустом списке считает рост: " + stuck.slice(0, 160));
+    assert.ok(/конец списка/.test(stuck), "на пустом списке не остановился");
+
+    const running = await tools.loadAllScroll(fakePage(99), { times: 4, read: true });
+    assert.ok(/предел 4 шагов/.test(running), "не сказал про предел шагов: " + running.slice(0, 200));
+  });
+
+  await test("browserAct: один объект вместо массива и строковые шаги", () => {
+    assert.ok(/args\.step \|\| args\.commands \|\| args\.pipeline/.test(toolsSrc), "не принимает шаги под другими именами");
+    assert.ok(/!Array\.isArray\(steps\)\) steps = \[steps\]/.test(toolsSrc), "объект-шаг не превращается в массив");
+    assert.ok(/получено: /.test(toolsSrc), "ошибка формата не говорит, что пришло");
+    // Живая проверка нормализатора: строки должны пониматься, а не падать.
+    const press = tools.normalizeStep("Enter");
+    assert.strictEqual(press && press.kind, "press", "«Enter» не стал клавишей");
+    const open = tools.normalizeStep("goto https://vk.com/im");
+    assert.strictEqual(open && open.kind, "open", "«goto …» не стал переходом");
+    const click = tools.normalizeStep("Написать сообщение");
+    assert.strictEqual(click && click.kind, "click", "обычная строка не стала кликом");
+    assert.strictEqual(tools.normalizeStep("   "), null, "пустая строка стала шагом");
+  });
+}
+
 (async () => {
   console.log("Smoke-тесты: " + path.basename(__filename));
   await testAgentCore();
@@ -6507,6 +7244,11 @@ async function testChatContextTransfer() {
   await testToolRouter();
   await testOllamaWindow();
   await testChatContextTransfer();
+  await testSettingsRedesign();
+  await testSettingsSearchLogic();
+  await testLeftRail();
+  await testSandboxObstacles();
+  await testLongChatRecovery();
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");
   process.exit(failed ? 1 : 0);
 })();

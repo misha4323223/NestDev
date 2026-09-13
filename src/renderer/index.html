@@ -17,22 +17,55 @@
 </head>
 <body>
   <div id="app">
+    <!-- Рельса быстрых панелей (как в Replit): остаётся на месте, даже когда список чатов свёрнут -->
+    <nav id="rail" aria-label="Быстрые панели">
+      <div class="rail-logo brand-logo" title="AI Developer Agent">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4" y="8" width="16" height="11" rx="4" />
+          <path d="M12 8V5" />
+          <circle cx="12" cy="4" r="1" />
+          <circle cx="9" cy="13" r="1.1" fill="currentColor" stroke="none" />
+          <circle cx="15" cy="13" r="1.1" fill="currentColor" stroke="none" />
+          <path d="M9 16.5h6" />
+        </svg>
+      </div>
+      <div class="rail-sep"></div>
+      <button id="rail-chats" class="rail-btn active" title="Чаты — список диалогов">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg>
+      </button>
+      <button id="rail-console" class="rail-btn" title="Консоль — логи и команды (как в Replit)">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6" /><path d="M12 19h8" /></svg>
+      </button>
+      <button id="rail-preview" class="rail-btn" title="Превью — сайт проекта, мобильный вид">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" /><circle cx="12" cy="12" r="3" /></svg>
+      </button>
+      <button id="rail-files" class="rail-btn" title="Файлы проекта — дерево, коммиты, откат">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg>
+      </button>
+      <button id="rail-cloud" class="rail-btn" title="Yandex Cloud — ресурсы каталога, деплой">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19a4.5 4.5 0 0 0 .5-8.97A6 6 0 0 0 6.34 8.5 4.5 4.5 0 0 0 7 17.5h10.5z" /></svg>
+        <span class="hd-dot" id="rail-cloud-dot"></span>
+      </button>
+      <div class="rail-spacer"></div>
+      <button id="rail-new" class="rail-btn rail-accent" title="Новый чат">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14" /></svg>
+      </button>
+      <button id="rail-settings" class="rail-btn" title="Настройки">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" /></svg>
+      </button>
+    </nav>
+
     <aside id="sidebar">
-      <div class="brand">
-        <div class="brand-logo">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="4" y="8" width="16" height="11" rx="4" />
-            <path d="M12 8V5" />
-            <circle cx="12" cy="4" r="1" />
-            <circle cx="9" cy="13" r="1.1" fill="currentColor" stroke="none" />
-            <circle cx="15" cy="13" r="1.1" fill="currentColor" stroke="none" />
-            <path d="M9 16.5h6" />
-          </svg>
+      <div class="side-head">
+        <div class="brand">
+          <div class="brand-text">
+            <div class="brand-name">AI Developer Agent</div>
+            <div class="brand-sub">Рабочее пространство</div>
+          </div>
         </div>
-        <div class="brand-text">
-          <div class="brand-name">AI Developer Agent</div>
-          <div class="brand-sub">Рабочее пространство</div>
-        </div>
+        <button id="btn-side-collapse" class="btn btn-ghost icon-btn" title="Свернуть панель чатов">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m14 7-5 5 5 5" /><path d="M19 5v14" /></svg>
+        </button>
       </div>
 
       <button id="btn-new-chat" class="btn btn-primary btn-block">
@@ -481,20 +514,57 @@
     <div class="settings-panel">
       <div class="settings-head">
         <h2>⚙️ Настройки</h2>
-        <button id="btn-close-settings" class="btn btn-ghost">✕</button>
+        <div class="settings-search">
+          <span class="settings-search-ico">⌕</span>
+          <input id="settings-search" placeholder="Поиск настроек — ключ, модель, пароль, почта…" spellcheck="false" autocomplete="off" />
+          <button id="settings-search-clear" class="btn btn-ghost btn-small hidden" title="Очистить поиск">✕</button>
+        </div>
+        <button id="btn-close-settings" class="btn btn-ghost" title="Закрыть настройки">✕</button>
       </div>
       <div class="settings-body">
-        <div class="settings-tabs">
-          <button class="stab active" data-tab="model" title="Основная модель: провайдер, ключ, сохранённые подключения">🤖 Модель</button>
-          <button class="stab" data-tab="vision" title="Вспомогательная модель: зрение и генерация изображений">👁 Зрение</button>
-          <button class="stab" data-tab="project" title="Рабочая директория, GitHub, git">📁 Проект и GitHub</button>
-          <button class="stab" data-tab="mobile" title="Доступ с телефона по локальной сети">📱 Мобильный</button>
-          <button class="stab" data-tab="secrets" title="Переменные окружения и секреты для команд">🔒 Секреты</button>
-          <button class="stab" data-tab="yandex" title="Yandex Cloud: авторизация, каталог, разрешения агента">☁️ Yandex Cloud</button>
-          <button class="stab" data-tab="mail" title="Почта: отправка писем и коды подтверждения (SMTP/IMAP)">✉️ Почта</button>
-          <button class="stab" data-tab="memory" title="Память диалогов: сжатые памятки контекста сохраняются локально по датам">🧠 Память</button>
-          <button class="stab" data-tab="ota" title="Локальные обновления кода на ходу">🔄 Self-update</button>
-        </div>
+        <nav class="settings-nav">
+          <div class="settings-nav-group">Агент</div>
+          <button class="stab active" data-tab="model" title="Основная модель: провайдер, ключ, сохранённые подключения">
+            <span class="stab-ico">🤖</span>
+            <span class="stab-text"><b>Модель</b><small>провайдер, ключ, подключения</small></span>
+          </button>
+          <button class="stab" data-tab="vision" title="Вспомогательная модель: зрение и генерация изображений">
+            <span class="stab-ico">👁</span>
+            <span class="stab-text"><b>Зрение</b><small>скриншоты и генерация картинок</small></span>
+          </button>
+          <button class="stab" data-tab="project" title="Рабочая директория, GitHub, git, браузер агента">
+            <span class="stab-ico">📁</span>
+            <span class="stab-text"><b>Проект и GitHub</b><small>папка, репозиторий, браузер</small></span>
+          </button>
+          <button class="stab" data-tab="secrets" title="Переменные окружения, пароли сайтов и поиск для агента">
+            <span class="stab-ico">🔒</span>
+            <span class="stab-text"><b>Секреты</b><small>переменные, пароли сайтов, поиск</small></span>
+          </button>
+          <div class="settings-nav-group">Интеграции</div>
+          <button class="stab" data-tab="yandex" title="Yandex Cloud: авторизация, каталог, разрешения агента">
+            <span class="stab-ico">☁️</span>
+            <span class="stab-text"><b>Yandex Cloud</b><small>хостинг и инфраструктура</small></span>
+          </button>
+          <button class="stab" data-tab="mail" title="Почта: отправка писем и коды подтверждения (SMTP/IMAP)">
+            <span class="stab-ico">✉️</span>
+            <span class="stab-text"><b>Почта</b><small>SMTP, IMAP, коды подтверждения</small></span>
+          </button>
+          <button class="stab" data-tab="mobile" title="Доступ с телефона по локальной сети">
+            <span class="stab-ico">📱</span>
+            <span class="stab-text"><b>Мобильный</b><small>телефон в той же Wi-Fi</small></span>
+          </button>
+          <div class="settings-nav-group">Данные</div>
+          <button class="stab" data-tab="memory" title="Память диалогов: сжатые памятки контекста сохраняются локально по датам">
+            <span class="stab-ico">🧠</span>
+            <span class="stab-text"><b>Память</b><small>памятки контекста по датам</small></span>
+          </button>
+          <button class="stab" data-tab="ota" title="Локальные обновления кода на ходу">
+            <span class="stab-ico">🔄</span>
+            <span class="stab-text"><b>Self-update</b><small>обновления кода на ходу</small></span>
+          </button>
+        </nav>
+        <div class="settings-content">
+          <div id="settings-empty" class="settings-empty hidden">Ничего не найдено. Попробуй другое слово — например «ключ», «модель», «почта», «пароль».</div>
 
         <!-- ── Вкладка: Модель ── -->
         <div class="settings-tab-body" data-tab-body="model">
@@ -1070,12 +1140,17 @@
           </div>
         </div>
 
-        <div class="settings-footer">
+        </div><!-- /settings-content -->
+      </div><!-- /settings-body -->
+      <div class="settings-footer">
+        <div id="settings-msg" class="settings-msg"></div>
+        <div class="settings-footer-btns">
           <button id="btn-test" class="btn btn-ghost">🔌 Проверить подключение</button>
           <button id="btn-save-settings" class="btn btn-primary">💾 Сохранить настройки</button>
         </div>
-        <div id="settings-msg" class="settings-msg"></div>
       </div>
+    </div>
+  </div>
 <script src="agent-core.js"></script>
   <script src="markdown.js"></script>
   <script src="bootstrap.js"></script>
