@@ -51,6 +51,10 @@
       <button id="rail-deploy" class="rail-btn" title="Деплой — собрать контейнер и выложить в облако">
         <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3c3.5 2.5 5.5 6 5.5 9.5L12 21l-5.5-8.5C6.5 9 8.5 5.5 12 3z" /><circle cx="12" cy="10" r="2" /></svg>
       </button>
+      <button id="rail-mission" class="rail-btn" title="Миссия — долгая работа агента: цель, шаги, журнал">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 22V4a1 1 0 0 1 1-1h9l1 2h5a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-6l-1-2H6v8z" /></svg>
+        <span class="rail-badge hidden" id="rail-mission-badge"></span>
+      </button>
       <button id="rail-tasks" class="rail-btn" title="Дела — задачи и сроки">
         <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6h11" /><path d="M9 12h11" /><path d="M9 18h11" /><path d="m3 6 1.5 1.5L7 5" /><path d="m3 12 1.5 1.5L7 11" /><path d="m3 18 1.5 1.5L7 17" /></svg>
         <span class="rail-badge hidden" id="rail-tasks-badge"></span>
@@ -233,6 +237,11 @@
           <button class="sp-btn active" data-sp="preview" role="tab" title="Превью — сайт проекта, мобильный вид, новая вкладка">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" /><circle cx="12" cy="12" r="3" /></svg>
             <span>Превью</span>
+          <button class="sp-btn" data-sp="mission" role="tab" title="Миссия — долгая работа агента: цель, план, журнал">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 22V4a1 1 0 0 1 1-1h9l1 2h5a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-6l-1-2H6v8z" /></svg>
+            <span>Миссия</span>
+            <i id="sp-mission-dot" class="sp-dot hidden"></i>
+          </button>
           <button class="sp-btn" data-sp="tasks" role="tab" title="Дела — задачи и сроки, панель менеджера">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6h11" /><path d="M9 12h11" /><path d="M9 18h11" /><path d="m3 6 1.5 1.5L7 5" /><path d="m3 12 1.5 1.5L7 11" /><path d="m3 18 1.5 1.5L7 17" /></svg>
             <span>Дела</span>
@@ -289,6 +298,34 @@
             <iframe id="preview-frame" title="Предпросмотр сайта" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
           </div>
         </div>
+      </div>
+      <div id="sp-mission" class="sp-body hidden">
+        <div class="ms-top">
+          <div class="ms-top-text">
+            <div class="ms-title" id="ms-title">Миссия</div>
+            <span class="ms-status" id="ms-status">—</span>
+          </div>
+          <button id="btn-mission-refresh" class="btn btn-ghost btn-small" title="Обновить">↻</button>
+        </div>
+        <div id="ms-empty" class="ms-empty">Миссий пока нет. Они появляются сами, когда работа агента становится длинной: цель, план и журнал работы ложатся файлами в папку <code>.agent/</code> рядом с проектом (миссии, журнал и отчёты видны в проводнике).</div>
+        <div id="ms-card" class="ms-card hidden">
+          <div class="ms-goal" id="ms-goal"></div>
+          <div class="ms-bar"><div class="ms-fill" id="ms-fill"></div></div>
+          <div class="ms-meta" id="ms-meta"></div>
+          <div class="ms-actions">
+            <button id="btn-mission-pause" class="btn btn-small" title="Приостановить работу: миссия останется незакрытой">⏸ Пауза</button>
+            <button id="btn-mission-resume" class="btn btn-primary btn-small" title="Продолжить работу с того же шага">▶ Продолжить</button>
+            <button id="btn-mission-stop" class="btn btn-danger btn-small" title="Остановить прогон">⏹ Стоп</button>
+            <button id="btn-mission-folder" class="btn btn-ghost btn-small" title="Открыть папку миссии в проводнике">📂</button>
+          </div>
+          <div class="ms-section-title">План</div>
+          <div id="ms-steps" class="ms-steps"></div>
+          <div class="ms-section-title">Журнал работы</div>
+          <div id="ms-journal" class="ms-journal"></div>
+        </div>
+        <div class="ms-section-title" id="ms-past-title">Прошлые миссии</div>
+        <div id="ms-list" class="ms-list"></div>
+        <div class="ms-hint">Миссия — это долгая работа, разбитая на шаги: 25 раундов за батч, затем следующий — так агент работает часами и не теряет задачу. Цель, план, журнал и итог лежат файлами в <code>.agent/missions/&lt;id&gt;/</code>.</div>
       </div>
       <div id="sp-tasks" class="sp-body hidden">
         <div class="tk-top">
@@ -705,6 +742,7 @@
                 <label>Базовый URL</label>
                 <input id="s-openai-url" placeholder="https://api.deepseek.com/v1" spellcheck="false" />
               </div>
+              <div class="hint-block">Здесь же работают <b>локальные серверы</b> с совместимым API: LM Studio (<code>http://localhost:1234/v1</code>), llama.cpp (<code>http://localhost:8080/v1</code>), vLLM, LocalAI, Jan. Адрес на <code>localhost</code> или в домашней сети приложение само считает местным: окно модели спрашивается у самого сервера (включая ручки LM Studio и llama.cpp), история не режется облачным бюджетом, а таймауты рассчитаны на медленный ответ CPU. Ключ таким серверам не нужен — поле можно оставить пустым. Если модель не умеет вызывать инструменты, включи галочку «Модель без поддержки инструментов» ниже.</div>
               <div class="field">
                 <label>API-ключ</label>
                 <div class="input-row">
@@ -743,6 +781,15 @@
                   <span class="check-row-text">
                     <b>Отправлять все инструменты</b>
                     <small>По умолчанию приложение отправляет модели базовый набор и только те группы, которые нужны задаче (git, браузер, система, почта и т.д.) — это быстрее и дешевле на каждом раунде, а нужная группа добирается автоматически при первом же вызове или через findTools. Включи этот флажок, если модель путается и «не видит» нужный инструмент: тогда уходят все схемы (медленнее и дороже).</small>
+                  </span>
+                </label>
+              </div>
+              <div class="field">
+                <label class="check-row" title="Модель не умеет вызывать инструменты — работаем текстовым протоколом">
+                  <input id="s-no-tools-model" type="checkbox" />
+                  <span class="check-row-text">
+                    <b>Модель без поддержки инструментов</b>
+                    <small>Для моделей, которые не умеют нативные вызовы (часть бесплатных сборок G4F и локальных серверов вроде LM Studio или llama.cpp). Схемы инструментов в запрос не отправляются: вместо них в системном сообщении компактный каталог, а вызов идёт JSON-блоком {"name": ..., "arguments": {...}}. У Ollama это определяется само по capability «tools»; у остальных серверов спросить негде, поэтому галочка ручная. Включай только если модель отвечает текстом вместо действий.</small>
                   </span>
                 </label>
               </div>
@@ -863,6 +910,35 @@
             <div class="field">
               <label class="check-row"><input id="s-task-reminders" type="checkbox" /> <span>Напоминать о делах в срок</span></label>
               <div class="hint-block">Пока приложение открыто, о деле напомнит уведомление Windows и лента чата. Дела живут в приложении (не в проекте) и переживают перезапуск: панель «Дела» — в рельсе слева.</div>
+            </div>
+            <div class="field">
+              <label class="check-row" title="Долгая работа миссиями: файлы .agent/ в рабочей папке, батчи по 25 раундов, авто-продолжение"><input id="s-long-work" type="checkbox" /> <span>Долгая работа агента (миссии)</span></label>
+              <div class="hint-block">Агент умеет работать часами, как человек: большая задача становится <b>миссией</b> — цель, план, шаги и журнал шагов сохраняются файлами в папке <code>.agent/</code> рядом с проектом. Работа идёт отрезками по 25 раундов и <b>продолжается сама</b>, если прогон оборвался, а после перезапуска приложения её можно продолжить кнопкой в панели «Миссия». Там же видно: сколько шагов сделано, сколько времени и токенов ушло, и чем агент занят прямо сейчас.</div>
+              <div class="input-row">
+                <label class="mini-label">Часов на миссию</label>
+                <input id="s-long-hours" type="number" min="1" max="24" step="1" class="mini-num" />
+                <label class="mini-label">Раундов на миссию</label>
+                <input id="s-long-rounds" type="number" min="25" max="2000" step="25" class="mini-num" />
+                <label class="mini-label">Авто-продолжений</label>
+                <input id="s-long-continue" type="number" min="0" max="20" step="1" class="mini-num" />
+              </div>
+              <div class="hint-block">«Часов на миссию» — как рабочий день: 8 часов, потом работа встаёт на паузу (её можно продолжить). «Авто-продолжений» — сколько раз приложение само подхватит работу после сбоя сети или провайдера.</div>
+            </div>
+            <div class="field">
+              <label class="check-row" title="Задачи, контекст и миссии агент ведёт файлами в папке .agent/ рядом с проектом: работа видна в проводнике и переживает перезапуск приложения.">
+                <input id="s-agent-files" type="checkbox" />
+                <span>Вести файлы работы рядом с проектом</span>
+              </label>
+              <div class="hint-block">Агент пишет свою работу сам: список дел — <code>.agent/tasks.md</code>, памятки контекста — <code>.agent/context/&lt;дата&gt;.md</code>, миссии — <code>.agent/missions/&lt;id&gt;/</code> (цель, план, журнал шагов, отчёт). Папка помечена исключённой из git, поэтому рабочий журнал не попадёт в коммиты. Галочка не нужна только в том случае, если в папке проекта не должно появляться ничего лишнего.</div>
+              <div class="input-row">
+                <button id="btn-agent-files-open" class="btn btn-ghost btn-small" title="Открыть папку работы в проводнике">📂 Открыть папку</button>
+                <button id="btn-agent-files-clear" class="btn btn-ghost btn-small" title="Удалить зеркала: список дел и памятки контекста. Миссии остаются — это работа агента.">🧹 Очистить зеркала</button>
+              </div>
+              <div id="agent-files-status" class="ota-status">—</div>
+            </div>
+            <div class="field">
+              <label class="check-row"><input id="s-task-auto" type="checkbox" /> <span>Автозадачи выполняет агент</span></label>
+              <div class="hint-block">Дело с отметкой «▶ агент» приложение запускает само по сроку: агент молча работает и кладёт ответ в чат «Автозадачи». Повторы — «каждый день», «по будням», «каждую пятницу», «каждый месяц», «каждые 2 часа». Без этой галочки дела только напоминают. Автозапуск работает, пока приложение открыто.</div>
             </div>
           </div>
           <div class="settings-section">

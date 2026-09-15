@@ -33,6 +33,7 @@ const {
   createRateLimiter,
   genCallId,
   contextBudget,
+  windowBudget,
   trimConversation,
   sanitizeToolPairs,
   truncateText,
@@ -51,10 +52,14 @@ const {
   UNAVAILABLE_MAX,
   searchTools,
   ROUTER_MAX_TOKENS,
+  routerMaxTokens,
   groupOfTool,
   PLAN_MODE_TOOL_DEFINITIONS,
   modelWindow,
   ollamaModelInfo,
+  ollamaNumCtx,
+  isLocalEndpoint,
+  toolsAsText,
   // инструменты ОС (парсеры, whitelist)
   parseProcessesCsv,
   registryPathAllowed,
@@ -74,6 +79,7 @@ const browserTools = require("./browser-tools.js"); // браузерные ин
 const appUi = require("./app-ui-tools.js"); // инструменты управления собственным окном приложения (app-*)
 const secrets = require("./secrets.js"); // секреты: ключи, токены, PIN, agentEnv (safeStorage)
 const agentStore = require("./agent-store.js"); // память проекта (заметки) и точки отката (чекпоинты)
+const missionStore = require("./mission-store.js"); // миссии: цель, план, журнал и отчёт файлами в .agent/
 const unifiedPatch = require("./unified-patch.js"); // применение unified diff (applyPatch)
 const codeIndex = require("./code-index.js"); // семантический индекс кода (BM25 + стемминг)
 const yandexCloud = require("./yandex-cloud.js"); // Yandex Cloud REST API: авторизация, дашборд, создание ресурсов
@@ -105,6 +111,10 @@ const mobileBridge = new MobileBridge({ handlerMap: ipcHandlerMap });
 // мобильного моста — у него фиктивное событие IPC с sender.id = 0). Клиентов
 // теперь несколько, и события чужого прогона нельзя подмешивать в свой чат.
 let activeRunOrigin = "desktop";
+// Роль и чат текущего прогона: у миссии есть хозяин (роль и чат), иначе её журнал
+// некуда показать. Значения приходят из интерфейса вместе с сообщением.
+let activeRunRole = "";
+let activeRunChatId = "";
 const ota = require("./ota.js"); // локальный self-update (OTA)
 const selfDev = require("./self-dev.js"); // защита критичной инфраструктуры самообновления
 
@@ -149,6 +159,7 @@ const DEFAULT_SETTINGS = {
   imageModel: "",
   defaultRole: "dev", // роль новых чатов: dev / assistant / manager / researcher
   taskReminders: true, // напоминать о делах в срок, пока приложение открыто
+  taskAuto: true, // дела с отметкой «выполняет агент» запускаются сами по сроку
   serperApiKey: "", // ключ Serper — усиленный Google-поиск для агента (webSearch)
   // Браузер агента: постоянный профиль (куки и входы на сайты переживают перезапуск приложения)
   browserProfile: true,
@@ -192,6 +203,16 @@ const DEFAULT_SETTINGS = {
   // согласия пользователя на диск ничего не пишется.
   contextMemory: false,
   contextMemoryDays: 30, // сколько дней хранить (старые дни удаляются автоматически)
+  // Долгая работа миссиями: цель, план, шаги и журнал лежат файлами в рабочей папке
+  // (.agent/missions/<id>/), прогон идёт батчами по 25 раундов и переживает перезапуск.
+  longWork: true, // по умолчанию включено: без этого агент умирает на 26-м раунде
+  longWorkHours: 8, // часов на одну миссию — как рабочий день, потом пауза и продолжение
+  longWorkRounds: 600, // раундов на миссию (батчами)
+  longWorkAutoContinue: 6, // сколько раз приложение само продолжает после обрыва/ошибки
+  // Файлы работы рядом с проектом (.agent/): задачи и контекст агент ведёт сам.
+  // Работа на 8 часов не имеет права жить только в памяти процесса — по этим файлам
+  // человек видит, чем занят агент, и по ним же работу можно поднять заново.
+  agentWorkFiles: true,
 
   // Журнал действий агента: опасные и требующие подтверждения действия пишутся
   // в userData/audit.log (JSONL). Секреты в журнал не попадают. Включён по умолчанию.
@@ -1861,6 +1882,21 @@ function emitTasksChanged() {
   try {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("tasks:changed", { ts: Date.now() });
   } catch {}
+  // Зеркало в рабочей папке (.agent/tasks.md): человек видит список дел файлом
+  // рядом с проектом, а не только в панели приложения.
+  try {
+    const s = loadSettings();
+    if (s.agentWorkFiles === false) return;
+    const brief = agentStore.tasksBrief(userDataDir(), 40);
+    const board = agentStore.tasksBoard(userDataDir());
+    const sum = (board && board.summary) || {};
+    missionStore.tasksMirror(
+      agentWorkDir(s),
+      "# Дела (зеркало списка приложения, обновлено " + new Date().toLocaleString() + ")\n\n" +
+        "Активных: " + (sum.active || 0) + ", просрочено: " + (sum.overdue || 0) + ", сегодня: " + (sum.today || 0) + ", выполнено: " + (sum.done || 0) + "\n\n" +
+        (brief || "Список пуст.")
+    );
+  } catch {}
 }
 
 // Напоминания о делах: раз в минуту смотрим, не подошёл ли срок. Уведомление Windows
@@ -1892,28 +1928,54 @@ function notifyUser(title, body) {
   }
 }
 
+// Точный будильник: таймер ровно на ближайший срок. Опрос раз в минуту остаётся
+// страховкой (сон, перевод часов, смена дел), но к сроку приложение приходит вовремя.
+let taskWakeTimer = null;
+function armTaskWake() {
+  if (taskWakeTimer) { clearTimeout(taskWakeTimer); taskWakeTimer = null; }
+  let ms = 0;
+  try { ms = agentStore.tasksNextDue(userDataDir()); } catch { ms = 0; }
+  if (!ms) return;
+  const delay = Math.max(1000, Math.min(ms + 250, 6 * 60 * 60 * 1000));
+  taskWakeTimer = setTimeout(() => { taskWakeTimer = null; checkTaskReminders(); }, delay);
+}
+
 function checkTaskReminders() {
   let due = [];
+  let auto = [];
+  let remindOn = true;
+  let autoOn = true;
   try {
-    if (loadSettings().taskReminders === false) return;
-    due = agentStore.tasksTakeReminders(userDataDir()).tasks;
+    const s = loadSettings();
+    remindOn = s.taskReminders !== false;
+    autoOn = s.taskAuto !== false;
+    if (remindOn) due = agentStore.tasksTakeReminders(userDataDir()).tasks;
+    // Автозадачи — это работа агента, а не тост: галочка напоминаний их не глушит.
+    if (autoOn) auto = agentStore.tasksTakeAuto(userDataDir()).tasks;
   } catch {
     return;
   }
-  if (!due.length) return;
   const now = Date.now();
   for (const t of due) {
     const at = new Date(t.due).getTime();
     const late = at < now;
     notifyUser((late ? "⚠ Дело просрочено: " : "⏰ Дело: ") + t.title, agentStore.humanDue(t, now));
   }
-  emitTasksChanged();
+  if (due.length || auto.length) emitTasksChanged();
   try {
-    mainWindow.webContents.send("ai:event", {
-      type: "task-reminder",
-      tasks: due.map((t) => ({ id: t.id, title: t.title, due: t.due, late: new Date(t.due).getTime() < now })),
-    });
+    if (due.length) {
+      mainWindow.webContents.send("ai:event", {
+        type: "task-reminder",
+        tasks: due.map((t) => ({ id: t.id, title: t.title, due: t.due, late: new Date(t.due).getTime() < now })),
+      });
+    }
+    if (auto.length) {
+      // from: "desktop" — событие уходит и на телефон, но запускать автозадачу
+      // должен только ПК-клиент: у чатов один хозяин, иначе прогон удвоится.
+      mainWindow.webContents.send("ai:event", { type: "task-due", from: "desktop", tasks: auto });
+    }
   } catch {}
+  armTaskWake();
 }
 
 async function executeTool(name, args, settings) {
@@ -1994,9 +2056,18 @@ async function autoCheckpointCommit(settings, messages) {
 
 // Память диалогов: сохраняем сжатую памятку в локальный дневник по датам, но
 // ТОЛЬКО если пользователь включил галочку «Память диалогов» (иначе — тишина).
+// Отдельно от дневника памяти работает зеркало рядом с проектом
+// (.agent/context/<дата>.md): долгая работа обязана оставлять следы файлами на ПК,
+// даже когда галочка «Память диалогов» выключена — поэтому зеркало решает своё
+// условие («файлы работы агента»), а не эту галочку.
 function saveContextMemo(settings, entry, emit) {
-  if (!settings || !settings.contextMemory) return null;
-  if (!entry || !String(entry.text || "").trim()) return null;
+  if (!settings || !entry || !String(entry.text || "").trim()) return null;
+  if (settings.agentWorkFiles !== false) {
+    try {
+      missionStore.contextMirror(agentWorkDir(settings), entry.ts, entry.text);
+    } catch {}
+  }
+  if (!settings.contextMemory) return null;
   try {
     const r = agentStore.contextMemorySave(app.getPath("userData"), {
       ts: entry.ts,
@@ -2027,6 +2098,180 @@ async function runAi(settings, messages, win, opts) {
   // набор схем не меняется на ходу, префикс запроса стабилен, каждый раунд дешевле.
   const role = rolePlan(opts.role);
   const roleNote = role.prompt ? "\n\n" + role.prompt : "";
+
+  // ── Миссия: долгая работа, которая переживает перезапуск ────────────────────
+  // Агент «на 8 часов» не имеет права терять задачу. Цель, план, шаги и журнал
+  // лежат файлами в рабочей папке (.agent/missions/<id>/), а прогон идёт БАТЧАМИ:
+  // 25 раундов, затем проверка «миссия жива? лимиты? был ли прогресс?» и новый
+  // батч с тем же контекстом. Раньше работа умирала на 26-м раунде и начиналась
+  // заново руками — теперь она продолжается сама и видна в панели «Миссия».
+  const missionDir = agentWorkDir(settings);
+  const longWork = !!settings.longWork && !planMode;
+  const missionLimits = {
+    minutes: Math.max(5, Math.min(24 * 60, Math.round((Number(settings.longWorkHours) || 8) * 60))),
+    rounds: Math.max(25, Math.min(2000, Number(settings.longWorkRounds) || 600)),
+    autoContinues: Math.max(0, Math.min(20, settings.longWorkAutoContinue == null ? 6 : Number(settings.longWorkAutoContinue))),
+  };
+  const MISSION_AUTO_ROUND = 6; // после скольких раундов работа считается длинной
+  const MISSION_AUTO_JOURNAL = new Map([
+    ["writeFile", "создан файл"],
+    ["editFile", "правка файла"],
+    ["applyPatch", "применён патч"],
+    ["taskAdd", "заведено дело"],
+    ["taskDone", "дело закрыто"],
+    ["mailSend", "отправлено письмо"],
+    ["generateImage", "сгенерировано изображение"],
+  ]);
+  const MISSION_JOURNAL_PER_BATCH = 30; // журнал не должен превращаться в поток
+  let mission = null; // запись миссии с диска
+  let missionAutoCreated = false; // миссию завело приложение, а не агент
+  let missionRounds = 0; // раундов за всю миссию (счётчик, переживает батчи)
+  let missionBatches = 0;
+  let missionTokens = 0;
+  let missionCompactions = 0;
+  let missionNudges = 0; // «миссия не закрыта, а модель замолчала»
+  let missionJournalLeft = MISSION_JOURNAL_PER_BATCH;
+  let missionStopReason = "";
+  let missionErrorContinues = 0; // авто-продолжений после сбоя (лимит из настроек)
+  let lastProgressRound = 0; // на каком раунде работа последний раз двигалась
+  let lastProgressSteps = 0; // сколько шагов миссии было готово тогда
+  const missionSignatures = new Map(); // подпись вызова → сколько раз за прогон
+  const missionStartedAt = Date.now();
+  const missionGoalSeed = (() => {
+    // Цель авто-миссии — последняя просьба пользователя: она уже есть в истории.
+    for (let i = (messages || []).length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m && m.role === "user" && typeof m.content === "string" && m.content.trim()) {
+        return m.content.trim().slice(0, 4000);
+      }
+    }
+    return "";
+  })();
+
+  const missionRead = () => {
+    if (!longWork) return null;
+    try {
+      return missionStore.missionActive(missionDir);
+    } catch {
+      return null;
+    }
+  };
+  const missionRefresh = () => {
+    if (longWork) mission = missionRead();
+    return mission;
+  };
+  // Состояние в интерфейс и на телефон: панель «Миссия» рисует по этому событию.
+  const missionEmit = (phase) => {
+    if (!mission) return;
+    try {
+      const pr = missionStore.missionProgress(mission);
+      emit({
+        type: "mission",
+        phase: phase || "tick",
+        id: mission.id,
+        title: mission.title,
+        goal: mission.goal,
+        status: mission.status,
+        steps: mission.steps.map((s) => ({ title: s.title, state: s.state, note: s.note })),
+        progress: pr,
+        rounds: missionRounds,
+        batches: missionBatches,
+        tokens: missionTokens,
+        compactions: missionCompactions,
+        startedAt: missionStartedAt,
+        limits: { minutes: missionLimits.minutes, rounds: missionLimits.rounds },
+        reason: missionStopReason || mission.reason || "",
+      });
+    } catch {}
+  };
+  // Миссия «сама собой»: длинную работу видно по делу (шестой раунд с инструментами),
+  // а не по обещаниям модели. Файлы появляются ровно тогда, когда они нужны.
+  const missionEnsure = (why) => {
+    if (!longWork || mission || !missionGoalSeed) return mission;
+    try {
+      const r = missionStore.missionCreate(missionDir, {
+        goal: missionGoalSeed,
+        title: missionGoalSeed.split("\n")[0].slice(0, 120),
+        role: role.id,
+        chatId: activeRunChatId,
+        limits: { minutes: missionLimits.minutes, rounds: missionLimits.rounds },
+      });
+      if (!r.ok) return null;
+      mission = r.mission;
+      missionAutoCreated = true;
+      missionStore.missionNote(missionDir, mission.id, "note", "📄 Миссию завело приложение (" + why + "): цель взята из последней просьбы.");
+      emit({
+        type: "notice",
+        text:
+          "📄 Длинная работа: завёл миссию «" + mission.title + "». Цель, план и журнал — в папке .agent/missions/" +
+          mission.id + "/ (рядом с проектом). Работа продолжится сама, если прогон оборвётся.",
+      });
+    } catch {}
+    return mission;
+  };
+  // Журнал по значимым действиям: даже если модель не зовёт missionStep, в журнале
+  // видно, чем она занята (файлы, дела, письма) — это и есть «отчёт о работе».
+  const missionJournalTool = (name, args) => {
+    if (!mission || missionJournalLeft <= 0) return;
+    const label = MISSION_AUTO_JOURNAL.get(name);
+    if (!label) return;
+    const a = args || {};
+    const what = String(a.path || a.title || a.key || a.prompt || "").slice(0, 100);
+    missionJournalLeft--;
+    try {
+      missionStore.missionNote(missionDir, mission.id, "tool", "⚙ " + label + (what ? ": " + what : ""));
+    } catch {}
+  };
+  // Прогресс — это новый шаг миссии ИЛИ новая работа инструментом. Повтор одного и
+  // того же вызова прогрессом не считается: так ловится цикл, в котором агент «крутится».
+  const missionTrackProgress = (calls) => {
+    const rec = missionRead();
+    let moved = false;
+    if (rec) {
+      const pr = missionStore.missionProgress(rec);
+      if (pr.done + pr.failed > lastProgressSteps) {
+        lastProgressSteps = pr.done + pr.failed;
+        moved = true;
+      }
+    }
+    for (const c of calls || []) {
+      const sig = c.name + "|" + JSON.stringify(c.args || {});
+      const n = missionSignatures.get(sig) || 0;
+      if (n <= 2) moved = true;
+    }
+    if (moved) {
+      lastProgressRound = missionRounds;
+      missionNudges = 0;
+    }
+  };
+  const missionStuckRounds = () => Math.max(0, missionRounds - lastProgressRound);
+  const missionFlood = () => {
+    for (const [sig, n] of missionSignatures) {
+      if (n >= 6) return { sig, n };
+    }
+    return null;
+  };
+  // Пауза по кнопке: работа не теряется, миссия остаётся незакрытой и продолжается
+  // из панели — ровно как человек, который встал и вернулся к делу.
+  const stopForPause = () => {
+    try {
+      if (mission) {
+        missionStore.missionFinish(missionDir, mission.id, { status: "paused", reason: "пауза по кнопке", next: mission.next });
+        missionStore.missionNote(missionDir, mission.id, "note", "⏸ Пауза по кнопке — работа сохранена.");
+      }
+    } catch {}
+    global.__agentPauseRequested = false;
+    missionStopReason = "пауза";
+    finalText = "⏸ Пауза. Работа сохранена: цель, план и журнал — в .agent/missions/. Продолжить — панель «Миссия» → «▶ Продолжить».";
+    emit({ type: "chunk", text: finalText });
+    missionEmit("paused");
+    lastUndoLog = activeRunUndo.slice();
+    persistUndo();
+    if (lastUndoLog.length) emit({ type: "undo_available", count: lastUndoLog.length });
+    emit({ type: "done" });
+    return { ok: true, text: finalText };
+  };
+
   // Менеджеру сразу даём свежую сводку дел — чтобы он не гадал и не звал taskList впустую.
   let tasksNote = "";
   if (role.id === "manager" && !planMode) {
@@ -2051,31 +2296,53 @@ async function runAi(settings, messages, win, opts) {
     throw new Error("Не выбрана модель. Открой Настройки и обнови список моделей (кнопка ↻).");
   }
 
+  // Локальный ли сервер — по АДРЕСУ, а не по имени семейства: LM Studio, vLLM,
+  // llama.cpp и g4f живут на своём ПК, и правила у них локальные (потолок по памяти,
+  // неспешные таймауты), хотя говорят они на OpenAI-совместимом API.
+  const localEndpoint = isLocalEndpoint(settings);
   // Контекст-окно: бюджет = реальное окно модели (если известно) минус резерв на вывод.
   let budget = contextBudget(provider, settings.model);
   let modelWin = 0; // реальное окно модели (0 — сервер не ответил)
   try {
     modelWin = await modelWindow(settings, settings.model);
-    if (modelWin > 0) budget = Math.min(budget, modelWin - 4096);
+    // Потолок бюджета. У облака это «сколько не жалко токенов», у локальной модели —
+    // её окно: локальные токены бесплатны, платим памятью (KV-кэш) и временем. Прежний
+    // общий потолок 14 000 душил локальную модель с окном 40–130k, а вместе с ним
+    // выключался и роутер инструментов (см. refreshTools).
+    if (modelWin > 0) budget = windowBudget(provider, budget, modelWin, { local: localEndpoint });
     // Нижний предел — 3000 токенов, но НИКОГДА больше реального окна: у модели с
     // окном 2048 «пол» в 3000 гарантировал переполнение на каждом запросе.
     budget = Math.max(budget, modelWin > 0 ? Math.min(3000, modelWin) : 3000);
   } catch {}
-  // Локальная модель без поддержки инструментов не сможет позвать ни один инструмент:
-  // агент молча «разговаривал бы» и ничего не делал. Говорим об этом заранее и честно.
+  // Возможности локальной модели (tools) — не «информация к сведению»: без capability
+  // «tools» схемы в запросе бесполезны, а часть сборок Ollama отвечает на них ошибкой и
+  // роняет весь раунд. Ниже это переключает протокол вызова инструментов.
+  let ollamaInfo = null;
   if (provider === "ollama") {
     try {
-      const oi = await ollamaModelInfo(settings, settings.model);
-      if (oi.known && !oi.tools) {
-        termEmit({
-          type: "metrics",
-          text:
-            "⚠ Модель «" + settings.model + "» не умеет вызывать инструменты (нет capability «tools»): " +
-            "она сможет только отвечать текстом, а не работать с файлами и git. " +
-            "Возьми модель с поддержкой инструментов (например qwen3, llama3.1, mistral-nemo).",
-        });
-      }
+      ollamaInfo = await ollamaModelInfo(settings, settings.model);
     } catch {}
+  }
+  // Ollama сама сообщает о поддержке инструментов (/api/show → capabilities).
+  // У совместимых серверов (LM Studio, vLLM, g4f) спросить негде, поэтому там это
+  // осознанная галочка в настройках — угадывать по имени модели мы не будем.
+  const noToolsDetected = !!(ollamaInfo && ollamaInfo.known && !ollamaInfo.tools);
+  const noTools = noToolsDetected || !!settings.noToolsModel;
+  if (noTools) {
+    // Говорим и в «Консоль», и в чат: раньше сообщение жило только в консоли,
+    // а пользователь видел «модель ничего не делает» без объяснения причины.
+    const noToolsNote = noToolsDetected
+      ? "⚠ Модель «" + settings.model + "» не объявила поддержку инструментов (нет capability «tools»). " +
+        "Схемы в таком запросе бесполезны, поэтому работаю по текстовому протоколу: в системное " +
+        "сообщение ушёл компактный каталог, а инструменты вызываются JSON-блоком " +
+        "{\"name\": ..., \"arguments\": {...}}. Для файлов и git надёжнее модель с инструментами " +
+        "(qwen3, llama3.1, mistral-nemo)."
+      : "⚠ Включена настройка «Модель без поддержки инструментов»: схемы не отправляю, " +
+        "вместо них в системном сообщении компактный каталог, а инструменты вызываются " +
+        "JSON-блоком {\"name\": ..., \"arguments\": {...}}. Выключи галочку, если модель " +
+        "умеет нативные вызовы — тогда вернутся схемы и точность вызовов будет выше.";
+    termEmit({ type: "metrics", text: noToolsNote });
+    emit({ type: "notice", text: noToolsNote });
   }
   let contextRetried = false; // при переполнении контекста пробуем ещё раз с меньшим бюджетом
   // Лимит 429: не роняем раунд — ждём столько, сколько просит провайдер, и повторяем.
@@ -2143,22 +2410,31 @@ async function runAi(settings, messages, win, opts) {
       activeTools = PLAN_MODE_TOOL_DEFINITIONS;
     } else {
       const baseWeight = routeTools({ text: "" }).tokens;
-      // Потолок: не больше ROUTER_MAX_TOKENS и не больше того, что оставляет место
-      // истории (system-промпт ~8k + минимум на диалог).
-      const maxTokens = Math.max(baseWeight, Math.min(ROUTER_MAX_TOKENS, Math.max(baseWeight, budget - 12000)));
+      // Потолок схем: не больше ROUTER_MAX_TOKENS и не больше того, что реально остаётся
+      // от окна после системного промпта и минимальной истории. Сама формула живёт в
+      // ядре (routerMaxTokens) — здесь только вызов.
+      const maxTokens = routerMaxTokens(budget, systemWeight, baseWeight);
       routeInfo = routeTools({ text: routerTask, sticky: [...stickyGroups], roleGroups: role.groups, forceAll: forceAllTools, maxTokens: maxTokens });
       for (const id of routeInfo.groups) stickyGroups.add(id);
       activeTools = routeInfo.tools;
     }
-    toolsWeight = activeTools.length ? estimateTokens(JSON.stringify(activeTools)) : 0;
+    // Вес того, что РЕАЛЬНО уйдёт в запрос. Без поддержки инструментов схемы не
+    // отправляются — вместо них текстовый каталог, и он вчетверо легче: считать по JSON
+    // значило бы сжимать историю раньше времени и зря пугать тесным окном.
+    toolsWeight = activeTools.length
+      ? estimateTokens(noTools ? toolsAsText(activeTools) : JSON.stringify(activeTools))
+      : 0;
     // Тесное окно: схемы + промпт уже занимают почти всё. Честно говорим об этом
     // один раз — иначе агент «тупеет» без объяснений (модель видит обрезанный хвост).
     if (!budgetWarned && !planMode && budget > 0 && toolsWeight + systemWeight > budget * 0.9) {
       budgetWarned = true;
-      termEmit({
-        type: "metrics",
-        text: "⚠ Окно модели мало: схемы (~" + Math.round(toolsWeight / 1000) + "k) + системный промпт (~" + Math.round(systemWeight / 1000) + "k) занимают почти всё окно (" + budget + " т.). Возьми модель с окном побольше — иначе агент видит обрезанный контекст и работает вслепую.",
-      });
+      const narrowNote =
+        "⚠ Окно модели мало: инструменты (~" + Math.round(toolsWeight / 1000) + "k) + системный промпт (~" +
+        Math.round(systemWeight / 1000) + "k) занимают почти всё окно (" + budget + " т.). " +
+        "Возьми модель с окном побольше — иначе агент видит обрезанный контекст и работает вслепую.";
+      termEmit({ type: "metrics", text: narrowNote });
+      // То же сообщение — в чат: в «Консоли» его не видит тот, кто просто пишет задачу.
+      emit({ type: "notice", text: narrowNote });
     }
     histBudget = Math.max(1500, Math.floor((budget - toolsWeight - systemWeight) * 0.85)); // история + резерв 15%: сжатие успевает до переполнения
     // Справочник группы: подключаем один раз за задачу, дальше он просто едет в запросе.
@@ -2183,6 +2459,11 @@ async function runAi(settings, messages, win, opts) {
     settings,
     emit,
     planMode,
+    // Сжатие идёт тем же сервером: локальной модели нужен тот же num_ctx, иначе Ollama
+    // возьмёт дефолт 2048 (памятка соберётся из обрезанного текста) и перезагрузит модель.
+    localCtx: provider === "ollama" ? ollamaNumCtx(budget, modelWin) : 0,
+    // Тот же признак, что и для бюджета: у местного сервера сжатие может идти минутами.
+    local: localEndpoint,
     // Память диалогов: при сжатии контекста пишем памятку в локальный дневник (по датам).
     onMemo: (m) => saveContextMemo(settings, m, emit),
   });
@@ -2195,6 +2476,113 @@ async function runAi(settings, messages, win, opts) {
       const percent = budget > 0 ? Math.max(0, Math.min(100, Math.round((used / budget) * 100))) : 0;
       emit({ type: "context", used, budget, percent, history: histTokens, tools: toolsWeight, system: systemWeight });
     } catch {}
+  };
+
+
+  // ── Завершение прогона — одна точка входа ──────────────────────────────────
+  // И обычный финал, и мягкая остановка миссии (лимит раундов/времени, зацикливание)
+  // проходят здесь: пользователь получает объяснение, а не «ошибку API».
+  const endRun = async (fallbackText) => {
+    if (!String(finalText || "").trim() && !abort.signal.aborted) {
+      finalText =
+        fallbackText ||
+        "⚠ Модель не прислала итоговый текст (вероятно, переполнен контекст). Изменения сохранены; нажми «↻ Перегенерировать» или напиши «продолжай».";
+      emit({ type: "chunk", text: finalText });
+    }
+    lastUndoLog = activeRunUndo.slice();
+    persistUndo();
+    if (lastUndoLog.length) emit({ type: "undo_available", count: lastUndoLog.length });
+    // Авто-чекпоинт: агент менял файлы — фиксируем локальный коммит-точку возврата (без пуша).
+    if (!planMode && lastUndoLog.length) {
+      const cp = await autoCheckpointCommit(settings, messages);
+      if (cp && cp.committed) emit({ type: "checkpoint", message: cp.message });
+    }
+    // Системное уведомление, если окно не в фокусе (долгий ответ закончился)
+    if (mainWindow && !mainWindow.isFocused() && Notification.isSupported()) {
+      try {
+        const snippet = String(finalText || "").trim().slice(0, 140);
+        new Notification({
+          title: "AI Developer Agent",
+          body: "Ответ агента готов" + (snippet ? ": " + snippet : ""),
+        }).show();
+      } catch {}
+    }
+    missionEmit("end");
+    emit({ type: "done" });
+    return { ok: true, text: finalText };
+  };
+
+  // ── Граница батча: продолжать долгую работу или остановиться ────────────────
+  // Жёсткий потолок раундов больше не убивает работу: миссия живёт на диске, поэтому
+  // каждый батч — отдельный отрезок, а между ними видно прогресс, время и повторы.
+  const missionAfterBatch = async () => {
+    if (!longWork) return { continue: false };
+    const rec = missionRefresh();
+    if (!rec) return { continue: false };
+    if (rec.status !== "active" && rec.status !== "paused") return { continue: false, closed: true };
+    const title = "«" + rec.title + "»";
+    const elapsedMin = (Date.now() - missionStartedAt) / 60000;
+    const hardStop = (reason, message) => {
+      missionStopReason = reason;
+      try {
+        missionStore.missionFinish(missionDir, rec.id, { status: "paused", reason: reason, next: rec.next });
+        missionStore.missionNote(missionDir, rec.id, "note", message);
+      } catch {}
+      missionEmit("paused");
+      return { finish: true, message: message };
+    };
+    const where = " Файлы: .agent/missions/" + rec.id + "/ — цель, план и журнал на месте.";
+    if (missionRounds >= missionLimits.rounds) {
+      return hardStop("лимит раундов", "⏹ Миссия " + title + " отработала лимит раундов (" + missionLimits.rounds + ")." + where + " Продолжить — панель «Миссия» → «▶ Продолжить».");
+    }
+    if (elapsedMin >= missionLimits.minutes) {
+      return hardStop(
+        "время миссии вышло",
+        "⏹ Миссия " + title + " работала " + Math.round(elapsedMin) + " мин — отведённое время вышло (в настройках это «часов на миссию»)." +
+          where + " Продолжить — кнопка «▶ Продолжить» в панели «Миссия»."
+      );
+    }
+    const flood = missionFlood();
+    if (flood) {
+      return hardStop(
+        "повтор одного вызова",
+        "⏹ Остановился: вызов «" + String(flood.sig).split("|")[0] + "» повторился " + flood.n + " раз — похоже на цикл." + where + " Продолжить можно вручную."
+      );
+    }
+    const stuck = missionStuckRounds();
+    if (stuck >= 12) {
+      return hardStop(
+        "нет прогресса",
+        "⏹ Остановился: " + stuck + " раундов без нового шага — чтобы не жечь токены впустую." + where + " Продолжить — кнопкой «▶ Продолжить»."
+      );
+    }
+    // Продолжаем: новый батч с тем же контекстом и коротким напоминанием о миссии.
+    missionBatches++;
+    missionNudges = 0;
+    missionJournalLeft = MISSION_JOURNAL_PER_BATCH;
+    const pr = missionStore.missionProgress(rec);
+    try {
+      missionStore.missionCounters(missionDir, rec.id, { batches: 1 });
+      missionStore.missionNote(missionDir, rec.id, "batch", "▶ Батч " + (missionBatches + 1) + ": раундов " + missionRounds + ", шагов " + pr.done + "/" + pr.total);
+    } catch {}
+    emit({
+      type: "notice",
+      text:
+        "▶ Батч " + (missionBatches + 1) + ": продолжаю миссию " + title + " — раундов " + missionRounds +
+        ", шагов " + pr.done + "/" + pr.total + ", в работе " + Math.round(elapsedMin) + " мин.",
+    });
+    missionEmit("batch");
+    canonical.push({
+      role: "user",
+      content:
+        "Работа продолжается (миссия " + title + ", файлы .agent/missions/" + rec.id + "/). Пройдено шагов: " +
+        pr.done + " из " + pr.total + (pr.current ? ", сейчас: " + pr.current : "") +
+        ". Не пересказывай сделанное — вызови следующий инструмент и двигай работу дальше. " +
+        "После каждого шага отмечай его через missionStep(done, next). Когда работа будет закончена — missionFinish(report).",
+    });
+    // Короткая пауза: провайдеру и интерфейсу даём вздохнуть, история не меняется.
+    await new Promise((r) => setTimeout(r, 1500));
+    return { continue: true };
   };
 
   // Вопрос пользователю (askUser / подтверждение опасной команды).
@@ -2301,10 +2689,35 @@ async function runAi(settings, messages, win, opts) {
   let roundUsage = null; // { prompt, completion, cached } текущего раунда
   for (let attemptNum = 1; ; attemptNum++) {
   try {
+  // Батчи: 25 раундов работы, затем проверка «миссия жива? лимиты? был ли прогресс?»
+  // и следующий батч с тем же контекстом. Долгая работа перестаёт быть одной
+  // длинной попыткой, которую обрывает счётчик раундов.
+  for (let batch = 1; ; batch++) {
   for (let round = 0; round < maxRounds; round++) {
     roundUsage = null; // аккумулятор токенов текущего раунда
     const roundStartedAt = Date.now();
     let roundTtfbMs = 0;
+    missionRounds++;
+    // Незакрытая миссия (в том числе с прошлого запуска приложения) — продолжаем её,
+    // а не начинаем работу заново: файлы и журнал лежат на диске.
+    if (longWork && missionRounds === 1) {
+      const had = missionRefresh();
+      if (had) {
+        try {
+          missionStore.missionNote(missionDir, had.id, "note", "▶ Продолжаю миссию: " + had.title);
+        } catch {}
+        emit({
+          type: "notice",
+          text: "▶ Миссия «" + had.title + "»: продолжаю с места остановки (готово шагов: " + missionStore.missionProgress(had).done + ").",
+        });
+        missionEmit("resume");
+      }
+    }
+    // Длинная работа видна по делу: если модель много раундов работает инструментами,
+    // заводим миссию — файлы, журнал и защита от обрыва появляются вовремя.
+    if (longWork && !mission && missionRounds >= MISSION_AUTO_ROUND) missionEnsure("работа идёт много раундов");
+    // Пауза из панели «Миссия»: не начинаем новый раунд, работу не теряем.
+    if (global.__agentPauseRequested) return stopForPause();
     // Пользователь остановил агента (Esc/Стоп) — не начинаем новый раунд.
     if (global.__agentStopRequested) return stopGraceful();
     // Роутер: пересобираем набор схем (группы могли добавиться в прошлом раунде).
@@ -2339,6 +2752,8 @@ async function runAi(settings, messages, win, opts) {
       // и реального окна модели, чтобы сервер не резал запрос молча.
       numCtxBudget: budget,
       modelWindow: modelWin,
+      // Модель без инструментов: схемы не отправляем, вместо них текстовый каталог.
+      noTools: noTools,
     });
     // Темп: если лимит провайдера уже известен, выдерживаем паузу ЗАРАНЕЕ, а не
     // после отказа. Это главный выигрыш по времени: 429 — потерянный раунд.
@@ -2474,9 +2889,13 @@ async function runAi(settings, messages, win, opts) {
       throw new Error("API error " + res.status + ": " + detail);
     }
 
+    let truncated = false;
     await consumeProviderStream({
       response: res,
       provider,
+      // Локальный сервер (в т.ч. LM Studio/vLLM на localhost) — свои таймауты:
+      // загрузка и чтение промпта на CPU не укладываются в облачные 90 с.
+      local: localEndpoint,
       onText: (text) => {
         const vis = stripper.push(text);
         if (vis) {
@@ -2486,6 +2905,11 @@ async function runAi(settings, messages, win, opts) {
       },
       onToolCall: (tc) => toolCalls.push(tc),
       onThinking: emitThink,
+      // Локальная модель, упёршаяся в лимит вывода, обрывает ответ на полуслове.
+      // Раньше это выглядело как законченный ответ — теперь помечаем.
+      onTruncated: () => {
+        truncated = true;
+      },
       onUsage: (u) => {
         if (!u) return;
         roundUsage = roundUsage || { prompt: 0, completion: 0, cached: 0 };
@@ -2496,6 +2920,13 @@ async function runAi(settings, messages, win, opts) {
         roundUsage.cached = Math.max(roundUsage.cached, u.cached || 0);
       },
     });
+
+    if (truncated) {
+      emit({
+        type: "notice",
+        text: "⚠ Ответ модели оборван лимитом вывода (done_reason «length»). Напиши «продолжай», если нужен остаток.",
+      });
+    }
 
     // Метрики раунда в «Консоль» (вкладка «Консоль» правой панели): без цифр
     // любая оптимизация контекста — гадание.
@@ -2522,6 +2953,12 @@ async function runAi(settings, messages, win, opts) {
           " · TTFB " + (roundTtfbMs / 1000).toFixed(1) + " с" +
           " · всего " + (totalMs / 1000).toFixed(1) + " с",
       });
+      // Цена работы в миссии: панель показывает токены и сжатия, чтобы «работает
+      // часами» не превращалось в невидимый расход.
+      if (longWork) {
+        if (roundUsage && roundUsage.prompt) missionTokens += (roundUsage.prompt || 0) + (roundUsage.completion || 0);
+        missionCompactions = ctxManager.compactions();
+      }
     }
 
     const tail = stripper.finish();
@@ -2581,6 +3018,51 @@ async function runAi(settings, messages, win, opts) {
       continue;
     }
 
+    // Миссия не закрыта, а модель ответила текстом — это обрыв, а не финал: длинная
+    // работа не должна заканчиваться словами «осталось сделать то и то».
+    if (
+      toolCalls.length === 0 &&
+      !planMode &&
+      longWork &&
+      mission &&
+      !abort.signal.aborted &&
+      (mission.status === "active" || mission.status === "paused") &&
+      missionNudges < 3
+    ) {
+      missionNudges++;
+      const prN = missionStore.missionProgress(mission);
+      emit({
+        type: "notice",
+        text: "📋 Миссия «" + mission.title + "» не закрыта (" + prN.done + "/" + prN.total + ") — прошу продолжить делом (попытка " + missionNudges + "/3).",
+      });
+      canonical.push({
+        role: "user",
+        content:
+          "Ты ответил текстом, но миссия «" + mission.title + "» не закрыта: готово " + prN.done + " из " + prN.total +
+          ". Не описывай, что осталось, а ВЫПОЛНЯЙ: вызови следующий инструмент. " +
+          "Если пункт сделать нельзя — отметь его fail через missionStep(fail, note) и переходи к следующему. " +
+          "Когда работа действительно закончена — missionFinish(report).",
+      });
+      continue;
+    }
+    // Модель несколько раз закончила ответ, не закрыв миссию: ставим её на паузу,
+    // чтобы она не висела «активной» и человек видел, что работа ждёт его.
+    if (toolCalls.length === 0 && !planMode && longWork && mission && mission.status === "active" && !abort.signal.aborted) {
+      try {
+        missionStore.missionFinish(missionDir, mission.id, {
+          status: "paused",
+          reason: "агент остановился, не закрыв миссию",
+          next: mission.next,
+        });
+        missionStore.missionNote(missionDir, mission.id, "note", "⏸ Агент закончил ответ, не закрыв миссию — поставил её на паузу.");
+      } catch {}
+      emit({
+        type: "notice",
+        text: "⏸ Миссия «" + mission.title + "» на паузе: агент закончил ответ, но не закрыл её. Продолжить — панель «Миссия» → «▶ Продолжить».",
+      });
+      missionEmit("paused");
+    }
+
     // Пустой финальный ответ — не молчим. Один раз просим итоговый отчёт.
     if (toolCalls.length === 0 && !planMode && !reportRetried && !String(finalText || "").trim() && !abort.signal.aborted) {
       reportRetried = true;
@@ -2592,33 +3074,7 @@ async function runAi(settings, messages, win, opts) {
       continue;
     }
 
-    if (toolCalls.length === 0) {
-      if (!String(finalText || "").trim() && !abort.signal.aborted) {
-        finalText =
-          "⚠ Модель не прислала итоговый текст (вероятно, переполнен контекст). Изменения сохранены; нажми «↻ Перегенерировать» или напиши «продолжай».";
-        emit({ type: "chunk", text: finalText });
-      }
-      lastUndoLog = activeRunUndo.slice();
-      persistUndo();
-      if (lastUndoLog.length) emit({ type: "undo_available", count: lastUndoLog.length });
-      // Авто-чекпоинт: агент менял файлы — фиксируем локальный коммит-точку возврата (без пуша).
-      if (!planMode && lastUndoLog.length) {
-        const cp = await autoCheckpointCommit(settings, messages);
-        if (cp && cp.committed) emit({ type: "checkpoint", message: cp.message });
-      }
-      // Системное уведомление, если окно не в фокусе (долгий ответ закончился)
-      if (mainWindow && !mainWindow.isFocused() && Notification.isSupported()) {
-        try {
-          const snippet = String(finalText || "").trim().slice(0, 140);
-          new Notification({
-            title: "AI Developer Agent",
-            body: "Ответ агента готов" + (snippet ? ": " + snippet : ""),
-          }).show();
-        } catch {}
-      }
-      emit({ type: "done" });
-      return { ok: true, text: finalText };
-    }
+    if (toolCalls.length === 0) return await endRun("");
 
     // Нормализуем имена, назначаем стабильные id (нужны для tool-сообщений)
     // и убираем дубли: одинаковый вызов в одном раунде выполняется один раз.
@@ -2642,14 +3098,23 @@ async function runAi(settings, messages, win, opts) {
     // наборе схем (группа не была активирована). Дотягиваем его группу — в этом и
     // следующих раундах схема будет на месте; сам вызов выполняем как обычно.
     if (!planMode && routeInfo) {
+      const fresh = [];
       for (const c of calls) {
         const gid = groupOfTool(c.name);
         if (!gid || stickyGroups.has(gid)) continue;
         stickyGroups.add(gid);
+        fresh.push(gid);
+      }
+      if (fresh.length) {
         refreshTools();
+        // Группа могла не поместиться в окно: обещать «схем станет больше», когда их не
+        // стало, — врать в глаза. Говорим результат, а не намерение.
+        const fits = fresh.filter((g) => routeInfo.groups.indexOf(g) >= 0);
         termEmit({
           type: "metrics",
-          text: "🔧 «" + c.name + "» вне набора схем — добавляю группу «" + gid + "» (схем станет " + activeTools.length + ").",
+          text: fits.length
+            ? "🔧 «" + calls[0].name + "» вне набора схем — включаю группу «" + fits.join(", ") + "» (схем теперь " + activeTools.length + ")."
+            : "🔧 «" + calls[0].name + "» вне набора схем: группа «" + fresh.join(", ") + "» включена, но её схемы не влезают в окно модели (схем " + activeTools.length + "). Вызов выполняю как обычно.",
         });
       }
     }
@@ -2751,6 +3216,13 @@ async function runAi(settings, messages, win, opts) {
       // Журнал действий: подтверждения, отказы, риск medium/high и незнакомые
       // инструменты. Секреты в журнал не попадают (редакция в tool-policy.js).
       audit.record({ tool: c.name, args: c.args, decision, result, source: activeRunOrigin });
+      // Миссия: журнал по значимым действиям (в журнале видно, чем агент занят) и
+      // счётчик повторов одного и того же вызова — по нему ловится цикл.
+      if (longWork && mission) {
+        missionJournalTool(c.name, c.args);
+        const mSig = c.name + "|" + JSON.stringify(c.args || {});
+        missionSignatures.set(mSig, (missionSignatures.get(mSig) || 0) + 1);
+      }
       // Держим контекст в рамках бюджета: длинный вывод инструмента ужимаем
       const capped = truncateText(result, 8000);
       emit({ type: "tool_result", name: c.name, result: capped });
@@ -2758,6 +3230,25 @@ async function runAi(settings, messages, win, opts) {
     }
     // Остановка во время выполнения инструментов — завершаем без нового раунда.
     if (global.__agentStopRequested) return stopGraceful();
+    if (longWork) missionTrackProgress(calls);
+  }
+  // Конец батча: миссия жива — продолжаем следующим батчом (тот же контекст),
+  // лимиты/зацикливание — мягкая остановка с сохранением работы, без ошибки в чате.
+  const afterBatch = await missionAfterBatch();
+  if (afterBatch.finish) return await endRun(afterBatch.message);
+  if (!afterBatch.continue) {
+    // Миссия закрыта — это НЕ исчерпание счётчика раундов: завершаем обычным
+    // финалом. Иначе успешная работа обрывалась бы грозным «превышено число
+    // раундов», и это выглядело бы как «агент ни с того ни с сего отвалился».
+    if (afterBatch.closed) {
+      const mDone = missionRefresh();
+      return await endRun(
+        "🏁 Работа закончена" + (mDone ? " — миссия «" + mDone.title + "» закрыта" : "") +
+          ". Цель, план, журнал и отчёт: .agent/missions/."
+      );
+    }
+    break;
+  }
   }
   throw Object.assign(
     new Error(
@@ -2768,7 +3259,23 @@ async function runAi(settings, messages, win, opts) {
   );
   } catch (e) {
     const fatal = (e && e.name === "AbortError") || (e && e.fatal) || global.__agentStopRequested || (e && e.message && /Не выбрана модель/.test(e.message));
-    if (fatal || attemptNum > AUTO_RETRY_LIMIT) throw e;
+    // Миссия и сбой: обычные ошибки (сеть, 5xx, обрыв) не повод бросать долгую работу.
+    // Ждём и продолжаем, пока миссия жива и не исчерпан запас авто-продолжений.
+    const mAlive = longWork && !fatal && !!missionRefresh() && (mission.status === "active" || mission.status === "paused");
+    const mContinues = mAlive && missionErrorContinues < missionLimits.autoContinues;
+    if (fatal || (attemptNum > AUTO_RETRY_LIMIT && !mContinues)) throw e;
+    if (mContinues) {
+      missionErrorContinues++;
+      try {
+        missionStore.missionNote(
+          missionDir,
+          mission.id,
+          "error",
+          "⚠ Сбой: " + String((e && e.message) || e).slice(0, 160) + " — жду и продолжаю (авто-продолжение " + missionErrorContinues + "/" + missionLimits.autoContinues + ")"
+        );
+      } catch {}
+      missionEmit("error");
+    }
     const errText = String((e && e.message) || e).slice(0, 800);
     // Провайдер отверг stream_options уже внутри ответа (не ошибкой на заголовках) —
     // снимаем флаг: авто-повтор ниже пойдёт без него.
@@ -3112,6 +3619,131 @@ ipcMain.handle("mobile:pinRegen", () => {
 // Возвращает список проектов (свежие сверху) и id активного.
 // Дела (личный список задач со сроками): панель в окне и на телефоне работают через это.
 ipcMain.handle("tasks:board", () => agentStore.tasksBoard(userDataDir()));
+
+// ── Миссии (долгая работа агента) ──────────────────────────────────────────
+// Панель «Миссия» показывает цель, шаги, журнал и метрики; кнопки ставят работу
+// на паузу, продолжают её и открывают папку миссии в проводнике.
+function missionStateForUi(settings) {
+  const s = settings || loadSettings();
+  const dir = agentWorkDir(s);
+  const enabled = !!s.longWork;
+  let active = null;
+  let list = [];
+  try {
+    if (enabled) {
+      active = missionStore.missionActive(dir);
+      list = missionStore.missionList(dir, { limit: 10 });
+    }
+  } catch {}
+  return {
+    enabled: enabled,
+    dir: dir,
+    folder: missionStore.agentRoot(dir),
+    active: active,
+    progress: active ? missionStore.missionProgress(active) : null,
+    journal: active ? missionStore.missionJournal(dir, active.id, { limit: 40 }) : [],
+    list: list.map((m) => ({
+      id: m.id,
+      title: m.title,
+      status: m.status,
+      createdAt: m.createdAt,
+      updatedAt: m.updatedAt,
+      steps: m.steps.length,
+      rounds: m.rounds,
+      tokens: m.metrics.tokens,
+      role: m.role,
+      chatId: m.chatId,
+      reason: m.reason || "",
+      progress: missionStore.missionProgress(m),
+    })),
+    running: !!global.__agentRunning,
+    paused: !!global.__agentPauseRequested,
+  };
+}
+ipcMain.handle("mission:state", () => missionStateForUi());
+ipcMain.handle("mission:pause", () => {
+  // Пауза — не остановка: работа сохраняется, миссия остаётся незакрытой.
+  if (global.__agentRunning) global.__agentPauseRequested = true;
+  return { ok: true, running: !!global.__agentRunning };
+});
+ipcMain.handle("mission:stop", () => {
+  global.__agentStopRequested = true;
+  global.__agentPauseRequested = false;
+  return { ok: true };
+});
+ipcMain.handle("mission:resume", () => {
+  const s = loadSettings();
+  const dir = agentWorkDir(s);
+  let rec = null;
+  try {
+    rec = missionStore.missionActive(dir);
+  } catch {}
+  if (!rec) return { ok: false, error: "Незакрытых миссий нет." };
+  return {
+    ok: true,
+    id: rec.id,
+    text: missionStore.missionResumeText(rec, missionStore.missionJournalText(dir, rec.id, { limit: 12 })),
+  };
+});
+ipcMain.handle("mission:open", (_e, id) => {
+  const dir = agentWorkDir(loadSettings());
+  const target = id ? missionStore.missionDirOf(dir, id) : missionStore.agentRoot(dir);
+  try {
+    shell.showItemInFolder(target);
+    return { ok: true, path: target };
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || String(err) };
+  }
+});
+ipcMain.handle("mission:list", () => missionStateForUi());
+
+// ── 🗂 Файлы работы агента рядом с проектом (.agent/) ──────────────────────
+// Задачи и контекст агент ведёт сам: список дел — в .agent/tasks.md, памятки
+// контекста — в .agent/context/<дата>.md, миссии — в .agent/missions/<id>/. Здесь
+// только состояние папки для настроек и две кнопки: открыть и очистить зеркала.
+function agentFilesStatus() {
+  const s = loadSettings();
+  const dir = agentWorkDir(s);
+  let st = { dir: dir, root: missionStore.agentRoot(dir), exists: false, tasks: null, contextDays: [], missions: 0, bytes: 0 };
+  try {
+    st = missionStore.mirrorStatus(dir);
+  } catch {}
+  return {
+    enabled: s.agentWorkFiles !== false,
+    longWork: !!s.longWork,
+    memory: !!s.contextMemory,
+    dir: st.dir,
+    folder: st.root,
+    exists: !!st.exists,
+    tasks: st.tasks ? { bytes: st.tasks.bytes, mtime: st.tasks.mtime } : null,
+    contextDays: st.contextDays || [],
+    missions: st.missions || 0,
+    bytes: st.bytes || 0,
+  };
+}
+ipcMain.handle("agentfiles:status", () => agentFilesStatus());
+
+ipcMain.handle("agentfiles:openDir", async (_e, id) => {
+  const s = loadSettings();
+  const dir = agentWorkDir(s);
+  const target = id ? missionStore.missionDirOf(dir, id) : missionStore.agentRoot(dir);
+  try {
+    fs.mkdirSync(target, { recursive: true });
+  } catch {}
+  const err = await shell.openPath(target);
+  return { ok: !err, path: target, error: err || "" };
+});
+
+ipcMain.handle("agentfiles:clear", () => {
+  const s = loadSettings();
+  const r = missionStore.mirrorClear(agentWorkDir(s));
+  return {
+    ...r,
+    message: r.ok
+      ? r.removed.length ? "Зеркала очищены: " + r.removed.join(", ") + ". Миссии не затронуты." : "Зеркал не было — чистить нечего."
+      : "Ошибка: " + r.error,
+  };
+});
 ipcMain.handle("tasks:list", (_e, opts) => agentStore.tasksList(userDataDir(), opts || {}));
 ipcMain.handle("tasks:add", (_e, input) => {
   const r = agentStore.tasksAdd(userDataDir(), input || {});
@@ -3353,6 +3985,8 @@ ipcMain.on("chats:saveSync", (e, d) => {
 ipcMain.handle("ai:send", async (e, messages, opts) => {
   const settings = loadSettings();
   activeRunOrigin = e && e.sender && e.sender.id ? "desktop" : "mobile";
+  activeRunRole = String((opts && opts.role) || "") || activeRunRole;
+  activeRunChatId = String((opts && opts.chatId) || "");
   global.__agentStopRequested = false;
   global.__agentRunning = true;
   try {
@@ -3374,6 +4008,7 @@ ipcMain.handle("ai:send", async (e, messages, opts) => {
     return { ok: false, error: msg };
   } finally {
     global.__agentStopRequested = false;
+    global.__agentPauseRequested = false;
     global.__agentRunning = false;
   }
 });
@@ -4474,6 +5109,7 @@ const agentToolHandlers = createAgentTools({
   execFile,
   // пояс проекта: заметки и дела, индекс кода, откат правок, журнал действий
   agentStore,
+  missionStore,
   unifiedPatch,
   codeIndex,
   audit,
@@ -4553,6 +5189,10 @@ const agentToolHandlers = createAgentTools({
     },
     activeEmit: () => activeEmit,
     activeToolRouter: () => activeToolRouter,
+    // Роль и чат текущего прогона: инструменты миссий записывают их в mission.json,
+    // чтобы панель «Миссия» знала, к какой работе относится журнал.
+    activeRunRole: () => activeRunRole,
+    activeRunChatId: () => activeRunChatId,
     mainWindow: () => mainWindow,
     // Откат правок и сводка плана: инструменты их не только читают, но и меняют —
     // поэтому запись идёт через сеттер, а не копией значения.

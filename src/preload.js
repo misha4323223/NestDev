@@ -59,6 +59,16 @@ contextBridge.exposeInMainWorld("api", {
   // Проекты (панель проекта, до 10)
   // Дела (личный список задач со сроками).
   tasksBoard: () => ipcRenderer.invoke("tasks:board"),
+  // Миссии (долгая работа): состояние для панели, пауза, продолжение, папка.
+  missionState: () => ipcRenderer.invoke("mission:state"),
+  missionPause: () => ipcRenderer.invoke("mission:pause"),
+  missionStop: () => ipcRenderer.invoke("mission:stop"),
+  missionResume: () => ipcRenderer.invoke("mission:resume"),
+  missionOpen: (id) => ipcRenderer.invoke("mission:open", id || ""),
+  // Файлы работы агента (.agent/ рядом с проектом): задачи и контекст
+  agentFilesStatus: () => ipcRenderer.invoke("agentfiles:status"),
+  agentFilesOpen: (id) => ipcRenderer.invoke("agentfiles:openDir", id || ""),
+  agentFilesClear: () => ipcRenderer.invoke("agentfiles:clear"),
   tasksList: (opts) => ipcRenderer.invoke("tasks:list", opts || {}),
   tasksAdd: (input) => ipcRenderer.invoke("tasks:add", input || {}),
   tasksUpdate: (key, patch) => ipcRenderer.invoke("tasks:update", key, patch || {}),

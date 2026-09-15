@@ -3492,3 +3492,64 @@ body { display: flex; flex-direction: column; }
 @media (max-width: 900px) {
   .role-popover { grid-template-columns: 1fr; right: 4px; left: 4px; width: auto; }
 }
+
+/* ─── Миссия: долгая работа агента (цель, шаги, журнал, метрики) ─────────── */
+#rail-mission { position: relative; }
+#rail-mission .rail-badge { background: var(--ok); }
+.sp-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); margin-left: 6px;
+  box-shadow: 0 0 6px rgba(46, 230, 168, 0.9); flex-shrink: 0; }
+.sp-dot.hidden { display: none; }
+#sp-mission { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding: 12px 14px 18px; }
+.ms-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.ms-top-text { min-width: 0; }
+.ms-title { font-size: 13.5px; font-weight: 600; letter-spacing: 0.01em; }
+.ms-status { display: block; margin-top: 3px; font-size: 11.5px; color: var(--text-dim); }
+.ms-status.ms-active { color: var(--ok); }
+.ms-status.ms-paused { color: var(--warn); }
+.ms-status.ms-failed { color: var(--danger); }
+.ms-status.ms-done, .ms-status.ms-stopped { color: var(--text-faint); }
+.ms-empty { font-size: 12px; color: var(--text-faint); line-height: 1.6; }
+.ms-empty code, .ms-hint code { color: var(--text-dim); }
+.ms-card { display: flex; flex-direction: column; gap: 9px; background: var(--bg-card);
+  border: 1px solid var(--border-soft); border-radius: 12px; padding: 10px 11px; }
+.ms-goal { font-size: 12.5px; color: var(--text); line-height: 1.55; }
+.ms-bar { height: 5px; border-radius: 999px; background: var(--bg-hover); overflow: hidden; }
+.ms-fill { height: 100%; width: 2%; background: var(--ok); border-radius: 999px; transition: width 0.4s ease; }
+.ms-meta { display: flex; flex-wrap: wrap; gap: 8px; font-size: 11.5px; color: var(--text-dim);
+  font-variant-numeric: tabular-nums; }
+.ms-meta .ms-bad { color: var(--danger); font-weight: 600; }
+.ms-meta .ms-reason { flex-basis: 100%; color: var(--text-faint); font-style: italic; }
+.ms-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.ms-section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-faint); margin-top: 2px; }
+.ms-section-title.hidden { display: none; }
+.ms-steps { display: flex; flex-direction: column; gap: 3px; }
+.ms-step { display: flex; align-items: baseline; gap: 7px; font-size: 12.5px; color: var(--text-dim);
+  padding: 3px 4px; border-radius: 7px; }
+.ms-step i { font-style: normal; width: 12px; flex-shrink: 0; text-align: center; }
+.ms-step-done { color: var(--text-faint); }
+.ms-step-done i { color: var(--ok); }
+.ms-step-done .ms-step-text { text-decoration: line-through; text-decoration-color: var(--border); }
+.ms-step-doing { color: var(--text); background: var(--bg-hover); }
+.ms-step-doing i { color: var(--warn); }
+.ms-step-failed i { color: var(--danger); }
+.ms-step-text { min-width: 0; overflow-wrap: anywhere; }
+.ms-step-note { color: var(--text-faint); font-size: 11px; }
+.ms-journal { display: flex; flex-direction: column; gap: 2px; max-height: 240px; overflow-y: auto;
+  border: 1px solid var(--border-soft); border-radius: 9px; padding: 6px 7px; background: var(--bg); }
+.ms-line { display: flex; gap: 7px; font-size: 11.5px; color: var(--text-dim); line-height: 1.5; }
+.ms-line .ms-time { color: var(--text-faint); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.ms-line-batch, .ms-line-start { color: var(--text); }
+.ms-line-error, .ms-line-fail { color: var(--warn); }
+.ms-line-tool { color: var(--text-faint); }
+.ms-muted { font-size: 11.5px; color: var(--text-faint); }
+.ms-list { display: flex; flex-direction: column; gap: 4px; }
+.ms-past { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-dim);
+  background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 9px; padding: 5px 8px; }
+.ms-past-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ms-past-meta { color: var(--text-faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+.ms-hint { font-size: 11px; color: var(--text-faint); line-height: 1.5; }
+
+/* Компактные числовые поля в настройках (часы, раунды, авто-продолжения) */
+.mini-label { font-size: 11.5px; color: var(--text-dim); align-self: center; white-space: nowrap; }
+.mini-num { width: 68px; flex: 0 0 auto; }

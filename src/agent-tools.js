@@ -19,6 +19,13 @@
    createDeployEngine): модуль чистый и проверяется в plain-node. */
 
 function createAgentTools(deps) {
+  // Панель «Миссия» обновляется сразу: шаг агента видно без ожидания опроса.
+  const notifyMission = () => {
+    try {
+      const em = deps.live && deps.live.activeEmit ? deps.live.activeEmit() : null;
+      if (em) em({ type: "mission", phase: "changed" });
+    } catch {}
+  };
   const {
     shell,
     path,
@@ -86,6 +93,7 @@ function createAgentTools(deps) {
     execFile,
     // Пояс проекта: заметки и дела, семантический индекс, откат правок, журнал действий.
     agentStore,
+    missionStore,
     unifiedPatch,
     codeIndex,
     audit,
@@ -180,6 +188,14 @@ function createAgentTools(deps) {
     get activeEmit() {
       return deps.live.activeEmit();
     },
+    // Роль и чат текущего прогона: миссия запоминает, кто её ведёт, — панель
+    // показывает работу в том чате, где она начата.
+    get activeRunRole() {
+      return deps.live.activeRunRole ? deps.live.activeRunRole() : "";
+    },
+    get activeRunChatId() {
+      return deps.live.activeRunChatId ? deps.live.activeRunChatId() : "";
+    },
     get activeToolRouter() {
       return deps.live.activeToolRouter();
     },
@@ -216,10 +232,20 @@ function createAgentTools(deps) {
         }
         const groups = [...new Set(found.map((f) => f.group).filter(Boolean))];
         if (live.activeToolRouter && groups.length) live.activeToolRouter.addGroups(groups);
+        // Схемы могут НЕ поместиться в узкое окно модели (группа включается, а вес не лезет).
+        // Раньше ответ безусловно обещал «схемы уже добавлены», и модель ждала, что вызов
+        // сработает сам. Говорим, что реально в запросе сейчас, а что видно только по имени.
+        const inSchemas = live.activeToolRouter ? live.activeToolRouter.names() : [];
+        const missing = found.filter((f) => inSchemas.indexOf(f.name) < 0).map((f) => f.name);
         return (
-          "Нашёл инструменты по запросу «" + query + "» (схемы уже добавлены в запрос — вызывай их как обычно):\n" +
+          "Нашёл инструменты по запросу «" + query + "»:\n" +
           found.map((f) => "• " + f.name + (f.group ? " [" + f.group + "]" : "") + " — " + truncateText(f.description, 160)).join("\n") +
-          (groups.length ? "\nВключены группы: " + groups.join(", ") + ". Список всех инструментов задачи — " + (live.activeToolRouter ? live.activeToolRouter.names().join(", ") : "") : "")
+          (groups.length ? "\nВключены группы: " + groups.join(", ") + "." : "") +
+          (missing.length
+            ? "\n⚠ В набор схем не поместились (узкое окно модели): " + missing.join(", ") +
+              ". Вызывай их так же по имени — вызов выполнится, просто схема не отправлена."
+            : "\nВсе найденные инструменты уже в запросе — вызывай как обычно.") +
+          (live.activeToolRouter ? "\nСейчас в запросе " + inSchemas.length + " инструментов." : "")
         );
     },
     "createFolder": async (args, settings) => {
@@ -828,6 +854,9 @@ function createAgentTools(deps) {
     },
     "browserNetwork": async (args, settings) => {
         return await browserTools.network(args);
+    },
+    "browserReplay": async (args, settings) => {
+        return await browserTools.replay(args);
     },
     "waitForIdle": async (args, settings) => {
         return await browserTools.waitForIdle(args);
@@ -2026,6 +2055,7 @@ function createAgentTools(deps) {
     "taskAdd": async (args, settings) => {
         const taR = agentStore.tasksAdd(userDataDir(), {
           title: args.title, due: args.due, priority: args.priority, project: args.project, note: args.note,
+          repeat: args.repeat, auto: args.auto, prompt: args.prompt,
         });
         if (!taR.ok) return "Ошибка: " + taR.error;
         emitTasksChanged();
@@ -2042,6 +2072,7 @@ function createAgentTools(deps) {
     "taskUpdate": async (args, settings) => {
         const tuR = agentStore.tasksUpdate(userDataDir(), args.key, {
           title: args.title, due: args.due, priority: args.priority, status: args.status, project: args.project, note: args.note,
+          repeat: args.repeat, auto: args.auto, prompt: args.prompt, snooze: args.snooze,
         });
         if (!tuR.ok) return "Ошибка: " + tuR.error;
         emitTasksChanged();
@@ -2058,6 +2089,80 @@ function createAgentTools(deps) {
         if (!txR.ok) return "Ошибка: " + txR.error;
         emitTasksChanged();
         return "OK — " + txR.message;
+    },
+    "missionStart": async (args, settings) => {
+        // Долгая работа: цель, план и журнал ложатся файлами в рабочую папку
+        // (.agent/missions/<id>/). Прогон после этого идёт батчами и переживает
+        // перезапуск — состояние миссии читается с диска, а не из памяти окна.
+        const msDir = agentWorkDir(settings);
+        const msMinutes = Number(args.minutes) || 0;
+        const msRole = live.activeRunRole || "";
+        const msChat = live.activeRunChatId || "";
+        const msR = missionStore.missionCreate(msDir, {
+          goal: args.goal, title: args.title, steps: args.steps,
+          role: msRole, chatId: msChat,
+          limits: msMinutes ? { minutes: msMinutes } : null,
+        });
+        if (!msR.ok) return "Ошибка: " + msR.error;
+        notifyMission();
+        const msP = missionStore.missionProgress(msR.mission);
+        const msPlanText = msR.mission.steps.length
+          ? msR.mission.steps.map((s, i) => (i + 1) + ") " + s.title).join("; ")
+          : "не задан";
+        return "OK — миссия создана: " + msR.mission.id +
+          "\nПапка: " + msR.dir +
+          "\nЦель: " + msR.mission.goal +
+          "\nПлан (" + msP.total + "): " + msPlanText +
+          "\nЛимит: " + msR.mission.limits.rounds + " раундов, " + Math.round(msR.mission.limits.minutes / 60) + " ч" +
+          "\nРаботай по шагам и после КАЖДОГО шага вызывай missionStep(done, next, note) — журнал читает человек." +
+          " Когда закончишь — missionFinish(report).";
+    },
+    "missionStep": async (args, settings) => {
+        const msDir2 = agentWorkDir(settings);
+        const msCur = missionStore.missionActive(msDir2);
+        if (!msCur) return "Ошибка: незакрытой миссии нет. Для длинной работы сначала missionStart(goal, steps).";
+        const msR2 = missionStore.missionStep(msDir2, msCur.id, {
+          done: args.done, fail: args.fail, next: args.next, note: args.note,
+        });
+        if (!msR2.ok) return "Ошибка: " + msR2.error;
+        notifyMission();
+        const msP2 = msR2.progress;
+        return "OK — миссия " + msCur.id + ": " + msP2.done + "/" + msP2.total + " готово" +
+          (msP2.failed ? ", сбоев " + msP2.failed : "") +
+          (msP2.current ? ". Сейчас: " + msP2.current : "") +
+          "\nЖурнал: .agent/missions/" + msCur.id + "/journal.md";
+    },
+    "missionStatus": async (args, settings) => {
+        const msDir3 = agentWorkDir(settings);
+        const msWanted = String(args.id || "").trim();
+        const msRec = msWanted ? missionStore.missionLoad(msDir3, msWanted) : missionStore.missionActive(msDir3);
+        if (!msRec) return msWanted ? "Ошибка: миссия " + msWanted + " не найдена." : "Незакрытых миссий нет.";
+        const msP3 = missionStore.missionProgress(msRec);
+        const msElapsed = Math.round((Date.now() - (msRec.startedAt || msRec.createdAt || Date.now())) / 60000);
+        const msHead = "Миссия «" + msRec.title + "» (" + msRec.id + ", состояние: " + msRec.status + ")\n" +
+          "Цель: " + msRec.goal + "\n" +
+          "Прогресс: " + msP3.done + "/" + msP3.total + (msP3.failed ? " (сбоев " + msP3.failed + ")" : "") +
+          (msP3.current ? ", сейчас: " + msP3.current : "") + "\n" +
+          "В работе " + msElapsed + " мин, раундов " + msRec.rounds + ", батчей " + msRec.batches +
+          ", токенов " + msRec.metrics.tokens + (msRec.next ? "\nДальше: " + msRec.next : "");
+        const msPlan = msRec.steps.length
+          ? "\nПлан:\n" + msRec.steps.map((s, i) => (s.state === "done" ? "  [x] " : s.state === "failed" ? "  [!] " : s.state === "doing" ? "  [→] " : "  [ ] ") + (i + 1) + ". " + s.title + (s.note ? " — " + s.note : "")).join("\n")
+          : "";
+        const msJ = missionStore.missionJournalText(msDir3, msRec.id, { limit: Number(args.journal) || 20 });
+        return msHead + msPlan + "\nЖурнал (хвост):\n" + msJ + "\nФайлы: .agent/missions/" + msRec.id + "/";
+    },
+    "missionFinish": async (args, settings) => {
+        const msDir4 = agentWorkDir(settings);
+        const msRec4 = missionStore.missionActive(msDir4);
+        if (!msRec4) return "Ошибка: незакрытой миссии нет — закрывать нечего.";
+        const msR4 = missionStore.missionFinish(msDir4, msRec4.id, {
+          report: args.report, status: args.status, next: args.next,
+        });
+        if (!msR4.ok) return "Ошибка: " + msR4.error;
+        notifyMission();
+        const msP4 = missionStore.missionProgress(msR4.mission);
+        return "OK — миссия " + msRec4.id + " закрыта (" + msR4.mission.status + "): " + msP4.done + "/" + msP4.total +
+          " шагов. Итог записан в .agent/missions/" + msRec4.id + "/report.md";
     },
     "todoWrite": async (args, settings) => {
         // План работ: приложение только нормализует и показывает его панелью-

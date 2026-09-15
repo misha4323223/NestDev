@@ -16,7 +16,8 @@
    - vault: менеджер паролей (поиск, отсутствие утечек паролей, подстановка входа, интерфейс).
    - yandex: логи внутренним API (REST+gRPC), автоматические YC_TOKEN/YC_CLOUD_ID/YC_FOLDER_ID, встроенный yc CLI;
      адреса сервисов (postbox/logging), повторы и пачечный опрос дашборда, свежие настройки у инструментов.
-   - tasks: дела со сроками (разбор «завтра 14:00», CRUD, панель по срокам, напоминания).
+   - tasks: дела со сроками (разбор «завтра 14:00», CRUD, панель по срокам, напоминания),
+     повторы («каждый день», «по будням») и автозадачи — планировщик будит агента по сроку.
    - app-ui: стабильные ref вместо номеров [N] (клик не уезжает после перерисовки окна).
    - стрим/печать: DOM и автопрокрутка обновляются не чаще кадра, фон под стеклянными
      панелями статичен (иначе блюры пересчитываются в каждом кадре и интерфейс «жуёт»).
@@ -34,7 +35,16 @@ const ROOT = path.join(__dirname, ".."); // корень проекта
 let passed = 0;
 let failed = 0;
 
+// Фильтр по имени: node test/smoke.test.js "replay|ленивый список" — прогон только тех
+// тестов, чьё имя содержит одну из подсказок (через |). Нужен для отладки и проверки
+// мутаций: весь набор идёт полторы минуты, а точечный прогон — секунды.
+const ONLY = String(process.argv[2] || "").split("|").map((s) => s.trim()).filter(Boolean);
+function selected(name) {
+  if (!ONLY.length) return true;
+  return ONLY.some((s) => name.indexOf(s) >= 0);
+}
 function test(name, fn) {
+  if (!selected(name)) return Promise.resolve();
   return Promise.resolve()
     .then(fn)
     .then(() => {
@@ -2358,7 +2368,9 @@ async function testMobileBridge() {
     // Совпадения с адресами (api.deepseek.com и т.п.) и сознательно отсутствующий
     // синхронный канал сохранения чатов: sendSync по WebSocket невозможен, при
     // закрытии страницы история уходит асинхронным saveChats.
-    const skip = new Set(["anthropic", "cerebras", "cloud", "deepseek", "groq", "mistral", "nvidia", "openai", "saveChatsSync"]);
+    // agentFilesOpen/agentFilesClear — только окно на ПК: открывают папку в проводнике
+// и удаляют файлы на диске, с телефона такие кнопки не нужны (и опасны без диалога).
+const skip = new Set(["anthropic", "cerebras", "cloud", "deepseek", "groq", "mistral", "nvidia", "openai", "saveChatsSync", "agentFilesOpen", "agentFilesClear"]);
     const used = [...new Set((app.match(/api\.[a-zA-Z0-9_]+/g) || []).map((s) => s.slice(4)))];
     const missing = used.filter((k) => !skip.has(k) && !keys.has(k));
     assert.deepStrictEqual(missing, [], "в мобильной копии API нет методов: " + missing.join(", "));
@@ -5545,6 +5557,301 @@ async function testBrowserOverlays() {
 }
 
 // ── Ускорение агента: батчинг, скриншоты JPEG, порог компакции ──────────────
+async function testBrowserReplayData() {
+  const bt = require(path.join(ROOT, "src", "browser-tools.js"));
+  const os = require("os");
+  const toolsSrc = backendSrc();
+  const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+  const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+  const policySrc = fs.readFileSync(path.join(ROOT, "src", "tool-policy.js"), "utf8");
+  const vkGuide = fs.readFileSync(path.join(ROOT, "src", "agent-guides", "vk.md"), "utf8");
+  const browserGuide = fs.readFileSync(path.join(ROOT, "src", "agent-guides", "browser.md"), "utf8");
+  const dir = path.join(os.tmpdir(), "ai-agent-replay-test");
+
+  // Формы и пути: пересборка тела НЕ должна портить нетронутые поля.
+  await test("replay: тело формы пересобирается байт в байт, пока поле не меняли", () => {
+    const body = "v=5.285&q=hello+world&access_token=vk1.a%2Bb&start_from=conversations_0";
+    const pairs = bt.parseForm(body);
+    assert.strictEqual(pairs.length, 4, "поля разобраны не все: " + JSON.stringify(pairs));
+    assert.strictEqual(bt.buildForm(pairs), body, "нетронутое тело пересобрано иначе");
+    assert.strictEqual(bt.pickPath({ a: 1 }, "a.b"), undefined, "отсутствующий путь не распознан");
+    assert.strictEqual(bt.pickPath({ a: { b: [{ c: 7 }] } }, "a.b.0.c"), 7, "путь с индексом сломан");
+    // Меняем одно поле — исходный кусок больше не используется.
+    const edited = bt.parseForm("start_from=conversations_0&q=hello+world");
+    edited[0][1] = "conversations_222";
+    edited[0].length = 2;
+    assert.strictEqual(bt.buildForm(edited), "start_from=conversations_222&q=hello+world", "правка поля пересобрана неверно");
+  });
+
+  await test("replay: секреты прячутся, а маршруты ответа находятся сами", () => {
+    const masked = bt.maskForm("v=5.285&access_token=vk1.SECRET&client_id=6287487");
+    assert.ok(masked.indexOf("vk1.SECRET") < 0, "токен остался в тексте: " + masked);
+    assert.ok(/access_token=«скрыто/.test(masked), masked);
+    assert.ok(/v=5\.285/.test(masked) && /client_id=6287487/.test(masked), "не секретные поля тоже скрыты: " + masked);
+    // Ответ в форме ВК: элементы, количество и курсор находятся без подсказок.
+    const vk = { response: { count: 42, conversations: { count: 42, items: [{ conversation: { peer: { id: 5 } } }] }, last_item: 999 } };
+    assert.strictEqual(bt.findItemsPath(vk), "response.conversations.items", "не нашёл массив диалогов");
+    assert.strictEqual(bt.findTotalPath(vk), "response.count", "не нашёл total_count");
+    assert.strictEqual(bt.findCursorPath(vk), "response.last_item", "не нашёл курсор");
+    assert.strictEqual(bt.keyOfItem(vk.response.conversations.items[0], ""), "5", "ключ строки не выведен из peer.id");
+    assert.strictEqual(bt.keyOfItem({ peer_id: 77 }, ""), "77", "peer_id не стал ключом");
+    // Незнакомый API: массив ищется сам.
+    const other = { payload: { rows: [{ id: 1 }, { id: 2 }] } };
+    assert.strictEqual(bt.findItemsPath(other), "payload.rows", "незнакомый ответ не разобран");
+    assert.strictEqual(bt.findCursorParam([["target_count", "20"], ["offset", "40"]]), "offset", "курсор в теле не найден");
+  });
+
+  // Ленивый список диалогов: 3 страницы курсором, повтор строки не дублируется.
+  const ITEM = (id) => ({ conversation: { peer: { id: id } }, last_message: { text: "msg-" + id } });
+  const VK_BODY = "v=5.285&client_id=6287487&start_from=conversations_0&filter=all&target_count=20&extended=1&access_token=vk1.SECRET&fields=bdate&q=hello+world";
+
+  function fakePage() {
+    const page = {
+      handlers: {},
+      _u: "https://vk.com/im",
+      viewportSize: () => ({ width: 1000, height: 800 }),
+      mouse: { async move() {}, async wheel() {} },
+      server: null,
+      on(type, fn) { (page.handlers[type] = page.handlers[type] || []).push(fn); },
+      off(type, fn) {
+        const l = page.handlers[type] || [];
+        const i = l.indexOf(fn);
+        if (i >= 0) l.splice(i, 1);
+      },
+      emit(type) {
+        const args = Array.prototype.slice.call(arguments, 1);
+        for (const fn of (page.handlers[type] || []).slice()) fn.apply(null, args);
+      },
+      async goto(u) { page._u = u; },
+      async waitForLoadState() {},
+      url() { return page._u; },
+      async title() { return "ВКонтакте"; },
+      async close() {},
+    };
+    page.evaluate = async (fn, arg) => {
+      if (fn === bt.fetchJsonInPage) return page.server ? page.server(arg) : { error: "нет сервера" };
+      if (fn === bt.itemsKeyInPage) return bt.itemsKeyInPage(arg);
+      if (fn === bt.scrollItemIntoViewInPage) return page.onScrollItem ? page.onScrollItem(arg) : { ok: false, count: 0 };
+      if (fn === bt.scrollStateInPage) return { y: 0, max: 0, vh: 800, docH: 800, inner: [] };
+      if (fn === bt.scrollPageInPage) return { mode: "page", moved: 0, y: 0, max: 0 };
+      if (typeof fn === "string") return "x".repeat(5000);
+      const src = String(fn);
+      if (/scrollingElement/.test(src)) return "0:0";
+      if (/replace/.test(src)) return "текст страницы";
+      if (/innerText/.test(src)) return 100;
+      return { url: page._u, title: "ВКонтакте", items: [] };
+    };
+    return page;
+  }
+
+  async function openWith(page) {
+    const browser = {
+      isConnected: () => true,
+      on() {},
+      async pages() { return [page]; },
+      async newPage() { return page; },
+      async close() {},
+    };
+    bt.setPlaywright({
+      chromium: {
+        executablePath: () => "",
+        async launch() { return browser; },
+        async launchPersistentContext() { return browser; },
+      },
+    });
+    await bt.close({ tabId: "all" });
+    await bt.open({ url: page._u });
+    return page;
+  }
+
+  await test("replay: повторяет запрос страницы, листает курсором и отдаёт файл", async () => {
+    const calls = [];
+    const page = fakePage();
+    page.server = (arg) => {
+      calls.push(arg.body);
+      const pairs = bt.parseForm(arg.body);
+      const cursor = (pairs.filter((p) => p[0] === "start_from")[0] || [])[1] || "";
+      const pages = {
+        "conversations_0": { items: [ITEM(111), ITEM(222)], last: 222 },
+        "conversations_222": { items: [ITEM(222), ITEM(333)], last: 333 },
+      };
+      const cur = pages[cursor] || { items: [], last: cursor };
+      return {
+        ok: true, status: 200, url: arg.url, text: "",
+        json: { response: { count: 3, conversations: { count: 3, items: cur.items }, last_item: cur.last } },
+      };
+    };
+    await openWith(page);
+    // Страница САМА отправила запрос — replay берёт адрес и тело из перехвата.
+    page.emit("request", {
+      method: () => "POST",
+      url: () => "https://api.vk.ru/method/messages.getItems?v=5.285&client_id=6287487",
+      resourceType: () => "xhr",
+      postData: () => VK_BODY,
+    });
+    const out = await bt.replay({ match: "messages.getItems", cursorParam: "start_from", cursorPrefix: "conversations_", dir: dir });
+    assert.ok(/собрано 3 строк за 2 запросов/.test(out), "не собрал все страницы:\n" + out);
+    assert.ok(/собрано всё: 3 из 3/.test(out), "не остановился по total_count:\n" + out);
+    assert.ok(/Повторов отброшено: 1/.test(out), "повтор строки не отброшен:\n" + out);
+    assert.ok(/response\.conversations\.items/.test(out), "не сказал, откуда взял данные:\n" + out);
+    assert.ok(out.indexOf("vk1.SECRET") < 0, "токен попал в ответ агента:\n" + out);
+    assert.strictEqual(calls[0], VK_BODY, "первый запрос ушёл не байт в байт с перехваченным:\n" + calls[0]);
+    assert.ok(/start_from=conversations_222/.test(calls[1]), "курсор не подставлен в следующий запрос:\n" + calls[1]);
+    assert.ok(calls[1].indexOf("q=hello+world") >= 0, "нетронутое поле пересобрано иначе:\n" + calls[1]);
+    assert.ok(calls[1].indexOf("access_token=vk1.SECRET") >= 0, "токен пересобран иначе (replay сломался бы):\n" + calls[1]);
+    const saved = out.match(/Файл: (.+?) —/);
+    assert.ok(saved, "не сказал, куда сохранил данные:\n" + out);
+    const data = JSON.parse(fs.readFileSync(saved[1], "utf8"));
+    assert.strictEqual(data.count, 3, "в файле не 3 строки");
+    assert.strictEqual(data.items.length, 3, "в файле лишние или потерянные строки");
+    assert.strictEqual(data.total, 3, "total не попал в файл");
+    assert.strictEqual(data.itemsPath, "response.conversations.items", "путь элементов не записан в файл");
+  });
+
+  await test("replay: неподвижный курсор — стоп, а не бесконечная лента", async () => {
+    const calls = [];
+    const page = fakePage();
+    page.server = (arg) => {
+      calls.push(arg.body);
+      return {
+        ok: true, status: 200, url: arg.url, text: "",
+        json: { response: { count: 0, items: [ITEM(100 + calls.length)], last_item: 999 } },
+      };
+    };
+    await openWith(page);
+    const out = await bt.replay({ url: "https://api.vk.ru/method/messages.getItems?v=5.285", body: VK_BODY, cursorParam: "start_from", cursorPrefix: "conversations_", dir: dir });
+    assert.ok(/курсор не двигается/.test(out), "не остановился на неподвижном курсоре:\n" + out);
+    assert.strictEqual(calls.length, 2, "сделал лишние запросы: " + calls.length);
+  });
+
+  await test("replay: set/remove правят тело, pick выводит строки, save отключается", async () => {
+    const calls = [];
+    const page = fakePage();
+    page.server = (arg) => {
+      calls.push(arg.body);
+      return {
+        ok: true, status: 200, url: arg.url, text: "",
+        json: { response: { count: 3, items: [ITEM(111), ITEM(222)], last_item: 333 } },
+      };
+    };
+    await openWith(page);
+    const out = await bt.replay({
+      url: "https://api.vk.ru/method/messages.getItems?v=5.285",
+      body: VK_BODY,
+      set: { target_count: 50, start_from: "conversations_0" },
+      remove: ["extended", "fields"],
+      save: false,
+      pick: ["conversation.peer.id", "last_message.text"],
+      maxSteps: 1,
+      dir: dir,
+    });
+    assert.ok(/target_count=50/.test(calls[0]), "set не применился:\n" + calls[0]);
+    assert.ok(!/extended=/.test(calls[0]), "remove не убрал поле extended:\n" + calls[0]);
+    assert.ok(!/fields=/.test(calls[0]), "remove не убрал поле fields:\n" + calls[0]);
+    assert.ok(/111 · msg-111/.test(out), "строки по pick не выведены:\n" + out);
+    assert.ok(/упёрся в предел 1 шагов/.test(out), "не сказал про потолок шагов:\n" + out);
+    assert.ok(out.indexOf("vk1.SECRET") < 0, "токен попал в ответ агента:\n" + out);
+    assert.ok(out.indexOf("Файл: ") < 0, "сохранил файл, хотя save: false");
+  });
+
+  await test("replay: без перехвата честно говорит, что повторять нечего", async () => {
+    const page = fakePage();
+    await openWith(page);
+    const out = await bt.replay({ match: "messages.getItems" });
+    assert.ok(/нечего повторять/.test(out), out);
+    assert.ok(/browserNetwork/.test(out), "не подсказал, где взять образец запроса:" + out);
+  });
+
+  await test("browserEval: save пишет результат в файл целиком", async () => {
+    const page = fakePage();
+    await openWith(page);
+    const out = await bt.evalJs({ script: "1", save: true, maxChars: 100 });
+    assert.ok(/Результат сохранён В ФАЙЛ/.test(out), out);
+    const saved = out.match(/В ФАЙЛ: (.+?)\n/);
+    assert.ok(saved, "путь к файлу не назван: " + out.slice(0, 200));
+    const text = fs.readFileSync(saved[1], "utf8");
+    assert.strictEqual(text.length, 5000, "в файл записан не весь результат (" + text.length + " символов)");
+    assert.ok(/Символов: 5000/.test(out), "не сообщил размер результата:\n" + out);
+    assert.ok(/readFile/.test(out), "не подсказал, как прочитать файл:\n" + out);
+    fs.rmSync(saved[1], { force: true });
+    // Без save поведение прежнее: обрезанный ответ и намёк на save.
+    const plain = await bt.evalJs({ script: "1", maxChars: 100 });
+    assert.ok(/обрезано, всего 5000 символов/.test(plain), plain);
+    assert.ok(/save: true/.test(plain), "нет намёка на save:\n" + plain);
+  });
+
+  await test("ленивый список: строки считаются по ключам, последняя прокручивается в кадр", async () => {
+    const rows = [
+      { innerText: "Диалог 1", id: "", getAttribute: () => "", querySelector: () => ({ getAttribute: () => "/im/convo/1" }) },
+      { innerText: "Диалог 2", id: "", getAttribute: () => "", querySelector: () => ({ getAttribute: () => "/im/convo/2" }) },
+    ];
+    let scrolled = "";
+    for (const r of rows) r.scrollIntoView = function (o) { scrolled = r.innerText + ":" + ((o && o.block) || ""); };
+    const prevDoc = global.document;
+    global.document = { querySelectorAll: () => rows.slice() };
+    try {
+      const s1 = bt.itemsKeyInPage({ item: ".convo-item" });
+      assert.strictEqual(s1.count, 2, "строки не посчитаны");
+      assert.strictEqual(s1.uniq, 2, "уникальные ключи не посчитаны");
+      assert.ok(/\/im\/convo\/1/.test(s1.joined), "ключ взят не из href: " + s1.joined);
+      rows.push({ innerText: "Диалог 3", id: "", getAttribute: () => "", querySelector: () => ({ getAttribute: () => "/im/convo/3" }) });
+      rows[rows.length - 1].scrollIntoView = function (o) { scrolled = this.innerText + ":" + ((o && o.block) || ""); };
+      const s2 = bt.itemsKeyInPage({ item: ".convo-item" });
+      assert.notStrictEqual(s1.joined, s2.joined, "рост списка не виден по ключам");
+      assert.ok(bt.scrollItemIntoViewInPage({ item: ".convo-item", up: false }).ok, "не прокрутил последнюю строку");
+      assert.ok(/Диалог 3:end/.test(scrolled), "прокручена не последняя строка: " + scrolled);
+      assert.ok(bt.scrollItemIntoViewInPage({ item: ".convo-item", up: true }).ok, "не прокрутил первую строку (чтение вверх)");
+      assert.ok(/Диалог 1:start/.test(scrolled), "при чтении вверх прокручена не первая строка: " + scrolled);
+
+      // Живая догрузка: каждая прокрутка добавляет строку, потом список кончается.
+      const page = fakePage();
+      let extra = 0;
+      page.onScrollItem = () => {
+        if (extra < 3) {
+          extra++;
+          const n = rows.length + 1; // номер фиксируем сейчас: иначе все новые строки получат один href
+          rows.push({ innerText: "Диалог " + n, id: "", getAttribute: () => "", querySelector: () => ({ getAttribute: () => "/im/convo/" + n }) });
+          return { ok: true, count: rows.length };
+        }
+        return { ok: false, count: rows.length };
+      };
+      await openWith(page);
+      const out = await bt.loadAllScroll(page, { item: ".convo-item", times: 12, read: true });
+      assert.ok(/Строк в списке: 6/.test(out), "не сказал, сколько строк собрано:\n" + out.slice(0, 300));
+      assert.ok(/конец списка/.test(out), "не понял, что список кончился:\n" + out.slice(0, 300));
+      assert.ok(/Новое содержимое появилось на 3/.test(out), "неверный счётчик роста:\n" + out.slice(0, 300));
+      // Дубликат той же строки (прокрутка туда-обратно) не считается новой.
+      rows.push({ innerText: "Диалог 1 (копия)", id: "", getAttribute: () => "", querySelector: () => ({ getAttribute: () => "/im/convo/1" }) });
+      assert.strictEqual(bt.itemsKeyInPage({ item: ".convo-item" }).uniq, 6, "повтор строки посчитан как новая");
+    } finally {
+      if (prevDoc === undefined) delete global.document;
+      else global.document = prevDoc;
+      bt.setPlaywright(null);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test("связки: инструмент объявлен и в ядре, и в политике, и в панели", () => {
+    assert.ok(/"browserReplay": async \(args, settings\) =>/.test(toolsSrc), "нет обработчика в agent-tools.js");
+    assert.ok(/browserTools\.replay\(args\)/.test(toolsSrc), "обработчик не зовёт replay");
+    assert.ok(/name: "browserReplay"/.test(coreSrc), "нет описания инструмента");
+    assert.ok(/replay: "browserReplay"/.test(coreSrc), "нет алиаса имени");
+    assert.ok(/"browserEval", "browserOverlays", "agentGuide", "browserReplay",/.test(coreSrc), "не попал в ядро инструментов");
+    assert.ok(/"browserNetwork", "browserReplay", "waitForIdle", "agentGuide"\]/.test(coreSrc), "не попал в группу браузера");
+    assert.ok(/browserNetwork, browserReplay, waitForIdle/.test(coreSrc), "не попал в список инструментов промпта");
+    assert.ok(/38\. Данные со страницы бери ЗАПРОСОМ/.test(coreSrc), "нет правила про сбор данных запросом");
+    assert.ok(/"browserEval", "browserScroll", "browserHover", "browserReplay"/.test(policySrc), "нет capability в политике инструментов");
+    assert.ok(/browserReplay: "🔁"/.test(appSrc), "нет иконки в журнале действий");
+    assert.ok(/browserReplay: "Повтор запроса сайта"/.test(appSrc), "нет подписи инструмента");
+    // Гайды: замер ВК и порядок работы по сети.
+    assert.ok(/api\.vk\.ru\/method\/messages\.getItems/.test(vkGuide), "в гайде ВК нет проверенного эндпоинта");
+    assert.ok(/v=5\.285/.test(vkGuide), "в гайде ВК нет версии клиента");
+    assert.ok(/ConvoList__itemsWrapper/.test(vkGuide), "в гайде ВК нет реального контейнера списка");
+    assert.ok(/cursorPrefix/.test(vkGuide), "в гайде ВК нет примера replay с курсором");
+    assert.ok(/browserReplay/.test(browserGuide), "в справочнике браузера нет раздела про запрос вместо DOM");
+  });
+}
+
 async function testAgentSpeedups() {
   const core = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
   const mainSrc = backendSrc();
@@ -6921,7 +7228,10 @@ async function testToolRouter() {
     const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
     // A: реальный вызов вне набора дотягивает группу и повторяет раунд со схемой.
     assert.ok(/const gid = groupOfTool\(c\.name\);/.test(mainSrc), "нет предохранителя A");
-    assert.ok(/stickyGroups\.add\(gid\);\s*\n\s*refreshTools\(\);/.test(mainSrc), "группа вызова не добавляется на ходу");
+    assert.ok(/stickyGroups\.add\(gid\);\s*\n\s*fresh\.push\(gid\);/.test(mainSrc), "группа вызова не добавляется на ходу");
+    assert.ok(/if \(fresh\.length\) \{\s*\n\s*refreshTools\(\);/.test(mainSrc), "набор схем не пересобирается после включения группы");
+    // Группа могла не поместиться в окно: обещать «схем станет больше» нельзя.
+    assert.ok(mainSrc.indexOf("не влезают в окно модели") !== -1, "отчёт о включении группы не сверяется с фактом");
     // B: findTools исполняется и включает группы текущей задачи.
     assert.ok(hasTool(mainSrc, "findTools"), "findTools не исполняется");
     assert.ok(/activeToolRouter\.addGroups\(groups\)/.test(mainSrc), "findTools не включает группы");
@@ -7036,7 +7346,246 @@ async function testOllamaWindow() {
       assert.ok(/Math\.min\(3000, modelWin\)/.test(mainSrc), "нижний предел бюджета не ограничен окном");
       assert.ok(/numCtxBudget: budget,/.test(mainSrc), "бюджет не передан в buildChatRequest");
       assert.ok(/modelWindow: modelWin,/.test(mainSrc), "окно не передано в buildChatRequest");
-      assert.ok(/oi\.known && !oi\.tools/.test(mainSrc), "нет проверки поддержки инструментов у модели");
+      assert.ok(/ollamaInfo\.known && !ollamaInfo\.tools/.test(mainSrc), "нет проверки поддержки инструментов у модели");
+      assert.ok(/noTools: noTools,/.test(mainSrc), "флаг noTools не доходит до сборки запроса");
+      assert.ok(
+        /budget = windowBudget\(provider, budget, modelWin, \{ local: localEndpoint \}\);/.test(mainSrc),
+        "бюджет не считается от окна модели"
+      );
+      assert.ok(mainSrc.indexOf("budget - 12000") === -1, "жёсткий резерв 12 000 вернулся: на локальном окне он срежет все группы");
+    });
+    await test("ollama: бюджет берётся от окна модели, а не от облачного потолка", () => {
+      // Локальные токены бесплатны: платим памятью (KV-кэш) и временем, поэтому потолок — окно.
+      const cloud = core.contextBudget("ollama", "qwen3:4b");
+      assert.strictEqual(cloud, 14000, "изменился запасной бюджет на случай молчащего сервера");
+      assert.strictEqual(core.windowBudget("ollama", cloud, 40960), 32768, "окно 40k не использовано");
+      assert.strictEqual(core.windowBudget("ollama", cloud, 8192), 4096, "окно 8k не учтено");
+      assert.strictEqual(core.windowBudget("ollama", cloud, 131072), 32768, "потолок памяти не держит");
+      // Окно меньше резерва на ответ: отдаём всё окно, но не больше него.
+      assert.strictEqual(core.windowBudget("ollama", cloud, 2048), 2048, "бюджет превысил окно модели");
+      // Окно неизвестно (сервер молчит) — поведение прежнее.
+      assert.strictEqual(core.windowBudget("ollama", cloud, 0), 14000, "без окна бюджет потерян");
+      // У облака бюджет про деньги — он остаётся потолком.
+      assert.strictEqual(core.windowBudget("openai", 50000, 131072), 50000, "облачный потолок превышен");
+      assert.strictEqual(core.windowBudget("openai", 50000, 8192), 4096, "малое окно у облака не учтено");
+    });
+
+    await test("роутер: на локальном окне группы помещаются (на прежних 14 000 — нет)", () => {
+      const baseCount = core.routeTools({ text: "" }).tools.length;
+      const base = core.routeTools({ text: "" }).tokens;
+      const sys = core.estimateTokens(core.SYSTEM_PROMPT);
+      const ask = { text: "открой вк и прочитай список диалогов", roleGroups: ["browser"] };
+      // Потолок схем считает ядро (routerMaxTokens) — тест зовёт ЕГО, а не свою копию
+      // формулы: иначе поломка самой формулы осталась бы незамеченной.
+      const pick = (budget) =>
+        core.routeTools(Object.assign({ maxTokens: core.routerMaxTokens(budget, sys, base) }, ask));
+      const now = pick(core.windowBudget("ollama", 14000, 40960));
+      assert.ok(now.groups.indexOf("browser") >= 0, "на окне 40k группа не включается: " + JSON.stringify(now.groups));
+      assert.ok(now.tools.length > baseCount, "набор схем не вырос: " + now.tools.length + " из " + baseCount);
+      // Дефект воспроизводится на том же честном расчёте, но с прежним бюджетом 14 000:
+      // от окна после промпта и истории остаётся ~30 токенов, и групп не помещается ни одна.
+      assert.strictEqual(pick(14000).groups.length, 0, "прежний бюджет 14 000 больше не воспроизводит дефект — тест перестал быть о том");
+      // И граница резерва: модели, у которой после промпта и истории остаётся место под
+      // группу (окно ~22k), группа обязана достаться. Жёсткий резерв 12 000 ломает ровно
+      // этот случай — тест держит и его.
+      assert.ok(pick(22000).groups.indexOf("browser") >= 0, "при достаточном окне группа не влезает: " + JSON.stringify(pick(22000).groups));
+    });
+
+    await test("модель без инструментов: вместо схем уходит текстовый каталог", () => {
+      const tools = core.routeTools({ text: "" }).tools;
+      const msgs = [{ role: "system", content: "СИСТЕМА" }, { role: "user", content: "привет" }];
+      const off = JSON.parse(core.buildChatRequest(settings, { model: "qwen3:4b", messages: msgs, tools: tools }).body);
+      assert.ok(Array.isArray(off.tools) && off.tools.length === tools.length, "обычной модели схемы перестали уходить");
+      const on = JSON.parse(
+        core.buildChatRequest(settings, { model: "qwen3:4b", messages: msgs, tools: tools, noTools: true }).body
+      );
+      assert.strictEqual(on.tools, undefined, "модели без инструментов всё ещё уходят схемы");
+      const sys = on.messages.filter((m) => m.role === "system")[0].content;
+      assert.ok(sys.indexOf("КАК ВЫЗЫВАТЬ ИНСТРУМЕНТЫ") !== -1, "протокол вызова не объяснён");
+      assert.ok(sys.indexOf('\"name\"') !== -1, "формат блока JSON не показан");
+      assert.strictEqual(sys.indexOf("СИСТЕМА"), 0, "системный промпт потерял начало");
+      for (const t of tools) {
+        assert.ok(sys.indexOf(t.function.name + "(") !== -1, "инструмент не попал в каталог: " + t.function.name);
+      }
+      // Каталог в разы легче JSON-схем: именно это делает узкое окно достижимым.
+      assert.ok(
+        core.estimateTokens(core.toolsAsText(tools)) * 3 < core.estimateTokens(JSON.stringify(tools)),
+        "текстовый каталог не легче схем"
+      );
+      // Исходные сообщения не портим: они переиспользуются между раундами.
+      assert.strictEqual(msgs[0].content, "СИСТЕМА", "текстовый протокол изменил исходные сообщения");
+    });
+
+    await test("ollama: обрыв ответа по лимиту вывода замечен (done_reason length)", async () => {
+      const ndjson =
+        JSON.stringify({ message: { role: "assistant", content: "Начало ответа, который " }, done: false }) + "\n" +
+        JSON.stringify({ message: { role: "assistant", content: "оборвался" }, done: false }) + "\n" +
+        JSON.stringify({ message: { role: "assistant", content: "" }, done: true, done_reason: "length", prompt_eval_count: 9000, eval_count: 512 }) + "\n";
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode(ndjson));
+          c.close();
+        },
+      });
+      const texts = [];
+      let cut = 0;
+      await core.consumeProviderStream({
+        response: { body: stream },
+        provider: "ollama",
+        onText: (t) => texts.push(t),
+        onTruncated: () => {
+          cut++;
+        },
+      });
+      assert.strictEqual(cut, 1, "обрыв по лимиту вывода не замечен");
+      assert.strictEqual(texts.join(""), "Начало ответа, который оборвался", "текст до обрыва потерян");
+      const okStream = new ReadableStream({
+        start(c) {
+          c.enqueue(
+            new TextEncoder().encode(
+              JSON.stringify({ message: { role: "assistant", content: "готово" }, done: true, done_reason: "stop" }) + "\n"
+            )
+          );
+          c.close();
+        },
+      });
+      let cut2 = 0;
+      await core.consumeProviderStream({
+        response: { body: okStream },
+        provider: "ollama",
+        onTruncated: () => {
+          cut2++;
+        },
+      });
+      assert.strictEqual(cut2, 0, "законченный ответ помечен обрывом");
+    });
+
+    await test("ollama: таймаут первого байта рассчитан на медленную локальную модель", () => {
+      // Модель на CPU грузится и читает промпт минутами: облачные 90 с её убивают.
+      const transportSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "provider-transport.js"), "utf8");
+      assert.ok(/const localish = !!local \|\| provider === \"ollama\";/.test(transportSrc), "локальный таймаут привязан к имени семейства");
+      assert.ok(/const firstMs = firstByteTimeoutMs \|\| \(localish \? 300000 : 90000\);/.test(transportSrc), "нет отдельного таймаута первого байта");
+      assert.ok(/const idleMs = idleTimeoutMs \|\| \(localish \? 120000 : 60000\);/.test(transportSrc), "нет отдельного простоя");
+    });
+
+    await test("локальный сервер совместимого API: окно и потолок как у Ollama", () => {
+      // Признак локальности — АДРЕС, а не имя семейства: LM Studio, vLLM, llama.cpp и g4f
+      // говорят на OpenAI-совместимом API, но токены там свои, а сервер может быть медленным.
+      assert.strictEqual(core.isLocalEndpoint({ provider: "ollama" }), true, "Ollama перестала считаться локальной");
+      assert.strictEqual(core.isLocalEndpoint({ provider: "openai", openaiUrl: "http://localhost:1234/v1" }), true, "LM Studio на localhost считается облаком");
+      assert.strictEqual(core.isLocalEndpoint({ provider: "openai", openaiUrl: "http://127.0.0.1:8080/v1" }), true, "llama.cpp на 127.0.0.1 считается облаком");
+      assert.strictEqual(core.isLocalEndpoint({ provider: "openai", openaiUrl: "http://192.168.1.50:8000/v1" }), true, "сервер в домашней сети считается облаком");
+      assert.strictEqual(core.isLocalEndpoint({ provider: "openai", openaiUrl: "https://api.deepseek.com/v1" }), false, "облако принято за локальный сервер");
+      assert.strictEqual(core.isLocalEndpoint({ provider: "anthropic" }), false, "Anthropic принят за локальный сервер");
+      // Потолок: у местного сервера платим памятью (KV-кэш), а не деньгами.
+      const cloud = core.contextBudget("openai", "qwen3-4b");
+      assert.strictEqual(cloud, 26000, "запасной бюджет совместимого API изменился");
+      assert.strictEqual(core.windowBudget("openai", cloud, 40960, { local: true }), 32768, "локальное окно 40k не использовано");
+      assert.strictEqual(core.windowBudget("openai", cloud, 40960), 26000, "облачный бюджет совместимого API поехал");
+      assert.strictEqual(core.windowBudget("openai", 50000, 131072, { local: true }), 32768, "потолок памяти не держит локальный сервер");
+      assert.strictEqual(core.windowBudget("openai", cloud, 8192, { local: true }), 4096, "окно 8k у локального сервера не учтено");
+      // окно неизвестно — бюджет не режем «на всякий случай»: у g4f и подобных
+      // местных прокси окна большие, а переполнение ловит повтор с меньшим бюджетом.
+      assert.strictEqual(core.windowBudget("openai", cloud, 0, { local: true }), 26000, "локальный сервер без окна потерял бюджет");
+      // main.js: признак считается один раз и уходит во все три места.
+      assert.ok(/const localEndpoint = isLocalEndpoint\(settings\);/.test(mainSrc), "признак локального сервера не считается в прогоне");
+      assert.ok(
+        /if \(modelWin > 0\) budget = windowBudget\(provider, budget, modelWin, \{ local: localEndpoint \}\);/.test(mainSrc),
+        "бюджет для местного сервера посчитан как облачный"
+      );
+      const localFlags = (mainSrc.match(/local: localEndpoint,/g) || []).length;
+      assert.strictEqual(localFlags, 2, "признак не дошёл до сжатия контекста и стрима: " + localFlags);
+    });
+
+    await test("modelWindow: окно локального сервера добирается его родными ручками", async () => {
+      try {
+        // LM Studio: в /v1/models окна нет, оно есть в /api/v0/models.
+        const calls = [];
+        global.fetch = async (url) => {
+          const u = String(url);
+          calls.push(u);
+          if (/\/api\/v0\/models$/.test(u)) return { ok: true, status: 200, json: async () => ({ data: [{ id: "qwen3-4b", max_context_length: 40960 }] }) };
+          if (/\/models$/.test(u)) return { ok: true, status: 200, json: async () => ({ data: [{ id: "qwen3-4b" }] }) };
+          return { ok: false, status: 404, json: async () => ({}) };
+        };
+        const lm = await core.modelWindow({ provider: "openai", openaiUrl: "http://127.0.0.1:12341/v1" }, "qwen3-4b");
+        assert.strictEqual(lm, 40960, "окно LM Studio не прочитано: " + lm);
+        assert.ok(calls.some((u) => /\/api\/v0\/models$/.test(u)), "родная ручка LM Studio не спрошена");
+        // llama.cpp: имя модели — путь к .gguf, окно отдаёт /props.
+        global.fetch = async (url) => {
+          const u = String(url);
+          if (/\/props$/.test(u)) return { ok: true, status: 200, json: async () => ({ default_generation_settings: { n_ctx: 4096 } }) };
+          if (/\/models$/.test(u)) return { ok: true, status: 200, json: async () => ({ data: [{ id: "ggml-org/Qwen3-4B-Q4_K_M.gguf" }] }) };
+          return { ok: false, status: 404, json: async () => ({}) };
+        };
+        const lp = await core.modelWindow({ provider: "openai", openaiUrl: "http://localhost:8081/v1" }, "Qwen3-4B-Q4_K_M");
+        assert.strictEqual(lp, 4096, "окно llama.cpp не прочитано: " + lp);
+        // vLLM отдаёт окно прямо в /models ключом max_model_len.
+        global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ data: [{ id: "Qwen/Qwen3-8B", max_model_len: 32768 }] }) });
+        assert.strictEqual(await core.modelWindow({ provider: "openai", openaiUrl: "http://localhost:8002/v1" }, "Qwen/Qwen3-8B"), 32768, "окно vLLM не прочитано");
+        // Облачный адрес родные ручки не трогает: лишние запросы к чужому серверу недопустимы.
+        const cloudCalls = [];
+        global.fetch = async (url) => {
+          cloudCalls.push(String(url));
+          return { ok: true, status: 200, json: async () => ({ data: [{ id: "deepseek-chat", context_length: 65536 }] }) };
+        };
+        assert.strictEqual(await core.modelWindow({ provider: "openai", openaiUrl: "https://api.example.com/v1" }, "deepseek-chat"), 65536, "окно облака не прочитано");
+        assert.strictEqual(cloudCalls.filter((u) => /\/api\/v0\/models$|\/props$/.test(u)).length, 0, "к облачному серверу ушли локальные пробы");
+      } finally {
+        global.fetch = realFetch;
+      }
+    });
+
+    await test("noTools у совместимых серверов: схем нет, каталог есть, картинка цела", () => {
+      const tools = core.routeTools({ text: "" }).tools;
+      const oa = { provider: "openai", openaiUrl: "http://localhost:1234/v1", model: "qwen3-4b" };
+      const msgs = [{ role: "system", content: "СИСТЕМА" }, { role: "user", content: "привет" }];
+      const off = JSON.parse(core.buildChatRequest(oa, { model: "qwen3-4b", messages: msgs, tools: tools }).body);
+      assert.ok(Array.isArray(off.tools) && off.tools.length === tools.length, "у совместимого сервера схемы пропали");
+      const on = JSON.parse(core.buildChatRequest(oa, { model: "qwen3-4b", messages: msgs, tools: tools, noTools: true }).body);
+      assert.strictEqual(on.tools, undefined, "серверу без инструментов всё ещё уходят схемы");
+      assert.ok(on.messages[0].content.indexOf("КАК ВЫЗЫВАТЬ ИНСТРУМЕНТЫ") !== -1, "текстового протокола нет");
+      // Anthropic: каталог дописывается В КОНЕЦ system — статичный префикс промпта
+      // остаётся началом, иначе сорвалась бы точка кэша промпта.
+      const anBody = JSON.parse(
+        core.buildChatRequest({ provider: "anthropic", model: "claude-sonnet-4" }, {
+          model: "claude-sonnet-4",
+          messages: msgs,
+          tools: tools,
+          noTools: true,
+          staticSystem: "СИСТЕМА",
+        }).body
+      );
+      assert.strictEqual(anBody.tools, undefined, "Anthropic всё ещё получает схемы при noTools");
+      const anSys = Array.isArray(anBody.system) ? anBody.system.map((b) => b.text || "").join("") : String(anBody.system || "");
+      assert.ok(anSys.indexOf("КАК ВЫЗЫВАТЬ ИНСТРУМЕНТЫ") !== -1, "каталог не доехал до Anthropic");
+      assert.strictEqual(anSys.indexOf("СИСТЕМА"), 0, "статичный префикс промпта сдвинулся — кэш сорвётся");
+      // content-массив (текст + картинка) не превращается в строку: картинка бы потерялась.
+      const mediaMsgs = [
+        { role: "system", content: [{ type: "text", text: "СИС" }] },
+        { role: "user", content: [{ type: "text", text: "что тут?" }, { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } }] },
+      ];
+      const media = JSON.parse(core.buildChatRequest(oa, { model: "qwen3-4b", messages: mediaMsgs, tools: tools, noTools: true }).body);
+      const sysParts = media.messages[0].content;
+      assert.ok(Array.isArray(sysParts), "content-массив системы превращён в строку");
+      assert.strictEqual(sysParts[0].text, "СИС", "текст системы изменился");
+      assert.strictEqual(sysParts.length, 2, "к системному сообщению добавлено не одну часть: " + sysParts.length);
+      assert.ok(String(sysParts[1].text).indexOf("КАК ВЫЗЫВАТЬ") !== -1, "каталог не дописан к частям сообщения");
+      assert.strictEqual(media.messages[1].content.length, 2, "картинка потерялась по дороге");
+    });
+
+    await test("настройка «модель без инструментов» доходит от галочки до запроса", () => {
+      const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+      const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+      const ctxSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "context-window.js"), "utf8");
+      assert.ok(htmlSrc.indexOf('id="s-no-tools-model"') !== -1, "галочки нет в настройках");
+      assert.ok(/^    noToolsModel: false,/m.test(appSrc), "у настройки нет значения по умолчанию");
+      assert.ok(/if \(\$\("s-no-tools-model"\)\) \$\("s-no-tools-model"\)\.checked = !!settings\.noToolsModel;/.test(appSrc), "галочка не читается из настроек");
+      assert.ok(/if \(\$\("s-no-tools-model"\)\) settings\.noToolsModel = !!\$\("s-no-tools-model"\)\.checked;/.test(appSrc), "галочка не сохраняется");
+      assert.ok(/const noTools = noToolsDetected \|\| !!settings\.noToolsModel;/.test(mainSrc), "настройка не влияет на протокол вызовов");
+      // Сжатие контекста тоже знает про местный сервер: на CPU это минуты, а не 30 с.
+      assert.ok(/const slowLocal = !!\(o\.local \|\| provider === "ollama"\);/.test(ctxSrc), "сжатие у местного сервера уходит в облачный таймаут");
+      assert.ok(/local: localServer,/.test(ctxSrc), "признак не доходит до самого сжатия");
     });
   } finally {
     global.fetch = realFetch;
@@ -7894,6 +8443,130 @@ async function testTasks() {
     const late = store.tasksAdd(ud, { title: "Старое", due: "2026-09-10" }).task;
     assert.ok(store.humanDue(late, NOW).includes("просрочено"), "просрочка не помечена: " + store.humanDue(late, NOW));
     assert.strictEqual(store.humanDue(store.tasksAdd(ud, { title: "Без срока" }).task, NOW), "без срока");
+  });
+
+  // Срок в формате дела — та же форма, что у панели («2026-09-14T10:00»).
+  const at2 = (base, shiftDays, clock) => {
+    const d = new Date(base);
+    d.setDate(d.getDate() + shiftDays);
+    d.setHours(clock, 0, 0, 0);
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0") + "T" + String(clock).padStart(2, "0") + ":00";
+  };
+
+  await test("tasks: повторы — разбор, подпись, следующий срок", () => {
+    assert.deepStrictEqual(store.parseRepeat("каждый день"), { ok: true, repeat: "daily" });
+    assert.strictEqual(store.parseRepeat("ежедневно").repeat, "daily");
+    assert.strictEqual(store.parseRepeat("по будням").repeat, "weekdays");
+    assert.strictEqual(store.parseRepeat("каждую пятницу").repeat, "weekly:5");
+    assert.strictEqual(store.parseRepeat("каждый месяц").repeat, "monthly");
+    assert.strictEqual(store.parseRepeat("каждые 2 часа").repeat, "every:120");
+    assert.strictEqual(store.parseRepeat("раз в неделю").repeat, "weekly");
+    assert.strictEqual(store.parseRepeat("без повтора").repeat, "");
+    assert.strictEqual(store.parseRepeat("").repeat, "");
+    assert.ok(!store.parseRepeat("как-нибудь").ok, "мусор принят за повтор");
+    assert.strictEqual(store.repeatLabel("daily"), "каждый день");
+    assert.strictEqual(store.repeatLabel("weekdays"), "по будням");
+    assert.strictEqual(store.repeatLabel("weekly:5"), "каждую пятницу");
+    assert.strictEqual(store.repeatLabel("monthly"), "каждый месяц");
+    assert.strictEqual(store.repeatLabel("every:120"), "каждые 2 ч");
+    assert.strictEqual(store.repeatLabel(""), "", "у дела без повтора не должно быть подписи");
+    const nx = (date, repeat) => store.nextDueDate(date, repeat, date.getTime());
+    const d = (y, m, day, h) => new Date(y, m - 1, day, h, 0, 0);
+    // daily — тот же час следующего дня.
+    const daily = nx(d(2026, 9, 13, 11), "daily");
+    assert.strictEqual(daily.getDate(), 14);
+    assert.strictEqual(daily.getHours(), 11);
+    // weekdays — выходные пропускаются (с воскресенья → на понедельник, с пятницы → на понедельник).
+    assert.strictEqual(nx(d(2026, 9, 13, 10), "weekdays").getDay(), 1);
+    assert.strictEqual(nx(d(2026, 9, 18, 10), "weekdays").getDay(), 1);
+    // weekly и конкретный день недели.
+    assert.strictEqual(nx(d(2026, 9, 13, 10), "weekly").getDate(), 20);
+    assert.strictEqual(nx(d(2026, 9, 13, 10), "weekly:5").getDay(), 5);
+    // monthly — следующий месяц, 31-е в коротком месяце = последний день.
+    const mon = nx(d(2026, 9, 15, 10), "monthly");
+    assert.strictEqual(mon.getMonth(), 9);
+    assert.strictEqual(mon.getDate(), 15);
+    assert.strictEqual(nx(d(2026, 1, 31, 10), "monthly").getDate(), 28);
+    // every:N — сдвиг по минутам.
+    assert.strictEqual(nx(d(2026, 9, 13, 12), "every:120").getHours(), 14);
+  });
+
+  await test("tasks: автозадача срабатывает по сроку, повтор сдвигается, тостов нет", () => {
+    const ud = tmpdir("tasks-auto-");
+    store.tasksAdd(ud, { title: "План дня", due: at2(NOW, 0, 11), repeat: "каждый день", auto: true, prompt: "собери план" }, NOW);
+    store.tasksAdd(ud, { title: "Оплатить", due: at2(NOW, 0, 11), auto: true }, NOW);
+    store.tasksAdd(ud, { title: "Позвонить", due: at2(NOW, 0, 11) }, NOW);
+    const fired = store.tasksTakeAuto(ud, NOW).tasks;
+    assert.deepStrictEqual(fired.map((t) => t.title).sort(), ["Оплатить", "План дня"], "автозадачи по сроку: " + JSON.stringify(fired.map((t) => t.title)));
+    assert.strictEqual(fired.find((t) => t.title === "План дня").prompt, "собери план", "задание агента потерялось");
+    assert.strictEqual(fired.find((t) => t.title === "План дня").repeat, "daily", "повтор не дошёл до события");
+    // По тому же сроку второй раз не запускаем — иначе агент сработает дважды.
+    assert.strictEqual(store.tasksTakeAuto(ud, NOW + 1000).tasks.length, 0, "автозадача запустилась дважды");
+    // Повтор уехал на завтра, разовое осталось активным (его закроет агент или человек).
+    const list = store.tasksList(ud, { status: "active", nowMs: NOW }).tasks;
+    assert.ok(list.find((t) => t.title === "План дня").due.startsWith("2026-09-14"), "повтор не сдвинулся");
+    // Автозадачи — работа агента, а не тост: напоминание приходит только обычному делу.
+    assert.deepStrictEqual(store.tasksTakeReminders(ud, NOW).tasks.map((t) => t.title), ["Позвонить"], "автозадача или её повтор дали лишнее напоминание");
+    // Вырожденный повтор не принимается.
+    assert.ok(store.tasksAdd(ud, { title: "Слишком часто", due: at2(NOW, 0, 11), repeat: "каждые 0 минут" }, NOW).ok === false, "нулевой повтор принят");
+  });
+
+  await test("tasks: отсрочка глушит и напоминание, и автозапуск", () => {
+    // Отсрочка считается от настоящих часов — тест берёт то же «сейчас». Просроченные
+    // дела делаем вчерашними, иначе автозапуск не о чем проверять.
+    const R = Date.now();
+    const past = at2(new Date(R), -1, 10);
+    const ud = tmpdir("tasks-snooze-");
+    const t = store.tasksAdd(ud, { title: "Авто", due: past, auto: true }, R).task;
+    const t2 = store.tasksAdd(ud, { title: "Тост", due: past }, R).task;
+    store.tasksUpdate(ud, t.id, { snooze: "через 2 часа" });
+    store.tasksUpdate(ud, t2.id, { snooze: "через 2 часа" });
+    assert.strictEqual(store.tasksTakeAuto(ud, R).tasks.length, 0, "отсроченная автозадача сработала");
+    assert.strictEqual(store.tasksTakeReminders(ud, R).tasks.length, 0, "отсроченное дело напомнило");
+    const later = R + 3 * 60 * 60 * 1000;
+    assert.strictEqual(store.tasksTakeAuto(ud, later).tasks.length, 1, "после отсрочки автозадача не сработала");
+    assert.deepStrictEqual(store.tasksTakeReminders(ud, later).tasks.map((x) => x.title), ["Тост"], "после отсрочки напоминание не вернулось");
+  });
+
+  await test("tasks: будильник знает ближайший срок", () => {
+    const ud = tmpdir("tasks-wake-");
+    assert.strictEqual(store.tasksNextDue(ud, NOW), 0, "пустой список что-то ждёт");
+    store.tasksAdd(ud, { title: "Скоро", due: at2(NOW, 0, 13) }, NOW);
+    store.tasksAdd(ud, { title: "Позже", due: at2(NOW, 0, 18) }, NOW);
+    assert.strictEqual(store.tasksNextDue(ud, NOW), 60 * 60 * 1000, "ближайший срок посчитан неверно: " + store.tasksNextDue(ud, NOW));
+    // Просроченное будильник не ждёт: его поднимает текущая проверка.
+    const ud2 = tmpdir("tasks-wake2-");
+    store.tasksAdd(ud2, { title: "Прошло", due: at2(NOW, -1, 10) }, NOW);
+    assert.strictEqual(store.tasksNextDue(ud2, NOW), 0, "будильник ждёт уже прошедший срок");
+  });
+
+  await test("задачи по сроку: приложение будит агента и пишет в чат «Автозадачи»", () => {
+    const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const core = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+    const tools = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
+    assert.ok(main.includes("tasksTakeAuto"), "планировщик не берёт автозадачи");
+    assert.ok(main.includes('type: "task-due"'), "событие срока автозадачи не отправляется");
+    assert.ok(main.includes("taskAuto: true"), "нет настройки «автозадачи выполняет агент»");
+    assert.ok(main.includes("armTaskWake") && main.includes("tasksNextDue"), "нет точного будильника на срок");
+    assert.ok(main.includes('{ type: "task-due", from: "desktop", tasks: auto }'), "автозадача уйдёт и на телефон — прогон удвоится");
+    assert.ok(app.includes("async function runTurn("), "обычная отправка и автозадача не идут общим путём");
+    assert.ok(app.includes("await runTurn(chat, content"), "отправка не пользуется общим прогоном");
+    assert.ok(app.includes('AUTO_CHAT_TITLE = "Автозадачи"'), "нет отдельного чата автозадач");
+    assert.ok(app.includes("ensureAutoChat"), "чат автозадач не создаётся");
+    const raPos = app.indexOf("async function runAutoTask");
+    assert.ok(raPos > 0, "окно не умеет запускать автозадачу");
+    const guardPos = app.indexOf("if (!isElectron) return;", raPos);
+    assert.ok(guardPos > raPos && guardPos - raPos < 600, "автозадачу не ограничили ПК-клиентом");
+    assert.ok(app.includes('ev.type === "task-due"'), "окно не слушает срок автозадачи");
+    assert.ok(app.includes("flushAutoQueue"), "автозадача не ждёт конца текущего прогона");
+    assert.ok(app.includes("settings.taskAuto"), "галочка автозадач не читается окном");
+    assert.ok(html.includes("s-task-auto"), "в настройках нет галочки автозадач");
+    assert.ok(core.includes("repeat: { type:") && core.includes("auto: { type:"), "инструменты дел не знают о повторах и автозапуске");
+    assert.ok(core.includes("Автозадачи"), "роль «Менеджер» не знает про чат автозадач");
+    assert.ok(tools.includes("repeat: args.repeat"), "повтор не доходит до хранилища");
+    assert.ok(tools.includes("snooze: args.snooze"), "отсрочка не доходит до хранилища");
   });
 }
 
@@ -9579,7 +10252,7 @@ async function testContextWindow() {
   const ctx = makeContext({ config, transport: { partsText } });
 
   await test("контекст: бюджет, обрезка и пары инструментов — без ядра", () => {
-    for (const n of ["estimateTokens", "estimateMessageTokens", "contextBudget", "sanitizeToolPairs", "trimConversation", "truncateText", "compactRemote", "createContextManager"]) {
+    for (const n of ["estimateTokens", "estimateMessageTokens", "contextBudget", "windowBudget", "sanitizeToolPairs", "trimConversation", "truncateText", "compactRemote", "createContextManager"]) {
       assert.strictEqual(typeof ctx[n], "function", "модуль не собрал " + n);
     }
     // Токены: текст считается по длине, картинка — как фиксированный вес.
@@ -9717,6 +10390,52 @@ async function testContextWindow() {
       const before = fetches.length;
       await planMgr.manage(messages, 200);
       assert.strictEqual(fetches.length, before, "в режиме плана контекст всё равно сжимался");
+    } finally {
+      global.fetch = real;
+    }
+  });
+
+  await test("контекст: сжатие локальной модели несёт num_ctx и keep_alive, провал слышен", async () => {
+    const real = global.fetch;
+    const calls = [];
+    try {
+      global.fetch = async (url, opts) => {
+        calls.push({ url: String(url), body: opts && opts.body });
+        return { ok: true, status: 200, json: async () => ({ message: { content: "ПАМЯТКА ЛОКАЛЬНАЯ" } }), text: async () => "" };
+      };
+      const local = { provider: "ollama", ollamaUrl: "http://localhost:11434", model: "qwen3:4b" };
+      const big = (role, text) => ({ role, content: text.repeat(1200) });
+      const messages = [
+        { role: "system", content: "СИСТЕМА" },
+        big("user", "просил "),
+        big("assistant", "сделал "),
+        { role: "user", content: "ЦЕЛЬ ЗАДАЧИ" },
+      ];
+      const memo = await ctx.compactRemote(local, messages, { numCtx: 18096 });
+      assert.strictEqual(memo, "ПАМЯТКА ЛОКАЛЬНАЯ", "памятка локальной модели не вернулась");
+      assert.strictEqual(calls[0].url, "http://localhost:11434/api/chat", "не нативный путь Ollama: " + calls[0].url);
+      const sent = JSON.parse(calls[0].body);
+      // Без num_ctx Ollama берёт дефолт 2048: памятка собиралась из обрезанного текста,
+      // а смена num_ctx заставляла её ещё и перезагрузить модель перед основным раундом.
+      assert.deepStrictEqual(sent.options, { num_ctx: 18096 }, "num_ctx не ушёл в запрос за памяткой");
+      assert.ok(sent.keep_alive, "keep_alive не ушёл: модель выгружалась бы между раундами");
+      assert.strictEqual(sent.stream, false, "запрос памятки ушёл потоком");
+
+      // Отказ сервера — не тишина: причина уходит наверх, иначе сжатие «молча не срабатывает».
+      const failed = [];
+      global.fetch = async () => ({ ok: false, status: 500, text: async () => "boom", json: async () => ({}) });
+      const none = await ctx.compactRemote(local, messages, { numCtx: 18096, onFail: (why) => failed.push(why) });
+      assert.strictEqual(none, null, "при отказе сервера вернулась памятка");
+      assert.strictEqual(failed.length, 1, "о провале сжатия никто не узнал");
+      assert.ok(/500/.test(failed[0]), "причина провала не названа: " + failed[0]);
+
+      // Менеджер сообщает о провале ОДИН раз за прогон, а не на каждом витке.
+      const events = [];
+      const mgr = ctx.createContextManager({ settings: local, emit: (e) => events.push(e), localCtx: 18096 });
+      await mgr.manage(messages, 200);
+      await mgr.manage(messages, 200);
+      const notes = events.filter((e) => e.type === "notice" && /Сжать старые шаги/.test(e.text || ""));
+      assert.strictEqual(notes.length, 1, "о провале сжатия сказано " + notes.length + " раз");
     } finally {
       global.fetch = real;
     }
@@ -10037,6 +10756,204 @@ async function testCoreSplit() {
   });
 }
 
+// ── 1.67 миссии: долгая работа, файлы рядом с проектом и панель ──────────────
+async function testMissions() {
+  const ms = require(path.join(ROOT, "src", "mission-store.js"));
+  // Фиксированное «сейчас»: 15 сентября 2026, 10:30 — тесты не зависят от дня запуска.
+  const DAY = new Date(2026, 8, 15, 10, 30, 0).getTime();
+
+  await test("миссии: цель, план и журнал ложатся файлами рядом с проектом", () => {
+    const wd = tmpdir("mission-create-");
+    const r = ms.missionCreate(wd, {
+      goal: "Разобрать входящие и разложить по делам",
+      title: "Разбор входящих",
+      steps: ["Прочитать письма", "Разложить по делам"],
+      ts: DAY,
+    });
+    assert.ok(r.ok, "missionCreate: " + (r.error || ""));
+    const id = r.mission.id;
+    const adir = path.join(wd, ".agent");
+    assert.ok(fs.existsSync(path.join(adir, "README.md")), "нет README в .agent");
+    assert.strictEqual(fs.readFileSync(path.join(adir, ".gitignore"), "utf8").trim(), "*", "журнал работы не исключён из git");
+    assert.ok(fs.existsSync(path.join(adir, "missions", id, "mission.json")), "нет mission.json");
+    assert.ok(fs.existsSync(path.join(adir, "missions", id, "journal.md")), "нет journal.md");
+    assert.ok(fs.existsSync(path.join(adir, "missions", id, "journal.jsonl")), "нет journal.jsonl");
+    const p = ms.missionProgress(r.mission);
+    assert.strictEqual(p.total, 2);
+    assert.strictEqual(p.done, 0);
+    assert.strictEqual(p.percent, 0);
+    assert.strictEqual(p.left, 2);
+    const active = ms.missionActive(wd);
+    assert.ok(active && active.id === id, "миссия не видна как незакрытая");
+    assert.ok(!ms.missionCreate(wd, { goal: "   " }).ok, "пустая цель принята");
+    assert.ok(!ms.missionCreate("", { goal: "цель" }).ok, "миссия создана без рабочей папки");
+    assert.ok(ms.missionJournalText(wd, id).indexOf("Миссия начата") >= 0, "старт миссии не попал в журнал");
+  });
+
+  await test("миссии: шаг отмечает план, незапланированное не теряется, журнал растёт", () => {
+    const wd = tmpdir("mission-step-");
+    const r = ms.missionCreate(wd, { goal: "Порядок в файлах", steps: ["Найти дубли", "Удалить дубли"], ts: DAY });
+    const id = r.mission.id;
+    const s1 = ms.missionStep(wd, id, { done: "Найти дубли", next: "Удалить дубли" });
+    assert.ok(s1.ok, "missionStep: " + (s1.error || ""));
+    assert.strictEqual(s1.progress.done, 1);
+    assert.strictEqual(s1.mission.next, "Удалить дубли");
+    assert.strictEqual(s1.mission.steps[1].state, "doing", "следующий шаг не переведён в работу");
+    const s2 = ms.missionStep(wd, id, { done: "Прибрал папку загрузок" });
+    assert.ok(s2.mission.steps.some((s) => s.title === "Прибрал папку загрузок" && s.state === "done"), "незапланированный шаг потерян");
+    const s3 = ms.missionStep(wd, id, { fail: "Удалить дубли", note: "нет прав" });
+    assert.strictEqual(s3.progress.failed, 1, "провал шага не отмечен");
+    assert.strictEqual(s3.mission.steps[1].note, "нет прав");
+    assert.ok(!ms.missionStep(wd, "нет-такой", { done: "x" }).ok, "шаг у несуществующей миссии прошёл молча");
+    const j = ms.missionJournal(wd, id, { limit: 20 });
+    assert.ok(j.length >= 4, "журнал пуст или короток: " + j.length);
+    assert.ok(j.every((e) => e.ts > 0 && e.text), "в журнале есть строки без времени или текста");
+    assert.ok(ms.missionJournalText(wd, id).indexOf("Дальше: Удалить дубли") >= 0, "в журнал не попал следующий шаг");
+    assert.ok(ms.missionCounters(wd, id, { rounds: 25, batches: 1, tokens: 100 }).ok, "счётчики миссии не пишутся");
+    assert.ok(!ms.missionCounters(wd, "нет-такой", { rounds: 1 }).ok, "счётчики у несуществующей миссии");
+  });
+
+  await test("миссии: секреты из переписки не оседают в файлах миссии", () => {
+    const wd = tmpdir("mission-secret-");
+    const KEY = "sk-" + "A1b2C3d4E5f6G7h8I9j0K1l2";
+    const r = ms.missionCreate(wd, { goal: "Починить интеграцию, ключ " + KEY, steps: ["Проверить ключ " + KEY], ts: DAY });
+    const id = r.mission.id;
+    ms.missionNote(wd, id, "note", "в логах светится " + KEY);
+    const files = ["mission.json", "journal.md", "journal.jsonl"].map((f) => path.join(wd, ".agent", "missions", id, f));
+    for (const f of files) {
+      const body = fs.readFileSync(f, "utf8");
+      assert.ok(body.indexOf(KEY) === -1, "ключ осел в " + path.basename(f));
+    }
+    assert.ok(fs.readFileSync(files[0], "utf8").indexOf("[секрет скрыт]") >= 0, "секрет не замаскирован, а просто потерян");
+  });
+
+  await test("миссии: закрытие пишет отчёт, шаги в работе закрываются вместе с миссией", () => {
+    const wd = tmpdir("mission-finish-");
+    const r = ms.missionCreate(wd, { goal: "Собрать отчёт за месяц", steps: ["Собрать данные", "Свести таблицу"], ts: DAY });
+    const id = r.mission.id;
+    ms.missionStep(wd, id, { done: "Собрать данные", next: "Свести таблицу" });
+    const fin = ms.missionFinish(wd, id, { status: "done", report: "Отчёт готов: 12 страниц." });
+    assert.ok(fin.ok, "missionFinish: " + (fin.error || ""));
+    assert.strictEqual(fin.mission.status, "done");
+    assert.strictEqual(fin.mission.steps[1].state, "done", "шаг «в работе» не закрылся вместе с миссией");
+    const rep = fs.readFileSync(path.join(wd, ".agent", "missions", id, "report.md"), "utf8");
+    assert.ok(rep.indexOf("Отчёт готов") >= 0, "в отчёте нет итога");
+    assert.ok(rep.indexOf("**План:** 2 из 2") >= 0, "в отчёте нет прогресса по плану");
+    assert.strictEqual(ms.missionActive(wd), null, "закрытая миссия считается незакрытой");
+    assert.ok(ms.missionNote(wd, id, "note", "после закрытия").ok, "в закрытую миссию нельзя дописать журнал");
+    // Приборка: свежие миссии остаются на месте.
+    assert.deepStrictEqual(ms.missionPrune(wd), { kept: 1, removed: 0 });
+  });
+
+  await test("миссии: текст продолжения несёт цель, план и хвост журнала", () => {
+    const wd = tmpdir("mission-resume-");
+    const r = ms.missionCreate(wd, { goal: "Привести в порядок смету", steps: ["Собрать цифры", "Свести смету"], ts: DAY });
+    const id = r.mission.id;
+    ms.missionStep(wd, id, { done: "Собрать цифры", next: "Свести смету" });
+    const txt = ms.missionResumeText(ms.missionLoad(wd, id), ms.missionJournalText(wd, id, { limit: 6 }));
+    assert.ok(txt.indexOf("Привести в порядок смету") >= 0, "в тексте продолжения нет цели");
+    assert.ok(txt.indexOf("Свести смету") >= 0, "в тексте продолжения нет плана");
+    assert.ok(txt.indexOf("Хвост журнала") >= 0, "в тексте продолжения нет журнала");
+    assert.ok(txt.indexOf(id) >= 0, "в тексте продолжения нет пути к файлам миссии");
+    assert.strictEqual(ms.missionResumeText(null, ""), "", "продолжение пустой миссии не пусто");
+  });
+
+  await test("миссии: задачи и контекст лежат рядом с проектом и чистятся отдельно", () => {
+    const wd = tmpdir("mission-mirror-");
+    const r = ms.missionCreate(wd, { goal: "Работа", ts: DAY });
+    const id = r.mission.id;
+    assert.ok(ms.tasksMirror(wd, "# Дела\n\n- Позвонить в банк").ok, "зеркало дел не записалось");
+    assert.ok(ms.contextMirror(wd, DAY, "Памятка: разобрали почту").ok, "зеркало контекста не записалось");
+    assert.ok(ms.contextMirror(wd, DAY, "Памятка вторая").ok, "вторая памятка за день не дописалась");
+    const day = path.join(wd, ".agent", "context", "2026-09-15.md");
+    const body = fs.readFileSync(day, "utf8");
+    assert.ok(body.indexOf("разобрали почту") >= 0 && body.indexOf("Памятка вторая") >= 0, "памятки за день не собраны в один файл");
+    const st = ms.mirrorStatus(wd);
+    assert.ok(st.exists, "статус папки не видит созданную папку");
+    assert.ok(st.tasks && st.tasks.bytes > 0, "статус папки не видит список дел");
+    assert.deepStrictEqual(st.contextDays, ["2026-09-15.md"]);
+    assert.strictEqual(st.missions, 1, "статус папки не считает миссии");
+    assert.ok(st.bytes > 0, "размер папки работы не считается");
+    assert.ok(!ms.tasksMirror("", "x").ok, "зеркало записалось без рабочей папки");
+    assert.ok(!ms.contextMirror(wd, DAY, "   ").ok, "пустая памятка записалась");
+    const cl = ms.mirrorClear(wd);
+    assert.ok(cl.ok && cl.removed.length === 2, "очистка зеркал: " + JSON.stringify(cl));
+    assert.ok(!fs.existsSync(path.join(wd, ".agent", "tasks.md")), "tasks.md остался после очистки");
+    assert.ok(!fs.existsSync(path.join(wd, ".agent", "context")), "context/ остался после очистки");
+    assert.ok(fs.existsSync(path.join(wd, ".agent", "missions", id, "mission.json")), "очистка зеркал снесла работу агента");
+    assert.deepStrictEqual(ms.mirrorClear(""), { ok: false, error: "Не задана рабочая папка." });
+  });
+
+  await test("миссии: файлы работы пишутся по своей галочке, а не по памяти диалогов", () => {
+    const main = mainOnlySrc();
+    // Зеркала решают своё условие: иначе контекст и задачи не попадали на диск,
+    // пока пользователь не включит «Память диалогов» (это про другое — про поиск по дням).
+    assert.ok(/if \(settings\.agentWorkFiles !== false\) \{\n\s+try \{\n\s+missionStore\.contextMirror/.test(main), "зеркало контекста зависит не от своей галочки");
+    assert.ok(/if \(!settings\.contextMemory\) return null;/.test(main), "дневник памяти больше не спрашивает свою галочку");
+    assert.ok(/if \(s\.agentWorkFiles === false\) return;/.test(main), "зеркало дел не слушает галочку файлов работы");
+    assert.ok(!/if \(!s\.longWork\) return;/.test(main), "зеркало дел всё ещё привязано к «долгой работе»");
+    assert.ok(/agentWorkFiles: true/.test(main), "файлы работы выключены по умолчанию");
+    for (const ch of ["agentfiles:status", "agentfiles:openDir", "agentfiles:clear"]) {
+      assert.ok(main.indexOf('ipcMain.handle("' + ch + '"') >= 0, "нет канала " + ch);
+    }
+    assert.ok(main.indexOf("missionStore.mirrorStatus") >= 0, "состояние папки не считается модулем миссий");
+  });
+
+  await test("долгая работа: батчи, авто-продолжение и мягкие стопы вместо обрыва на 26-м раунде", () => {
+    const main = mainOnlySrc();
+    assert.ok(main.indexOf("for (let batch = 1; ; batch++)") >= 0, "нет внешнего цикла батчей");
+    assert.ok(/const afterBatch = await missionAfterBatch\(\);/.test(main), "граница батча не считается");
+    assert.ok(/if \(!afterBatch\.continue\) \{/.test(main), "конец батча не продолжает и не завершает работу");
+    assert.ok(main.indexOf("if (afterBatch.closed)") >= 0, "закрытая миссия рвётся ошибкой счётчика раундов");
+    assert.ok(/missionErrorContinues < missionLimits\.autoContinues/.test(main), "сбой провайдера обрывает долгую работу");
+    assert.ok(main.indexOf("longWorkAutoContinue") >= 0, "нет запаса авто-продолжений");
+    assert.ok(main.indexOf("MISSION_AUTO_ROUND") >= 0, "миссия не заводится сама на длинной работе");
+    assert.ok(main.indexOf("missionSignatures") >= 0, "нет защиты от зацикливания на одном вызове");
+    assert.ok(main.indexOf("MISSION_JOURNAL_PER_BATCH") >= 0, "журнал может превратиться в поток");
+    assert.ok(/longWork: true/.test(main), "долгая работа выключена по умолчанию");
+    assert.ok(/longWorkHours: 8/.test(main), "рабочий день по умолчанию не 8 часов");
+    assert.ok(main.indexOf("missionResumeText") >= 0, "нет продолжения миссии с места остановки");
+    assert.ok(main.indexOf("global.__agentPauseRequested") >= 0, "нет паузы у долгой работы");
+    // Жёсткий лимит раундов остался только для короткой работы и режима плана.
+    assert.ok(/const maxRounds = planMode \? 3 : 25;/.test(main), "лимит раундов отрезка изменился");
+  });
+
+  await test("миссии: инструменты, панель, настройки и мост на месте", () => {
+    const main = mainOnlySrc();
+    const tools = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
+    const policy = fs.readFileSync(path.join(ROOT, "src", "tool-policy.js"), "utf8");
+    const core = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    const pre = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
+    const mob = fs.readFileSync(path.join(ROOT, "src", "renderer", "mobile-api.js"), "utf8");
+    for (const t of ["missionStart", "missionStep", "missionStatus", "missionFinish"]) {
+      assert.ok(hasTool(tools, t), "нет инструмента агента " + t);
+    }
+    assert.ok(policy.indexOf('"mission.write"') >= 0 && policy.indexOf('"mission.read"') >= 0, "миссии вне политики прав");
+    assert.ok(core.indexOf('"missionStart"') >= 0, "миссий нет в группах инструментов");
+    assert.ok(/мисси/.test(core), "в промпте нет правил про миссии");
+    for (const id of [
+      "sp-mission", "ms-steps", "ms-journal", "ms-list", "ms-card", "ms-meta",
+      "btn-mission-pause", "btn-mission-resume", "btn-mission-stop", "btn-mission-folder", "btn-mission-refresh",
+      "rail-mission", "sp-mission-dot", "s-long-work", "s-long-hours", "s-long-rounds", "s-long-continue",
+      "s-agent-files", "btn-agent-files-open", "btn-agent-files-clear", "agent-files-status",
+    ]) {
+      assert.ok(html.indexOf('id="' + id + '"') >= 0, "в интерфейсе нет " + id);
+    }
+    assert.ok(app.indexOf("renderAgentFilesStatus") >= 0, "настройки окна не показывают папку работы");
+    assert.ok(app.indexOf("agentWorkFiles") >= 0, "окно не сохраняет галочку файлов работы");
+    assert.ok(app.indexOf("agentFilesClear") >= 0 && app.indexOf("agentFilesOpen") >= 0, "кнопки папки работы ни к чему не привязаны");
+    for (const k of ["missionState", "missionPause", "missionStop", "missionResume", "missionOpen", "agentFilesStatus"]) {
+      assert.ok(pre.indexOf(k) >= 0, "мост не отдаёт " + k);
+    }
+    assert.ok(mob.indexOf('"mission:state"') >= 0 && mob.indexOf('"agentfiles:status"') >= 0, "с телефона не видно работу агента");
+    assert.ok(/mission:|agentfiles:/.test(pre), "мост не знает каналов миссий");
+    // Список дел тоже виден файлом: иначе «файлы работы» — только про миссии.
+    assert.ok(main.indexOf("missionStore.tasksMirror") >= 0, "список дел не зеркалится файлом");
+  });
+}
+
 (async () => {
   console.log("Smoke-тесты: " + path.basename(__filename));
   await testAgentCore();
@@ -10069,6 +10986,7 @@ async function testCoreSplit() {
   await testStreamThrottle();
   await testBrowserSpeed();
   await testBrowserSenses();
+  await testBrowserReplayData();
   await testAgentSpeedups();
   await testPowerShellSession();
   await testPromptCacheAndUsage();
@@ -10081,6 +10999,7 @@ async function testCoreSplit() {
   await testSandboxObstacles();
   await testLongChatRecovery();
   await testTasks();
+  await testMissions();
   await testYcConsole();
   await testDeploy();
   await testToolPolicy();

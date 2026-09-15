@@ -35,6 +35,11 @@
     openaiActiveProfile: "", // id активного подключения
     autoSwitchProfiles: false, // при ошибке ключа/баланса/лимита — авто-переключение
     sendAllTools: false, // предохранитель C: слать все схемы инструментов (медленнее, но надёжнее)
+    longWork: true, // долгая работа миссиями (файлы .agent/, батчи, авто-продолжение)
+    longWorkHours: 8, // часов на одну миссию — как рабочий день
+    longWorkRounds: 600, // раундов на миссию
+    longWorkAutoContinue: 6, // авто-продолжений после сбоя
+    noToolsModel: false, // модель без нативных вызовов: схемы не шлём, инструменты — JSON-блоком
   };
 
   // Пресеты для OpenAI-совместимых API (ключ/модель хранятся отдельно по каждому пресету? нет — единый URL+ключ).
@@ -539,6 +544,7 @@
     return chat;
   }
   function chatTitle(c) {
+    if (c && c.auto) return "Автозадачи"; // чат автозадач всегда зовётся одинаково
     const firstUser = c.messages.find((m) => m.role === "user");
     if (firstUser) {
       const t = msgText(firstUser.content) || "📷 Изображение";
@@ -1250,6 +1256,7 @@
     browserScroll: "↕️",
     browserHover: "👆",
     browserNetwork: "📡",
+    browserReplay: "🔁",
     waitForIdle: "⏸",
     agentGuide: "📘",
     browserClose: "🚪",
@@ -1352,6 +1359,7 @@
     browserScroll: "Прокрутка страницы",
     browserHover: "Наведение мыши",
     browserNetwork: "Запросы страницы",
+    browserReplay: "Повтор запроса сайта",
     waitForIdle: "Ожидание покоя страницы",
     agentGuide: "Справочник агента",
     browserClose: "Закрыть вкладку",
@@ -1693,6 +1701,59 @@
     sendMessage();
   }
 
+  // Один прогон агента в конкретном чате. Сюда идут И обычная отправка, И автозадача:
+  // второй копии логики (история, сессия, стрим, завершение) быть не должно — иначе
+  // починка в одном месте обходит другое.
+  async function runTurn(chat, content, opts) {
+    opts = opts || {};
+    const usePlan = !!opts.plan;
+    chat.messages.push({ id: uid(), role: "user", content, createdAt: Date.now() });
+    const assistantMsg = { id: uid(), role: "assistant", content: "", pending: true, createdAt: Date.now() };
+    if (usePlan) assistantMsg.plan = true;
+    chat.messages.push(assistantMsg);
+    renderSidebar();
+    $("welcome").classList.add("hidden");
+    $("messages").appendChild(buildMessageEl(chat.messages[chat.messages.length - 2]));
+    $("messages").appendChild(buildMessageEl(assistantMsg));
+    scrollBottom();
+    persistChats();
+    setStreaming(true);
+
+    // История уходит в main ЦЕЛИКОМ: там её держат в бюджете модели, а при переполнении
+    // голова уходит в памятку (сжатие). Раньше история обрезалась здесь по ПОЛНОМУ бюджету
+    // модели — на длинном чате срез схлопывался до одного последнего сообщения, сжатию было
+    // нечего сворачивать, и агент терял задачу («перестаёт нормально работать»).
+    let history = chat.messages
+      .filter((m) => {
+        if (!m || !m.content) return false;
+        if (m.role === "user" || m.role === "assistant") return true;
+        // Служебные заметки (перенос задачи из прошлого чата, восстановление после сбоя,
+        // авто-переключение подключения) — тоже часть контекста.
+        return m.role === "system";
+      })
+      .map((m) => ({ role: m.role, content: m.content }));
+
+    session = { chatId: chat.id, assistantId: assistantMsg.id, segmentIds: [assistantMsg.id] };
+    try {
+      if (isElectron) {
+        await api.sendMessage(history, { plan: usePlan, role: chat.role || "dev", chatId: chat.id });
+      } else {
+        webAbort = new AbortController();
+        try {
+          await webSend(history, onAiEvent, webAbort.signal, { plan: usePlan, role: chat.role || "dev", chatId: chat.id });
+        } catch (e) {
+          if (e.name !== "AbortError") onAiEvent({ type: "error", message: e.message || String(e) });
+        }
+      }
+    } finally {
+      finishStream(chat, assistantMsg);
+      session = null;
+      webAbort = null;
+      flushAutoQueue(); // во время прогона автозадача ждала — самое время её запустить
+    }
+    return assistantMsg;
+  }
+
   async function sendMessage() {
     const input = $("input");
     const text = input.value.trim();
@@ -1722,51 +1783,67 @@
     const content = pendingImage
       ? [{ type: "text", text }, { type: "image_url", image_url: { url: pendingImage } }]
       : text;
-    chat.messages.push({ id: uid(), role: "user", content, createdAt: Date.now() });
     hideAttachBar();
-    const assistantMsg = { id: uid(), role: "assistant", content: "", pending: true, createdAt: Date.now() };
-    if (usePlan) assistantMsg.plan = true;
-    chat.messages.push(assistantMsg);
     input.value = "";
     autoResize();
-    renderSidebar();
-    $("welcome").classList.add("hidden");
-    $("messages").appendChild(buildMessageEl(chat.messages[chat.messages.length - 2]));
-    $("messages").appendChild(buildMessageEl(assistantMsg));
-    scrollBottom();
+    await runTurn(chat, content, { plan: usePlan });
+  }
+
+  // ─────────────── Автозадачи (планировщик дел) ───────────────
+  // Дело с отметкой «выполняет агент» приложение запускает само по сроку: агент молча
+  // работает в отдельном чате «Автозадачи», ответ остаётся там. Если в этот момент идёт
+  // другой прогон — автозадача встаёт в очередь и стартует сразу после него.
+  const AUTO_CHAT_TITLE = "Автозадачи";
+  const autoQueue = [];
+
+  function ensureAutoChat() {
+    let chat = chatsData.chats.find((c) => c.auto === true);
+    if (chat) return chat;
+    chat = createChat({ title: AUTO_CHAT_TITLE });
+    chat.auto = true;
+    chat.role = "manager";
+    chat.messages.push({
+      id: uid(),
+      role: "system",
+      content: "🗓 Это чат автозадач: сюда приложение складывает дела, которые агент выполняет сам по сроку. Задачи появляются здесь без твоего участия — можно просто читать ответы.",
+      createdAt: Date.now(),
+    });
     persistChats();
-    setStreaming(true);
+    renderSidebar();
+    return chat;
+  }
 
-    // История уходит в main ЦЕЛИКОМ: там её держат в бюджете модели, а при переполнении
-    // голова уходит в памятку (сжатие). Раньше история обрезалась здесь по ПОЛНОМУ бюджету
-    // модели — на длинном чате срез схлопывался до одного последнего сообщения, сжатию было
-    // нечего сворачивать, и агент терял задачу («перестаёт нормально работать»).
-    let history = chat.messages
-      .filter((m) => {
-        if (!m || !m.content) return false;
-        if (m.role === "user" || m.role === "assistant") return true;
-        // Служебные заметки (перенос задачи из прошлого чата, восстановление после сбоя,
-        // авто-переключение подключения) — тоже часть контекста.
-        return m.role === "system";
-      })
-      .map((m) => ({ role: m.role, content: m.content }));
+  function autoTaskText(t) {
+    const what = String(t.prompt || "").trim() || "Выполни это дело и кратко напиши результат.";
+    return "⏰ Автозадача по сроку: «" + t.title + "»\n\n" + what;
+  }
 
-    session = { chatId: chat.id, assistantId: assistantMsg.id, segmentIds: [assistantMsg.id] };
-    try {
-      if (isElectron) {
-        await api.sendMessage(history, { plan: usePlan, role: chat.role || "dev" });
-      } else {
-        webAbort = new AbortController();
-        try {
-          await webSend(history, onAiEvent, webAbort.signal, { plan: usePlan, role: chat.role || "dev" });
-        } catch (e) {
-          if (e.name !== "AbortError") onAiEvent({ type: "error", message: e.message || String(e) });
-        }
-      }
-    } finally {
-      finishStream(chat, assistantMsg);
-      session = null;
-      webAbort = null;
+  function flushAutoQueue() {
+    if (streaming || !autoQueue.length) return;
+    runAutoTask(autoQueue.shift());
+  }
+
+  async function runAutoTask(task) {
+    // Автозадачу выполняет ПК-клиент: у чатов один хозяин, иначе прогон удвоился бы
+    // (событие срока уходит и на телефон).
+    if (!isElectron) return;
+    if (!task || !task.id) return;
+    if (streaming) { autoQueue.push(task); return; }
+    if (!settings.model) {
+      toast("⏰ Дело «" + task.title + "» — автозапуск пропущен: не выбрана модель");
+      return;
+    }
+    const chat = ensureAutoChat();
+    if (chatsData.activeId !== chat.id) selectChat(chat.id);
+    const assistantMsg = await runTurn(chat, autoTaskText(task), {});
+    if (assistantMsg && assistantMsg.error) {
+      toast("⏰ Автозадача «" + task.title + "» не выполнилась — смотри чат «Автозадачи»");
+      return;
+    }
+    // Разовое дело после выполнения закрываем: сделано — висеть просроченным незачем.
+    if (!task.repeat && api && api.tasksDone) {
+      try { await api.tasksDone(task.id); } catch {}
+      renderTasks();
     }
   }
 
@@ -1833,6 +1910,14 @@
         toast(text);
       }
       renderTasks();
+      return;
+    }
+    // Срок автозадачи: приложение будит агента само (чат «Автозадачи»).
+    if (ev && ev.type === "task-due") {
+      if (!isElectron) return;
+      const list = Array.isArray(ev.tasks) ? ev.tasks : [];
+      for (const t of list) autoQueue.push(t);
+      flushAutoQueue();
       return;
     }
     // Прогон запущен другим клиентом (обычно телефоном): у событий нет привязки к
@@ -1997,6 +2082,11 @@
         break;
       case "undo_available": {
         lastUndoCount = ev.count || 0;
+        break;
+      }
+      case "mission": {
+        // Движок миссии: батч, пауза, лимит, смена шага — панель обновляется сразу.
+        missionFromEvent(ev);
         break;
       }
       case "checkpoint": {
@@ -2205,6 +2295,10 @@
     if (spCloudEl) spCloudEl.classList.toggle("hidden", sideTab !== "cloud");
     const spTasksEl = $("sp-tasks");
     if (spTasksEl) spTasksEl.classList.toggle("hidden", sideTab !== "tasks");
+    const spMissionEl = $("sp-mission");
+    if (spMissionEl) spMissionEl.classList.toggle("hidden", sideTab !== "mission");
+    if ($("rail-mission")) $("rail-mission").classList.toggle("active", sideTab === "mission");
+    if (sideTab === "mission") refreshMission();
     const spDeployEl = $("sp-deploy");
     if (spDeployEl) spDeployEl.classList.toggle("hidden", sideTab !== "deploy");
     if ($("rail-deploy")) $("rail-deploy").classList.toggle("active", sideTab === "deploy");
@@ -2234,6 +2328,7 @@
     $("btn-toggle-preview").classList.remove("active");
     if ($("btn-toggle-cloud")) $("btn-toggle-cloud").classList.remove("active");
     if ($("rail-tasks")) $("rail-tasks").classList.remove("active");
+    if ($("rail-mission")) $("rail-mission").classList.remove("active");
     if ($("rail-deploy")) $("rail-deploy").classList.remove("active");
     if ($("btn-toggle-deploy")) $("btn-toggle-deploy").classList.remove("active");
     syncRail();
@@ -2352,6 +2447,23 @@
     if (diff > 1 && diff < 7) return "через " + diff + " дн" + time;
     return at.toLocaleDateString("ru-RU", { day: "numeric", month: "long" }) + time;
   }
+  // Повтор по-человечески — та же строка, что хранит приложение («daily», «weekly:5»…).
+  const REPEAT_TEXT = { daily: "каждый день", weekdays: "по будням", weekly: "каждую неделю", monthly: "каждый месяц" };
+  const WEEKDAY_ACC = ["воскресенье", "понедельник", "вторник", "среду", "четверг", "пятницу", "субботу"];
+  function repeatText(r) {
+    const s = String(r || "");
+    if (!s) return "";
+    if (REPEAT_TEXT[s]) return REPEAT_TEXT[s];
+    if (s.startsWith("weekly:")) {
+      const d = parseInt(s.slice(7), 10);
+      return d >= 0 && d <= 6 ? "каждую " + WEEKDAY_ACC[d] : "каждую неделю";
+    }
+    if (s.startsWith("every:")) {
+      const mins = parseInt(s.slice(6), 10) || 60;
+      return mins % 60 === 0 && mins >= 60 ? "каждые " + mins / 60 + " ч" : "каждые " + mins + " мин";
+    }
+    return s;
+  }
   function updateTasksBadge(s) {
     const b = $("rail-tasks-badge");
     if (!b) return;
@@ -2389,6 +2501,20 @@
     due.title = "Клик — изменить срок (например: завтра 14:00)";
     due.onclick = () => startTaskEdit(row, due, t, "due");
     meta.appendChild(due);
+    if (t.repeat) {
+      const rep = document.createElement("span");
+      rep.className = "task-tag";
+      rep.textContent = "🔁 " + repeatText(t.repeat);
+      rep.title = "Дело повторяется: " + repeatText(t.repeat);
+      meta.appendChild(rep);
+    }
+    if (t.auto) {
+      const bus = document.createElement("span");
+      bus.className = "task-tag";
+      bus.textContent = "▶ агент";
+      bus.title = "В срок приложение само запустит агента — ответ придёт в чат «Автозадачи»";
+      meta.appendChild(bus);
+    }
     if (t.project) {
       const tag = document.createElement("span");
       tag.className = "task-tag";
@@ -2481,6 +2607,239 @@
       box.appendChild(b);
     }
   }
+
+  // ── Миссия (долгая работа агента) ──────────────────────────────────────────
+  // Агент, который работает часами, должен быть виден: цель, шаги, живой журнал,
+  // время и токены. Данные приходят из main (файлы .agent/) — панель их только рисует.
+  let missionCache = null;
+  let missionTimer = null;
+  const MISSION_STATUS_LABEL = {
+    active: "работает",
+    paused: "на паузе",
+    done: "завершена",
+    failed: "с ошибкой",
+    stopped: "остановлена",
+  };
+  const MISSION_STEP_ICON = { done: "✓", failed: "!", doing: "▸", todo: "○" };
+
+  function missionSupported() {
+    return !!(isElectron && api.missionState);
+  }
+
+  function missionClock(ms) {
+    const total = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const sec = total % 60;
+    return (h ? h + ":" + String(m).padStart(2, "0") : String(m)) + ":" + String(sec).padStart(2, "0");
+  }
+
+  async function refreshMission() {
+    if (!missionSupported()) return null;
+    try {
+      missionCache = await api.missionState();
+    } catch {
+      missionCache = null;
+    }
+    renderMission();
+    return missionCache;
+  }
+
+  function missionDot(active) {
+    const dot = $("sp-mission-dot");
+    if (dot) dot.classList.toggle("hidden", !active);
+    const badge = $("rail-mission-badge");
+    if (badge) {
+      badge.classList.toggle("hidden", !active);
+      if (active) badge.textContent = "●";
+    }
+  }
+
+  function renderMission() {
+    const host = $("sp-mission");
+    if (!host) return;
+    const st = missionCache;
+    if (!st || !st.enabled) {
+      const empty = $("ms-empty");
+      if (empty) {
+        empty.classList.remove("hidden");
+        empty.textContent = st && !st.enabled
+          ? "Долгая работа выключена: включи галочку «Долгая работа агента (миссии)» в настройках — тогда большие задачи будут вестись миссиями с файлами в папке .agent/."
+          : "Миссий пока нет. Они появляются сами, когда работа агента становится длинной: цель, план и журнал работы ложатся файлами в папку .agent/ рядом с проектом.";
+      }
+      if ($("ms-card")) $("ms-card").classList.add("hidden");
+      if ($("ms-list")) $("ms-list").innerHTML = "";
+      missionDot(false);
+      return;
+    }
+    const m = st.active;
+    if ($("ms-empty")) $("ms-empty").classList.toggle("hidden", !!m);
+    const card = $("ms-card");
+    if (card) card.classList.toggle("hidden", !m);
+    missionDot(!!(m && (m.status === "active" || m.status === "paused")));
+
+    if (m) {
+      const pr = st.progress || m.progress || { total: 0, done: 0, failed: 0, current: "" };
+      const running = st.running && m.status === "active";
+      if ($("ms-title")) $("ms-title").textContent = m.title || "Миссия";
+      const statusEl = $("ms-status");
+      if (statusEl) {
+        const label = MISSION_STATUS_LABEL[m.status] || m.status;
+        statusEl.textContent = (running ? "работает" : label) + " · " + pr.done + "/" + pr.total;
+        statusEl.className = "ms-status ms-" + m.status;
+      }
+      if ($("ms-goal")) $("ms-goal").textContent = m.goal || "";
+      if ($("ms-fill")) $("ms-fill").style.width = Math.max(2, pr.percent || 0) + "%";
+      const elapsed = running && st.startedAt ? Date.now() - st.startedAt : (m.finishedAt || m.updatedAt || m.createdAt) - (m.startedAt || m.createdAt);
+      if ($("ms-meta")) {
+        $("ms-meta").innerHTML =
+          '<span title="Время работы">⏱ ' + missionClock(elapsed) + "</span>" +
+          '<span title="Раундов пройдено">⚙ ' + (st.rounds || m.rounds || 0) + "</span>" +
+          '<span title="Батчей (отрезков по 25 раундов)">◆ ' + (st.batches || m.batches || 0) + "</span>" +
+          '<span title="Токенов израсходовано">✦ ' + (st.tokens || m.metrics.tokens || 0) + "</span>" +
+          '<span title="Сжатий контекста">🧠 ' + (st.compactions || m.metrics.compactions || 0) + "</span>" +
+          (pr.failed ? '<span class="ms-bad" title="Шагов не удалось">⚠ ' + pr.failed + "</span>" : "") +
+          (m.reason ? '<span class="ms-reason" title="Причина остановки">' + roleEsc(m.reason) + "</span>" : "");
+      }
+      const steps = m.steps || [];
+      const sbox = $("ms-steps");
+      if (sbox) {
+        sbox.innerHTML = steps.length
+          ? steps.map((s, i) =>
+              '<div class="ms-step ms-step-' + (s.state || "todo") + '">' +
+              '<i>' + (MISSION_STEP_ICON[s.state] || "○") + "</i>" +
+              '<span class="ms-step-text">' + (i + 1) + ". " + roleEsc(s.title || "") + "</span>" +
+              (s.note ? '<span class="ms-step-note" title="' + roleEsc(s.note) + '">' + roleEsc(s.note) + "</span>" : "") +
+              "</div>"
+            ).join("")
+          : '<div class="ms-muted">План пока не составлен — агент добавит шаги по ходу работы.</div>';
+      }
+      const jbox = $("ms-journal");
+      if (jbox) {
+        const rows = st.journal || [];
+        jbox.innerHTML = rows.length
+          ? rows.slice().reverse().map((r) =>
+              '<div class="ms-line ms-line-' + roleEsc(r.kind || "note") + '">' +
+              '<span class="ms-time">' + new Date(r.ts).toLocaleTimeString().slice(0, 5) + "</span>" +
+              "<span>" + roleEsc(r.text || "") + "</span></div>"
+            ).join("")
+          : '<div class="ms-muted">Журнал пуст — работа ещё не начиналась.</div>';
+      }
+      const pauseBtn = $("btn-mission-pause");
+      if (pauseBtn) pauseBtn.disabled = !running;
+      const resumeBtn = $("btn-mission-resume");
+      if (resumeBtn) resumeBtn.disabled = running || !!streaming;
+      const stopBtn = $("btn-mission-stop");
+      if (stopBtn) stopBtn.disabled = !st.running;
+    }
+
+    const list = (st.list || []).filter((x) => !m || x.id !== m.id);
+    const lbox = $("ms-list");
+    if (lbox) {
+      lbox.innerHTML = list.length
+        ? list.map((x) =>
+            '<div class="ms-past" data-id="' + roleEsc(x.id) + '">' +
+            '<span class="ms-past-title">' + roleEsc(x.title || x.id) + "</span>" +
+            '<span class="ms-past-meta">' + (MISSION_STATUS_LABEL[x.status] || x.status) + " · " +
+            (x.progress ? x.progress.done + "/" + x.progress.total : "0/0") + "</span>" +
+            '<button class="btn btn-ghost btn-small ms-past-open" title="Открыть папку миссии">📂</button>' +
+            "</div>"
+          ).join("")
+        : '<div class="ms-muted">Прошлых миссий нет.</div>';
+      for (const row of lbox.querySelectorAll(".ms-past-open")) {
+        row.onclick = (e) => {
+          e.stopPropagation();
+          const box = row.closest(".ms-past");
+          if (box && api.missionOpen) api.missionOpen(box.dataset.id);
+        };
+      }
+    }
+    const pastTitle = $("ms-past-title");
+    if (pastTitle) pastTitle.classList.toggle("hidden", !list.length);
+  }
+
+  function missionTickStart() {
+    if (missionTimer) return;
+    missionTimer = setInterval(() => {
+      if (!missionCache || !missionCache.active || !missionCache.running || sideTab !== "mission") return;
+      renderMission();
+    }, 1000);
+  }
+
+  function initMissionPanel() {
+    if ($("btn-mission-refresh")) $("btn-mission-refresh").onclick = () => refreshMission();
+    if ($("btn-mission-pause")) {
+      $("btn-mission-pause").onclick = async () => {
+        try {
+          await api.missionPause();
+          toast("⏸ Пауза: работа сохранена, миссия ждёт продолжения");
+        } catch {}
+      };
+    }
+    if ($("btn-mission-stop")) {
+      $("btn-mission-stop").onclick = async () => {
+        try {
+          await api.missionStop();
+          toast("⏹ Останавливаю прогон");
+        } catch {}
+      };
+    }
+    if ($("btn-mission-resume")) {
+      $("btn-mission-resume").onclick = async () => {
+        if (streaming) return;
+        let r = null;
+        try {
+          r = await api.missionResume();
+        } catch {}
+        if (!r || !r.ok) {
+          toast((r && r.error) || "Незакрытых миссий нет");
+          return;
+        }
+        const chat = getActiveChat();
+        if (chat) selectChat(chat.id);
+        $("input").value = r.text;
+        autoResize();
+        sendMessage();
+      };
+    }
+    if ($("btn-mission-folder")) {
+      $("btn-mission-folder").onclick = () => {
+        const id = missionCache && missionCache.active ? missionCache.active.id : "";
+        if (api.missionOpen) api.missionOpen(id);
+      };
+    }
+    if (missionSupported()) {
+      refreshMission();
+      missionTickStart();
+    }
+  }
+
+  // Событие прогона: агент или движок что-то записали в миссию — обновляем панель.
+  function missionFromEvent(ev) {
+    if (!missionSupported() || !ev) return;
+    if (ev.id) {
+      missionCache = Object.assign({}, missionCache || {}, {
+        active: Object.assign({}, (missionCache && missionCache.active) || {}, {
+          id: ev.id,
+          title: ev.title,
+          goal: ev.goal,
+          status: ev.status,
+          steps: ev.steps || [],
+          reason: ev.reason || "",
+        }),
+        progress: ev.progress || null,
+        rounds: ev.rounds,
+        batches: ev.batches,
+        tokens: ev.tokens,
+        compactions: ev.compactions,
+        startedAt: ev.startedAt,
+        running: true,
+      });
+      renderMission();
+    }
+    refreshMission();
+  }
+
   async function renderTasks() {
     if (!tasksSupported()) {
       const c0 = $("tasks-counts");
@@ -2592,6 +2951,11 @@
       if (sidePanelVisible() && sideTab === "tasks") closeSidePanel();
       else openSidePanel("tasks");
     };
+    if ($("rail-mission")) $("rail-mission").onclick = () => {
+      if (sidePanelVisible() && sideTab === "mission") closeSidePanel();
+      else openSidePanel("mission");
+    };
+    initMissionPanel();
     if ($("btn-task-add")) $("btn-task-add").onclick = addTaskFromPanel;
     if ($("task-new-title")) $("task-new-title").onkeydown = (e) => {
       if (e.key === "Enter") { e.preventDefault(); addTaskFromPanel(); }
@@ -4136,12 +4500,20 @@
     $("vision-model-hints").classList.add("hidden");
     if ($("s-default-role")) $("s-default-role").value = AgentCore.roleById(settings.defaultRole).id;
     if ($("s-task-reminders")) $("s-task-reminders").checked = settings.taskReminders !== false;
+    if ($("s-task-auto")) $("s-task-auto").checked = settings.taskAuto !== false;
+    if ($("s-long-work")) $("s-long-work").checked = settings.longWork !== false;
+    if ($("s-long-hours")) $("s-long-hours").value = settings.longWorkHours || 8;
+    if ($("s-long-rounds")) $("s-long-rounds").value = settings.longWorkRounds || 600;
+    if ($("s-long-continue")) $("s-long-continue").value = settings.longWorkAutoContinue == null ? 6 : settings.longWorkAutoContinue;
+    if ($("s-agent-files")) $("s-agent-files").checked = settings.agentWorkFiles !== false;
+    renderAgentFilesStatus();
     if ($("s-audit-log")) $("s-audit-log").checked = settings.auditLog !== false;
     $("s-ota-enabled").checked = settings.otaEnabled !== false;
     $("s-ota-dir").value = settings.otaDir || "";
     renderOpenaiProfiles();
     $("s-auto-switch").checked = !!settings.autoSwitchProfiles;
     $("s-send-all-tools").checked = !!settings.sendAllTools;
+    if ($("s-no-tools-model")) $("s-no-tools-model").checked = !!settings.noToolsModel;
     // Почта
     $("s-mail-address").value = settings.mailAddress || "";
     $("s-mail-from-name").value = settings.mailFromName || "";
@@ -4198,11 +4570,18 @@
     settings.imageModel = $("s-image-model").value.trim();
     if ($("s-default-role")) settings.defaultRole = AgentCore.roleById($("s-default-role").value).id;
     if ($("s-task-reminders")) settings.taskReminders = !!$("s-task-reminders").checked;
+    if ($("s-task-auto")) settings.taskAuto = !!$("s-task-auto").checked;
+    if ($("s-long-work")) settings.longWork = !!$("s-long-work").checked;
+    if ($("s-long-hours")) settings.longWorkHours = Math.max(1, Math.min(24, parseInt($("s-long-hours").value, 10) || 8));
+    if ($("s-long-rounds")) settings.longWorkRounds = Math.max(25, Math.min(2000, parseInt($("s-long-rounds").value, 10) || 600));
+    if ($("s-long-continue")) settings.longWorkAutoContinue = Math.max(0, Math.min(20, parseInt($("s-long-continue").value, 10) || 0));
+    if ($("s-agent-files")) settings.agentWorkFiles = !!$("s-agent-files").checked;
     if ($("s-audit-log")) settings.auditLog = !!$("s-audit-log").checked;
     settings.otaEnabled = !!$("s-ota-enabled").checked;
     settings.otaDir = $("s-ota-dir").value.trim();
     settings.autoSwitchProfiles = !!$("s-auto-switch").checked;
     settings.sendAllTools = !!$("s-send-all-tools").checked;
+    if ($("s-no-tools-model")) settings.noToolsModel = !!$("s-no-tools-model").checked;
     // Зеркало модели активного провайдера
     settings.model = settings[MODEL_KEY[settings.provider]] || "";
   }
@@ -4594,6 +4973,36 @@
   }
 
   // 🧠 Память диалогов: включена ли и сколько памяток уже сохранено.
+  // Папка работы агента (.agent/): что уже лежит рядом с проектом. Показываем
+  // факты (файлы, миссии, размер), а не намерение — включённая галочка ≠ файлы есть.
+  async function renderAgentFilesStatus() {
+    const el = $("agent-files-status");
+    if (!el) return;
+    if (!(($("s-agent-files") || {}).checked)) {
+      el.textContent = "Выключено: агент не создаёт файлы работы в папке проекта.";
+      return;
+    }
+    if (!isElectron || !api.agentFilesStatus) {
+      el.textContent = "Файлы работы агента ведутся в desktop-приложении (в веб-превью недоступны).";
+      return;
+    }
+    try {
+      const r = await api.agentFilesStatus();
+      if (!r || !r.enabled) return;
+      const parts = [];
+      parts.push(r.tasks ? "задачи: " + (r.tasks.bytes / 1024).toFixed(1) + " КБ" : "задачи: файла ещё нет");
+      parts.push(r.contextDays && r.contextDays.length ? "дней контекста: " + r.contextDays.length : "контекст: памяток ещё нет");
+      parts.push(r.missions ? "миссий: " + r.missions : "миссий: нет");
+      if (r.bytes) parts.push("всего " + (r.bytes / 1024).toFixed(0) + " КБ");
+      el.textContent =
+        (r.exists ? "Папка .agent/ уже есть: " : "Папка .agent/ появится при первой записи. ") +
+        parts.join(" · ") +
+        " Место: .agent/ в рабочей папке (раздел «Проект»).";
+    } catch {
+      el.textContent = "Не удалось прочитать состояние папки работы.";
+    }
+  }
+
   async function renderMemoryStatus() {
     const el = $("memory-status");
     if (!el) return;
@@ -8275,6 +8684,27 @@
     if (isElectron) api.otaOpenDir();
   };
   // ── 🧠 Память диалогов: открыть папку и очистить дневник ──
+  // Файлы работы агента: открыть папку и очистить зеркала (миссии не трогаем).
+  if ($("btn-agent-files-open")) $("btn-agent-files-open").onclick = async () => {
+    if (!isElectron || !api.agentFilesOpen) {
+      toast("Файлы работы агента доступны в приложении на ПК");
+      return;
+    }
+    const r = await api.agentFilesOpen();
+    if (r && r.ok) toast("Открываю папку работы агента");
+    else toast("⚠ Не удалось открыть папку" + (r && r.error ? ": " + r.error : ""));
+  };
+  if ($("btn-agent-files-clear")) $("btn-agent-files-clear").onclick = () => {
+    if (!isElectron || !api.agentFilesClear) return;
+    confirmModal(
+      "Удалить зеркала работы агента? Будут удалены .agent/tasks.md и .agent/context/. Миссии, их журналы и отчёты останутся на месте.",
+      async () => {
+        const r = await api.agentFilesClear();
+        toast((r && r.message) || "Зеркала очищены");
+        renderAgentFilesStatus();
+      }
+    );
+  };
   if ($("btn-memory-open")) $("btn-memory-open").onclick = async () => {
     if (!isElectron || !api.memoryOpenDir) {
       toast("Память диалогов доступна в приложении на ПК");
@@ -8298,6 +8728,7 @@
     );
   };
   if ($("s-context-memory")) $("s-context-memory").addEventListener("change", renderMemoryStatus);
+  if ($("s-agent-files")) $("s-agent-files").addEventListener("change", renderAgentFilesStatus);
   $("btn-toggle-vision-key").onclick = () => toggleKey("s-vision-key");
   $("btn-toggle-serper-key").onclick = () => toggleKey("s-serper-key");
   if ($("btn-mail-eye")) $("btn-mail-eye").onclick = () => toggleKey("s-mail-pass");

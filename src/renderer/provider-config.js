@@ -102,13 +102,21 @@
   // браузер блокирует прямые запросы («Failed to fetch»). В браузерном режиме база
   // переписывается на локальный прокси preview-сервера (/api/llm/...), который ходит
   // к провайдеру сам (server.js разрешает внешние https, внутренние сети — 403).
+  // Локальный ли адрес: свой ПК или домашняя сеть. Один признак нужен в ДВУХ местах:
+  // прокси веб-превью не должен заворачивать localhost, а агент по нему понимает, что
+  // токены бесплатны (бюджет от окна модели, а не облачный потолок) и что модель
+  // может быть неспешной. Раньше «локальность» определялась только по имени провайдера
+  // («ollama»), поэтому LM Studio и vLLM на localhost считались платным облаком.
+  function isLocalBase(url) {
+    const s = String(url || "").trim();
+    return /^(https?:\/\/)?(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/i.test(s);
+  }
+
   function proxiedBase(base) {
     const b = String(base || "");
-    const local =
-      /^(https?:\/\/)?(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/i;
     if (
       typeof location !== "undefined" && location && location.origin &&
-      /^https:\/\//i.test(b) && !local.test(b)
+      /^https:\/\//i.test(b) && !isLocalBase(b)
     ) {
       return location.origin + "/api/llm/" + encodeURIComponent(b);
     }
@@ -323,6 +331,7 @@
     trimBase,
     anthropicApiBase,
     baseFor,
+    isLocalBase,
     proxiedBase,
     apiKeyFor,
     apiHeaders,

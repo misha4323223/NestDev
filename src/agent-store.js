@@ -639,6 +639,7 @@ const TASK_NOTE_MAX = 2000;
 const TASK_STATUSES = ["todo", "doing", "done", "canceled"];
 const TASK_PRIORITIES = ["low", "normal", "high"];
 const TASK_REMIND_BEFORE_MS = 15 * 60 * 1000; // напоминаем за 15 минут до срока
+const TASK_REPEAT_MAX_MIN = 60 * 24 * 31; // «каждые N минут» — не реже раза в месяц
 const TASK_ALLDAY_HOUR = 9; // срок «в этот день» без времени = 09:00
 const WEEKDAY_NAMES = ["воскресенье", "понедельник", "вторник", "среда", "четверг", "пятница", "суббота"];
 const WEEKDAY_INDEX = [
@@ -870,6 +871,99 @@ function dayKey(d) {
   return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
 }
 
+// ── Повторы дел ─────────────────────────────────────────────────────────────
+// Дело может повторяться. Хранится одной строкой: "" (без повтора), "daily",
+// "weekdays", "weekly", "weekly:<день недели>", "monthly", "every:<минут>".
+// Разбор человеческий: «каждый день», «по будням», «каждую пятницу»,
+// «каждый месяц», «каждые 2 часа», «раз в неделю».
+const WEEKDAY_ACC = ["воскресенье", "понедельник", "вторник", "среду", "четверг", "пятницу", "субботу"];
+
+function parseRepeat(input) {
+  const raw = String(input == null ? "" : input).trim().toLowerCase().replace(/ё/g, "е");
+  if (!raw) return { ok: true, repeat: "" };
+  if (/^(нет|без повтор[а-я]*|однократ[а-я]*|один раз|once|none|-|0)$/.test(raw)) return { ok: true, repeat: "" };
+  // «каждые N минут/часов»
+  let m = raw.match(/кажд[а-я]*\s*(\d+)?\s*(минут|мин|час|часа|часов)/);
+  if (m) {
+    const n = m[1] ? parseInt(m[1], 10) : 1;
+    const mins = /^мин/.test(m[2]) ? n : n * 60;
+    if (!(mins >= 1) || mins > TASK_REPEAT_MAX_MIN) return repeatError(raw);
+    return { ok: true, repeat: "every:" + mins };
+  }
+  if (/(кажд[а-я]*\s*(день|дня|дней)|ежедневн|daily)/.test(raw)) return { ok: true, repeat: "daily" };
+  if (/будн|по рабочим|weekday/.test(raw)) return { ok: true, repeat: "weekdays" };
+  // Конкретный день недели: «каждую пятницу» (до общего «каждую неделю»).
+  const wd = WEEKDAY_INDEX.find((x) => raw.includes(x[0]));
+  if (wd && /кажд|по /.test(raw)) return { ok: true, repeat: "weekly:" + wd[1] };
+  if (/(кажд[а-я]*\s*недел|раз в неделю|weekly)/.test(raw)) return { ok: true, repeat: "weekly" };
+  if (/(кажд[а-я]*\s*месяц|раз в месяц|monthly)/.test(raw)) return { ok: true, repeat: "monthly" };
+  return repeatError(raw);
+}
+
+function repeatError(raw) {
+  return {
+    ok: false,
+    error: "Не понял повтор «" + raw + "». Примеры: каждый день, по будням, каждую пятницу, каждый месяц, каждые 2 часа, без повтора.",
+  };
+}
+
+function repeatLabel(repeat) {
+  const r = String(repeat || "");
+  if (!r) return "";
+  if (r === "daily") return "каждый день";
+  if (r === "weekdays") return "по будням";
+  if (r === "weekly") return "каждую неделю";
+  if (r === "monthly") return "каждый месяц";
+  if (r.startsWith("weekly:")) {
+    const d = parseInt(r.slice(7), 10);
+    return d >= 0 && d <= 6 ? "каждую " + WEEKDAY_ACC[d] : "каждую неделю";
+  }
+  if (r.startsWith("every:")) {
+    const mins = parseInt(r.slice(6), 10) || 60;
+    return mins % 60 === 0 && mins >= 60 ? "каждые " + mins / 60 + " ч" : "каждые " + mins + " мин";
+  }
+  return r;
+}
+
+// Следующий срок после указанного — по повторам. Всегда СТРОГО позже now,
+// чтобы дело не «крутилось» на одном моменте.
+function nextDueDate(from, repeat, nowMs) {
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const r = String(repeat || "");
+  const d = new Date(from.getTime());
+  if (!r) return d;
+  const bump = () => {
+    if (r === "daily") d.setDate(d.getDate() + 1);
+    else if (r === "weekdays") { do { d.setDate(d.getDate() + 1); } while (d.getDay() === 0 || d.getDay() === 6); }
+    else if (r === "weekly") d.setDate(d.getDate() + 7);
+    else if (r.startsWith("weekly:")) {
+      const want = parseInt(r.slice(7), 10);
+      do { d.setDate(d.getDate() + 1); } while (d.getDay() !== want);
+    } else if (r === "monthly") {
+      const day = d.getDate();
+      d.setMonth(d.getMonth() + 1);
+      if (d.getDate() !== day) d.setDate(0); // 31-е в коротком месяце → последний день
+    } else if (r.startsWith("every:")) {
+      d.setMinutes(d.getMinutes() + (parseInt(r.slice(6), 10) || 60));
+    }
+  };
+  let guard = 0;
+  do { bump(); guard++; } while (d.getTime() <= now && guard < 400);
+  return d;
+}
+
+// Сдвинуть повторяющееся дело на следующий срок (после того как оно сработало).
+function advanceRepeat(t, nowMs) {
+  if (!t || !t.repeat || !t.due) return false;
+  const at = dueDate(t);
+  if (!at) return false;
+  t.due = fmtDue(nextDueDate(at, t.repeat, nowMs));
+  t.firedAt = 0;
+  t.remindedAt = 0;
+  t.updatedAt = Number.isFinite(nowMs) ? nowMs : Date.now();
+  return true;
+}
+
 // Поиск дела по id («t7») или по куску названия. Возвращает { task } либо { error }.
 function tasksFind(data, key) {
   const k = String(key == null ? "" : key).trim();
@@ -900,6 +994,8 @@ function tasksAdd(userData, input, nowMs) {
   const dueR = parseDue(inp.due, now);
   if (!dueR.ok) return { ok: false, error: dueR.error };
   const priority = TASK_PRIORITIES.includes(inp.priority) ? inp.priority : "normal";
+  const repR = parseRepeat(inp.repeat);
+  if (!repR.ok) return { ok: false, error: repR.error };
   const task = {
     id: "t" + (++data.seq),
     title: title,
@@ -909,6 +1005,13 @@ function tasksAdd(userData, input, nowMs) {
     priority: priority,
     status: "todo",
     project: String(inp.project || "").trim().slice(0, 120),
+    repeat: repR.repeat,
+    auto: !!inp.auto,
+    prompt: String(inp.prompt || "").trim().slice(0, TASK_NOTE_MAX),
+    chatId: String(inp.chatId || "").trim().slice(0, 80),
+    snoozeUntil: 0,
+    firedAt: 0,
+    runs: 0,
     createdAt: now,
     updatedAt: now,
     doneAt: 0,
@@ -919,7 +1022,8 @@ function tasksAdd(userData, input, nowMs) {
   return {
     ok: true,
     task: task,
-    message: "Дело «" + task.title + "» добавлено (" + task.id + (task.due ? ", срок: " + humanDue(task, now) : ", без срока") + ").",
+    message: "Дело «" + task.title + "» добавлено (" + task.id + (task.due ? ", срок: " + humanDue(task, now) : ", без срока") +
+      (task.repeat ? ", повтор: " + repeatLabel(task.repeat) : "") + (task.auto ? ", выполняет агент" : "") + ").",
   };
 }
 
@@ -948,6 +1052,25 @@ function tasksUpdate(userData, key, patch) {
     t.due = dueR.due || "";
     t.allDay = !!dueR.allDay;
     t.remindedAt = 0; // новый срок — напомнить заново
+    t.firedAt = 0; // новый срок — автозадача может сработать снова
+  }
+  if (p.repeat !== undefined) {
+    const repR2 = parseRepeat(p.repeat);
+    if (!repR2.ok) return { ok: false, error: repR2.error };
+    t.repeat = repR2.repeat;
+    t.firedAt = 0;
+  }
+  if (p.auto !== undefined) {
+    t.auto = !!p.auto;
+    t.firedAt = 0;
+  }
+  if (p.prompt !== undefined) t.prompt = String(p.prompt || "").trim().slice(0, TASK_NOTE_MAX);
+  // Отсрочка: «напомни через час» — срок не меняем, но приставать перестаём до этого момента.
+  if (p.snooze !== undefined) {
+    const snR = parseDue(p.snooze, Date.now());
+    if (!snR.ok) return { ok: false, error: snR.error };
+    t.snoozeUntil = snR.due ? new Date(snR.due).getTime() : 0;
+    t.remindedAt = 0;
   }
   if (p.status !== undefined) {
     if (!TASK_STATUSES.includes(p.status)) {
@@ -1098,16 +1221,63 @@ function tasksTakeReminders(userData, nowMs) {
   let changed = false;
   for (const t of data.tasks) {
     if (t.status === "done" || t.status === "canceled") continue;
+    if (t.auto) continue; // автозадачу будит агент, а не тост
+    if (t.snoozeUntil && t.snoozeUntil > now) continue; // отсрочено — молчим
     const at = dueDate(t);
     if (!at) continue;
     if (t.remindedAt) continue;
     if (at.getTime() - now > TASK_REMIND_BEFORE_MS) continue;
     t.remindedAt = now;
-    out.push(t);
+    out.push(Object.assign({}, t)); // снимок ДО сдвига повтора — в тосте старый срок
+    if (t.repeat) advanceRepeat(t, now);
     changed = true;
   }
   if (changed) tasksSave(userData, data);
   return { ok: true, tasks: out };
+}
+
+// Автозадачи: срок пришёл — пора будить агента. Повторяющиеся после запуска
+// сдвигаются на следующий раз, разовые остаются активными (закрыть их — дело
+// человека или агента). firedAt не даёт запустить одно и то же дважды.
+function tasksTakeAuto(userData, nowMs) {
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const data = tasksLoad(userData);
+  const out = [];
+  let changed = false;
+  for (const t of data.tasks) {
+    if (t.status === "done" || t.status === "canceled") continue;
+    if (!t.auto) continue;
+    if (t.snoozeUntil && t.snoozeUntil > now) continue;
+    const at = dueDate(t);
+    if (!at) continue;
+    if (now < at.getTime()) continue; // срок ещё не пришёл
+    if (t.firedAt && t.firedAt >= at.getTime()) continue; // уже запускали для этого срока
+    t.firedAt = at.getTime();
+    t.runs = (t.runs || 0) + 1;
+    out.push({ id: t.id, title: t.title, prompt: t.prompt || "", note: t.note || "", repeat: t.repeat || "", due: t.due, runs: t.runs });
+    if (t.repeat) advanceRepeat(t, now);
+    changed = true;
+  }
+  if (changed) tasksSave(userData, data);
+  return { ok: true, tasks: out };
+}
+
+// Через сколько миллисекунд наступит ближайший срок — чтобы будильник сработал
+// минута в минуту, а не «при следующем опросе». 0 — ждать нечего.
+function tasksNextDue(userData, nowMs) {
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const data = tasksLoad(userData);
+  let best = 0;
+  for (const t of data.tasks) {
+    if (t.status === "done" || t.status === "canceled") continue;
+    const at = dueDate(t);
+    if (!at) continue;
+    let when = at.getTime();
+    if (t.snoozeUntil && t.snoozeUntil > now) when = Math.max(when, t.snoozeUntil);
+    if (when <= now) continue; // уже пора — разберётся текущая проверка
+    if (!best || when < best) best = when;
+  }
+  return best ? best - now : 0;
 }
 
 // «сегодня 14:30», «завтра (без времени)», «просрочено на 2 ч» — для агента и UI.
@@ -1133,6 +1303,8 @@ function taskLine(t, nowMs) {
   const pr = t.priority === "high" ? "❗" : t.priority === "low" ? "·" : "";
   const st = t.status === "doing" ? "в работе" : t.status === "done" ? "выполнено" : t.status === "canceled" ? "отменено" : "к выполнению";
   return pr + t.id + " · " + t.title + " — " + humanDue(t, nowMs) + " · " + st +
+    (t.repeat ? " · 🔁 " + repeatLabel(t.repeat) : "") +
+    (t.auto ? " · ▶ выполняет агент" : "") +
     (t.project ? " · проект: " + t.project : "") + (t.note ? " · заметка: " + t.note.slice(0, 160) : "");
 }
 
@@ -1185,8 +1357,13 @@ module.exports = {
   TASK_STATUSES,
   TASK_PRIORITIES,
   TASK_REMIND_BEFORE_MS,
+  TASK_REPEAT_MAX_MIN,
   tasksFile,
   parseDue,
+  parseRepeat,
+  repeatLabel,
+  nextDueDate,
+  advanceRepeat,
   tasksAdd,
   tasksList,
   tasksUpdate,
@@ -1195,6 +1372,8 @@ module.exports = {
   tasksBoard,
   tasksSummary,
   tasksTakeReminders,
+  tasksTakeAuto,
+  tasksNextDue,
   tasksFormatText,
   tasksBrief,
   humanDue,

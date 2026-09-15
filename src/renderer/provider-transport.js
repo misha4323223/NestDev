@@ -19,6 +19,7 @@
   const {
     splitG4fRoute,
     baseFor,
+    isLocalBase,
     proxiedBase,
     apiKeyFor,
     apiHeaders,
@@ -250,10 +251,70 @@
     return [{ role: "system", content: heads.join("\n\n") }, ...list.slice(i)];
   }
 
+  // ── Текстовый протокол вызова инструментов (для моделей БЕЗ capability «tools») ──
+  // Такой модели схемы бесполезны, а часть сборок Ollama отвечает на них ошибкой
+  // «does not support tools» — раунд падал целиком. Вместо JSON-схем (у базового
+  // набора это ~6 000 токенов) кладём в системное сообщение компактный каталог
+  // текстом: имя(поля) — короткое описание. Ответ модели разбирает
+  // extractToolCallsFromText в ядре, поэтому формат блока должен быть ровно такой.
+  const TEXT_TOOLS_MAX = 5000; // символов: каталог не должен сам съесть окно слабой модели
+  function toolsAsText(tools) {
+    const lines = [];
+    for (const t of tools || []) {
+      const f = t && t.function;
+      if (!f || !f.name) continue;
+      const props = (f.parameters && f.parameters.properties) || {};
+      const required = (f.parameters && f.parameters.required) || [];
+      const sign = Object.keys(props)
+        .map((a) => (required.indexOf(a) >= 0 ? a : a + "?"))
+        .join(", ");
+      const desc = String(f.description || "").replace(/\s+/g, " ").split(". ")[0];
+      lines.push(f.name + "(" + sign + ") — " + desc.slice(0, 140));
+    }
+    if (!lines.length) return "";
+    let text = lines.join("\n");
+    if (text.length > TEXT_TOOLS_MAX) {
+      text = text.slice(0, TEXT_TOOLS_MAX) + "\n… (каталог обрезан — остальные найдёт findTools)";
+    }
+    return text;
+  }
+
+  // Правило вызова + каталог — одним куском. Нужен и для сообщения (withTextTools),
+  // и для системного поля Anthropic, поэтому текст собран в одном месте.
+  function textToolRule(tools) {
+    const cat = toolsAsText(tools);
+    if (!cat) return "";
+    return (
+      "\n\n=== КАК ВЫЗЫВАТЬ ИНСТРУМЕНТЫ (структурный вызов твоим сервером не поддержан) ===\n" +
+      "Закончи ответ ОДНИМ блоком JSON в отдельной строке — без пояснений внутри блока:\n" +
+      '{"name": "имяИнструмента", "arguments": {"поле": "значение"}}\n' +
+      "Пояснение, если нужно, пиши ДО блоков. Можно дать несколько блоков подряд, каждый на своей строке — " +
+      "приложение выполнит их и вернёт результаты. Если инструмент не нужен — просто ответь текстом.\n\n" +
+      "Доступны (в скобках поля, «?» — необязательное поле):\n" + cat
+    );
+  }
+
+  // Каталог + правило вызова дописываются в СИСТЕМНОЕ сообщение: у Ollama часть
+  // шаблонов читает только первый system, а mergeLeadingSystem уже склеил ведущие.
+  function withTextTools(messages, tools) {
+    const rule = textToolRule(tools);
+    if (!rule || !messages || !messages.length) return messages;
+    const first = messages[0] && messages[0].role === "system" ? messages[0] : null;
+    if (!first) return [{ role: "system", content: rule.trim() }].concat(messages);
+    // У OpenAI-совместимых content бывает массивом частей (текст + картинки):
+    // превращать его в строку нельзя — картинка потеряется.
+    if (Array.isArray(first.content)) {
+      const parts = first.content.concat([{ type: "text", text: rule }]);
+      return [Object.assign({}, first, { content: parts })].concat(messages.slice(1));
+    }
+    const head = first.content == null ? "" : String(first.content);
+    return [Object.assign({}, first, { content: head + rule })].concat(messages.slice(1));
+  }
+
   /**
    * Собирает HTTP-запрос к нужному провайдеру.
    * s — объект настроек: { provider, ollamaUrl, openaiUrl, anthropicUrl, openaiApiKey, anthropicApiKey }
-   * opts — { model, messages, tools, fromBrowser }
+   * opts — { model, messages, tools, fromBrowser, noTools, numCtxBudget, modelWindow }
    */
   function buildChatRequest(s, opts) {
     const provider = s && s.provider ? s.provider : "openai";
@@ -268,34 +329,43 @@
       // num_ctx: без него Ollama берёт дефолт модели (часто 2048) и молча режет запрос,
       // где только промпт ~6k и схемы инструментов ~6k. keep_alive: дефолтные 5 минут
       // выгружали модель между раундами (загрузка = секунды на каждом).
+      const merged = mergeLeadingSystem(messagesForProvider(provider, messages));
       const body = {
         model,
-        messages: mergeLeadingSystem(messagesForProvider(provider, messages)),
-        tools,
+        messages: merged,
         stream: true,
         keep_alive: OLLAMA_KEEP_ALIVE,
       };
+      // Модель, которая сама себя объявила без инструментов (capabilities из /api/show):
+      // схемы в запросе ей бесполезны, а сервер может ответить ошибкой — тогда раунд
+      // падал целиком. Отдаём каталог текстом и просим вызывать инструменты JSON-блоком.
+      if (opts && opts.noTools) body.messages = withTextTools(merged, tools);
+      else body.tools = tools;
       const numCtx = ollamaNumCtx(opts && opts.numCtxBudget, opts && opts.modelWindow);
       if (numCtx > 0) body.options = { num_ctx: numCtx };
       return { url: baseFor(provider, s) + "/api/chat", headers, body: JSON.stringify(body) };
     }
     const cacheKind = cacheableProvider(provider, baseFor(provider, s), model);
     if (provider === "anthropic") {
+      const noTools = !!(opts && opts.noTools);
       const toolDefs = toolsForProvider(provider, tools);
       // Точка кэша на последней схеме инструмента — кэширует весь блок tools.
-      if (cacheKind && toolDefs.length) {
+      if (cacheKind && !noTools && toolDefs.length) {
         toolDefs[toolDefs.length - 1] = Object.assign({}, toolDefs[toolDefs.length - 1], {
           cache_control: { type: "ephemeral" },
         });
       }
-      const sys = systemText(messages);
+      let sys = systemText(messages);
       const body = {
         model,
         max_tokens: 4096,
         messages: messagesForProvider(provider, messages),
-        tools: toolDefs,
         stream: true,
       };
+      // Каталог дописывается В КОНЕЦ системного текста: статичный префикс промпта
+      // остаётся началом строки, поэтому точка кэша не срывается.
+      if (noTools) sys += textToolRule(tools);
+      else body.tools = toolDefs;
       if (sys) body.system = anthropicSystem(sys, cacheKind, opts && opts.staticSystem);
       return {
         url: baseFor(provider, s) + "/v1/messages",
@@ -307,11 +377,16 @@
     // современный g4f принимает провайдера отдельным полем provider, а имя модели — без префикса.
     // Справочники/паспорт проекта идут несколькими system подряд: строгим серверам
     // отдаём один ведущий system (текст и порядок те же).
+    const noToolsOpenai = !!(opts && opts.noTools);
     let openaiMessages = mergeLeadingSystem(messagesForProvider("openai", messages));
+    // Сервер не умеет вызывать инструменты (модель без tools у LM Studio/vLLM или
+    // строгий шлюз): схемы не шлём, отдаём каталог текстом — иначе запрос падает 400.
+    if (noToolsOpenai) openaiMessages = withTextTools(openaiMessages, tools);
     if (cacheableProvider(provider, baseFor(provider, s), model) === "openrouter") {
       openaiMessages = withCacheOnFirstSystem(openaiMessages, opts && opts.staticSystem);
     }
-    const body = { model, messages: openaiMessages, tools, stream: true };
+    const body = { model, messages: openaiMessages, stream: true };
+    if (!noToolsOpenai) body.tools = tools;
     // Токены и попадание в кэш OpenAI-совместимые API отдают в стриме ТОЛЬКО по
     // явному запросу stream_options.include_usage (последний чанк с usage).
     // Строгий сервер может поля не знать — тогда main.js выключает его и повторяет.
@@ -357,7 +432,7 @@
     return { prompt: prompt || 0, completion: completion || 0, cached: cached || 0 };
   }
 
-  async function consumeProviderStream({ response, provider, onText, onToolCall, onThinking, onUsage, firstByteTimeoutMs, idleTimeoutMs }) {
+  async function consumeProviderStream({ response, provider, onText, onToolCall, onThinking, onUsage, onTruncated, local, firstByteTimeoutMs, idleTimeoutMs }) {
     if (!response || !response.body) throw new Error("Пустой ответ от сервера (нет тела).");
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -380,8 +455,13 @@
       accum.clear();
       pendingExtra = null;
     };
-    const firstMs = firstByteTimeoutMs || 90000;
-    const idleMs = idleTimeoutMs || 60000;
+    // Локальная модель грузится и читает промпт на CPU минутами: 90 с на первый байт
+    // для неё — обрыв на пустом месте (модель просто ещё считает). Облачные значения
+    // не трогаем: там молчание 90 с — признак настоящей поломки. «Локальность»
+    // приходит флагом: LM Studio и vLLM на localhost — такие же местные серверы.
+    const localish = !!local || provider === "ollama";
+    const firstMs = firstByteTimeoutMs || (localish ? 300000 : 90000);
+    const idleMs = idleTimeoutMs || (localish ? 120000 : 60000);
     let gotFirst = false;
     // reader.read() с таймером: зависший стрим не держит чат в «думании» вечно.
     const readChunk = () =>
@@ -442,6 +522,9 @@
             if (onUsage && obj.done && (obj.prompt_eval_count != null || obj.eval_count != null)) {
               onUsage({ prompt: obj.prompt_eval_count || 0, completion: obj.eval_count || 0, cached: 0 });
             }
+            // done_reason «length» = модель упёрлась в лимит вывода и оборвала ответ
+            // на полуслове. Раньше это выглядело как обычный законченный ответ.
+            if (obj.done && obj.done_reason === "length" && onTruncated) onTruncated();
             if (Array.isArray(msg.tool_calls)) {
               for (const tc of msg.tool_calls) {
                 const f = tc.function || {};
@@ -643,6 +726,35 @@
   // ── Реальное окно модели (context_length / context_window из GET /models) ──
   const _ctxModelsCache = new Map(); // base → { ts, byModel: Map<model, window> }
   const _CTX_TTL = 10 * 60 * 1000;
+  // Родные ручки локальных серверов: /v1/models у них часто без окна.
+  // LM Studio: /api/v0/models → max_context_length; llama.cpp: /props → n_ctx
+  // (имя модели там — путь к .gguf, поэтому окно сервера идёт «общим» на базу).
+  async function _localServerWindows(root, byModel) {
+    const to = () =>
+      typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(4000) : undefined;
+    let propsWindow = 0;
+    try {
+      const r = await fetch(root + "/api/v0/models", { signal: to() });
+      if (r.ok) {
+        const d = await r.json();
+        for (const m of d.data || []) {
+          const id = m && m.id ? String(m.id) : "";
+          const win = Number((m && (m.max_context_length || m.loaded_context_length)) || 0) || 0;
+          if (id && win > 0 && !byModel.has(id)) byModel.set(id, win);
+        }
+      }
+    } catch {}
+    try {
+      const r = await fetch(root + "/props", { signal: to() });
+      if (r.ok) {
+        const d = await r.json();
+        const dg = (d && d.default_generation_settings) || {};
+        propsWindow = Number(dg.n_ctx || (d && d.n_ctx) || 0) || 0;
+      }
+    } catch {}
+    return propsWindow;
+  }
+
   async function modelWindow(s, model) {
     const provider = s && s.provider ? s.provider : "openai";
     if (provider === "ollama") return (await ollamaModelInfo(s, model)).window || 0;
@@ -651,7 +763,8 @@
     const now = Date.now();
     let entry = _ctxModelsCache.get(base);
     if (!entry || now - entry.ts > _CTX_TTL) {
-      let fetched = null;
+      const byModel = new Map();
+      let propsWindow = 0;
       try {
         const timeout = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined;
         const res = await fetch(proxiedBase(base) + "/models", {
@@ -660,16 +773,21 @@
         });
         if (res.ok) {
           const d = await res.json();
-          const byModel = new Map();
           for (const m of d.data || []) {
             const id = m && m.id ? String(m.id) : "";
-            const win = (m && (m.context_length || m.context_window)) || 0;
+            // max_model_len отдают vLLM и часть сборок TGI.
+            const win = Number((m && (m.context_length || m.context_window || m.max_model_len)) || 0) || 0;
             if (id && win > 0) byModel.set(id, win);
           }
-          fetched = { ts: now, byModel };
         }
       } catch {}
-      entry = fetched || { ts: now, byModel: new Map() };
+      // Только для локальных адресов: у облака этих ручек нет, а лишний запрос
+      // к чужому серверу — это шум и подозрительное поведение.
+      if (isLocalBase(base)) {
+        const root = String(base || "").replace(/\/+$/, "").replace(/\/v1$/, "");
+        propsWindow = await _localServerWindows(root, byModel);
+      }
+      entry = { ts: now, byModel: byModel, propsWindow: propsWindow };
       _ctxModelsCache.set(base, entry);
     }
     if (!entry) return 0;
@@ -678,6 +796,8 @@
     for (const [id, win] of entry.byModel) {
       if (id.startsWith(model + ":") || id.startsWith(model + "@") || id.startsWith(model + "-")) return win;
     }
+    // llama.cpp назвал модель путём к .gguf — окно сервера всё равно верное.
+    if (entry.propsWindow > 0) return entry.propsWindow;
     return 0;
   }
 
@@ -688,6 +808,8 @@
     messagesForProvider,
     systemText,
     toolsForProvider,
+    toolsAsText,
+    withTextTools,
     cacheableProvider,
     splitStaticSystem,
     anthropicSystem,

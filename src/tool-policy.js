@@ -80,7 +80,7 @@ const CAPABILITIES = [
   ]},
   { cap: "browser.act", risk: RISK.MEDIUM, tools: [
     "browserOpen", "browserClick", "browserFill", "browserPress", "browserSelect", "browserAct",
-    "browserEval", "browserScroll", "browserHover", "browserClose",
+    "browserEval", "browserScroll", "browserHover", "browserReplay", "browserClose",
   ]},
   // Вход в СВОЙ Chrome — свой чекбокс browserConnect в настройках.
   { cap: "browser.account", risk: RISK.HIGH, tools: ["browserConnect"] },
@@ -100,6 +100,9 @@ const CAPABILITIES = [
   // ── дела и заметки ──
   { cap: "tasks.read", risk: RISK.LOW, tools: ["taskList"] },
   { cap: "tasks.write", risk: RISK.LOW, tools: ["taskAdd", "taskUpdate", "taskDone", "taskDelete"] },
+  // Миссии: файлы .agent/ в рабочей папке — это рабочий журнал агента, не код проекта.
+  { cap: "mission.read", risk: RISK.LOW, tools: ["missionStatus"] },
+  { cap: "mission.write", risk: RISK.LOW, tools: ["missionStart", "missionStep", "missionFinish"] },
   { cap: "notes.write", risk: RISK.LOW, tools: ["noteSave", "noteDelete", "checkpointSave"] },
   // Откат чекпоинта перезаписывает файлы проекта — спрашиваем.
   { cap: "notes.restore", risk: RISK.MEDIUM, confirm: true, tools: ["checkpointRollback"] },

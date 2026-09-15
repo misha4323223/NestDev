@@ -33,6 +33,7 @@
     G4F_PROVIDERS,
     splitG4fRoute,
     baseFor,
+    isLocalBase,
     proxiedBase,
     apiKeyFor,
     apiHeaders,
@@ -46,6 +47,25 @@
     createRateLimiter,
     fmtError,
   } = ProviderConfig;
+
+  // ── Локальный ли сервер ────────────────────────────────────────────────
+  // Признак — АДРЕС, а не имя семейства. LM Studio, vLLM, llama.cpp и LocalAI
+  // говорят на OpenAI-совместимом API, но живут на своём ПК: токены там бесплатны,
+  // окно может быть маленьким, а ответ на CPU — долгим. Раньше всё это было
+  // привязано к provider === "ollama", и локальный сервер получал облачные лимиты
+  // (бюджет от денег, таймаут 90 с, схемы всегда). Ollama остаётся локальной всегда:
+  // даже на удалённом хосте её num_ctx/keep_alive — часть своего протокола.
+  function isLocalEndpoint(settings) {
+    const s = settings || {};
+    const provider = s.provider || "openai";
+    if (provider === "ollama") return true;
+    try {
+      return isLocalBase(baseFor(provider, s));
+    } catch {
+      return false;
+    }
+  }
+
   const SYSTEM_PROMPT = `Ты — «Ассистент», AI-разработчик-агент, встроенный в приложение AI Developer Agent. Ты помогаешь пользователю с разработкой: создаёшь папки и файлы, читаешь их, работаешь с git-репозиториями. В начале диалога к твоему системному промпту приложение автоматически добавляет блок «САММАРИ ПРОЕКТА» — краткую визитку рабочей папки (имя проекта, скрипты package.json, структура, начало README). Используй её как отправную точку, не переспрашивай очевидное; детали смотри через listFiles / fileOutline / readFileLines, а актуальность проверяй поиском (searchProject / searchFile).
 
 Правила:
@@ -90,7 +110,8 @@
 
 36. Роли чата: у диалога есть роль — Разработчик (обычная работа с кодом), Ассистент (дела на этом ПК: файлы, письма, сайты, порядок), Менеджер (задачи и сроки), Исследователь (поиск и разбор источников). Текущая роль и её правила приходят блоком «РЕЖИМ» в системном промпте — следуй ему: он важнее привычки писать код. Если просьба явно не про твою роль (например просят чинить код в режиме Менеджера) — сделай что можешь и предложи переключить роль кнопкой «Роль» у поля ввода.
 37. Дела и сроки (taskAdd / taskList / taskUpdate / taskDone / taskDelete): личный список задач пользователя со сроками — он живёт в приложении и виден в панели «Дела». Начинай с taskList, когда речь о планах, дедлайнах, «что сегодня» и отчётах. Любую задачу и договорённость превращай в дело с сроком; просроченное называй первым и прямо. Срок разбирается по-человечески («завтра 14:00», «в пятницу», «через 2 недели»). Закрывай дела только по словам пользователя.
-Доступные инструменты: createFolder, readFile, readFileLines, writeFile, editFile, searchFile, listDirectory, runCommand, webSearch, webFetch, gitClone, gitStatus, gitCommit, gitPush, gitPublish, gitPull, gitLog, gitRevert, askUser, startBackground, listBackground, backgroundOutput, sendInput, stopBackground, shellStart, shellSend, checkUrl, openUrl, showImage, checkPort, listPorts, dockerBuild, dockerRun, dockerExec, installPackage, lintProject, runTests, diffView, previewUI, screenshotCapture, envSet, envList, envUnset, fileOutline, readFileStructure, explainCode, undoEdit, refactorRename, runCommandOutput, retryCommand, timeoutCommand, shellsStatus, checkInstalledProgram, canExecute, installSystemPackage, runCommandAsAdmin, refreshEnv, getSystemInfo, explainError, downloadAndExtract, apiRequest, runScript, validateProject, gitBranch, gitDiff, gitUndoLastCommit, gitInit, getDependencies, formatCode, dbQuery, gitCheckout, findReferences, analyzeImage, generateImage, listProcesses, killProcess, clipboardRead, clipboardWrite, screenshotDesktop, registryRead, registryWrite, openPath, wingetSearch, installExe, browserConnect, browserOpen, browserSnapshot, browserFill, browserClick, browserSelect, browserPress, browserText, browserScreenshot, browserWait, browserEval, browserDOM, browserOverlays, browserAct, browserScroll, browserHover, browserNetwork, waitForIdle, agentGuide, browserClose, browserStatus, browserClearProfile, vaultList, vaultFill, mailSend, mailList, mailCode, appRead, appClick, appFill, appSelect, appPress, appWait, appScreenshot, noteSave, noteRead, noteList, noteDelete, memoryList, memorySearch, todoWrite, checkpointSave, checkpointList, checkpointRollback, applyPatch, waitUntil, gitStash, gitCherryPick, gitBlame, semanticSearch, otaStatus, otaCheck, otaRollback, ycStatus, ycList, ycContainer, ycCosts, ycCreate, ycDelete, ycDeploy, ycLogs, ycInstall, taskAdd, taskList, taskUpdate, taskDone, taskDelete.`;
+38. Данные со страницы бери ЗАПРОСОМ, а не из DOM. Ленивые и виртуальные списки (диалоги ВК, длинные таблицы, ленты) в DOM неполные: строки не отрисованы либо переиспользуются, ref устаревают после перерисовки, а прокрутка «на глаз» проскакивает элементы. Порядок: дай клиенту САМОМУ сделать запрос (открой страницу, прокрути, нажми) → browserNetwork { since: false } (адрес, тело POST, ответ) → browserReplay { match: "часть адреса", cursorParam: "...", cursorPrefix: "...", maxSteps: 30 } — он повторяет тот же запрос ИЗ СТРАНИЦЫ (те же куки и CORS) и листает ответ курсором до конца. Версию API (v) и токен НИКОГДА не подставляй сам — они берутся из перехвата (чужая версия даёт ошибку 100 invalid v). Для ленивого списка по DOM указывай СЕЛЕКТОР СТРОКИ: browserScroll { loadAll: true, container: "...", item: ".convo-item" } — тогда рост считается по уникальным строкам, а последняя прокручивается в кадр (это и запускает подгрузку). Крупные данные складывай в ФАЙЛ (save: true у browserReplay и browserEval) и читай через readFile: window теряется при перезагрузке вкладки. Встроенные предохранители: потолок шагов, стоп по пустому ответу/тоталу/неподвижному курсору, дедуп по ключу (peer_id/href).
+Доступные инструменты: createFolder, readFile, readFileLines, writeFile, editFile, searchFile, listDirectory, runCommand, webSearch, webFetch, gitClone, gitStatus, gitCommit, gitPush, gitPublish, gitPull, gitLog, gitRevert, askUser, startBackground, listBackground, backgroundOutput, sendInput, stopBackground, shellStart, shellSend, checkUrl, openUrl, showImage, checkPort, listPorts, dockerBuild, dockerRun, dockerExec, installPackage, lintProject, runTests, diffView, previewUI, screenshotCapture, envSet, envList, envUnset, fileOutline, readFileStructure, explainCode, undoEdit, refactorRename, runCommandOutput, retryCommand, timeoutCommand, shellsStatus, checkInstalledProgram, canExecute, installSystemPackage, runCommandAsAdmin, refreshEnv, getSystemInfo, explainError, downloadAndExtract, apiRequest, runScript, validateProject, gitBranch, gitDiff, gitUndoLastCommit, gitInit, getDependencies, formatCode, dbQuery, gitCheckout, findReferences, analyzeImage, generateImage, listProcesses, killProcess, clipboardRead, clipboardWrite, screenshotDesktop, registryRead, registryWrite, openPath, wingetSearch, installExe, browserConnect, browserOpen, browserSnapshot, browserFill, browserClick, browserSelect, browserPress, browserText, browserScreenshot, browserWait, browserEval, browserDOM, browserOverlays, browserAct, browserScroll, browserHover, browserNetwork, browserReplay, waitForIdle, agentGuide, browserClose, browserStatus, browserClearProfile, vaultList, vaultFill, mailSend, mailList, mailCode, appRead, appClick, appFill, appSelect, appPress, appWait, appScreenshot, noteSave, noteRead, noteList, noteDelete, memoryList, memorySearch, todoWrite, checkpointSave, checkpointList, checkpointRollback, applyPatch, waitUntil, gitStash, gitCherryPick, gitBlame, semanticSearch, otaStatus, otaCheck, otaRollback, ycStatus, ycList, ycContainer, ycCosts, ycCreate, ycDelete, ycDeploy, ycLogs, ycInstall, taskAdd, taskList, taskUpdate, taskDone, taskDelete.`;
 
   const TOOL_DEFINITIONS = [
     {
@@ -543,13 +564,14 @@
           "Выполнить JavaScript на открытой странице и получить результат. Самый надёжный путь через любые слои: " +
           "нажать перекрытую кнопку (el.click()), отметить скрытую галочку (нужно сначала выставить checked, затем dispatchEvent change), " +
           "прочитать значение из JS-состояния, разобрать структуру. script — выражение или код (можно свои return); " +
-          "результат возвращается текстом (объект — JSON), поэтому проси примитивы: outerHTML, textContent, length, Array.from(...).map(...).",
+          "результат возвращается текстом (объект — JSON), поэтому проси примитивы: outerHTML, textContent, length, Array.from(...).map(...). Для БОЛЬШИХ данных добавь save: true — результат целиком уйдёт в файл, а в ответе придёт путь (читай его через readFile): так ни один хвост не обрежется и данные переживут перезагрузку вкладки.",
         parameters: {
           type: "object",
           properties: {
             script: { type: "string", description: "JS-код или выражение, например: document.querySelector('input[type=checkbox]').click()" },
             tabId: { type: "string", description: "id вкладки (необязательно, по умолчанию активная)" },
             maxChars: { type: "integer", description: "Сколько символов результата вернуть (по умолчанию 2000)" },
+            save: { type: "boolean", description: "Записать результат в файл и вернуть путь (большие данные: страница перезагрузится — накопленное в window пропадёт, файл останется)" },
           },
           required: ["script"],
         },
@@ -664,7 +686,7 @@
         name: "browserNetwork",
         description:
           "Что страница РЕАЛЬНО отправила и что ответил сервер (XHR/fetch: метод, адрес, статус, тип, тело ответа). Спрашивай СРАЗУ после действия — тогда видно, ушла ли форма и что вернул сервер (ошибку, токен, пустой ответ), вместо догадок по DOM. " +
-          "По умолчанию отдаёт новые запросы с прошлого вызова и очищает журнал; статика (картинки, скрипты, стили) отсеивается. filter — подстрока адреса; all: true — включая статику; bodies: false — без тел ответов; since: false — всё накопленное без очистки.",
+          "По умолчанию отдаёт новые запросы с прошлого вызова и очищает журнал; статика (картинки, скрипты, стили) отсеивается. filter — подстрока адреса; all: true — включая статику; bodies: false — без тел ответов; since: false — всё накопленное без очистки. Видно и ТЕЛО POST-запроса (секреты скрыты) — по нему browserReplay повторяет тот же запрос с пагинацией.",
         parameters: {
           type: "object",
           properties: {
@@ -675,6 +697,43 @@
             since: { type: "boolean", description: "false — отдать всё накопленное и не очищать журнал" },
             clear: { type: "boolean", description: "Просто очистить журнал" },
             limit: { type: "integer", description: "Сколько последних запросов показать (по умолчанию 25)" },
+          },
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "browserReplay",
+        description:
+          "Собрать данные тем же ЗАПРОСОМ, который делает сам сайт, — для ленивых и виртуальных списков (диалоги ВК, таблицы, ленты), где DOM показывает лишь часть строк. " +
+          "Сначала дай клиенту сделать запрос (открой страницу/прокрути/кликни), посмотри browserNetwork { since: false } — а потом вызови browserReplay { match: \"часть адреса\" }: он возьмёт из перехвата адрес, метод, версию API и токен, повторит запрос ИЗ САМОЙ страницы (куки и CORS как у клиента) и пролистает ответ курсором. " +
+          "НАСТРОЙКИ ПАГИНАЦИИ: cursorParam (поле тела, например start_from), cursorPrefix (префикс значения, например conversations_), cursorPath (где в ответе лежит курсор — определяется автоматически), start (первое значение), itemsPath (где массив элементов — определяется автоматически), totalPath, maxSteps (потолок, по умолчанию 20). " +
+          "ПРАВКИ ЗАПРОСА: set (переопределить поля тела), remove (убрать поля), key (по какому полю считать повторы — по умолчанию peer_id/id/href). " +
+          "РЕЗУЛЬТАТ: по умолчанию пишется В ФАЙЛ (save: false — вернуть в чат), pick: [\"путь.к.полю\", ...] — показать строки таблицей, rows — сколько строк. " +
+          "Предохранители встроены: потолок шагов, стоп по пустому ответу, по достижению total и по неподвижному курсору, дедупликация повторов. НЕ подставляй версию API (v) и токен руками — они берутся из перехвата, чужая версия даёт ошибку 100 invalid v.",
+        parameters: {
+          type: "object",
+          properties: {
+            match: { type: "string", description: "Часть адреса запроса из журнала сети, например messages.getItems (по умолчанию — последний POST с телом)" },
+            url: { type: "string", description: "Адрес запроса, если повторять не из перехвата" },
+            method: { type: "string", description: "POST (по умолчанию) или GET" },
+            body: { type: "string", description: "Тело запроса (form-encoded), если задаёшь вручную" },
+            set: { type: "object", description: "Переопределить поля тела, например { target_count: 50 }" },
+            remove: { type: "array", description: "Убрать поля тела" },
+            cursorParam: { type: "string", description: "Поле тела с курсором, например start_from" },
+            cursorPrefix: { type: "string", description: "Префикс значения курсора, например conversations_" },
+            cursorPath: { type: "string", description: "Где в ответе взять следующий курсор (по умолчанию ищется сам)" },
+            itemsPath: { type: "string", description: "Где в ответе массив элементов (по умолчанию ищется сам)" },
+            totalPath: { type: "string", description: "Где в ответе общее количество" },
+            key: { type: "string", description: "Поле для дедупликации строк, например conversation.peer.id" },
+            maxSteps: { type: "integer", description: "Потолок запросов (1–60, по умолчанию 20)" },
+            pick: { type: "array", description: "Какие поля вывести строками, например [\"conversation.peer.id\", \"last_message.text\"]" },
+            rows: { type: "integer", description: "Сколько строк показать (по умолчанию 20)" },
+            save: { type: "boolean", description: "false — вернуть данные в чат вместо файла" },
+            dir: { type: "string", description: "Папка для файла результата" },
+            headers: { type: "object", description: "Дополнительные заголовки запроса" },
+            tabId: { type: "string", description: "id вкладки (необязательно, по умолчанию активная)" },
           },
         },
       },
@@ -1893,7 +1952,7 @@
       type: "function",
       function: {
         name: "taskAdd",
-        description: "Добавить дело в личный список задач со сроком (таск-менеджер приложения). Срок разбирается по-человечески: «завтра 14:00», «сегодня вечером», «в пятницу», «через 2 недели», «15.09», «10 октября», «через 2 часа». Дата без времени = весь день (09:00). Указывай срок, если он звучит в словах пользователя; срока нет — спроси, не выдумывай.",
+        description: "Добавить дело в личный список задач со сроком (таск-менеджер приложения). Срок разбирается по-человечески: «завтра 14:00», «сегодня вечером», «в пятницу», «через 2 недели», «15.09», «10 октября», «через 2 часа». Дата без времени = весь день (09:00). Указывай срок, если он звучит в словах пользователя; срока нет — спроси, не выдумывай. Повтор («каждый день», «по будням», «каждую пятницу», «каждый месяц», «каждые 2 часа») ставится параметром repeat. Если дело должен выполнить САМ агент по сроку — добавь auto: true и prompt (что сделать).",
         parameters: {
           type: "object",
           properties: {
@@ -1902,6 +1961,9 @@
             priority: { type: "string", enum: ["low", "normal", "high"], description: "Приоритет (по умолчанию normal)" },
             project: { type: "string", description: "Проект или сфера дела: работа, личное, клиент X" },
             note: { type: "string", description: "Детали дела (до 2000 символов)" },
+            repeat: { type: "string", description: "Повтор: «каждый день», «по будням», «каждую пятницу», «каждый месяц», «каждые 2 часа», пусто — без повтора" },
+            auto: { type: "boolean", description: "true — приложение само запустит агента в срок (в чате «Автозадачи») и положит ответ туда" },
+            prompt: { type: "string", description: "Задание для автозапуска: что именно сделать в срок (нужно при auto: true)" },
           },
           required: ["title"],
         },
@@ -1937,6 +1999,10 @@
             status: { type: "string", enum: ["todo", "doing", "done", "canceled"] },
             project: { type: "string" },
             note: { type: "string" },
+            repeat: { type: "string", description: "Повтор: «каждый день», «по будням», «каждую пятницу», «каждый месяц», «каждые 2 часа», «без повтора»" },
+            auto: { type: "boolean", description: "true — агент выполнит дело сам по сроку" },
+            prompt: { type: "string", description: "Задание для автозапуска: что именно сделать" },
+            snooze: { type: "string", description: "Отсрочить напоминание: «через час», «завтра 9:00» (срок при этом не меняется)" },
           },
           required: ["key"],
         },
@@ -1966,6 +2032,73 @@
           type: "object",
           properties: { key: { type: "string", description: "id дела или часть названия" } },
           required: ["key"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "missionStart",
+        description:
+          "Начать ДОЛГУЮ работу миссией: приложение заведёт папку .agent/missions/<id>/ в рабочей папке (цель, план, журнал шагов, отчёт), будет сама продолжать прогон батчами и сохранит состояние, даже если приложение перезапустят. Вызывай, когда работа требует много шагов: разобрать десятки писем, навести порядок в куче файлов, обработать документы, собрать большой отчёт. Для короткой задачи миссия НЕ нужна — обычная работа идёт как раньше.",
+        parameters: {
+          type: "object",
+          properties: {
+            goal: { type: "string", description: "Что нужно сделать — полностью, словами пользователя (это цель миссии)" },
+            title: { type: "string", description: "Короткое название миссии (для папки и панели)" },
+            steps: { type: "array", items: { type: "string" }, description: "План работ: 3–10 шагов по порядку" },
+            minutes: { type: "number", description: "Сколько минут разрешено работать над миссией (по умолчанию из настроек, 480 = 8 часов)" },
+          },
+          required: ["goal"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "missionStep",
+        description:
+          "Отметить шаг миссии: done — что сделано, fail — что не получилось, next — что делаешь дальше, note — что попутно замечено. Всё пишется в журнал .agent/missions/<id>/journal.md, поэтому отмечай КАЖДЫЙ законченный шаг: по журналу человек видит, чем ты занят. Работает и без missionStart — если миссия есть, шаг попадёт в неё.",
+        parameters: {
+          type: "object",
+          properties: {
+            done: { type: "string", description: "Что выполнено (коротко, по-русски)" },
+            fail: { type: "string", description: "Что не получилось (вместо done)" },
+            next: { type: "string", description: "Следующий шаг — что делаешь сейчас" },
+            note: { type: "string", description: "Деталь: сколько нашёл, что решил, что мешает" },
+          },
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "missionStatus",
+        description:
+          "Показать миссию: цель, план с отметками, прогресс, метрики и хвост журнала. Вызывай в начале работы (чтобы продолжить с места остановки) и когда нужно понять, что уже сделано.",
+        parameters: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "id миссии (без него — текущая незакрытая)" },
+            journal: { type: "number", description: "Сколько строк журнала показать (по умолчанию 20)" },
+          },
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "missionFinish",
+        description:
+          "Закрыть миссию, когда работа действительно закончена: report — короткий итог для человека (попадёт в report.md и в чат), status — done | failed | stopped. Если миссию не закрыть, приложение будет считать работу незавершённой и предлагать продолжить.",
+        parameters: {
+          type: "object",
+          properties: {
+            report: { type: "string", description: "Итог: что сделано, что осталось, как проверить" },
+            status: { type: "string", enum: ["done", "failed", "stopped"], description: "Состояние миссии (по умолчанию done)" },
+            next: { type: "string", description: "Что осталось на потом (необязательно)" },
+          },
+          required: ["report"],
         },
       },
     },
@@ -2307,6 +2440,8 @@
     modelWindow,
     ollamaModelInfo,
     ollamaNumCtx,
+    toolsAsText,
+    withTextTools,
   } = ProviderTransport({ config: ProviderConfig, toolDefinitions: TOOL_DEFINITIONS });
 
   // ── Контекст и компакция ───────────────────────────────────────────────────
@@ -2319,6 +2454,7 @@
     estimateTokens,
     estimateMessageTokens,
     contextBudget,
+    windowBudget,
     sanitizeToolPairs,
     trimConversation,
     truncateText,
@@ -2565,6 +2701,12 @@
     hover: "browserHover",
     scroll: "browserScroll",
     network: "browserNetwork",
+    replay: "browserReplay",
+    browser_replay: "browserReplay",
+    replay_request: "browserReplay",
+    virtual_list: "browserReplay",
+    list_all: "browserReplay",
+    read_all: "browserReplay",
     browser_scroll: "browserScroll",
     scroll_page: "browserScroll",
     scrollto: "browserScroll",
@@ -2992,7 +3134,7 @@
     // Браузерный минимум: без него при тесном контексте агент не мог открыть сайт вообще.
     "browserOpen", "browserSnapshot", "browserClick", "browserFill", "browserAct",
     "browserScroll", "browserHover", "browserScreenshot", "browserNetwork", "waitForIdle",
-    "browserEval", "browserOverlays", "agentGuide",
+    "browserEval", "browserOverlays", "agentGuide", "browserReplay",
   ]);
   const CORE_TOOL_DEFINITIONS = TOOL_DEFINITIONS.filter((t) => CORE_TOOL_NAMES.has(t.function && t.function.name));
   // План-режим: модель должна уметь составить план структурой, а не текстом,
@@ -3080,6 +3222,12 @@
         "6. Письма и напоминания наружу — только по явной просьбе и после подтверждения адресата.",
         "7. Код и файлы проекта не трогай, пока не попросят: твоя работа — дела, сроки и порядок.",
         "8. Если дел нет — так и скажи и предложи занести первое.",
+        "9. Повторяющиеся планы («каждый день в 9», «по понедельникам») заводи через taskAdd с repeat: «каждый день», «по будням», «каждую пятницу», «каждый месяц», «каждые 2 часа».",
+        "10. Дело, которое агент должен ВЫПОЛНИТЬ сам по сроку, помечай auto: true и пиши prompt — что именно сделать. Тогда приложение в срок запустит агента в чате «Автозадачи», и ответ появится там. Без auto дело только напоминает.",
+        "11. Отсрочить надоевшее напоминание — taskUpdate с snooze: «через час», «завтра 9:00». Срок при этом не меняется.",
+        "12. БОЛЬШАЯ работа (разобрать десятки писем, навести порядок в куче файлов, обработать пачку документов, собрать большой отчёт) — это миссия: сначала missionStart(goal, steps), потом работай шаг за шагом и после КАЖДОГО шага вызывай missionStep(done, next, note). Файлы миссии лежат в рабочей папке (.agent/missions/<id>/), поэтому работу видно человеку и она переживает перезапуск приложения.",
+        "13. Миссия не закрыта — не заканчивай ответ словами «осталось сделать то и то»: продолжай делом. Закрывай её только когда работа действительно сделана — missionFinish(report) с коротким итогом.",
+        "14. Если тебя разбудили по сроку (чат «Автозадачи») — сначала missionStatus (или missionStart, если миссии ещё нет), потом работа: в журнале должно быть видно, чем ты занимался.",
       ].join("\n"),
     },
     {
@@ -3158,11 +3306,11 @@
       keywords: ["браузер", "browser", "сайт", "страниц", "вкладк", "зайди", "зайти", "открой ссылк",
         "ссылк", "url", "http", "гугл", "google", "авито", "вконтакте", "вк ", "клик", "нажми",
         "навед", "прокрут", "скролл", "подсказк", "капч", "cookies", "сесси", "chromium", "playwright",
-        "авторизуй", "форма вход"],
+        "авторизуй", "форма вход", "ленив", "виртуальн", "диалог", "пагинац", "все сообщения"],
       names: ["browserOpen", "browserConnect", "browserClose", "browserStatus", "browserClearProfile",
         "browserSnapshot", "browserClick", "browserFill", "browserAct", "browserSelect", "browserPress",
         "browserText", "browserScreenshot", "browserEval", "browserDOM", "browserOverlays", "browserWait",
-        "browserScroll", "browserHover", "browserNetwork", "waitForIdle", "agentGuide"],
+        "browserScroll", "browserHover", "browserNetwork", "browserReplay", "waitForIdle", "agentGuide"],
     },
     {
       id: "system",
@@ -3215,8 +3363,10 @@
       title: "дела и сроки (личный список задач)",
       keywords: ["задач", "срок", "дедлайн", "deadline", "просроч", "напомни", "мои дела", "список дел",
         "напомина", "расписан", "календар", "встреч", "план на", "чеклист", "менеджер",
-        "что сделать", "успеть", "перенес", "записать дело", "меня дела", "по делам", "на сегодня", "на неделю"],
-      names: ["taskAdd", "taskList", "taskUpdate", "taskDone", "taskDelete"],
+        "что сделать", "успеть", "перенес", "записать дело", "меня дела", "по делам", "на сегодня", "на неделю",
+        "мисси", "долгая работа", "долго работать", "работай долго", "по шагам", "не останавливайся", "работай часами"],
+      names: ["taskAdd", "taskList", "taskUpdate", "taskDone", "taskDelete",
+        "missionStart", "missionStep", "missionStatus", "missionFinish"],
     },
     {
       id: "mail",
@@ -3411,6 +3561,21 @@
 
   // Итоговый набор схем: база + липкие/найденные группы в КАНОНИЧЕСКОМ порядке.
   // opts: { text, sticky (массив id), roleGroups (id групп роли), forceAll, maxTokens }
+  // Минимальная история, которую оставляем модели. Служит границей для роутера:
+  // сколько токенов окна можно отдать схемам, не оставив диалог без истории.
+  // Раньше граница была жёсткой (12 000) и на локальном окне 8–32k съедала весь
+  // остаток — группы схем срезались всегда, то есть роли и справочники не работали.
+  const MIN_HISTORY_TOKENS = 1500;
+  // Потолок веса схем: не больше ROUTER_MAX_TOKENS и не больше того, что реально
+  // остаётся от окна после системного промпта и минимальной истории.
+  function routerMaxTokens(budget, systemWeight, baseWeight) {
+    const b = Math.max(0, Math.round(Number(budget) || 0));
+    const sys = Math.max(0, Math.round(Number(systemWeight) || 0));
+    const base = Math.max(0, Math.round(Number(baseWeight) || 0));
+    const spare = b - sys - MIN_HISTORY_TOKENS;
+    return Math.max(base, Math.min(ROUTER_MAX_TOKENS, Math.max(base, spare)));
+  }
+
   function routeTools(opts) {
     const o = opts || {};
     const sticky = new Set(o.sticky || []);
@@ -3560,8 +3725,12 @@
     PLAN_MAX_ITEMS,
     extractToolCallsFromText,
     // транспорт провайдеров
+    baseFor,
+    isLocalBase,
     buildChatRequest,
     consumeProviderStream,
+    toolsAsText,
+    withTextTools,
     listModels,
     readApiError,
     friendlyRateLimitError,
@@ -3572,11 +3741,14 @@
     estimateTokens,
     estimateMessageTokens,
     contextBudget,
+    windowBudget,
     trimConversation,
     sanitizeToolPairs,
     truncateText,
     selectTools,
     routeTools,
+    routerMaxTokens,
+    MIN_HISTORY_TOKENS,
     routerTaskText,
     coldCacheInfo,
     UNAVAILABLE_MAX,
@@ -3595,6 +3767,7 @@
     modelWindow,
     ollamaModelInfo,
     ollamaNumCtx,
+    isLocalEndpoint,
     compactRemote,
     createContextManager,
     // веб (общий для Electron main и preview-сервера)

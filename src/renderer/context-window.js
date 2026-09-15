@@ -55,11 +55,38 @@
     // уходит нужный num_ctx. Здесь — только потолок на случай, когда сервер молчит:
     // прежние 14 000 не были ошибкой как потолок, но без реального окна и без num_ctx
     // агент получал дефолтные 2048 токенов контекста и обрезание на середине задачи.
-    if (provider === "ollama") return 14000;
+    if (provider === "ollama") return LOCAL_CTX_FALLBACK;
+    // Локальный сервер совместимого API с НЕИЗВЕСТНЫМ окном сюда намеренно не заведён:
+    // снижать бюджет «на всякий случай» — значит молча отнимать историю у g4f и подобных
+    // местных прокси к большим моделям. Окно спрашивается у самого сервера
+    // (modelWindow: /models, LM Studio /api/v0/models, llama.cpp /props), а переполнение
+    // ловит существующий повтор того же раунда с меньшим бюджетом.
     const m = String(model || "");
     if (/deepseek|qwen/i.test(m)) return 26000;
     if (provider === "anthropic") return 80000;
     return 50000;
+  }
+
+  // ── Сколько контекста выделять, когда окно модели ИЗВЕСТНО ──
+  // У облака бюджет — «сколько не жалко токенов»: он и остаётся потолком.
+  // У локальной модели токены бесплатны, платим памятью (KV-кэш) и временем,
+  // поэтому потолок другой, а настоящий предел даёт окно модели.
+  // Прежние жёсткие 14 000 были наследием облачной экономии: у модели с окном 40k
+  // история сжималась втрое раньше, чем кончалось место.
+  const LOCAL_CTX_FALLBACK = 14000; // окно неизвестно (сервер молчит) — безопасный дефолт
+  const LOCAL_CTX_CAP = 32768; // KV-кэш 8B-модели ~4 ГБ: выше — уже не ноутбук
+  const OUTPUT_RESERVE = 4096; // запас на ответ модели и результаты инструментов
+  function windowBudget(provider, cloudBudget, window, opts) {
+    const win = Math.round(Number(window) || 0);
+    const cloud = Math.round(Number(cloudBudget) || 0);
+    if (win <= 0) return cloud; // окно неизвестно — поведение прежнее
+    // Потолок локального сервера — память (KV-кэш), а не наш облачный бюджет:
+    // у LM Studio и vLLM на localhost токены так же бесплатны, как у Ollama.
+    const local = !!((opts && opts.local) || provider === "ollama");
+    const cap = local ? LOCAL_CTX_CAP : cloud;
+    const fit = Math.min(win - OUTPUT_RESERVE, cap);
+    // Окно меньше резерва (модель на 2k): отдаём всё окно, не больше и не меньше.
+    return fit > 0 ? fit : Math.min(cloud, win);
   }
 
   // Обрезает массив канонических сообщений так, чтобы их суммарная оценка токенов
@@ -136,7 +163,16 @@
   }
 
   // ── Компакция: старые витки диалога сжимаются в памятку дешёвым вызовом модели ──
-  async function compactRemote(s, messages) {
+  async function compactRemote(s, messages, opts) {
+    // opts — { numCtx, keepAlive, timeoutMs, onFail }: локальной модели нужен свой
+    // num_ctx (иначе Ollama берёт дефолт 2048 и собирает памятку из обрезанного
+    // текста), а о провале надо сказать вслух, а не молчать.
+    const o = opts || {};
+    const fail = (why) => {
+      if (typeof o.onFail === "function") {
+        try { o.onFail(why); } catch (e) {}
+      }
+    };
     try {
       const provider = s && s.provider ? s.provider : "openai";
       const model = (s && s.model) || "";
@@ -167,7 +203,12 @@
       if (!body.trim()) return null;
       const sys =
         "Ты — менеджер памяти ИИ-агента-разработчика. Сожми переписку в краткую памятку на русском (до 700 слов): что просил пользователь, что уже сделано (файлы, команды, git), текущее состояние проекта, что осталось сделать. Памятка должна позволить агенту продолжить работу без исходных сообщений. Пиши только саму памятку, без пояснений.";
-      const timeout = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(30000) : undefined;
+      // Сжать «до 700 слов» на CPU — это минуты: 30 с рвали запрос на середине, и
+      // сжатие всегда «не срабатывало». Облаку хватает 30 с, локальной модели — нет,
+      // причём «локальная» — это любой местный сервер, а не только Ollama.
+      const slowLocal = !!(o.local || provider === "ollama");
+      const timeoutMs = Math.round(Number(o.timeoutMs) || (slowLocal ? 300000 : 30000));
+      const timeout = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(timeoutMs) : undefined;
       const headers = apiHeaders(provider, apiKeyFor(provider, s), false, projectHeader(s));
       if (provider === "anthropic") {
         const res = await fetch(baseFor(provider, s) + "/v1/messages", {
@@ -181,13 +222,23 @@
         return (d.content || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n") || null;
       }
       if (provider === "ollama") {
+        const localChat = {
+          model: model,
+          messages: [{ role: "system", content: sys }, { role: "user", content: body }],
+          stream: false,
+          // keep_alive обязателен и здесь: без него локальная сессия получает дефолтные
+          // 5 минут и выгружает модель ровно тогда, когда она нужна для работы.
+          keep_alive: o.keepAlive || "5m",
+        };
+        const numCtx = Math.round(Number(o.numCtx) || 0);
+        if (numCtx > 0) localChat.options = { num_ctx: numCtx };
         const res = await fetch(baseFor(provider, s) + "/api/chat", {
           method: "POST",
-          headers,
+          headers: headers,
           signal: timeout,
-          body: JSON.stringify({ model, messages: [{ role: "system", content: sys }, { role: "user", content: body }], stream: false }),
+          body: JSON.stringify(localChat),
         });
-        if (!res.ok) return null;
+        if (!res.ok) throw new Error("Ollama error " + res.status + ": " + (await res.text()).slice(0, 200));
         const d = await res.json();
         return (d.message && d.message.content) || null;
       }
@@ -200,7 +251,10 @@
       if (!res.ok) return null;
       const d = await res.json();
       return (d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content) || null;
-    } catch {
+    } catch (e) {
+      // Раньше ошибка глоталась здесь: сжатие молча «не срабатывало», вместо памятки
+      // шла обрезка головы вместе с целью задачи, и агент выглядел забывчивым.
+      fail(e && e.name === "AbortError" ? "не успело за отведённое время" : (e && e.message) || String(e));
       return null;
     }
   }
@@ -222,6 +276,12 @@
     let compactCount = 0;
     const COMPACT_LIMIT = 3;
     let compactMemo = null;
+    // num_ctx для запроса за памяткой: тот же, что у основного запроса, иначе Ollama
+    // собирает памятку с дефолтным окном 2048 и ещё и перезагружает модель.
+    const localCtx = Math.round(Number(opts && opts.localCtx) || 0);
+    // Локальный сервер (по адресу) — тому же флагу доверяем и таймаут сжатия.
+    const localServer = !!(opts && opts.local);
+    let compactFailed = false;
     return {
       async manage(messages, budget) {
         if (!Array.isArray(messages) || !messages.length) return messages || [];
@@ -239,7 +299,21 @@
             // повторное сжатие потеряло бы всё, что уже было свёрнуто в неё.
             const memoText = await compactRemote(
               settings,
-              compactMemo ? [compactMemo, ...messages] : messages
+              compactMemo ? [compactMemo, ...messages] : messages,
+              {
+                numCtx: localCtx,
+                local: localServer,
+                onFail: (why) => {
+                  if (compactFailed) return; // говорим один раз за прогон, а не каждый виток
+                  compactFailed = true;
+                  if (emit) {
+                    emit({
+                      type: "notice",
+                      text: "⚠ Сжать старые шаги не удалось (" + why + "): обрезаю историю и продолжаю. Контекст сохранён не будет.",
+                    });
+                  }
+                },
+              }
             );
             if (memoText && String(memoText).trim()) {
               compactMemo = {
@@ -270,6 +344,11 @@
       memo() {
         return compactMemo;
       },
+      // Сколько сжатий сделано за прогон: панель «Миссия» показывает это как
+      // признак того, что работа действительно долгая.
+      compactions() {
+        return compactCount;
+      },
     };
   }
 
@@ -277,6 +356,7 @@
     estimateTokens,
     estimateMessageTokens,
     contextBudget,
+    windowBudget,
     sanitizeToolPairs,
     trimConversation,
     truncateText,

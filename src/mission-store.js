@@ -1,0 +1,634 @@
+"use strict";
+/* Миссии агента — то, что делает долгую работу видимой и переживающей перезапуск.
+
+   Зачем файлы, а не память процесса: агент, который работает часами, не имеет права
+   терять задачу из-за перезапуска, обновления или обрыва связи. Поэтому цель, план,
+   шаги и журнал шагов лежат на диске — рядом с проектом, в папке `.agent/`:
+
+     <рабочая папка>/.agent/
+       README.md              — что это за папка (создаётся один раз, для человека)
+       .gitignore             — `*`: журнал не должен попадать в коммиты проекта
+       tasks.md               — зеркало списка дел (читаемо, если включено в настройках)
+       context/<ГГГГ-ММ-ДД>.md — зеркало памяток контекста за день
+       missions/<id>/
+         mission.json         — цель, шаги, состояние, метрики, лимиты
+         journal.md           — журнал человеческим языком (время · шаг · что сделано)
+         journal.jsonl        — то же машинно: панель «Миссия» читает хвост
+         report.md            — итог работы (когда миссия закрыта)
+
+   Никаких зависимостей от Electron: рабочая папка приходит аргументом, поэтому модуль
+   проверяется обычными тестами. Секреты маскируются тем же кодом, что и дневник
+   контекста (agent-store), — чтобы случайный ключ из переписки не осел на диске. */
+
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const { redactSecrets, localDayKey } = require("./agent-store.js");
+
+const AGENT_DIR = ".agent";
+const MISSIONS_DIR = "missions";
+const MISSION_MAX_KEEP = 40; // сколько миссий храним (старые закрытые удаляются)
+const MISSION_MAX_STEPS = 200; // шагов в одной миссии
+const MISSION_TEXT_MAX = 2000; // символов в поле/строке журнала
+const JOURNAL_MAX_BYTES = 1500 * 1024; // после этого журнал подрезается до хвоста
+const JOURNAL_KEEP_LINES = 400;
+const JOURNAL_TAIL_LINES = 20; // хвост для панели и для агента
+const MISSION_STATUSES = ["active", "paused", "done", "failed", "stopped"];
+const STEP_STATES = ["todo", "doing", "done", "failed"];
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function stamp(ts) {
+  const d = new Date(Number(ts) || Date.now());
+  return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+}
+
+function humanTs(ts) {
+  const d = new Date(Number(ts) || Date.now());
+  return pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+}
+
+// Заголовок → часть имени папки: «Разбери входящие за неделю» → «razberi-vhodyashchie».
+// Транслит не делаем: кириллица в именах папок Windows и Linux работает нормально,
+// а читаемость для человека важнее. Служебные символы пути вырезаем всегда.
+function slugify(text, max) {
+  const s = String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9а-яё]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, max || 28);
+  return s || "missiya";
+}
+
+function clip(text, max) {
+  const s = redactSecrets(String(text == null ? "" : text)).trim();
+  const m = max || MISSION_TEXT_MAX;
+  return s.length > m ? s.slice(0, m) + " …" : s;
+}
+
+function atomicWriteText(file, text) {
+  const tmp = file + ".tmp";
+  fs.writeFileSync(tmp, String(text), "utf8");
+  fs.renameSync(tmp, file);
+}
+
+// ── Пути ──────────────────────────────────────────────────────────────────────
+function agentRoot(workDir) {
+  return path.join(String(workDir || ""), AGENT_DIR);
+}
+
+function missionsDir(workDir) {
+  return path.join(agentRoot(workDir), MISSIONS_DIR);
+}
+
+function missionDirOf(workDir, id) {
+  return path.join(missionsDir(workDir), String(id || ""));
+}
+
+function missionFile(workDir, id) {
+  return path.join(missionDirOf(workDir, id), "mission.json");
+}
+
+// Папка `.agent` создаётся один раз: README для человека и .gitignore (`*`), чтобы
+// рабочий журнал не попадал в коммиты проекта (авто-коммит агента делает git add -A).
+const AGENT_README = [
+  "# .agent — рабочая папка агента",
+  "",
+  "Здесь агент хранит свою работу, чтобы не терять её при перезапуске:",
+  "",
+  "- `missions/<id>/mission.json` — цель, план, шаги, состояние, метрики;",
+  "- `missions/<id>/journal.md` — журнал шагов человеческим языком;",
+  "- `missions/<id>/report.md` — итог по завершении;",
+  "- `tasks.md` — зеркало списка дел приложения (если включено в настройках);",
+  "- `context/<дата>.md` — зеркало памяток контекста (если включена «Память диалогов»).",
+  "",
+  "Папку можно удалять целиком — приложение создаст её заново. Она исключена из git",
+  "файлом `.gitignore` внутри (строка `*`), поэтому журнал не попадает в коммиты.",
+  "",
+].join("\n");
+
+function ensureAgentRoot(workDir) {
+  const root = agentRoot(workDir);
+  fs.mkdirSync(root, { recursive: true });
+  const readme = path.join(root, "README.md");
+  if (!fs.existsSync(readme)) atomicWriteText(readme, AGENT_README);
+  const gi = path.join(root, ".gitignore");
+  if (!fs.existsSync(gi)) {
+    // `*` в .gitignore внутри каталога исключает и сам файл — папка целиком вне git.
+    atomicWriteText(gi, "*\n");
+  }
+  fs.mkdirSync(missionsDir(workDir), { recursive: true });
+  return root;
+}
+
+// ── Журнал ────────────────────────────────────────────────────────────────────
+function journalMdFile(workDir, id) {
+  return path.join(missionDirOf(workDir, id), "journal.md");
+}
+
+function journalJsonFile(workDir, id) {
+  return path.join(missionDirOf(workDir, id), "journal.jsonl");
+}
+
+function journalTrimIfBig(file) {
+  try {
+    const st = fs.statSync(file);
+    if (st.size <= JOURNAL_MAX_BYTES) return;
+    const lines = fs.readFileSync(file, "utf8").split("\n");
+    const tail = lines.slice(Math.max(0, lines.length - JOURNAL_KEEP_LINES));
+    atomicWriteText(file, "… (старые строки журнала свёрнуты)\n" + tail.join("\n"));
+  } catch {}
+}
+
+// Одна строка журнала: пишем и человеку (markdown), и панели (jsonl).
+function journalAppend(workDir, id, entry) {
+  const e = entry || {};
+  const ts = Number(e.ts) || Date.now();
+  const text = clip(e.text, MISSION_TEXT_MAX);
+  if (!text) return;
+  const rec = { ts, kind: String(e.kind || "note").slice(0, 20), text, step: e.step == null ? null : Number(e.step) };
+  try {
+    fs.appendFileSync(journalMdFile(workDir, id), "- `" + stamp(ts) + "` " + text.replace(/\n+/g, " ") + "\n", "utf8");
+    fs.appendFileSync(journalJsonFile(workDir, id), JSON.stringify(rec) + "\n", "utf8");
+    journalTrimIfBig(journalJsonFile(workDir, id));
+    journalTrimIfBig(journalMdFile(workDir, id));
+  } catch {}
+}
+
+// Хвост файла: у длинной миссии читать целиком нельзя (журнал растёт часами).
+function readTailLines(file, limit) {
+  let fd = null;
+  try {
+    const st = fs.statSync(file);
+    const bytes = Math.min(st.size, 256 * 1024);
+    const buf = Buffer.alloc(bytes);
+    fd = fs.openSync(file, "r");
+    fs.readSync(fd, buf, 0, bytes, st.size - bytes);
+    const lines = buf.toString("utf8").split("\n").filter(Boolean);
+    // Первая строка может быть обрезана посередине — её выбрасываем, если читали не с начала.
+    const clean = st.size > bytes ? lines.slice(1) : lines;
+    return clean.slice(Math.max(0, clean.length - (limit || JOURNAL_TAIL_LINES)));
+  } catch {
+    return [];
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+function missionJournal(workDir, id, opts) {
+  const o = opts || {};
+  const limit = Math.max(1, Math.min(200, Number(o.limit) || JOURNAL_TAIL_LINES));
+  const out = [];
+  for (const line of readTailLines(journalJsonFile(workDir, id), limit)) {
+    try {
+      const rec = JSON.parse(line);
+      if (rec && rec.text) out.push(rec);
+    } catch {}
+  }
+  return out;
+}
+
+function missionJournalText(workDir, id, opts) {
+  const rows = missionJournal(workDir, id, opts);
+  if (!rows.length) return "Журнал пуст — работа ещё не начиналась.";
+  return rows.map((r) => "- " + humanTs(r.ts) + " " + r.text).join("\n");
+}
+
+// ── Миссия ────────────────────────────────────────────────────────────────────
+function newId(goal, ts) {
+  const d = new Date(Number(ts) || Date.now());
+  const day = d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate());
+  const time = pad2(d.getHours()) + pad2(d.getMinutes());
+  return day + "-" + time + "-" + slugify(goal, 28);
+}
+
+function stepsFrom(list) {
+  const out = [];
+  for (const raw of Array.isArray(list) ? list.slice(0, MISSION_MAX_STEPS) : []) {
+    const title = typeof raw === "string" ? raw : raw && raw.title;
+    const t = clip(title, 200);
+    if (!t) continue;
+    out.push({
+      title: t,
+      state: (raw && STEP_STATES.indexOf(raw.state) >= 0 && raw.state) || "todo",
+      note: raw && raw.note ? clip(raw.note, 400) : "",
+      doneAt: 0,
+    });
+  }
+  return out;
+}
+
+function missionCreate(workDir, opts) {
+  const dir = String(workDir || "").trim();
+  if (!dir) return { ok: false, error: "Не задана рабочая папка — миссию некуда положить." };
+  const o = opts || {};
+  const goal = clip(o.goal || o.title, 4000);
+  if (!goal) return { ok: false, error: "Пустая цель: миссии нужна хотя бы одна строка, что делать." };
+  const ts = Number(o.ts) || Date.now();
+  let id = newId(o.title || goal, ts);
+  let n = 2;
+  while (fs.existsSync(missionDirOf(dir, id)) && n < 50) id = newId(o.title || goal, ts) + "-" + n++;
+  const rec = {
+    id,
+    title: clip(o.title || goal.split("\n")[0], 160),
+    goal,
+    role: String(o.role || "").slice(0, 40),
+    chatId: String(o.chatId || "").slice(0, 80),
+    workDir: dir,
+    status: "active",
+    createdAt: ts,
+    updatedAt: ts,
+    startedAt: ts,
+    finishedAt: 0,
+    rounds: 0,
+    batches: 0,
+    steps: stepsFrom(o.steps),
+    next: o.next ? clip(o.next, 400) : "",
+    limits: {
+      minutes: Math.max(1, Math.min(24 * 60, Number(o.limits && o.limits.minutes) || 480)),
+      rounds: Math.max(1, Math.min(10000, Number(o.limits && o.limits.rounds) || 600)),
+    },
+    metrics: { tokens: 0, compactions: 0, autoContinuations: 0, errors: 0 },
+    reason: "",
+  };
+  try {
+    ensureAgentRoot(dir);
+    fs.mkdirSync(missionDirOf(dir, id), { recursive: true });
+    atomicWriteText(missionFile(dir, id), JSON.stringify(rec, null, 2));
+  } catch (err) {
+    return { ok: false, error: "Не удалось создать миссию: " + (err.message || String(err)) };
+  }
+  journalAppend(dir, id, { kind: "start", text: "🎯 Миссия начата: " + rec.title, ts });
+  if (rec.steps.length) {
+    journalAppend(dir, id, { kind: "plan", text: "План (" + rec.steps.length + "): " + rec.steps.map((s) => s.title).join(" · "), ts });
+  }
+  missionPrune(dir);
+  return { ok: true, mission: rec, dir: missionDirOf(dir, id) };
+}
+
+function missionLoad(workDir, id) {
+  try {
+    const rec = JSON.parse(fs.readFileSync(missionFile(workDir, id), "utf8"));
+    if (!rec || !rec.id) return null;
+    return rec;
+  } catch {
+    return null;
+  }
+}
+
+function missionSave(workDir, rec) {
+  if (!rec || !rec.id) return { ok: false, error: "Миссия без id." };
+  try {
+    rec.updatedAt = Date.now();
+    atomicWriteText(missionFile(workDir, rec.id), JSON.stringify(rec, null, 2));
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: "Не удалось сохранить миссию: " + (err.message || String(err)) };
+  }
+}
+
+function missionProgress(rec) {
+  const steps = (rec && rec.steps) || [];
+  let done = 0;
+  let failed = 0;
+  let current = "";
+  for (const s of steps) {
+    if (s.state === "done") done++;
+    else if (s.state === "failed") failed++;
+    else if (!current && s.state === "doing") current = s.title;
+  }
+  return {
+    total: steps.length,
+    done,
+    failed,
+    left: Math.max(0, steps.length - done - failed),
+    current: current || (rec && rec.next) || "",
+    percent: steps.length ? Math.round(((done + failed) / steps.length) * 100) : 0,
+  };
+}
+
+// Один шаг работы: что сделано, что дальше, что попутно замечено.
+function missionStep(workDir, id, opts) {
+  const o = opts || {};
+  const rec = missionLoad(workDir, id);
+  if (!rec) return { ok: false, error: "Миссия не найдена: " + id };
+  const ts = Date.now();
+  const lines = [];
+  const findStep = (title) => {
+    const t = clip(title, 200).toLowerCase();
+    if (!t) return -1;
+    let idx = rec.steps.findIndex((s) => s.title.toLowerCase() === t);
+    if (idx < 0) idx = rec.steps.findIndex((s) => s.state !== "done" && s.state !== "failed" && (s.title.toLowerCase().indexOf(t) >= 0 || t.indexOf(s.title.toLowerCase()) >= 0));
+    return idx;
+  };
+
+  if (o.done) {
+    let idx = findStep(o.done);
+    if (idx < 0) {
+      // Сделано то, чего не было в плане, — не теряем это, добавляем шагом.
+      if (rec.steps.length < MISSION_MAX_STEPS) {
+        rec.steps.push({ title: clip(o.done, 200), state: "done", note: "", doneAt: ts });
+        idx = rec.steps.length - 1;
+      }
+    } else {
+      rec.steps[idx].state = "done";
+      rec.steps[idx].doneAt = ts;
+    }
+    lines.push("✅ Шаг выполнен: " + clip(o.done, 200));
+  }
+  if (o.fail) {
+    const idx = findStep(o.fail);
+    if (idx >= 0) {
+      rec.steps[idx].state = "failed";
+      rec.steps[idx].note = clip(o.note || "", 400);
+      rec.steps[idx].doneAt = ts;
+    } else if (rec.steps.length < MISSION_MAX_STEPS) {
+      rec.steps.push({ title: clip(o.fail, 200), state: "failed", note: clip(o.note || "", 400), doneAt: ts });
+    }
+    lines.push("⚠ Не удалось: " + clip(o.fail, 200) + (o.note ? " — " + clip(o.note, 300) : ""));
+  }
+  if (o.next) {
+    const idx = findStep(o.next);
+    if (idx >= 0) {
+      rec.steps[idx].state = "doing";
+      rec.next = rec.steps[idx].title;
+    } else if (rec.steps.length < MISSION_MAX_STEPS) {
+      rec.steps.push({ title: clip(o.next, 200), state: "doing", note: "", doneAt: 0 });
+      rec.next = clip(o.next, 200);
+    } else {
+      rec.next = clip(o.next, 200);
+    }
+    lines.push("▸ Дальше: " + clip(o.next, 200));
+  }
+  if (o.note) lines.push("· " + clip(o.note, 600));
+  for (const t of lines) journalAppend(workDir, id, { kind: o.fail ? "fail" : "step", text: t, ts });
+  const saved = missionSave(workDir, rec);
+  if (!saved.ok) return saved;
+  return { ok: true, mission: rec, progress: missionProgress(rec) };
+}
+
+// Служебная запись в журнал (батч начался, пауза, ошибка, авто-продолжение).
+function missionNote(workDir, id, kind, text) {
+  const rec = missionLoad(workDir, id);
+  if (!rec) return { ok: false, error: "Миссия не найдена: " + id };
+  journalAppend(workDir, id, { kind, text });
+  return { ok: true };
+}
+
+function missionCounters(workDir, id, patch) {
+  const rec = missionLoad(workDir, id);
+  if (!rec) return { ok: false, error: "Миссия не найдена: " + id };
+  const p = patch || {};
+  rec.rounds += Math.max(0, Number(p.rounds) || 0);
+  rec.batches += Math.max(0, Number(p.batches) || 0);
+  rec.metrics.tokens += Math.max(0, Number(p.tokens) || 0);
+  rec.metrics.compactions += Math.max(0, Number(p.compactions) || 0);
+  rec.metrics.autoContinuations += Math.max(0, Number(p.autoContinuations) || 0);
+  rec.metrics.errors += Math.max(0, Number(p.errors) || 0);
+  if (p.next) rec.next = clip(p.next, 400);
+  const saved = missionSave(workDir, rec);
+  return saved.ok ? { ok: true, mission: rec } : saved;
+}
+
+// Закрытие миссии: итог уходит в report.md, состояние — в mission.json.
+function missionFinish(workDir, id, opts) {
+  const o = opts || {};
+  const rec = missionLoad(workDir, id);
+  if (!rec) return { ok: false, error: "Миссия не найдена: " + id };
+  const status = MISSION_STATUSES.indexOf(o.status) >= 0 ? o.status : "done";
+  const report = clip(o.report, 20000);
+  rec.status = status;
+  rec.finishedAt = Date.now();
+  rec.reason = clip(o.reason || "", 400);
+  if (o.next) rec.next = clip(o.next, 400);
+  for (const s of rec.steps) {
+    if (s.state === "doing") s.state = status === "done" ? "done" : "todo";
+  }
+  const icons = { done: "🏁 Миссия завершена", failed: "❌ Миссия завершилась ошибкой", stopped: "⏹ Миссия остановлена", paused: "⏸ Миссия на паузе", active: "▶ Миссия продолжается" };
+  journalAppend(workDir, id, { kind: "finish", text: icons[status] + (rec.reason ? ": " + rec.reason : "") + (report ? " — итог в report.md" : "") });
+  if (report) {
+    try {
+      const pr = missionProgress(rec);
+      const lines = [
+        "# " + rec.title,
+        "",
+        "**Цель.** " + rec.goal,
+        "",
+        "**Итог (" + status + ", " + new Date(rec.finishedAt).toLocaleString() + ").**",
+        "",
+        report,
+        "",
+        "**План:** " + pr.done + " из " + pr.total + " выполнено" + (pr.failed ? ", не удалось: " + pr.failed : "") + ".",
+        rec.steps.length ? rec.steps.map((s, i) => "- " + (s.state === "done" ? "[x]" : s.state === "failed" ? "[!]" : "[ ]") + " " + (i + 1) + ". " + s.title + (s.note ? " — " + s.note : "")).join("\n") : "",
+        "",
+        "**Метрики:** раундов " + rec.rounds + ", батчей " + rec.batches + ", токенов " + rec.metrics.tokens + ", сжатий " + rec.metrics.compactions + ".",
+        "",
+      ];
+      atomicWriteText(path.join(missionDirOf(workDir, id), "report.md"), lines.join("\n"));
+    } catch {}
+  }
+  const saved = missionSave(workDir, rec);
+  return saved.ok ? { ok: true, mission: rec } : saved;
+}
+
+function missionList(workDir, opts) {
+  const o = opts || {};
+  const dir = missionsDir(workDir);
+  let names = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const name of names) {
+    const rec = missionLoad(workDir, name);
+    if (!rec) continue;
+    if (o.status && o.status !== "all" && rec.status !== o.status) continue;
+    out.push(rec);
+  }
+  out.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  return out.slice(0, Math.max(1, Math.min(100, Number(o.limit) || MISSION_MAX_KEEP)));
+}
+
+// Незакрытая миссия (свежая): её и продолжает кнопка «▶ Продолжить».
+function missionActive(workDir) {
+  const list = missionList(workDir, { limit: 20 });
+  return list.find((m) => m.status === "active" || m.status === "paused") || null;
+}
+
+function missionPrune(workDir) {
+  const all = missionList(workDir, { limit: 100 });
+  const keep = all.slice(0, MISSION_MAX_KEEP);
+  const keepIds = new Set(keep.map((m) => m.id));
+  for (const m of all) {
+    if (keepIds.has(m.id)) continue;
+    try {
+      fs.rmSync(missionDirOf(workDir, m.id), { recursive: true, force: true });
+    } catch {}
+  }
+  return { kept: keep.length, removed: all.length - keep.length };
+}
+
+// Текст для «продолжи миссию»: цель, план, где остановились, хвост журнала.
+function missionResumeText(rec, journalText) {
+  if (!rec) return "";
+  const pr = missionProgress(rec);
+  const lines = [
+    "Продолжи миссию «" + rec.title + "» (файлы: .agent/missions/" + rec.id + "/).",
+    "Цель: " + rec.goal,
+    "План: " + (rec.steps.length ? rec.steps.map((s, i) => (i + 1) + ") " + (s.state === "done" ? "✓ " : s.state === "failed" ? "⚠ " : "") + s.title).join("; ") : "не составлен"),
+    "Прогресс: " + pr.done + " из " + pr.total + " готово" + (pr.failed ? ", не удалось: " + pr.failed : "") + ".",
+    pr.current ? "Остановились на: " + pr.current : "",
+    "Хвост журнала:\n" + (journalText || ""),
+    "Работай дальше: вызывай инструменты и после каждого шага отмечай его через missionStep(done, next). Файлы миссии обновляй сам — в них должна быть видна твоя работа.",
+  ];
+  return lines.filter(Boolean).join("\n");
+}
+
+// ── Зеркала: задачи и контекст рядом с проектом ───────────────────────────────
+// Дела живут в данных приложения (userData), но человек просил видеть их файлом на ПК.
+function tasksMirror(workDir, text) {
+  const dir = String(workDir || "").trim();
+  if (!dir) return { ok: false, error: "Не задана рабочая папка." };
+  try {
+    ensureAgentRoot(dir);
+    atomicWriteText(path.join(agentRoot(dir), "tasks.md"), clip(text, 200000) + "\n");
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || String(err) };
+  }
+}
+
+function contextMirror(workDir, ts, text) {
+  const dir = String(workDir || "").trim();
+  if (!dir) return { ok: false, error: "Не задана рабочая папка." };
+  const body = clip(text, 20000);
+  if (!body) return { ok: false, error: "Пустая памятка." };
+  const t = Number(ts) || Date.now();
+  try {
+    ensureAgentRoot(dir);
+    const cdir = path.join(agentRoot(dir), "context");
+    fs.mkdirSync(cdir, { recursive: true });
+    const file = path.join(cdir, localDayKey(t) + ".md");
+    const head = "# Памятки контекста за " + localDayKey(t) + "\n";
+    const chunk = "\n## " + humanTs(t) + "\n\n" + body + "\n";
+    if (!fs.existsSync(file)) atomicWriteText(file, head + chunk);
+    else fs.appendFileSync(file, chunk, "utf8");
+    return { ok: true, file };
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || String(err) };
+  }
+}
+
+// Суммарный размер папки (для настроек: видно, сколько работа агента занимает).
+// Глубина ограничена: в missions/ лежат только файлы, рекурсия не уйдёт вглубь проекта.
+function dirBytes(dir, depth) {
+  const d = depth == null ? 3 : depth;
+  if (d < 0) return 0;
+  let names = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return 0;
+  }
+  let total = 0;
+  for (const n of names) {
+    const p = path.join(dir, n);
+    try {
+      const st = fs.statSync(p);
+      if (st.isDirectory()) total += dirBytes(p, d - 1);
+      else total += st.size;
+    } catch {}
+  }
+  return total;
+}
+
+// Что уже лежит рядом с проектом: для настроек («папка работы агента»).
+function mirrorStatus(workDir) {
+  const dir = String(workDir || "").trim();
+  const out = { dir, root: agentRoot(dir), exists: false, tasks: null, contextDays: [], missions: 0, bytes: 0 };
+  if (!dir) return out;
+  try {
+    out.exists = fs.existsSync(out.root);
+    if (!out.exists) return out;
+    const tf = path.join(out.root, "tasks.md");
+    if (fs.existsSync(tf)) {
+      const st = fs.statSync(tf);
+      out.tasks = { file: tf, bytes: st.size, mtime: st.mtimeMs };
+    }
+    const cdir = path.join(out.root, "context");
+    if (fs.existsSync(cdir)) {
+      out.contextDays = fs
+        .readdirSync(cdir)
+        .filter((f) => /\.md$/.test(f))
+        .sort()
+        .reverse()
+        .slice(0, 30);
+    }
+    out.missions = missionList(dir, { limit: 100 }).length;
+    out.bytes = dirBytes(out.root);
+  } catch {}
+  return out;
+}
+
+// Очистка зеркал: убираем только tasks.md и context/ — миссии не трогаем,
+// это работа агента, её удаляет человек сам в проводнике.
+function mirrorClear(workDir) {
+  const dir = String(workDir || "").trim();
+  if (!dir) return { ok: false, error: "Не задана рабочая папка." };
+  const removed = [];
+  try {
+    const tf = path.join(agentRoot(dir), "tasks.md");
+    if (fs.existsSync(tf)) {
+      fs.rmSync(tf, { force: true });
+      removed.push("tasks.md");
+    }
+    const cdir = path.join(agentRoot(dir), "context");
+    if (fs.existsSync(cdir)) {
+      fs.rmSync(cdir, { recursive: true, force: true });
+      removed.push("context/");
+    }
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || String(err) };
+  }
+  return { ok: true, removed };
+}
+
+module.exports = {
+  AGENT_DIR,
+  MISSIONS_DIR,
+  MISSION_MAX_KEEP,
+  MISSION_MAX_STEPS,
+  JOURNAL_KEEP_LINES,
+  MISSION_STATUSES,
+  STEP_STATES,
+  agentRoot,
+  missionsDir,
+  missionDirOf,
+  missionFile,
+  ensureAgentRoot,
+  slugify,
+  missionCreate,
+  missionLoad,
+  missionSave,
+  missionProgress,
+  missionStep,
+  missionNote,
+  missionCounters,
+  missionFinish,
+  missionList,
+  missionActive,
+  missionPrune,
+  missionJournal,
+  missionJournalText,
+  missionResumeText,
+  tasksMirror,
+  contextMirror,
+  mirrorStatus,
+  mirrorClear,
+};

@@ -116,6 +116,14 @@
     fsOpenInExplorer: invoke("fs:openInExplorer"),
 
     tasksBoard: invoke("tasks:board"),
+    // Миссии: с телефона видно, что делает агент, и работу можно поставить на
+    // паузу или продолжить — обработчики в main те же, что у окна на ПК.
+    missionState: invoke("mission:state"),
+    missionPause: invoke("mission:pause"),
+    missionStop: invoke("mission:stop"),
+    missionResume: invoke("mission:resume"),
+    missionOpen: invoke("mission:open"),
+    agentFilesStatus: invoke("agentfiles:status"),
     tasksList: invoke("tasks:list"),
     tasksAdd: invoke("tasks:add"),
     tasksUpdate: invoke("tasks:update"),

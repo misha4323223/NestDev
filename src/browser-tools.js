@@ -332,6 +332,7 @@ function adoptExistingPages() {
     if (!/^https?:/i.test(url)) continue;
     const tabId = "tab" + (++tabSeq);
     tabs.set(tabId, { id: tabId, page: p, openedAt: Date.now(), adopted: true });
+    netRecorder(p); // журнал сети ведём с открытия вкладки: replay ищет в нём образец запроса
     if (!activeTabId) activeTabId = tabId;
     try {
       p.on("close", () => {
@@ -367,6 +368,7 @@ async function adoptNewPages(before) {
     if (tabs.size >= 25) break;
     const tabId = "tab" + (++tabSeq);
     tabs.set(tabId, { id: tabId, page: p, openedAt: Date.now(), adopted: !!cdpActive });
+    netRecorder(p);
     activeTabId = tabId;
     try {
       p.on("close", () => {
@@ -1337,6 +1339,7 @@ async function open(args) {
   if (!page) page = await newPageInBrowser();
   const tabId = "tab" + (++tabSeq);
   tabs.set(tabId, { id: tabId, page, openedAt: Date.now() });
+  netRecorder(page);
   activeTabId = tabId;
   page.on("close", () => {
     if (tabs.has(tabId)) {
@@ -1671,8 +1674,37 @@ async function evalJs(args) {
     text = String(value);
   }
   if (text == null) text = "(выражение ничего не вернуло)";
-  const shown = text.length > max ? text.slice(0, max) + "\n… [обрезано, всего " + text.length + " символов]" : text;
   const info = await pageInfo(t.tab.page);
+  // save / saveToFile: результат пишется В ФАЙЛ и переживает перезагрузку вкладки.
+  // Раньше большие данные складывали в window.__var и резали ответ до maxChars —
+  // хвост (total_count, курсор) прочитать было нельзя, а перезагрузка вкладки
+  // стирала всё накопленное. Файл закрывает оба случая.
+  const saveArg = args.save != null ? args.save : args.saveToFile != null ? args.saveToFile : args.file;
+  const saveAs = typeof saveArg === "string" && saveArg.trim() ? saveArg.trim() : "";
+  if (saveArg === true || saveAs) {
+    let file = saveAs;
+    try {
+      if (!file) {
+        const dir = path.join(os.tmpdir(), "ai-agent-eval");
+        fs.mkdirSync(dir, { recursive: true });
+        file = path.join(dir, "eval-" + new Date().toISOString().replace(/[:.]/g, "-") + ".txt");
+      }
+      fs.writeFileSync(file, text, "utf8");
+    } catch (e) {
+      return "Ошибка browserEval: результат не удалось записать в файл (" + String((e && e.message) || e).slice(0, 120) + ").";
+    }
+    const head = text.slice(0, Math.min(max, 800));
+    return (
+      "browserEval выполнен. URL: " + (info.url || "—") +
+      "\nРезультат сохранён В ФАЙЛ: " + file +
+      "\nСимволов: " + text.length + " (файл переживает перезагрузку вкладки — не держи накопленное в window)." +
+      "\nДальше: readFile { path: \"" + file + "\" } — или разбирай файл своим кодом (runCommand).\n" +
+      "Начало:\n" + head + (text.length > head.length ? "\n… [остальное в файле]" : "")
+    );
+  }
+  const shown = text.length > max
+    ? text.slice(0, max) + "\n… [обрезано, всего " + text.length + " символов. Нужен весь ответ — повтори с save: true]"
+    : text;
   return "browserEval выполнен. URL: " + (info.url || "—") + "\nРезультат: " + shown;
 }
 
@@ -2361,6 +2393,12 @@ async function loadAllScroll(page, args) {
   const up = how === "up" || how === "top";
   const maxSteps = Math.max(1, Math.min(parseInt(args.times, 10) || 12, 40));
   const dyBase = Math.max(300, Math.round(Number(args.by != null ? args.by : args.dy) || 0) || 700);
+  // item — селектор СТРОКИ списка. С ним рост считается по уникальным ключам
+  // строк (а не по длине текста страницы, где перемешаны меню и реклама), а
+  // последняя строка прокручивается в кадр: именно это движение запускает
+  // IntersectionObserver, который и подгружает следующую пачку. Прокрутка «на
+  // глаз» крупным шагом промахивается мимо него — строки проскакивают.
+  const itemSel = String(args.item || args.items || "").trim();
   let box = null;
   let boxDesc = "";
   if (args.container) {
@@ -2373,7 +2411,15 @@ async function loadAllScroll(page, args) {
   const readState = async () => (await page.evaluate(scrollStateInPage).catch(() => ({}))) || {};
   const textLen = async () =>
     page.evaluate(() => String((document.body && document.body.innerText) || "").length).catch(() => 0);
-  const mark = async () => lazyKeyOf(await readState(), await textLen());
+  const itemState = async () =>
+    itemSel ? await page.evaluate(itemsKeyInPage, { item: itemSel }).catch(() => null) : null;
+  const mark = async () => {
+    if (itemSel) {
+      const s = await itemState();
+      if (s) return "items:" + s.count + ":" + s.joined;
+    }
+    return lazyKeyOf(await readState(), await textLen());
+  };
 
   let prev = await mark();
   let steps = 0;
@@ -2381,7 +2427,16 @@ async function loadAllScroll(page, args) {
   let sameRuns = 0;
   for (let i = 0; i < maxSteps; i++) {
     const dy = up ? -dyBase : dyBase;
-    if (box) {
+    if (itemSel) {
+      // Строка списка: прокручиваем ЕЁ в кадр (а не страницу «на глаз»).
+      const sc = await page.evaluate(scrollItemIntoViewInPage, { item: itemSel, up: up }).catch(() => null);
+      if (!sc || !sc.ok) {
+        const w = await wheelAt(page, 0, dy, 1, box);
+        if ((!w.ok || w.error) && !box) {
+          await page.evaluate(scrollPageInPage, { how: up ? "up" : "down", dy: dy, dx: 0 }).catch(() => null);
+        }
+      }
+    } else if (box) {
       await wheelAt(page, 0, dy, 1, box);
     } else {
       const w = await wheelAt(page, 0, dy, 1, null);
@@ -2405,6 +2460,7 @@ async function loadAllScroll(page, args) {
   }
   const st = await readState();
   const atEnd = up ? Number(st.y || 0) <= 2 : Number(st.max || 0) - Number(st.y || 0) <= 2;
+  const its = itemSel ? await itemState() : null;
   let out =
     "OK — " + (box ? "догрузил контейнер «" + boxDesc + "» " : "догрузил страницу ") + how + ", шагов: " + steps +
     ". Новое содержимое появилось на " + grew + " " + (grew === 1 ? "шаге" : "шагах") +
@@ -2413,6 +2469,10 @@ async function loadAllScroll(page, args) {
       : atEnd
         ? ", похоже, это конец списка."
         : ", упёрся в предел " + maxSteps + " шагов — вызови ещё раз, если нужно больше.");
+  if (its) {
+    out += "\nСтрок в списке: " + its.count + " (уникальных: " + its.uniq + ").";
+    if (its.sample && its.sample.length) out += "\nВидно: " + its.sample.join(" · ");
+  }
   out += "\n" + posLine(st);
   if (args.read || args.text) {
     const txt = await page
@@ -2428,7 +2488,6 @@ async function loadAllScroll(page, args) {
   }
   return out;
 }
-
 // browserScroll: страница, внутренние контейнеры, «до элемента» (+ что появилось в кадре).
 async function scroll(args) {
   args = args || {};
@@ -2572,10 +2631,16 @@ function netRecorder(page) {
   try {
     page.on("request", (req) => {
       try {
+        // Тело POST-формы храним целиком: по нему browserReplay повторяет ТОТ ЖЕ
+        // запрос клиента — с его версией API (v) и токеном сессии, которые
+        // угадывать нельзя (чужая версия даёт ошибку 100 invalid v).
+        let post = "";
+        try { post = req.postData ? String(req.postData() || "") : ""; } catch (e) {}
         push({
           method: req.method ? req.method() : "GET",
           url: String(req.url ? req.url() : ""),
           type: req.resourceType ? String(req.resourceType()) : "",
+          post: post.slice(0, 8000),
           ts: Date.now(),
         });
       } catch (e) {}
@@ -2644,6 +2709,8 @@ async function network(args) {
     const st = e.status == null ? "…" : e.status;
     const mime = String(e.mime || "").split(";")[0].slice(0, 24);
     out.push(i + 1 + ". " + e.method + " " + e.url.slice(0, 160) + " → " + st + (mime ? " (" + mime + ")" : "") + (e.status >= 400 || e.status == null ? " ❌" : ""));
+    if (e.post) out.push("   ⤴ отправил: " + maskForm(e.post).slice(0, 400));
+    if (e.post) out.push("      повторить с пагинацией: browserReplay { match: \"" + e.url.slice(0, 50) + "\" }");
     if (e.body) {
       const body = String(e.body).replace(/\s+/g, " ").trim().slice(0, 300);
       out.push("   → " + body);
@@ -2722,6 +2789,7 @@ async function auditPage(url, opts) {
   }
   const tabId = "tab" + (++tabSeq);
   tabs.set(tabId, { id: tabId, page, openedAt: Date.now() });
+  netRecorder(page);
   activeTabId = tabId;
 
   const consoleErrors = [];
@@ -2817,6 +2885,422 @@ async function auditPage(url, opts) {
   };
 }
 
+// ── Replay: повторить запрос самой страницы и пролистать ответ курсором ──────
+// Зачем: виртуальные списки (диалоги ВК, таблицы, ленты) нельзя надёжно прочитать
+// из DOM — узлы переиспользуются, часть строк вообще не отрисована, а ref из карты
+// устаревают после любой перерисовки. Зато страница УЖЕ ходит за этими данными
+// запросом к серверу. Мы повторяем ТОТ ЖЕ запрос (его адрес, его версию API, его
+// токен) ИЗ САМОЙ страницы: куки и CORS такие же, как у клиента, — и листаем ответ
+// курсором, пока сервер отдаёт новое.
+//
+// Замер на живом ВК (15.09): POST api.vk.ru/method/messages.getItems?v=5.285,
+// поля v, client_id, start_from=conversations_<id>, target_count, access_token —
+// в теле (form-encoded); курсор — в ответе; конец — пустой items[]. Версия 5.285 —
+// внутренняя версия клиента: свои версии сервер отвергает ошибкой 100 invalid v,
+// поэтому v и токен берутся из перехвата, а не подставляются руками.
+
+// Токен и пароли нужны инструменту, но не тексту ответа: в чат они не попадают.
+const SECRET_KEY_RE = /token|password|passwd|secret|api[_-]?key|auth|session|sid|hash/i;
+function maskForm(body) {
+  return String(body || "").replace(/([^&=]+)=([^&]*)/g, function (m, k, v) {
+    let key = k;
+    try { key = decodeURIComponent(k); } catch (e) {}
+    if (!SECRET_KEY_RE.test(key)) return m;
+    return k + "=«скрыто, " + String(v || "").length + " симв.»";
+  });
+}
+
+// Тело формы → пары [ключ, значение, исходный кусок]. Исходный кусок храним,
+// чтобы НЕ тронутые поля уходили на сервер байт в байт (плюсы в токенах и base64
+// слепая пересборка портит).
+function parseForm(body) {
+  const out = [];
+  const parts = String(body || "").split("&");
+  for (const part of parts) {
+    if (!part) continue;
+    const i = part.indexOf("=");
+    const k = i < 0 ? part : part.slice(0, i);
+    const v = i < 0 ? "" : part.slice(i + 1);
+    let dk = k;
+    let dv = v;
+    try { dk = decodeURIComponent(k); } catch (e) {}
+    try { dv = decodeURIComponent(v); } catch (e) {}
+    out.push([dk, dv, part]);
+  }
+  return out;
+}
+function buildForm(pairs) {
+  return (pairs || [])
+    .map(function (p) {
+      if (p.length > 2 && typeof p[2] === "string") {
+        const eq = p[2].indexOf("=");
+        let back = "";
+        try { back = eq < 0 ? "" : decodeURIComponent(p[2].slice(eq + 1)); } catch (e) { back = ""; }
+        if (back === String(p[1])) return p[2]; // поле не меняли — шлём как было
+      }
+      return encodeURIComponent(p[0]) + "=" + encodeURIComponent(p[1]);
+    })
+    .join("&");
+}
+
+// Путь по ответу: response.conversations.items или a.b.0.c
+function pickPath(obj, spec) {
+  if (spec == null || spec === "") return undefined;
+  let cur = obj;
+  const parts = String(spec).split(".");
+  for (const part of parts) {
+    if (cur == null) return undefined;
+    if (/^\d+$/.test(part)) { cur = cur[Number(part)]; continue; }
+    cur = cur[part];
+  }
+  return cur;
+}
+
+// Где в ответе массив элементов: сначала частые имена, потом первый массив
+// объектов на глубине до 4 — работает и на незнакомом API.
+function findItemsPath(json) {
+  const known = [
+    "response.items", "response.conversations.items", "response.messages.items",
+    "response.list", "response.results", "response.rows", "response.data",
+    "items", "results", "data", "list", "rows",
+  ];
+  for (const p of known) if (Array.isArray(pickPath(json, p))) return p;
+  const queue = [[json, ""]];
+  let seen = 0;
+  while (queue.length && seen < 80) {
+    const cur = queue.shift();
+    seen++;
+    const node = cur[0];
+    if (Array.isArray(node)) {
+      if (node.length && node[0] && typeof node[0] === "object") return cur[1].replace(/^\./, "");
+      continue;
+    }
+    if (!node || typeof node !== "object") continue;
+    for (const k of Object.keys(node)) {
+      const child = node[k];
+      if (child == null || typeof child !== "object") continue;
+      queue.push([child, cur[1] + "." + k]);
+    }
+  }
+  return "";
+}
+function findTotalPath(json) {
+  const known = [
+    "response.count", "response.total_count", "response.total",
+    "response.conversations.count", "total_count", "total", "count",
+  ];
+  for (const p of known) {
+    const v = pickPath(json, p);
+    if (typeof v === "number" && v > 0) return p;
+  }
+  return "";
+}
+function findCursorPath(json) {
+  const known = [
+    "response.last_item", "response.next_from", "response.next_cursor", "response.cursor",
+    "last_item", "next_from", "next_cursor", "cursor",
+  ];
+  for (const p of known) {
+    const v = pickPath(json, p);
+    if (v != null && v !== "" && typeof v !== "object") return p;
+  }
+  const resp = pickPath(json, "response");
+  if (resp && typeof resp === "object") {
+    for (const k of Object.keys(resp)) {
+      const v = resp[k];
+      if (v == null || v === "" || typeof v === "object") continue;
+      if (/from|offset|cursor|next/i.test(k)) return "response." + k;
+    }
+  }
+  return "";
+}
+function findCursorParam(pairs) {
+  const known = ["start_from", "offset", "from", "cursor", "next_from", "page"];
+  for (const name of known) for (const p of pairs || []) if (p[0] === name) return name;
+  return "";
+}
+
+// Уникальный ключ строки: явный путь, затем обычные имена, в конце — сам JSON.
+function keyOfItem(item, keyPath) {
+  if (keyPath) {
+    const v = pickPath(item, keyPath);
+    if (v != null && typeof v !== "object") return String(v);
+    if (v != null) return JSON.stringify(v);
+  }
+  const known = ["peer_id", "id", "conversation.peer.id", "conversation.peer_id", "uid", "key", "message_id", "conversation_id"];
+  for (const p of known) {
+    const v = pickPath(item, p);
+    if (v != null && typeof v !== "object") return String(v);
+  }
+  try { return JSON.stringify(item).slice(0, 200); } catch (e) { return String(item); }
+}
+
+// Выполняется В СТРАНИЦЕ: повторяет запрос клиента его же куками и CORS.
+async function fetchJsonInPage(a) {
+  a = a || {};
+  const method = String(a.method || "POST").toUpperCase();
+  const opt = { method: method, credentials: "include", headers: a.headers || {} };
+  let url = String(a.url || "");
+  const body = a.body == null ? "" : String(a.body);
+  if (method === "GET" || method === "HEAD") {
+    if (body) url += (url.indexOf("?") < 0 ? "?" : "&") + body;
+  } else if (body) {
+    opt.body = body;
+  }
+  let res = null;
+  let text = "";
+  try {
+    res = await fetch(url, opt);
+  } catch (e) {
+    return { error: "сеть или CORS: " + String((e && e.message) || e || "").slice(0, 200), url: url };
+  }
+  try { text = await res.text(); } catch (e) { text = ""; }
+  let json = null;
+  try { json = JSON.parse(text); } catch (e) { json = null; }
+  return { ok: res.ok, status: res.status, url: url, json: json, text: String(text || "").slice(0, 1200) };
+}
+
+// Выполняется В СТРАНИЦЕ: сколько строк списка и их стабильные ключи.
+// Ключ — href или id, а не текст: превью сообщения меняется от времени, и по нему
+// один и тот же диалог считался бы новым (дубли при прокрутке туда-обратно).
+function itemsKeyInPage(a) {
+  a = a || {};
+  let nodes = [];
+  try { nodes = Array.from(document.querySelectorAll(String(a.item || ""))); } catch (e) { nodes = []; }
+  const keys = [];
+  const sample = [];
+  for (const el of nodes) {
+    let href = "";
+    try {
+      const link = el.querySelector ? el.querySelector("a[href]") : null;
+      href = link ? String(link.getAttribute("href") || "") : "";
+    } catch (e) {}
+    let id = "";
+    try {
+      id = String(
+        (el.getAttribute && (el.getAttribute("data-peer") || el.getAttribute("data-id") || el.getAttribute("data-uid"))) || el.id || ""
+      );
+    } catch (e) {}
+    let first = "";
+    try {
+      first = String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60);
+    } catch (e) {}
+    const key = href || id || first;
+    if (key) keys.push(key);
+    if (sample.length < 8 && first) sample.push(first.slice(0, 40));
+  }
+  const uniq = {};
+  for (const k of keys) uniq[k] = 1;
+  return { count: nodes.length, uniq: Object.keys(uniq).length, joined: keys.join("~"), sample: sample };
+}
+
+// Выполняется В СТРАНИЦЕ: прокрутить последнюю (или первую — при чтении вверх)
+// строку списка в кадр. Подгрузку запускает именно это движение.
+function scrollItemIntoViewInPage(a) {
+  a = a || {};
+  let nodes = [];
+  try { nodes = Array.from(document.querySelectorAll(String(a.item || ""))); } catch (e) { nodes = []; }
+  if (!nodes.length) return { ok: false, count: 0 };
+  const el = a.up ? nodes[0] : nodes[nodes.length - 1];
+  try {
+    el.scrollIntoView({ block: a.up ? "start" : "end", inline: "nearest" });
+  } catch (e) {
+    try { el.scrollIntoView(); } catch (e2) { return { ok: false, count: nodes.length }; }
+  }
+  return { ok: true, count: nodes.length };
+}
+
+// Образец для повтора: последний запрос страницы (xhr/fetch), который подходит.
+function replayFindSample(rec, args) {
+  const match = String(args.match || args.filter || "").toLowerCase();
+  const wantGet = String(args.method || "").toUpperCase() === "GET";
+  for (let i = rec.entries.length - 1; i >= 0; i--) {
+    const e = rec.entries[i];
+    const method = String(e.method || "").toUpperCase();
+    if (!wantGet && method !== "POST") continue;
+    if (String(e.url || "").indexOf("http") !== 0) continue;
+    const type = String(e.type || "");
+    if (type && type !== "xhr" && type !== "fetch") continue;
+    if (match && e.url.toLowerCase().indexOf(match) < 0) continue;
+    if (!e.post) continue;
+    return e;
+  }
+  return null;
+}
+
+// browserReplay: собрать данные тем же запросом, что делает сам сайт.
+async function replay(args) {
+  args = args || {};
+  const t = needTab(args.tabId || args.tab);
+  if (t.error) return t.error;
+  const page = t.tab.page;
+  const rec = netRecorder(page);
+  let url = String(args.url || "").trim();
+  let method = String(args.method || "").toUpperCase();
+  let body = String(args.body != null ? args.body : "");
+  let from = "указан вручную";
+  if (!url || !body) {
+    const sample = replayFindSample(rec, args);
+    if (sample) {
+      if (!url) url = String(sample.url || "");
+      if (!method) method = String(sample.method || "POST").toUpperCase();
+      if (!body) body = String(sample.post || "");
+      from = "из перехвата сети (страница сама отправила такой запрос)";
+    }
+  }
+  if (!url) {
+    return (
+      "Ошибка browserReplay: нечего повторять. Либо укажи url и body, либо открой страницу, где сайт САМ делает этот " +
+      "запрос, дёрни нужный элемент и повтори — накопленное покажет browserNetwork { since: false }."
+    );
+  }
+  if (!method) method = body ? "POST" : "GET";
+  const headers = Object.assign(
+    { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+    args.headers && typeof args.headers === "object" ? args.headers : {}
+  );
+  const maxSteps = Math.max(1, Math.min(parseInt(args.maxSteps, 10) || 20, 60));
+  const pairs = parseForm(body);
+  if ((method === "GET" || method === "HEAD") && url.indexOf("?") >= 0) {
+    const qi = url.indexOf("?");
+    for (const p of parseForm(url.slice(qi + 1))) pairs.push(p);
+    url = url.slice(0, qi);
+  }
+  const setPair = function (name, value) {
+    for (const p of pairs) {
+      if (p[0] === name) {
+        p[1] = String(value);
+        p.length = 2; // значение изменили — исходный кусок больше не годится
+        return;
+      }
+    }
+    pairs.push([String(name), String(value)]);
+  };
+  if (args.set && typeof args.set === "object") for (const k of Object.keys(args.set)) setPair(k, args.set[k]);
+  if (Array.isArray(args.remove)) {
+    const drop = args.remove.map(String);
+    for (let i = pairs.length - 1; i >= 0; i--) if (drop.indexOf(pairs[i][0]) >= 0) pairs.splice(i, 1);
+  }
+  let cursorParam = String(args.cursorParam || args.cursorParamName || args.cursor || "").trim();
+  if (!cursorParam) cursorParam = findCursorParam(pairs);
+  let cursorPath = String(args.cursorPath || "").trim();
+  let itemsPath = String(args.itemsPath || "").trim();
+  let totalPath = String(args.totalPath || "").trim();
+  let cursor = args.start != null ? String(args.start) : "";
+  if (cursor && cursorParam) setPair(cursorParam, cursor);
+  if (!cursor && cursorParam) {
+    // Курсор уже был в перехваченном теле — берём его текущим: тогда сервер,
+    // отдающий тот же курсор, сразу распознаётся как «дальше пусто».
+    for (const p of pairs) {
+      if (p[0] === cursorParam && p[1]) { cursor = String(p[1]); break; }
+    }
+  }
+
+  const items = [];
+  const seen = {};
+  let steps = 0;
+  let dupes = 0;
+  let total = 0;
+  let stop = "";
+  for (let step = 0; step < maxSteps; step++) {
+    const res = await page.evaluate(fetchJsonInPage, {
+      url: url, method: method, body: buildForm(pairs), headers: headers,
+    });
+    steps++;
+    if (!res || res.error) { stop = "запрос не прошёл — " + ((res && res.error) || "нет ответа"); break; }
+    if (!res.json) { stop = "ответ не JSON (статус " + res.status + "): " + String(res.text || "").slice(0, 300); break; }
+    const j = res.json;
+    if (j && j.error) { stop = "сервер вернул ошибку: " + JSON.stringify(j.error).slice(0, 300); break; }
+    if (!itemsPath) itemsPath = findItemsPath(j);
+    if (!totalPath) totalPath = findTotalPath(j);
+    if (!cursorPath) cursorPath = findCursorPath(j);
+    const arr = itemsPath ? pickPath(j, itemsPath) : null;
+    const list = Array.isArray(arr) ? arr : [];
+    const tot = totalPath ? Number(pickPath(j, totalPath)) : 0;
+    if (tot > total) total = tot;
+    let fresh = 0;
+    for (const it of list) {
+      const k = keyOfItem(it, String(args.key || ""));
+      if (seen[k]) { dupes++; continue; }
+      seen[k] = 1;
+      items.push(it);
+      fresh++;
+    }
+    if (!list.length) { stop = "сервер отдал пустой список — это конец"; break; }
+    if (total && items.length >= total) { stop = "собрано всё: " + items.length + " из " + total; break; }
+    if (!fresh) { stop = "новых строк нет (сервер повторяет те же) — дальше пусто"; break; }
+    if (!cursorPath) { stop = "в ответе нет курсора — сервер отдаёт всё сразу"; break; }
+    const next = pickPath(j, cursorPath);
+    const nextCursor = next == null || next === "" ? "" : String(next);
+    if (!nextCursor) { stop = "курсор пустой — это конец"; break; }
+    // Сравниваем в том же виде, в каком отправляем: с префиксом. Иначе сервер,
+    // отдающий один и тот же курсор, заставлял бы листать до потолка шагов.
+    const composed = String(args.cursorPrefix != null ? args.cursorPrefix : "") + nextCursor;
+    if (composed === cursor) { stop = "курсор не двигается — это конец"; break; }
+    cursor = composed;
+    setPair(cursorParam, cursor);
+  }
+  if (!stop) stop = "упёрся в предел " + maxSteps + " шагов — вызови ещё раз";
+
+  // Данные — В ФАЙЛ: 100+ диалогов в чат не влезут, а файл агент читает сам и он
+  // переживает перезагрузку вкладки (в отличие от window.__var).
+  let file = "";
+  const inlineJson = JSON.stringify(items);
+  if (args.save !== false) {
+    try {
+      const dir = String(args.dir || path.join(os.tmpdir(), "ai-agent-replay"));
+      fs.mkdirSync(dir, { recursive: true });
+      file = path.join(dir, "replay-" + new Date().toISOString().replace(/[:.]/g, "-") + ".json");
+      fs.writeFileSync(
+        file,
+        JSON.stringify(
+          {
+            source: url, method: method, steps: steps, total: total, stop: stop,
+            itemsPath: itemsPath, cursorPath: cursorPath, count: items.length, items: items,
+          },
+          null, 1
+        ),
+        "utf8"
+      );
+    } catch (e) { file = ""; }
+  }
+  let out =
+    "OK — собрано " + items.length + " " + (items.length === 1 ? "строка" : "строк") +
+    " за " + steps + " " + (steps === 1 ? "запрос" : "запросов") +
+    (total ? " (всего на сервере: " + total + ")" : "") + ". Стоп: " + stop + "." +
+    "\nИсточник: " + from + "\n" + method + " " + url.slice(0, 160) +
+    "\nТело (секреты скрыты): " + maskForm(buildForm(pairs)).slice(0, 300);
+  if (dupes) out += "\nПовторов отброшено: " + dupes + ".";
+  if (itemsPath) out += "\nЭлементы взяты из " + itemsPath + (cursorPath ? ", курсор: " + cursorPath : "");
+  if (file) {
+    out += "\nФайл: " + file + " — полный JSON (items[]): читай через readFile или разбирай своим кодом.";
+  } else if (args.save === false) {
+    out += "\nitems: " + inlineJson.slice(0, 3000) +
+      (inlineJson.length > 3000 ? " … [обрезано — добавь save: true и получишь файл]" : "");
+  }
+  const pick = Array.isArray(args.pick) ? args.pick.map(String) : [];
+  if (pick.length && items.length) {
+    const rows = Math.max(1, Math.min(parseInt(args.rows, 10) || 20, 60));
+    out += "\n\nСтроки:";
+    for (let i = 0; i < items.length && i < rows; i++) {
+      const vals = pick.map(function (p) {
+        const v = pickPath(items[i], p);
+        return v == null || typeof v === "object" ? "" : String(v).replace(/\s+/g, " ").slice(0, 120);
+      });
+      out += "\n" + (i + 1) + ". " + vals.filter(function (x) { return x !== ""; }).join(" · ");
+    }
+    if (items.length > rows) out += "\n… ещё " + (items.length - rows) + " в файле";
+  } else if (items.length) {
+    out += "\n\nПервая строка (её поля потом можно выбрать через pick):\n" + JSON.stringify(items[0]).slice(0, 600);
+  }
+  if (/не прошёл|не JSON|сервер вернул ошибку/.test(stop)) {
+    out += (
+      "\nЕсли сервер отверг версию API или запрос — не подставляй v сам: вернись на страницу, дай клиенту " +
+      "сделать запрос ещё раз и повтори browserReplay (он возьмёт свежий перехват)."
+    );
+  }
+  return out;
+}
 module.exports = {
   open,
   snapshot,
@@ -2829,6 +3313,21 @@ module.exports = {
   scroll,
   hover,
   network,
+  replay,
+  maskForm,
+  parseForm,
+  buildForm,
+  pickPath,
+  findItemsPath,
+  findTotalPath,
+  findCursorPath,
+  findCursorParam,
+  keyOfItem,
+  // тесты: строки списка и прокрутка строки в кадр
+  itemsKeyInPage,
+  scrollItemIntoViewInPage,
+  fetchJsonInPage,
+  replayFindSample,
   waitForIdle,
   overlayKind,
   overlayItems,
