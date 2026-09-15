@@ -27,7 +27,7 @@ function createSystemStack(deps) {
   const { fs, path, os, execFile, winPs, probeEnv, stripAnsi, runTerminalCommand, live } = deps;
 
 // ═══════════════════ Системные программы и окружение ═══════════════════
-// Получить PATH (с учётом live.agentEnv) — на Windows ключ может быть «Path».
+// Получить PATH (пробы секретов не получают) — на Windows ключ может быть «Path».
 function envPathInfo() {
   const e = probeEnv();
   const key = Object.keys(e).find((k) => k.toLowerCase() === "path");
@@ -107,7 +107,7 @@ function spawnRaw(args, opts) {
       timeout: o.timeoutMs || 60000,
       maxBuffer: 16 * 1024 * 1024,
       windowsHide: true,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", FORCE_COLOR: "0", ...live.agentEnv },
+      env: { ...live.envFor(o.capability), GIT_TERMINAL_PROMPT: "0", FORCE_COLOR: "0" },
     }, (err, stdout, stderr) => {
       let code = 0;
       let errText = stripAnsi(stderr || "");

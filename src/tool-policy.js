@@ -163,6 +163,11 @@ const CONFIRM_TOOLS = new Set(
   CAPABILITIES.filter((c) => c.confirm).reduce((acc, c) => acc.concat(c.tools || []), [])
 );
 
+// Инструменты конкретной capability (копия — вызывающий не должен править индекс).
+function toolsForCapability(cap) {
+  return (_byCap.get(String(cap)) || []).slice();
+}
+
 const UNKNOWN = { capability: "unknown", risk: RISK.MEDIUM, confirm: false };
 
 // Политика инструмента. Неизвестный инструмент не блокируется — но помечается
@@ -281,10 +286,126 @@ function redact(value, depth, secrets) {
   return String(value);
 }
 
+// ── Выдача секретов по назначению ─────────────────────────────────────────────
+// Переменные агента (`settings.agentEnv`) — это ключи, пароли и токены
+// пользователя. Раньше их получала ЛЮБАЯ команда агента: и сборка проекта, и git,
+// и облако, и браузер. Теперь переменную можно выдать конкретному инструменту —
+// вернее, его capability или целой группе (`terminal`, `git`, `cloud`, …).
+//
+// Правила (совместимость важнее красоты):
+// - переменной нет в списке ограничений — она доходит всюду, как раньше;
+// - переменная ограничена — доходит только до названных capability/групп и до
+//   помеченного `*`;
+// - список ограничений есть, но после чистки пуст (опечатка, чужое имя) —
+//   переменная не выдаётся НИКОМУ. Так опечатка сужает выдачу, а не расширяет
+//   её: молча отдать секрет всем командам — худший из возможных исходов.
+const SCOPE_ALL = "*";
+
+// Группа capability: `git.push` → `git`, `terminal.execute` → `terminal`.
+// Односегментные capability (`unknown`) группы не имеют.
+function capabilityGroup(cap) {
+  const c = String(cap || "").trim().toLowerCase();
+  const dot = c.indexOf(".");
+  return dot > 0 ? c.slice(0, dot) : c;
+}
+
+// Допустимые имена ограничений: capability, их группы и «все» (*).
+const _scopeNames = new Set([SCOPE_ALL]);
+for (const cap of _byCap.keys()) {
+  _scopeNames.add(cap);
+  const g = capabilityGroup(cap);
+  if (g.indexOf(".") === -1 && g) _scopeNames.add(g);
+}
+
+// Группы для интерфейса собираются из самой таблицы прав: отдельного списка
+// нет — UI и политика не могут разойтись. Инструменты считаются по capability.
+function scopeGroups() {
+  const byGroup = new Map();
+  for (const cap of _byCap.keys()) {
+    const g = capabilityGroup(cap);
+    if (!g || g === cap) continue;
+    if (!byGroup.has(g)) byGroup.set(g, []);
+    byGroup.get(g).push(cap);
+  }
+  return Array.from(byGroup.entries())
+    .map(([group, caps]) => ({
+      group,
+      caps: caps.slice().sort(),
+      tools: caps.reduce((n, c) => n + toolsForCapability(c).length, 0),
+    }))
+    .sort((a, b) => (a.group < b.group ? -1 : a.group > b.group ? 1 : 0));
+}
+
+// Приводит пользовательский список ограничений к предсказуемому виду.
+// Ключ в результате ЕСТЬ всегда, если он был во входе: «нет записи» и «запись
+// без допустимых имён» — разные состояния (см. правило про опечатку выше).
+function normalizeScopes(scopes) {
+  const out = {};
+  if (!scopes || typeof scopes !== "object") return out;
+  for (const key of Object.keys(scopes)) {
+    const name = String(key || "").trim();
+    if (!name) continue;
+    const raw = Array.isArray(scopes[key]) ? scopes[key] : scopes[key] == null ? [] : [scopes[key]];
+    const list = [];
+    for (const s of raw) {
+      const v = String(s || "").trim().toLowerCase();
+      if (!v || !_scopeNames.has(v) || list.indexOf(v) !== -1) continue;
+      list.push(v);
+    }
+    out[name] = list;
+  }
+  return out;
+}
+
+// Дойдёт ли ограничение scope до названного назначения.
+// Назначение пустое или незнакомое (действие не от инструмента, новый
+// инструмент без политики) — ограниченная переменная не выдаётся.
+function scopeAllows(scope, capability) {
+  const s = String(scope || "").trim().toLowerCase();
+  if (!s) return false;
+  if (s === SCOPE_ALL) return true;
+  const cap = String(capability || "").trim().toLowerCase();
+  if (!cap || cap === "unknown") return false;
+  return s === cap || s === capabilityGroup(cap);
+}
+
+// Подмножество переменных, которое можно отдать названному назначению.
+function envForCapability(values, scopes, capability) {
+  const out = {};
+  const vals = values && typeof values === "object" ? values : {};
+  const sc = normalizeScopes(scopes);
+  for (const k of Object.keys(vals)) {
+    if (!(k in sc)) {
+      out[k] = vals[k]; // ограничения нет — как раньше, доходит всюду
+      continue;
+    }
+    const list = sc[k];
+    if (list.indexOf(SCOPE_ALL) !== -1 || list.some((s) => scopeAllows(s, capability))) out[k] = vals[k];
+  }
+  return out;
+}
+
+// Объяснение выдачи для интерфейса и инструмента envList: кто получит значение.
+function scopeSummary(scopes, name) {
+  const sc = normalizeScopes(scopes);
+  if (!(name in sc)) return "всем командам";
+  const list = sc[name];
+  if (!list.length) return "ни одному инструменту";
+  if (list.indexOf(SCOPE_ALL) !== -1) return "всем командам";
+  return list.join(", ");
+}
+
 module.exports = {
   RISK,
   RISK_WEIGHT,
   CAPABILITIES,
+  SCOPE_ALL,
+  scopeGroups,
+  normalizeScopes,
+  scopeAllows,
+  envForCapability,
+  scopeSummary,
+  capabilityGroup,
   CONFIRM_TOOLS,
   DANGEROUS_CMD_RE,
   ENV_DUMP_RE,
@@ -300,5 +421,5 @@ module.exports = {
   scrub,
   redact,
   allCapabilities: () => Array.from(_byCap.keys()),
-  toolsForCapability: (cap) => (_byCap.get(String(cap)) || []).slice(),
+  toolsForCapability,
 };

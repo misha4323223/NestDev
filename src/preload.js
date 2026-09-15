@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld("api", {
   isElectron: true,
   getSettings: () => ipcRenderer.invoke("settings:get"),
   setSettings: (s) => ipcRenderer.invoke("settings:set", s),
+  policyGroups: () => ipcRenderer.invoke("policy:groups"), // группы выдачи секретов для настроек
   loadChats: () => ipcRenderer.invoke("chats:load"),
   saveChats: (d) => ipcRenderer.invoke("chats:save", d),
   saveChatsSync: (d) => ipcRenderer.sendSync("chats:saveSync", d),

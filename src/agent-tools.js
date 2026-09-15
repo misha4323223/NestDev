@@ -41,6 +41,7 @@ function createAgentTools(deps) {
     saveSettings,
     resolvePath,
     runGit,
+    envFor, // выдача окружения по назначению (мост к main.js)
     agentWorkDir,
     repoNameFromUrl,
     stripUrlCreds,
@@ -156,6 +157,10 @@ function createAgentTools(deps) {
   const live = {
     get agentEnv() {
       return deps.live.agentEnv();
+    },
+    // Сводка «кому выдана переменная» — через мост, как и остальные живые значения.
+    scopeSummary(name) {
+      return deps.live.scopeSummary(name);
     },
     get userAgentEnv() {
       return deps.live.userAgentEnv();
@@ -656,10 +661,23 @@ function createAgentTools(deps) {
         const value = String(args.value ?? "");
         const s = loadSettings();
         live.userAgentEnv[key] = value;
-        s.agentEnv = { ...userAgentEnv };
+        // Читаем ИМЕННО через мост: после разреза модуля «голое» имя main.js здесь
+        // недоступно — было ReferenceError, и envSet отвечал ошибкой вместо работы.
+        s.agentEnv = { ...live.userAgentEnv };
+        // Выдача: вручную ограничить, кому переменная подставляется. Без scopes —
+        // как раньше, всем командам агента. Имена проверяет политика при сохранении.
+        const askedScope = args.scopes !== undefined;
+        if (askedScope) {
+          const list = Array.isArray(args.scopes) ? args.scopes : [args.scopes];
+          s.agentEnvScopes = { ...(s.agentEnvScopes || {}), [key]: list };
+        }
         saveSettings(s);
         applyAgentEnv(s);
-        return "OK — переменная " + key + " задана. Она доступна во всех следующих командах (runCommand, startBackground, shell, git, docker). Значение в чат не выводится.";
+        const scopeNote = askedScope ? " Выдача: " + live.scopeSummary(key) + "." : "";
+        const who = askedScope
+          ? " Значение получат только названные команды."
+          : " Она подставляется командам агента (всем, пока не ограничишь выдачу).";
+        return "OK — переменная " + key + " задана." + scopeNote + who + " Значение в чат не выводится.";
     },
     "envList": async (args, settings) => {
         const keys = Object.keys(live.agentEnv);
@@ -668,9 +686,10 @@ function createAgentTools(deps) {
         return "Доступные переменные (" + keys.length + "):\n" +
           keys.map((k) => {
             const v = String(live.agentEnv[k] || "");
-            return "• " + k + " — установлена (" + v.length + " симв.)" + (k in auto ? " [авто: Yandex Cloud]" : "");
+            const scope = live.scopeSummary ? live.scopeSummary(k) : "";
+            return "• " + k + " — установлена (" + v.length + " симв.)" + (k in auto ? " [авто: Yandex Cloud]" : "") + (scope ? " [выдача: " + scope + "]" : "");
           }).join("\n") +
-          "\n\nЗначения скрыты — они подмешиваются в команды автоматически.";
+          "\n\nЗначения скрыты — их получают только те команды, которым переменная выдана.";
     },
     "envUnset": async (args, settings) => {
         const key = String(args.key || "").trim();
@@ -684,7 +703,7 @@ function createAgentTools(deps) {
         }
         const s = loadSettings();
         delete live.userAgentEnv[key];
-        s.agentEnv = { ...userAgentEnv };
+        s.agentEnv = { ...live.userAgentEnv };
         saveSettings(s);
         applyAgentEnv(s);
         return "OK — переменная " + key + " удалена.";
@@ -1673,7 +1692,8 @@ function createAgentTools(deps) {
         } catch {}
         if (!kind) return "Ошибка: поддерживаются строки подключения postgres://... и mysql://...";
         return await new Promise((resolve) => {
-          const baseEnv = { ...process.env, ...agentEnv };
+          // Клиент БД получает выданное ему (db.query), а не весь набор переменных агента.
+          const baseEnv = { ...envFor("db.query") };
           if (kind === "postgres") {
             execFile("psql", [conn, "-v", "ON_ERROR_STOP=1", "-c", sql], { timeout: 60000, maxBuffer: 16 * 1024 * 1024, windowsHide: true, env: baseEnv }, (err, stdout, stderr) => {
               const o = stripAnsi((stdout || "").toString());

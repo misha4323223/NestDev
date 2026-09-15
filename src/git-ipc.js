@@ -22,6 +22,7 @@ function registerGitIpc(deps) {
     runGit,
     sanitizeDir,
     cloneRepoTo,
+    withCapability, // клон из панели объявляет назначение git.clone
     pickCloneBase,
     stageAllSafe,
     setLastAgentRepoDir,
@@ -33,12 +34,12 @@ ipcMain.handle("git:repoInfo", async (_e, dir) => {
   const d = sanitizeDir(dir);
   if (!d) return { ok: false, error: "Папка не найдена" };
   const s = loadSettings();
-  const root = await runGit(d, ["rev-parse", "--show-toplevel"], s);
+  const root = await runGit(d, ["rev-parse", "--show-toplevel"], s, "git.read");
   if (!root.ok) return { ok: true, isRepo: false, message: "Не git-репозиторий" };
   const rootDir = (root.out || "").trim();
   const [branchR, remoteR] = await Promise.all([
-    runGit(rootDir, ["branch", "--show-current"], s),
-    runGit(rootDir, ["remote", "get-url", "origin"], s),
+    runGit(rootDir, ["branch", "--show-current"], s, "git.read"),
+    runGit(rootDir, ["remote", "get-url", "origin"], s, "git.read"),
   ]);
   let remote = remoteR.ok ? remoteR.out.trim() : "";
   // Никогда не показываем токен, если он оказался зашит в URL
@@ -49,7 +50,7 @@ ipcMain.handle("git:repoInfo", async (_e, dir) => {
 ipcMain.handle("git:status", async (_e, dir) => {
   const d = sanitizeDir(dir);
   if (!d) return { ok: false, error: "Папка не найдена" };
-  const r = await runGit(d, ["status", "--porcelain=v1", "-b", "-uall"], loadSettings());
+  const r = await runGit(d, ["status", "--porcelain=v1", "-b", "-uall"], loadSettings(), "git.read");
   if (!r.ok) return { ok: false, error: r.err };
   const staged = [];
   const unstaged = [];
@@ -96,7 +97,7 @@ ipcMain.handle("git:log", async (_e, dir, n) => {
   const d = sanitizeDir(dir);
   if (!d) return { ok: false, error: "Папка не найдена" };
   const count = Math.max(1, Math.min(parseInt(n, 10) || 50, 200));
-  const r = await runGit(d, ["log", "-n", String(count), "--pretty=format:%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s"], loadSettings());
+  const r = await runGit(d, ["log", "-n", String(count), "--pretty=format:%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s"], loadSettings(), "git.read");
   if (!r.ok) return { ok: false, error: r.err };
   const commits = r.out
     ? r.out.split("\n").map((line) => {
@@ -120,7 +121,8 @@ ipcMain.handle("git:commitDetail", async (_e, dir, hash) => {
   const r = await runGit(
     d,
     ["show", "--numstat", "--format=%H%x1f%s%x1f%an%x1f%aI", String(hash)],
-    loadSettings()
+    loadSettings(),
+    "git.read"
   );
   if (!r.ok) return { ok: false, error: r.err };
   const lines = r.out.split("\n");
@@ -161,7 +163,7 @@ function gitRelFile(dir, file) {
 ipcMain.handle("git:pull", async (_e, dir) => {
   const d = sanitizeDir(dir);
   if (!d) return { ok: false, error: "Папка не найдена" };
-  const r = await runGit(d, ["pull", "--ff-only"], loadSettings());
+  const r = await runGit(d, ["pull", "--ff-only"], loadSettings(), "git.clone");
   return r.ok ? { ok: true, out: r.out || "Изменения подтянуты." } : { ok: false, error: r.err || "Не удалось подтянуть изменения" };
 });
 
@@ -169,7 +171,7 @@ ipcMain.handle("git:pull", async (_e, dir) => {
 ipcMain.handle("git:unstage", async (_e, dir, file) => {
   const prep = gitRelFile(dir, file);
   if (!prep.ok) return prep;
-  const r = await runGit(prep.dir, ["reset", "HEAD", "--", prep.rel], loadSettings());
+  const r = await runGit(prep.dir, ["reset", "HEAD", "--", prep.rel], loadSettings(), "git.commit");
   return r.ok ? { ok: true, out: "Файл убран из индекса." } : { ok: false, error: r.err };
 });
 
@@ -177,7 +179,7 @@ ipcMain.handle("git:unstage", async (_e, dir, file) => {
 ipcMain.handle("git:rm", async (_e, dir, file) => {
   const prep = gitRelFile(dir, file);
   if (!prep.ok) return prep;
-  const r = await runGit(prep.dir, ["rm", "-f", "--", prep.rel], loadSettings());
+  const r = await runGit(prep.dir, ["rm", "-f", "--", prep.rel], loadSettings(), "git.commit");
   if (r.ok) return { ok: true, out: "Файл удалён." };
   const abs = path.join(prep.dir, prep.rel);
   try {
@@ -194,21 +196,21 @@ ipcMain.handle("git:rm", async (_e, dir, file) => {
 ipcMain.handle("git:revert", async (_e, dir, hash) => {
   const d = sanitizeDir(dir);
   if (!d) return { ok: false, error: "Папка не найдена" };
-  const r = await runGit(d, ["revert", "--no-edit", String(hash)], loadSettings());
+  const r = await runGit(d, ["revert", "--no-edit", String(hash)], loadSettings(), "git.commit");
   return r.ok ? { ok: true, out: r.out || "Коммит отменён." } : { ok: false, error: r.err || "Не удалось откатить (возможен конфликт)" };
 });
 
 ipcMain.handle("git:resetHard", async (_e, dir, hash) => {
   const d = sanitizeDir(dir);
   if (!d) return { ok: false, error: "Папка не найдена" };
-  const r = await runGit(d, ["reset", "--hard", String(hash)], loadSettings());
+  const r = await runGit(d, ["reset", "--hard", String(hash)], loadSettings(), "git.commit");
   return r.ok ? { ok: true, out: "Сброшено к " + String(hash) } : { ok: false, error: r.err };
 });
 
 ipcMain.handle("git:restore", async (_e, dir) => {
   const d = sanitizeDir(dir);
   if (!d) return { ok: false, error: "Папка не найдена" };
-  const r = await runGit(d, ["restore", "."], loadSettings());
+  const r = await runGit(d, ["restore", "."], loadSettings(), "git.commit");
   return r.ok ? { ok: true, out: "Изменения отменены." } : { ok: false, error: r.err };
 });
 
@@ -218,11 +220,11 @@ ipcMain.handle("git:undoLastCommit", async (_e, dir) => {
   const d = sanitizeDir(dir);
   if (!d) return { ok: false, error: "Папка не найдена" };
   const s = loadSettings();
-  const log = await runGit(d, ["log", "-1", "--pretty=%h"], s);
+  const log = await runGit(d, ["log", "-1", "--pretty=%h"], s, "git.read");
   if (!log.ok || !String(log.out || "").trim()) {
     return { ok: false, error: "В истории нет коммитов для отмены" };
   }
-  const r = await runGit(d, ["reset", "--soft", "HEAD~1"], s);
+  const r = await runGit(d, ["reset", "--soft", "HEAD~1"], s, "git.commit");
   if (!r.ok) return { ok: false, error: r.err || "Не удалось отменить коммит" };
   return { ok: true, out: "Последний коммит " + String(log.out).trim() + " отменён (reset --soft): его изменения вернулись как незакоммиченные, ничего не потеряно." };
 });
@@ -237,7 +239,7 @@ ipcMain.handle("git:diff", async (_e, dir, file) => {
   // отвечал «не в git» вместе с его размером. Правило должно быть одно.
   const prep = gitRelFile(d, file);
   if (!prep.ok) return prep;
-  const r = await runGit(d, ["diff", "--", prep.rel], loadSettings());
+  const r = await runGit(d, ["diff", "--", prep.rel], loadSettings(), "git.read");
   if (r.ok && r.out) return { ok: true, diff: r.out, untracked: false };
   const abs = path.join(d, prep.rel);
   if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
@@ -258,7 +260,8 @@ ipcMain.handle("git:commit", async (_e, dir, message) => {
   const commit = await runGit(
     d,
     ["-c", "user.name=AI Agent", "-c", "user.email=ai-agent@local", "commit", "-m", msg],
-    s
+    s,
+    "git.commit"
   );
   if (!commit.ok) return { ok: false, error: commit.err || "Коммит не создан (нет изменений?)" };
   return { ok: true, out: commit.out || "Коммит создан." };
@@ -267,7 +270,7 @@ ipcMain.handle("git:commit", async (_e, dir, message) => {
 ipcMain.handle("git:push", async (_e, dir) => {
   const d = sanitizeDir(dir);
   if (!d) return { ok: false, error: "Папка не найдена" };
-  const r = await runGit(d, ["push"], loadSettings());
+  const r = await runGit(d, ["push"], loadSettings(), "git.push");
   return r.ok ? { ok: true, out: r.out || "Отправлено на GitHub." } : { ok: false, error: r.err };
 });
 
@@ -276,7 +279,9 @@ ipcMain.handle("git:clone", async (_e, base, url) => {
   if (!/^(https?:\/\/|git@)/i.test(u)) return { ok: false, error: "URL должен начинаться с https:// или git@" };
   const prep = pickCloneBase(base, loadSettings());
   if (!prep.ok) return prep;
-  const r = await cloneRepoTo(u, prep.dir, loadSettings());
+  // Клон из панели идёт под своим назначением: GIT_SSH_COMMAND и прочее,
+  // выданное git.clone, должно дойти до настоящего git.
+  const r = await withCapability("git.clone", () => cloneRepoTo(u, prep.dir, loadSettings()));
   if (r.ok) {
     // Состояние агента живёт в main.js: пишем через сеттеры, чтобы не держать
     // устаревшую копию значения у себя.

@@ -1011,8 +1011,9 @@
           <div class="settings-section">
             <div class="settings-section-title">🔒 Секреты · переменные окружения</div>
             <div class="field">
-              <label>Задаются один раз — автоматически подставляются во все команды (агент, терминал, git, docker). В чат не выводятся.</label>
+              <label>Задаются один раз и в чат не выводятся. У каждой переменной видна выдача: кому её подставлять — всем командам (как раньше) или одному инструменту.</label>
               <div id="env-list" class="env-list"></div>
+              <div class="env-note">Выдача сужает доступ: переменная с ограничением доходит только до выбранного, без ограничения — до всех команд агента.</div>
               <div class="env-add">
                 <input id="s-env-key" placeholder="ИМЯ_ПЕРЕМЕННОЙ" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" />
                 <input id="s-env-value" type="password" placeholder="значение" spellcheck="false" autocomplete="off" />

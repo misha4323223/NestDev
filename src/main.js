@@ -131,6 +131,9 @@ const DEFAULT_SETTINGS = {
   githubRepoDir: "",
   allowAgentPush: false, // агенту ЗАПРЕЩЕНО пушить в GitHub, пока пользователь явно не включит
   agentAutoCommit: true, // авто-чекпоинт: локальный коммит после каждого завершённого задания агента
+  // Кому выдана каждая переменная агента: { ИМЯ: ["terminal", "git", "*"] }.
+  // Пусто (нет записи) — переменная доходит до всех команд агента, как раньше.
+  agentEnvScopes: {},
   projects: [], // список проектов (до 10): { id, name, dir, createdAt, lastOpened }
 
   // Мобильный доступ: мост по LAN с PIN-кодом (телефон в той же Wi-Fi сети).
@@ -242,6 +245,9 @@ function normalizeSettings(raw) {
     }
   }
   if (!Array.isArray(s.projects)) s.projects = [];
+  // Кому выданы переменные агента: мусор и опечатки в именах ограничений
+  // отбрасываются политикой (и тогда переменная не выдаётся никому — см. tool-policy.js).
+  s.agentEnvScopes = toolPolicy.normalizeScopes(s.agentEnvScopes);
   // Пароли сайтов: чистка мусора и дублей (пустые/битые записи отбрасываются).
   s.sitePasswords = vault.sanitizeList(s.sitePasswords);
   return s;
@@ -251,6 +257,30 @@ function normalizeSettings(raw) {
 // (settings.agentEnv) и подмешиваются во все команды: runCommand, фоновые процессы, shell, git, docker.
 let agentEnv = {}; // итоговый набор: пользовательский + автоматический (Yandex Cloud)
 let userAgentEnv = {}; // только то, что задал пользователь — это и сохраняется в настройках
+// Кому какая переменная выдана: { ИМЯ: ["terminal", "git"] } (settings.agentEnvScopes).
+// Пусто для переменной — как раньше: доходит до всех команд агента. Заполнено —
+// только до названных инструментов и групп (см. tool-policy.js).
+let agentEnvScopes = {};
+// Инструмент, который выполняется СЕЙЧАС (его capability). Команды внутри одного
+// вызова получают выданное этому инструменту; действие без инструмента (кнопка
+// «Запустить», авто-коммит, сборка бандла) назначения не имеет и объявляет его само.
+let activeToolCapability = "";
+function activeCapability() {
+  return activeToolCapability;
+}
+
+// Выполнить операцию под названным назначением. Нужно действиям НЕ от инструмента:
+// кнопка «Загрузить» в панели git, «Опубликовать на GitHub». Внутри вложенных вызовов
+// это назначение видят все помощники — runGit, commandEnv, spawnRaw.
+async function withCapability(capability, fn) {
+  const prev = activeToolCapability;
+  activeToolCapability = capability;
+  try {
+    return await fn();
+  } finally {
+    activeToolCapability = prev;
+  }
+}
 
 // Автоматические переменные Yandex Cloud для команд агента. yc CLI читает их прямо
 // из окружения, поэтому подключённый аккаунт работает без интерактивного `yc init`.
@@ -305,14 +335,26 @@ function pathOnlyEnv() {
   return safe;
 }
 
+// Окружение для названного назначения: инструмент получает ТОЛЬКО те переменные
+// агента, которые ему выданы (или все неограниченные — как раньше). Назначения:
+// capability инструмента в работе, а для действий без инструмента — явное имя
+// (кнопка «Запустить» → terminal.execute, авто-коммит → git.commit).
+function envFor(capability) {
+  const cap = capability || activeToolCapability;
+  return { ...process.env, ...toolPolicy.envForCapability(agentEnv, agentEnvScopes, cap) };
+}
+
 // Окружение для команды, которую СОЧИНИЛ агент (runCommand, фоновые процессы, shell).
-// Обычные команды (npm, docker, yc, git) получают переменные агента как раньше, но
+// Обычные команды (npm, docker, yc, git) получают выданные переменные агента, но
 // команда, которая просто печатает всё окружение (env, printenv, set, Get-ChildItem Env:),
 // секретов не получает — иначе модель одной строкой выводит пароли пользователя в чат.
-function commandEnv(command) {
+function commandEnv(command, capability) {
   const base = { ...process.env, GIT_TERMINAL_PROMPT: "0", FORCE_COLOR: "0" };
   if (toolPolicy.commandDumpsEnv(command)) return { ...base, ...pathOnlyEnv() };
-  return { ...base, ...agentEnv };
+  // Инструмент в работе важнее: команда внутри cloud-инструмента получает выданное
+  // облаку, а не терминалу. «terminal.execute» объявляется только тогда, когда
+  // инструмента нет вовсе (терминал пользователя, кнопка запуска превью).
+  return { ...base, ...envFor(capability || activeToolCapability || "terminal.execute") };
 }
 
 // Служебные пробы (поиск программы в PATH, проверка версии) секретов не требуют.
@@ -374,6 +416,7 @@ function ycEnsurePath() {
 // Пересобрать окружение агента: пользовательские переменные + автоматические YC.
 function applyAgentEnv(s) {
   userAgentEnv = (s && typeof s.agentEnv === "object" && s.agentEnv) || {};
+  agentEnvScopes = toolPolicy.normalizeScopes(s && s.agentEnvScopes);
   lastAgentEnvSettings = s || lastAgentEnvSettings;
   rebuildAgentEnv();
   ycEnsurePath();
@@ -501,11 +544,17 @@ function resolvePath(p, settings) {
 
 // ─────────────────────────── Git ───────────────────────────
 // cwd — директория, в которой выполняется git; settings — для токена авторизации (OAuth / PAT).
-function runGit(cwd, args, settings) {
+function runGit(cwd, args, settings, capability) {
   return new Promise((resolve) => {
     const opts = { cwd, timeout: 180000, maxBuffer: 16 * 1024 * 1024, windowsHide: true };
+    // Git-операции объявляют своё назначение: инструмент git* — своим именем, а
+    // авто-коммит и кнопки (не от инструмента) — git.commit и git.read.
+    // Назначение: инструмент git* — своим именем, каналы панели приходят с явной
+    // операцией (git:push → git.push), а внутренние вызовы (авто-коммит, клон,
+    // публикация) объявляют группу git — им выдаётся разрешённое всей группе.
+    const gitEnv = { ...envFor(capability || activeToolCapability || "git"), GIT_TERMINAL_PROMPT: "0" };
     if (settings && settings.githubToken) {
-      opts.env = { ...process.env, GIT_TERMINAL_PROMPT: "0", ...agentEnv };
+      opts.env = gitEnv;
       // GitHub принимает на git-эндпоинте только Basic-авторизацию (Bearer отклоняет
       // с «remote: invalid credentials»). Схема как в GitHub Actions:
       // Authorization: Basic base64(<login или x-access-token>:<token>).
@@ -513,7 +562,7 @@ function runGit(cwd, args, settings) {
       const ghAuth = Buffer.from(ghUser + ":" + settings.githubToken).toString("base64");
       args = ["-c", "http.extraheader=Authorization: Basic " + ghAuth, ...args];
     } else if (Object.keys(agentEnv).length) {
-      opts.env = { ...process.env, GIT_TERMINAL_PROMPT: "0", ...agentEnv };
+      opts.env = gitEnv;
     }
     execFile("git", args, opts, (err, stdout, stderr) => {
       const out = (stdout || "").toString();
@@ -871,7 +920,7 @@ function unifiedDiff(p1, p2) {
       timeout: 30000,
       maxBuffer: 16 * 1024 * 1024,
       windowsHide: true,
-      env: { ...process.env, ...agentEnv },
+      env: { ...envFor("git.read"), GIT_TERMINAL_PROMPT: "0" },
     }, (err, stdout, stderr) => {
       // git diff --no-index возвращает код 1 при различиях — это норма, патч в stdout.
       resolve({ patch: stripAnsi((stdout || "") + (stderr || "")).trim() });
@@ -1633,6 +1682,9 @@ const systemStack = createSystemStack({
     get agentEnv() {
       return agentEnv;
     },
+    // Системный раздел получает не «всё подряд», а выданное назначению:
+    // установщики, архивы и админ-запуск работают под своим инструментом.
+    envFor,
   },
 });
 const {
@@ -1866,6 +1918,11 @@ function checkTaskReminders() {
 
 async function executeTool(name, args, settings) {
   args = args || {};
+  // Инструмент в работе: его capability решает, какие переменные агента дойдут до
+  // команд внутри него. Вызовы инструментов идут по очереди (цикл runAi), поэтому
+  // одного «текущего назначения» достаточно; вложенный вызов вернёт своё.
+  const prevCapability = activeToolCapability;
+  activeToolCapability = toolPolicy.capabilityOf(name);
   try {
     // Пользователь нажал Esc/«Стоп» — агент должен немедленно остановиться.
     if (global.__agentStopRequested) {
@@ -1878,6 +1935,8 @@ async function executeTool(name, args, settings) {
     return await handler(args, settings);
   } catch (e) {
     return "Ошибка: " + fmtError(e);
+  } finally {
+    activeToolCapability = prevCapability;
   }
 }
 
@@ -2863,7 +2922,7 @@ function termStart(cwd) {
       detached: !isWin,
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", FORCE_COLOR: "0", ...agentEnv },
+      env: { ...envFor("terminal.execute"), GIT_TERMINAL_PROMPT: "0", FORCE_COLOR: "0" },
     });
   } catch (e) {
     return { ok: false, error: e.message };
@@ -2953,6 +3012,9 @@ function termComplete(line) {
 
 // ─────────────────────────── IPC ───────────────────────────
 ipcMain.handle("settings:get", () => loadSettings());
+// Группы выдачи секретов (terminal, git, cloud …) для настроек: собираются из
+// таблицы прав (tool-policy.js) — рендерер ничего не дублирует у себя.
+ipcMain.handle("policy:groups", () => toolPolicy.scopeGroups());
 ipcMain.handle("settings:set", (_e, s) => {
   const prev = loadSettings();
   if (s && s.workingDir && prev.workingDir !== s.workingDir) {
@@ -3982,7 +4044,9 @@ ipcMain.handle("github:publish", async (_e, opts) => {
   opts = opts || {};
   const reqDir = opts.dir && typeof opts.dir === "string" ? opts.dir.trim() : "";
   const dir = reqDir ? (sanitizeDir(reqDir) || reqDir) : agentWorkDir(s);
-  const res = await publishLocalToGithub(dir, s, opts);
+  // Публикация из панели — не инструмент: назначение объявляем сами, чтобы
+  // переменные, выданные группе git, дошли до git init/commit/push.
+  const res = await withCapability("git.push", () => publishLocalToGithub(dir, s, opts));
   if (res.ok) githubEmit({ type: "published", slug: res.slug, dir: res.dir, url: res.url });
   return res;
 });
@@ -4363,6 +4427,7 @@ const agentToolHandlers = createAgentTools({
   saveSettings,
   resolvePath,
   runGit,
+  envFor, // окружение по назначению: инструментам — своё, а не всё сразу
   agentWorkDir,
   repoNameFromUrl,
   stripUrlCreds,
@@ -4475,6 +4540,9 @@ const agentToolHandlers = createAgentTools({
   live: {
     agentEnv: () => agentEnv,
     userAgentEnv: () => userAgentEnv,
+    // Что и кому выдано — envList показывает это честно, чтобы агент не искал
+    // переменную, которой у него нет.
+    scopeSummary: (name) => toolPolicy.scopeSummary(agentEnvScopes, name),
     lastAgentRepoDir: () => lastAgentRepoDir,
     setLastAgentRepoDir: (v) => {
       lastAgentRepoDir = v;

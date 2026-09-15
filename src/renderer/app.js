@@ -21,6 +21,10 @@
     workingDir: "",
     previewUrl: "http://localhost:5000",
     agentEnv: {}, // секреты/переменные окружения: подставляются в команды агента, терминал, git, docker
+    agentEnv: {}, // подставляются в команды агента (кому именно — решает выдача ниже)
+    // Кому выдана каждая переменная: { ИМЯ: ["terminal", "git"] }. Нет записи — всем
+    // командам агента (как раньше), пустой список — никому.
+    agentEnvScopes: {},
     githubToken: "",
     githubClientId: "",
     githubLogin: "",
@@ -3244,6 +3248,52 @@
 
 
   // ─────────────── Секреты: переменные окружения (Настройки) ───────────────
+  // ── Выдача секретов: кому подставлять переменную ───────────────────────────
+  // Названия групп приходят из таблицы прав главного процесса (policy:groups):
+  // список у интерфейса свой, но собирается он из политики — разойтись не могут.
+  let envScopeGroupList = null;
+  const ENV_SCOPE_LABELS = {
+    agent: "ожидание", api: "внешние API", app: "окно приложения", browser: "браузер",
+    clipboard: "буфер обмена", cloud: "облако", db: "базы данных", files: "файлы проекта",
+    git: "git и GitHub", mail: "почта", media: "картинки", notes: "заметки и чекпоинты",
+    preview: "превью и ссылки", project: "сборка, тесты, зависимости", screen: "экран",
+    secrets: "переменные агента", self: "обновление приложения", system: "система",
+    tasks: "дела", terminal: "терминал и команды", vault: "пароли сайтов", web: "поиск в сети",
+  };
+  function envScopeLabel(g) {
+    return ENV_SCOPE_LABELS[g] || g;
+  }
+  function envScopeGroups() {
+    if (envScopeGroupList) return envScopeGroupList;
+    if (!isElectron || !api.policyGroups) return [];
+    api.policyGroups().then((list) => {
+      envScopeGroupList = Array.isArray(list) ? list : [];
+      renderEnvVars(); // группы пришли после первой отрисовки — перерисовываем один раз
+    }).catch(() => {
+      envScopeGroupList = [];
+    });
+    return [];
+  }
+  // Выдача переменной: "*" — всем, "none" — никому, группа/имя — ей, "__multi" — несколько.
+  function envScopeValue(k) {
+    const sc = settings.agentEnvScopes || {};
+    if (!(k in sc)) return "*";
+    const list = Array.isArray(sc[k]) ? sc[k] : [];
+    if (!list.length) return "none";
+    if (list.indexOf("*") !== -1) return "*";
+    return list.length === 1 ? list[0] : "__multi";
+  }
+  function setEnvScope(k, v) {
+    if (!settings.agentEnvScopes) settings.agentEnvScopes = {};
+    // «Всем» — это отсутствие записи: так файл настроек остаётся чистым, а поведение
+    // по умолчанию (как раньше) видно по самому отсутствию ограничения.
+    if (v === "*") delete settings.agentEnvScopes[k];
+    else if (v === "none") settings.agentEnvScopes[k] = [];
+    else if (v !== "__multi") settings.agentEnvScopes[k] = [v];
+    persistSettings();
+    renderEnvVars();
+  }
+
   function renderEnvVars() {
     const box = $("env-list");
     if (!box) return;
@@ -3254,6 +3304,7 @@
       box.innerHTML = '<div class="env-note">Переменных пока нет. Добавь вручную ниже или импортируй из файла .env.</div>';
       return;
     }
+    const groups = envScopeGroups();
     for (const k of keys) {
       const v = String(vars[k] || "");
       const row = document.createElement("div");
@@ -3265,7 +3316,32 @@
       const vEl = document.createElement("span");
       vEl.className = "env-val";
       vEl.textContent = v ? "•••••••• (" + v.length + " симв.)" : "(пусто)";
-      vEl.title = v ? "Значение скрыто — оно подставляется в команды автоматически" : "";
+      vEl.title = v ? "Значение скрыто — оно подставляется только тем, кому выдано" : "";
+      // Выдача: кому эта переменная подставляется.
+      const current = envScopeValue(k);
+      const sel = document.createElement("select");
+      sel.className = "env-scope" + (current === "*" ? "" : " limited");
+      sel.title = "Кому подставлять «" + k + "»";
+      const add = (value, text) => {
+        const o = document.createElement("option");
+        o.value = value;
+        o.textContent = text;
+        sel.appendChild(o);
+      };
+      add("*", "Всем командам");
+      add("none", "Ни одному инструменту");
+      const stored = (settings.agentEnvScopes || {})[k];
+      if (current === "__multi") add("__multi", "Несколько: " + (Array.isArray(stored) ? stored.join(", ") : ""));
+      for (const g of groups) add(g.group, envScopeLabel(g.group) + " — " + g.tools + " инстр.");
+      // Точная capability (её задал envSet) в списке групп не найдётся — показываем как есть.
+      if (Array.isArray(stored)) {
+        for (const s of stored) {
+          if (s === "*") continue;
+          if (!groups.some((g) => g.group === s)) add(s, s);
+        }
+      }
+      sel.value = current;
+      sel.onchange = () => setEnvScope(k, sel.value);
       const del = document.createElement("button");
       del.type = "button";
       del.className = "btn btn-ghost btn-small env-del";
@@ -3274,6 +3350,7 @@
       del.onclick = () => envDelete(k);
       row.appendChild(kEl);
       row.appendChild(vEl);
+      row.appendChild(sel);
       row.appendChild(del);
       box.appendChild(row);
     }
@@ -3298,6 +3375,9 @@
   function envDelete(k) {
     if (!settings.agentEnv || !(k in settings.agentEnv)) return;
     delete settings.agentEnv[k];
+    // Выдача живёт вместе с переменной: осиротевшее ограничение потом выдало бы
+    // себя, когда переменную создадут заново.
+    if (settings.agentEnvScopes && k in settings.agentEnvScopes) delete settings.agentEnvScopes[k];
     persistSettings();
     renderEnvVars();
     toast("Удалено: " + k);

@@ -144,6 +144,7 @@ async function startServer(port) {
           openaiApiKey: "live-test-key",
           openaiModel: "live-test-model",
           model: "live-test-model",
+          agentEnv: { LIVE_SCOPE_KEY: "секрет-для-выдачи" },
         })
       );
       localStorage.setItem("chats", JSON.stringify({ chats: [], activeId: null }));
@@ -259,6 +260,31 @@ async function startServer(port) {
     await page.click("#btn-close-settings");
     await sleep(250);
     check("настройки закрываются", !(await page.locator("#settings-overlay").isVisible()));
+
+    // Выдача секретов (1.5.84): у каждой переменной агента видно, кому она подставляется.
+    await page.click("#rail-settings");
+    await sleep(250);
+    await page.click('.stab[data-tab="secrets"]');
+    await sleep(300);
+    const scopeSel = page.locator("#env-list .env-scope");
+    check("у переменной агента есть выбор выдачи", (await scopeSel.count()) === 1);
+    const scopeOpts = await scopeSel.locator("option").allTextContents();
+    check(
+      "выдача предлагает «всем командам» и «ни одному инструменту»",
+      scopeOpts.some((t) => /Всем командам/.test(t)) && scopeOpts.some((t) => /Ни одному/.test(t))
+    );
+    check("по умолчанию переменная выдана всем", (await scopeSel.inputValue()) === "*");
+    await scopeSel.selectOption("none");
+    await sleep(250);
+    const savedScopes = await page.evaluate(() => JSON.parse(localStorage.getItem("settings") || "{}").agentEnvScopes || {});
+    check("выбранная выдача сохраняется настройками", Array.isArray(savedScopes.LIVE_SCOPE_KEY) && savedScopes.LIVE_SCOPE_KEY.length === 0);
+    check("ограничение видно прямо в строке", ((await scopeSel.getAttribute("class")) || "").includes("limited"));
+    await scopeSel.selectOption("*"); // возвращаем как было — дальше проверки не должны зависеть от этого
+    await sleep(200);
+    const backToAll = await page.evaluate(() => JSON.parse(localStorage.getItem("settings") || "{}").agentEnvScopes || {});
+    check("«всем» убирает ограничение из настроек", !("LIVE_SCOPE_KEY" in backToAll));
+    await page.click("#btn-close-settings");
+    await sleep(250);
 
     await page.click("#rail-chats");
     await sleep(400);

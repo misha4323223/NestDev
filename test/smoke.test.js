@@ -3137,7 +3137,10 @@ async function testYandexCloud() {
     assert.ok(main.includes("applyAgentEnv(s);"), "loadSettings не пересобирает окружение");
     assert.ok(main.includes("applyAgentEnv(merged);"), "смена настроек не пересобирает окружение");
     // Автоподстановка не должна оседать в настройках: сохраняем только пользовательское.
-    assert.ok(main.includes("s.agentEnv = { ...userAgentEnv }"), "в настройки пишется не только пользовательское");
+    assert.ok(main.includes("s.agentEnv = { ...live.userAgentEnv }"), "в настройки пишется не только пользовательское");
+    // «Голое» имя main.js внутри модуля недоступно: было ReferenceError, и envSet/envUnset
+    // отвечали ошибкой вместо работы (нашлось при вводе выдачи секретов).
+    assert.ok(!main.includes("s.agentEnv = { ...userAgentEnv }"), "инструменты берут окружение не через мост");
     assert.ok(!main.includes("s.agentEnv = { ...agentEnv }"), "в настройки попадает объединённое окружение");
     assert.ok(main.includes("YC_TOKEN") && main.includes("[авто: Yandex Cloud]"), "envList не помечает автоматические переменные");
     assert.ok(/подставляется автоматически из настроек Yandex Cloud/.test(main), "envUnset не защищает автоматические переменные");
@@ -3873,7 +3876,7 @@ async function testShellAndCdp() {
       probeEnv: () => ({ ...process.env }),
       stripAnsi: (x) => String(x || ""),
       runTerminalCommand: async () => "",
-      live: { get agentEnv() { return {}; } },
+      live: { get agentEnv() { return {}; }, envFor: () => ({ ...process.env }) },
       ...(over || {}),
     });
   const spawnRaw = mkSystemStack().spawnRaw;
@@ -9120,6 +9123,7 @@ async function testFsGitIpc() {
       sanitizeDir: inside,
       cloneRepoTo: async (u, d) => ({ ok: true, dir: path.join(d, "repo"), message: "Клонировано" }),
       pickCloneBase: () => ({ ok: true, dir: root }),
+      withCapability: async (cap, fn) => await fn(), // назначение окружения для git-панели
       stageAllSafe: async () => { stageCalled++; return { ok: true }; },
       setLastAgentRepoDir: (v) => { state.dir = v; },
       setClonedRepoPending: (v) => { state.pending = v; },
@@ -10092,6 +10096,213 @@ async function testCoreSplit() {
   await testProviderConfig();
   await testProviderTransport();
   await testContextWindow();
+  await testSecretScopes();
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");
   process.exit(failed ? 1 : 0);
 })();
+
+// ── Выдача секретов по назначению (1.5.84) ───────────────────────────────────
+// Переменные агента раньше получала ЛЮБАЯ команда: и сборка проекта, и git, и
+// облако. Теперь переменную можно выдать конкретному инструменту (или группе).
+// Проверяем три слоя: правило выдачи в политике (включая опечатку, которая
+// обязана СУЖАТЬ доступ, а не открывать его), фактическую выдачу окружения в
+// модулях — вызовом, а не по тексту, — и связку интерфейса: настройки, канал
+// policy:groups, мост телефона.
+async function testSecretScopes() {
+  const policy = require(path.join(ROOT, "src", "tool-policy.js"));
+
+  await test("секреты: без ограничения — всем, с ограничением — только назначению", () => {
+    const vals = { DB: "pg", API: "sk-1", TOKEN: "ghp_x" };
+    const scopes = { API: ["terminal"], TOKEN: ["git.push"], DB: ["*"] };
+    const keysFor = (cap) => Object.keys(policy.envForCapability(vals, scopes, cap)).sort();
+    assert.deepStrictEqual(keysFor("terminal.execute"), ["API", "DB"], "группа terminal не получила выданное ей");
+    assert.deepStrictEqual(keysFor("terminal.admin"), ["API", "DB"], "вторая capability группы не получила выданное");
+    assert.deepStrictEqual(keysFor("git.push"), ["DB", "TOKEN"], "точная capability не получила своё");
+    assert.deepStrictEqual(keysFor("git.read"), ["DB"], "переменная ушла туда, где её не выдавали");
+    assert.deepStrictEqual(keysFor(""), ["DB"], "действие без инструмента получило ограниченное");
+    assert.deepStrictEqual(keysFor("выдуманный"), ["DB"], "инструмент без политики получил ограниченное");
+    assert.deepStrictEqual(Object.keys(vals), ["DB", "API", "TOKEN"], "набор значений изменён на месте");
+  });
+
+  await test("секреты: опечатка сужает доступ, а не открывает его", () => {
+    const vals = { A: "1" };
+    assert.deepStrictEqual(Object.keys(policy.envForCapability(vals, { A: ["termianl"] }, "terminal.execute")), [], "опечатка выдала переменную всем");
+    assert.deepStrictEqual(Object.keys(policy.envForCapability(vals, { A: [] }, "terminal.execute")), [], "пустое ограничение выдало переменную");
+    assert.deepStrictEqual(Object.keys(policy.envForCapability(vals, {}, "terminal.execute")), ["A"], "отсутствие записи перестало значить «всем»");
+    assert.strictEqual(policy.scopeAllows("*", ""), true, "«*» не работает без имени инструмента");
+    assert.strictEqual(policy.scopeAllows("git", "unknown"), false, "инструмент без политики получил ограниченное");
+    assert.strictEqual(policy.scopeAllows("git", ""), false, "действие без имени получило ограниченное");
+    assert.strictEqual(policy.scopeSummary({}, "A"), "всем командам", "сводка для неограниченной переменной неверна");
+    assert.strictEqual(policy.scopeSummary({ A: ["git", "terminal"] }, "A"), "git, terminal", "сводка выдачи неверна");
+  });
+
+  await test("секреты: группы собираются из таблицы прав, а не из отдельного списка", () => {
+    const groups = policy.scopeGroups();
+    assert.ok(groups.length >= 15, "групп подозрительно мало: " + groups.length);
+    const seen = new Map();
+    for (const g of groups) {
+      assert.ok(g.caps.length, "пустая группа " + g.group);
+      assert.ok(g.tools > 0, "в группе " + g.group + " нет инструментов");
+      for (const cap of g.caps) {
+        assert.ok(!seen.has(cap), "capability в двух группах: " + cap);
+        seen.set(cap, g.group);
+        assert.strictEqual(policy.capabilityGroup(cap), g.group, "группа не совпадает с именем capability: " + cap);
+        assert.ok(policy.toolsForCapability(cap).length > 0, "capability без инструментов: " + cap);
+      }
+    }
+    for (const cap of policy.allCapabilities()) assert.ok(seen.has(cap), "capability вне групп выдачи: " + cap);
+    // Каждая группа обязана реально отдавать выданное своему инструменту.
+    for (const g of groups) {
+      const got = Object.keys(policy.envForCapability({ S: "1" }, { S: [g.group] }, g.caps[0]));
+      assert.deepStrictEqual(got, ["S"], "группа " + g.group + " не отдала переменную своему инструменту");
+    }
+  });
+
+  await test("секреты: git-панель объявляет назначение по вызовам, клон идёт под своим", async () => {
+    const { registerGitIpc } = require(path.join(ROOT, "src", "git-ipc.js"));
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "git-scope-"));
+    const handlers = new Map();
+    const asked = [];
+    const wrapped = [];
+    registerGitIpc({
+      ipcMain: { handle: (ch, fn) => handlers.set(ch, fn) },
+      path,
+      fs,
+      loadSettings: () => ({}),
+      runGit: async (dir, args, settings, capability) => {
+        asked.push(args[0] + ":" + capability);
+        return { ok: true, out: "" };
+      },
+      sanitizeDir: (d) => String(d || "") || root,
+      cloneRepoTo: async () => ({ ok: true, dir: root }),
+      withCapability: async (cap, fn) => {
+        wrapped.push(cap);
+        return await fn();
+      },
+      pickCloneBase: () => ({ ok: true, dir: root }),
+      stageAllSafe: async () => ({ ok: true }),
+      setLastAgentRepoDir: () => {},
+      setClonedRepoPending: () => {},
+    });
+    const call = (ch, ...a) => handlers.get(ch)(null, ...a);
+    await call("git:status", root);
+    await call("git:pull", root);
+    await call("git:push", root);
+    await call("git:commit", root, "правка");
+    await call("git:clone", root, "https://github.com/user/repo");
+    assert.ok(asked.includes("status:git.read"), "статус не объявил git.read — " + asked.join(", "));
+    assert.ok(asked.includes("pull:git.clone"), "pull не объявил git.clone — " + asked.join(", "));
+    assert.ok(asked.includes("push:git.push"), "push не объявил git.push — " + asked.join(", "));
+    assert.ok(asked.some((a) => a.endsWith(":git.commit")), "коммит не объявил git.commit — " + asked.join(", "));
+    assert.deepStrictEqual(wrapped, ["git.clone"], "клон идёт без своего назначения — " + wrapped.join(", "));
+  });
+
+  await test("секреты: системный раздел спрашивает окружение у назначения, а не берёт весь набор", async () => {
+    const { createSystemStack } = require(path.join(ROOT, "src", "system-stack.js"));
+    const asked = [];
+    let seenEnv = null;
+    const stack = createSystemStack({
+      fs,
+      path,
+      os,
+      execFile: (bin, args, opts, cb) => {
+        seenEnv = opts && opts.env;
+        setTimeout(() => cb(null, "ok", ""), 0);
+      },
+      winPs: { exec: async () => ({ noSession: true, ok: true, code: 0, out: "", err: "" }) },
+      probeEnv: () => ({ ...process.env }),
+      stripAnsi: (x) => String(x || ""),
+      runTerminalCommand: async () => "",
+      live: {
+        get agentEnv() {
+          return { СЛИШКОМ_МНОГО: "всё сразу" };
+        },
+        envFor: (capability) => {
+          asked.push(capability);
+          return { SCOPE: String(capability) };
+        },
+      },
+    });
+    await stack.spawnRaw(["node", "-e", "1"], { capability: "custom.cap" });
+    assert.deepStrictEqual(asked, ["custom.cap"], "назначение не дошло до main.js — " + asked.join(", "));
+    assert.strictEqual(seenEnv && seenEnv.SCOPE, "custom.cap", "процесс не получил выданное назначению");
+    assert.ok(!(seenEnv && "СЛИШКОМ_МНОГО" in seenEnv), "процесс получил окружение агента напрямую");
+    const src = fs.readFileSync(path.join(ROOT, "src", "system-stack.js"), "utf8");
+    assert.ok(src.indexOf("live.agentEnv") === -1, "system-stack всё ещё берёт окружение копией");
+  });
+
+  await test("секреты: envSet записывает выдачу, envList её показывает (живой вызов)", async () => {
+    const { createAgentTools } = require(path.join(ROOT, "src", "agent-tools.js"));
+    const state = { userAgentEnv: {}, agentEnv: {}, saved: null };
+    const base = new Proxy({}, { get: () => () => undefined });
+    const tools = createAgentTools(
+      Object.assign(Object.create(base), {
+        path,
+        loadSettings: () => ({ agentEnv: { ...state.userAgentEnv }, agentEnvScopes: state.saved ? { ...state.saved.agentEnvScopes } : {} }),
+        saveSettings: (s) => {
+          state.saved = JSON.parse(JSON.stringify(s));
+        },
+        applyAgentEnv: () => {},
+        ycAutoEnv: () => ({}),
+        live: {
+          agentEnv: () => state.agentEnv,
+          userAgentEnv: () => state.userAgentEnv,
+          envFor: () => ({}),
+          scopeSummary: (name) => policy.scopeSummary(state.saved ? state.saved.agentEnvScopes : {}, name),
+        },
+      })
+    );
+    // Проверка не по тексту, а вызовом: раньше здесь падало «userAgentEnv is not defined»
+    // (имя из main.js, не переданное через мост) — инструмент отвечал ошибкой.
+    const set = await tools.envSet({ key: "DEPLOY_KEY", value: "с-1", scopes: ["git", "terminal"] }, {});
+    assert.match(set, /задана/, "envSet не ответил: " + set);
+    assert.match(set, /Выдача: git, terminal/, "выдача не подтверждена: " + set);
+    assert.match(set, /только названные команды/, "не сказано, что значение получат только выбранные: " + set);
+    assert.deepStrictEqual(state.saved && state.saved.agentEnvScopes && state.saved.agentEnvScopes.DEPLOY_KEY, ["git", "terminal"], "выдача не сохранена: " + JSON.stringify(state.saved && state.saved.agentEnvScopes));
+    assert.strictEqual(state.saved.agentEnv.DEPLOY_KEY, "с-1", "переменная не сохранена в настройках");
+
+    state.agentEnv = { DEPLOY_KEY: "с-1" };
+    const list = await tools.envList({}, {});
+    assert.match(list, /\[выдача: git, terminal\]/, "envList не сообщает выдачу: " + list);
+
+    const plain = await tools.envSet({ key: "PLAIN_KEY", value: "x" }, {});
+    assert.ok(!/Выдача/.test(plain), "лишнее упоминание выдачи там, где ограничения нет: " + plain);
+    assert.ok(!state.saved.agentEnvScopes.PLAIN_KEY, "переменная без выдачи получила запись ограничения");
+
+    const unset = await tools.envUnset({ key: "PLAIN_KEY" }, {});
+    assert.match(unset, /удалена/, "envUnset не ответил: " + unset);
+  });
+
+  await test("секреты: одна точка выдачи в main.js и никаких прямых подстановок", () => {
+    for (const f of ["src/main.js", "src/agent-tools.js", "src/system-stack.js", "src/git-ipc.js"]) {
+      const src = fs.readFileSync(path.join(ROOT, f), "utf8");
+      assert.ok(src.indexOf("...agentEnv") === -1, f + ": окружение агента всё ещё подставляется напрямую");
+      assert.ok(src.indexOf("...live.agentEnv") === -1, f + ": модуль берёт окружение копией, а не по назначению");
+    }
+    const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    assert.ok(main.includes("function envFor(capability)"), "нет единой точки выдачи окружения");
+    assert.ok(main.includes("toolPolicy.envForCapability(agentEnv, agentEnvScopes, cap)"), "выдача не ограничивается настройками");
+    assert.ok(/activeToolCapability = toolPolicy\.capabilityOf\(name\)/.test(main), "инструмент в работе не объявляет назначение");
+    assert.ok(/finally\s*\{\s*activeToolCapability = prevCapability;/.test(main), "назначение не возвращается после инструмента");
+    assert.ok(main.includes("agentEnvScopes"), "настройки выдачи не читаются");
+    assert.ok(main.includes('ipcMain.handle("policy:groups"'), "окно не может получить группы выдачи");
+    assert.ok(/s\.agentEnvScopes = toolPolicy\.normalizeScopes/.test(main), "сохранённая выдача не чистится политикой");
+  });
+
+  await test("секреты: выдача видна в настройках и доступна с телефона", () => {
+    const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const preload = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
+    const mobile = fs.readFileSync(path.join(ROOT, "src", "renderer", "mobile-api.js"), "utf8");
+    const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+    assert.ok(app.includes("agentEnvScopes"), "настройки в окне не знают про выдачу");
+    assert.ok(app.includes('sel.className = "env-scope"'), "в списке переменных нет выбора выдачи");
+    assert.ok(app.includes("setEnvScope(k, sel.value)"), "выбор выдачи ни к чему не привязан");
+    assert.ok(app.includes("api.policyGroups"), "окно не спрашивает группы выдачи");
+    assert.ok(app.includes("envScopeLabel"), "группы не переводятся на человеческий язык");
+    assert.ok(preload.includes('"policy:groups"'), "мост не отдаёт группы выдачи");
+    assert.ok(mobile.includes('"policy:groups"'), "с телефона выдача недоступна");
+    assert.ok(html.includes("выдача"), "в интерфейсе не объяснено, что такое выдача");
+    assert.ok(coreSrc.includes("scopes: {"), "у envSet нет параметра выдачи");
+  });
+}

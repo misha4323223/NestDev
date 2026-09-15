@@ -813,6 +813,12 @@ body.resizing { cursor: col-resize; user-select: none; }
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .env-del { flex-shrink: 0; padding: 2px 7px; font-size: 12px; }
+.env-scope {
+  flex-shrink: 0; max-width: 190px; font-size: 11.5px;
+  background: var(--bg-input); color: var(--text-dim);
+  border: 1px solid var(--border-soft); border-radius: 7px; padding: 3px 5px;
+}
+.env-scope.limited { color: var(--accent-2); border-color: rgba(0, 229, 255, 0.35); }
 .env-add { display: flex; gap: 6px; }
 .env-add input { flex: 1; min-width: 0; }
 .field textarea {
