@@ -74,7 +74,10 @@ function sources(settings) {
   };
   push(OTA_ROOT());
   push((settings && settings.otaDir) || "");
-  push(path.join(__dirname, "..", "ota"));
+  // Папку ota/ рядом с кодом смотрим только в обычном режиме: если корень OTA
+  // переопределён (живые тесты), она не должна подмешивать бандл и перезапускать
+  // приложение прямо посреди прогона.
+  if (!process.env.AI_AGENT_OTA_ROOT) push(path.join(__dirname, "..", "ota"));
   return list.filter((d) => fs.existsSync(path.join(d, "manifest.json")));
 }
 

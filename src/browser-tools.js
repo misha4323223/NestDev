@@ -2701,6 +2701,122 @@ async function waitForIdle(args) {
   );
 }
 
+// ── Аудит страницы для деплоя ────────────────────────────────────────────────
+// Открывает адрес в браузере агента, слушает консоль, ошибки страницы и сеть,
+// снимает скриншот и закрывает вкладку. Нужен после выката: HTTP 200 ещё не
+// значит, что страница нарисовалась. Возвращает данные, а не текст — решение
+// «годится / не годится» принимает src/deploy-check.js, чтобы правила были
+// в одном месте и проверялись тестами без браузера.
+async function auditPage(url, opts) {
+  const o = opts || {};
+  const target = String(url || "").trim();
+  if (!/^https?:\/\//i.test(target)) return { ok: false, error: "Нужен полный адрес (http/https): " + target };
+  const r = await ensureBrowser();
+  if (!r.ok) return { ok: false, error: r.message || "браузер не запустился" };
+  const started = Date.now();
+  let page = null;
+  try {
+    page = await newPageInBrowser();
+  } catch (e) {
+    return { ok: false, error: "не удалось открыть вкладку: " + ((e && e.message) || String(e)) };
+  }
+  const tabId = "tab" + (++tabSeq);
+  tabs.set(tabId, { id: tabId, page, openedAt: Date.now() });
+  activeTabId = tabId;
+
+  const consoleErrors = [];
+  const pageErrors = [];
+  const failedRequests = [];
+  const onConsole = (m) => {
+    try {
+      if (m.type() === "error") consoleErrors.push(String(m.text()).slice(0, 300));
+    } catch {}
+  };
+  const onPageError = (e) => pageErrors.push(String((e && e.message) || e).slice(0, 300));
+  const onFailed = (req) => {
+    try {
+      const f = req.failure && req.failure();
+      failedRequests.push({ url: String(req.url()).slice(0, 200), reason: String((f && f.errorText) || "") });
+    } catch {}
+  };
+  page.on("console", onConsole);
+  page.on("pageerror", onPageError);
+  page.on("requestfailed", onFailed);
+
+  let status = 0;
+  let navError = "";
+  try {
+    const resp = await page.goto(target, {
+      waitUntil: o.waitUntil === "load" ? "load" : "domcontentloaded",
+      timeout: o.timeoutMs || 25000,
+    });
+    status = (resp && resp.status && resp.status()) || 0;
+  } catch (e) {
+    navError = String((e && e.message) || e).slice(0, 300);
+  }
+  // Странице надо дать дорисоваться: у SPA разметка и картинки приходят после DOMContentLoaded.
+  try {
+    await page.waitForLoadState("networkidle", { timeout: o.idleMs || 4000 });
+  } catch {}
+  const settle = Math.min(Math.max(parseInt(o.settleMs, 10) || 1200, 0), 10000);
+  if (settle) await new Promise((res) => setTimeout(res, settle));
+
+  let info;
+  try {
+    info = await page.evaluate(() => {
+      const body = document.body;
+      const text = body ? String(body.innerText || "").trim() : "";
+      const root = document.getElementById("root") || document.getElementById("app") || document.getElementById("__next");
+      return {
+        title: document.title || "",
+        textLen: text.length,
+        sample: text.slice(0, 200),
+        rootChildren: root ? root.children.length : -1,
+        h1: Array.from(document.querySelectorAll("h1")).slice(0, 3).map((h) => String(h.innerText || "").trim().slice(0, 80)),
+      };
+    });
+  } catch (e) {
+    info = { title: "", textLen: 0, sample: "", rootChildren: -1, h1: [], evalError: String((e && e.message) || e).slice(0, 200) };
+  }
+
+  let screenshot = null;
+  try {
+    screenshot = await page.screenshot({ fullPage: false });
+  } catch {}
+
+  let finalUrl = target;
+  try {
+    finalUrl = page.url() || target;
+  } catch {}
+  try {
+    if (page.off) {
+      page.off("console", onConsole);
+      page.off("pageerror", onPageError);
+      page.off("requestfailed", onFailed);
+    }
+  } catch {}
+  // Вкладку закрываем: проверка не должна оставлять мусор в браузере агента.
+  try {
+    await page.close();
+  } catch {}
+  if (tabs.has(tabId)) tabs.delete(tabId);
+  if (activeTabId === tabId) activeTabId = tabs.size ? Array.from(tabs.keys()).pop() : null;
+
+  return {
+    ok: true,
+    target,
+    url: finalUrl,
+    status,
+    navError,
+    consoleErrors,
+    pageErrors,
+    failedRequests,
+    info,
+    screenshot,
+    ms: Date.now() - started,
+  };
+}
+
 module.exports = {
   open,
   snapshot,
@@ -2721,6 +2837,7 @@ module.exports = {
   press,
   text,
   screenshot,
+  auditPage, // аудит выкаченной страницы: консоль, ошибки, скриншот (для деплоя)
   wait,
   close,
   status,

@@ -56,6 +56,16 @@ contextBridge.exposeInMainWorld("api", {
   fsOpenInExplorer: (p) => ipcRenderer.invoke("fs:openInExplorer", p),
 
   // Проекты (панель проекта, до 10)
+  // Дела (личный список задач со сроками).
+  tasksBoard: () => ipcRenderer.invoke("tasks:board"),
+  tasksList: (opts) => ipcRenderer.invoke("tasks:list", opts || {}),
+  tasksAdd: (input) => ipcRenderer.invoke("tasks:add", input || {}),
+  tasksUpdate: (key, patch) => ipcRenderer.invoke("tasks:update", key, patch || {}),
+  tasksDone: (key, done) => ipcRenderer.invoke("tasks:done", key, done !== false),
+  tasksDelete: (key) => ipcRenderer.invoke("tasks:delete", key),
+  onTasksChanged: (cb) => {
+    ipcRenderer.on("tasks:changed", (_e, payload) => cb(payload || {}));
+  },
   projectsList: () => ipcRenderer.invoke("projects:list"),
   projectsCreate: (name, dir) => ipcRenderer.invoke("projects:create", name, dir || ""),
   projectsActivate: (id) => ipcRenderer.invoke("projects:activate", id),
@@ -128,9 +138,18 @@ contextBridge.exposeInMainWorld("api", {
   ycSetPermissions: (allowCreate, allowDelete, allowUpdate) => ipcRenderer.invoke("yc:setPermissions", allowCreate, allowDelete, allowUpdate),
   ycLogout: () => ipcRenderer.invoke("yc:logout"),
   ycResources: () => ipcRenderer.invoke("yc:resources"),
-  ycCreate: (serviceKey, name) => ipcRenderer.invoke("yc:create", serviceKey, name),
+  ycConsoleOverview: (args) => ipcRenderer.invoke("yc:console:overview", args || {}),
+  ycConsoleList: (args) => ipcRenderer.invoke("yc:console:list", args || {}),
+  ycConsoleRollback: (args) => ipcRenderer.invoke("yc:console:rollback", args || {}),
+  ycCosts: (serviceKey, params) => ipcRenderer.invoke("yc:costs", serviceKey, params || {}),
+  ycCreate: (serviceKey, name, opts) => ipcRenderer.invoke("yc:create", serviceKey, name, opts || {}),
   ycDelete: (serviceKey, resourceId) => ipcRenderer.invoke("yc:delete", serviceKey, resourceId),
   ycDeploy: (folderDir, appName, opts) => ipcRenderer.invoke("yc:deploy", folderDir, appName, opts || {}),
+  // Деплой: состояние .cloud проекта, запуск, откат и разовая проверка адреса.
+  deployState: (dir) => ipcRenderer.invoke("deploy:state", dir || ""),
+  deployRun: (dir, opts) => ipcRenderer.invoke("deploy:run", dir || "", opts || {}),
+  deployRollback: (dir, opts) => ipcRenderer.invoke("deploy:rollback", dir || "", opts || {}),
+  deployHealth: (url, paths) => ipcRenderer.invoke("deploy:health", url || "", paths || []),
   ycLogs: (serviceKey, resourceId) => ipcRenderer.invoke("yc:logs", serviceKey, resourceId),
   ycCliStatus: () => ipcRenderer.invoke("yc:cliStatus"),
   ycInstallCli: () => ipcRenderer.invoke("yc:installCli"),

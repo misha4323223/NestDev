@@ -11,6 +11,8 @@
   <link rel="stylesheet" href="styles.css" />
   <!-- Монохромный слой и зачистка тяжёлых эффектов (backdrop-filter, неон, анимации) -->
   <link rel="stylesheet" href="monochrome.css" />
+  <link rel="stylesheet" href="yc-console.css" />
+  <link rel="stylesheet" href="deploy-panel.css" />
   <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="icon" href="/icon.svg" type="image/svg+xml" />
   <meta name="theme-color" content="#0a0a0b" />
@@ -45,6 +47,13 @@
       <button id="rail-cloud" class="rail-btn" title="Yandex Cloud — ресурсы каталога, деплой">
         <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19a4.5 4.5 0 0 0 .5-8.97A6 6 0 0 0 6.34 8.5 4.5 4.5 0 0 0 7 17.5h10.5z" /></svg>
         <span class="hd-dot" id="rail-cloud-dot"></span>
+      </button>
+      <button id="rail-deploy" class="rail-btn" title="Деплой — собрать контейнер и выложить в облако">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3c3.5 2.5 5.5 6 5.5 9.5L12 21l-5.5-8.5C6.5 9 8.5 5.5 12 3z" /><circle cx="12" cy="10" r="2" /></svg>
+      </button>
+      <button id="rail-tasks" class="rail-btn" title="Дела — задачи и сроки">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6h11" /><path d="M9 12h11" /><path d="M9 18h11" /><path d="m3 6 1.5 1.5L7 5" /><path d="m3 12 1.5 1.5L7 11" /><path d="m3 18 1.5 1.5L7 17" /></svg>
+        <span class="rail-badge hidden" id="rail-tasks-badge"></span>
       </button>
       <div class="rail-spacer"></div>
       <button id="rail-new" class="rail-btn rail-accent" title="Новый чат">
@@ -106,6 +115,9 @@
           <button id="btn-toggle-cloud" class="btn btn-ghost icon-btn" title="Yandex Cloud — ресурсы каталога, деплой">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19a4.5 4.5 0 0 0 .5-8.97A6 6 0 0 0 6.34 8.5 4.5 4.5 0 0 0 7 17.5h10.5z" /></svg>
             <span class="hd-dot" id="btn-toggle-cloud-dot"></span>
+          </button>
+          <button id="btn-toggle-deploy" class="btn btn-ghost icon-btn" title="Деплой — состояние, история, откат">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3c3.5 2.5 5.5 6 5.5 9.5L12 21l-5.5-8.5C6.5 9 8.5 5.5 12 3z" /><circle cx="12" cy="10" r="2" /></svg>
           </button>
           <button id="btn-copy-chat" class="btn btn-ghost icon-btn" title="Скопировать весь чат в буфер обмена (markdown)">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
@@ -190,6 +202,7 @@
             <span id="attach-name" class="attach-name">Скриншот — отправится с сообщением</span>
             <button id="btn-attach-remove" type="button" class="btn btn-ghost btn-small" title="Убрать вложение">✕</button>
           </div>
+          <div id="role-chips" class="role-chips hidden"></div>
           <textarea id="input" rows="1" placeholder="Напиши, что сделать..."></textarea>
           <div id="ctx-indicator" class="ctx-indicator" title="Заполняемость контекста модели"><span id="ctx-text"></span><div id="ctx-bar" class="ctx-bar"><div id="ctx-fill" class="ctx-fill"></div></div></div>
           <div class="composer-row">
@@ -197,6 +210,7 @@
             <div class="composer-btns">
               <input type="file" id="file-input" class="hidden" multiple accept="image/*,.txt,.js,.ts,.py,.json,.md,.html,.css,.csv,.log,.yaml,.yml,.xml,.sql,.sh,.dart,.go,.rs,.java,.cpp,.c,.rb,.php" />
               <button id="btn-attach-file" class="btn btn-ghost btn-small" title="Прикрепить файл или изображение">📎</button>
+              <button id="btn-role" class="btn btn-ghost btn-small role-btn" title="Роль чата: как агент себя ведёт">🛠 Разработчик</button>
               <button id="btn-plan" class="btn btn-ghost btn-small plan-toggle" title="Режим плана: сначала агент составит план и спросит разрешение, потом выполнит">📋 План-режим</button>
               <button id="btn-stop" class="btn btn-danger icon-btn hidden" title="Остановить">
                 <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2.5" /></svg>
@@ -205,6 +219,7 @@
                 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13" /><path d="M22 2 15 22l-4-9-9-4z" /></svg>
               </button>
             </div>
+            <div id="role-popover" class="role-popover hidden"></div>
           </div>
         </div>
       </footer>
@@ -218,6 +233,10 @@
           <button class="sp-btn active" data-sp="preview" role="tab" title="Превью — сайт проекта, мобильный вид, новая вкладка">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" /><circle cx="12" cy="12" r="3" /></svg>
             <span>Превью</span>
+          <button class="sp-btn" data-sp="tasks" role="tab" title="Дела — задачи и сроки, панель менеджера">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6h11" /><path d="M9 12h11" /><path d="M9 18h11" /><path d="m3 6 1.5 1.5L7 5" /><path d="m3 12 1.5 1.5L7 11" /><path d="m3 18 1.5 1.5L7 17" /></svg>
+            <span>Дела</span>
+          </button>
           </button>
           <button class="sp-btn" data-sp="console" role="tab" title="Консоль — логи сервера и команды в рабочей директории">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6" /><path d="M12 19h8" /></svg>
@@ -226,6 +245,10 @@
           <button class="sp-btn" data-sp="cloud" role="tab" title="Yandex Cloud — дашборд ресурсов каталога">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19a4.5 4.5 0 0 0 .5-8.97A6 6 0 0 0 6.34 8.5 4.5 4.5 0 0 0 7 17.5h10.5z" /></svg>
             <span>Cloud</span>
+          </button>
+          <button class="sp-btn" data-sp="deploy" role="tab" title="Деплой — что выложено, история, откат">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3c3.5 2.5 5.5 6 5.5 9.5L12 21l-5.5-8.5C6.5 9 8.5 5.5 12 3z" /><circle cx="12" cy="10" r="2" /></svg>
+            <span>Деплой</span>
           </button>
         </div>
         <button id="btn-sp-close" class="btn btn-ghost icon-btn" title="Скрыть панель">✕</button>
@@ -266,6 +289,55 @@
             <iframe id="preview-frame" title="Предпросмотр сайта" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
           </div>
         </div>
+      </div>
+      <div id="sp-tasks" class="sp-body hidden">
+        <div class="tk-top">
+          <div class="tk-top-text">
+            <div class="tk-title">Дела и сроки</div>
+            <span id="tasks-counts" class="tasks-counts">—</span>
+          </div>
+          <button id="btn-tasks-refresh" class="btn btn-ghost btn-small" title="Обновить список">↻</button>
+        </div>
+        <div id="tasks-filters" class="tk-filters"></div>
+        <div class="tk-composer">
+          <div class="tk-composer-line">
+            <input id="task-new-title" class="tk-new-title" placeholder="Что нужно сделать" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" />
+            <button id="btn-task-add" class="btn btn-primary btn-small tk-add" title="Добавить дело (Enter)">＋</button>
+          </div>
+          <div class="tk-composer-line">
+            <input id="task-new-due" class="tasks-due-input tk-new-due" placeholder="срок — завтра 14:00" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" title="Срок по-человечески: завтра 14:00, сегодня вечером, в пятницу, через 2 недели, 15.09" />
+            <select id="task-new-priority" class="tasks-prio" title="Приоритет дела">
+              <option value="normal">обычный</option>
+              <option value="high">важное</option>
+              <option value="low">мелкое</option>
+            </select>
+          </div>
+          <div id="tasks-quick-due" class="tk-quick"></div>
+        </div>
+        <div id="tasks-groups" class="tasks-groups tk-list"></div>
+        <div id="tasks-empty" class="tasks-empty tk-empty hidden"></div>
+        <div class="tk-done-block">
+          <button id="btn-tasks-done-toggle" class="tk-done-toggle" title="Показать выполненные дела"><span class="tk-done-arrow">▸</span><span class="tk-done-label">Выполненные</span></button>
+          <div id="tasks-done-list" class="tasks-groups hidden"></div>
+        </div>
+        <div class="tasks-hint">Срок понимается по-человечески: <b>завтра 14:00</b>, <b>сегодня вечером</b>, <b>в пятницу</b>, <b>через 2 недели</b>. Дела живут в приложении (не в проекте) и переживают перезапуск.</div>
+      </div>
+      <div id="sp-deploy" class="sp-body hidden">
+        <div class="dp-top">
+          <div class="dp-title">Деплой</div>
+          <span id="dp-status" class="dp-status">—</span>
+          <div class="dp-btns">
+            <button id="btn-dp-deploy" class="btn btn-primary btn-small" title="Собрать контейнер и выложить в Serverless Containers">🚀 Задеплоить</button>
+            <button id="btn-dp-rollback" class="btn btn-ghost btn-small" title="Вернуть прошлую рабочую версию">↩ Откатить</button>
+            <button id="btn-dp-health" class="btn btn-ghost btn-small" title="Проверить адрес сайта">🩺</button>
+            <button id="btn-dp-refresh" class="btn btn-ghost btn-small" title="Обновить">↻</button>
+          </div>
+        </div>
+        <div class="dp-name-row">
+          <label for="dp-name">Имя приложения</label>
+          <input id="dp-name" placeholder="my-app" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" />
+        </div>
+        <div id="dp-body"></div>
       </div>
       <div id="sp-cloud" class="sp-body hidden">
         <div class="yc-dash-top">
@@ -744,8 +816,9 @@
               </label>
             </div>
             <div class="field vision-fields hidden" id="vision-fields">
-              <label>Базовый URL <span class="hint">(по умолчанию OpenRouter)</span></label>
+              <label>Базовый URL <span class="hint">(OpenRouter, OpenAI, Gemini, Яндекс AI Studio или локальная SD)</span></label>
               <input id="s-vision-url" placeholder="https://openrouter.ai/api/v1" spellcheck="false" autocomplete="off" />
+              <div class="hint" id="vision-detect-hint"></div>
               <label>API-ключ второго аккаунта <span class="hint">(если пусто — используется основной ключ)</span></label>
               <div class="input-row">
                 <input id="s-vision-key" type="password" placeholder="sk-or-v1-..." spellcheck="false" autocomplete="off" />
@@ -756,7 +829,7 @@
                 <input id="s-vision-model" placeholder="google/gemini-2.0-flash-001" spellcheck="false" autocomplete="off" />
                 <button id="btn-refresh-vision-models" class="btn btn-ghost" title="Загрузить список моделей">↻</button>
               </div>
-              <label>Модель-генерация <span class="hint">(создаёт картинки; напр. openai/dall-e-3, black-forest-labs/flux-1.1-pro)</span></label>
+              <label>Модель-генерация <span class="hint">(создаёт картинки; OpenRouter: openai/dall-e-3, black-forest-labs/flux-1.1-pro · OpenAI: gpt-image-1, dall-e-3 · Gemini: gemini-2.5-flash-image, imagen-4.0-generate-001 · Яндекс: yandex-art/latest)</span></label>
               <div class="input-row">
                 <input id="s-image-model" placeholder="openai/dall-e-3" spellcheck="false" autocomplete="off" />
                 <button id="btn-refresh-image-models" class="btn btn-ghost" title="Загрузить список моделей">↻</button>
@@ -775,6 +848,23 @@
 
         <!-- ── Вкладка: Проект и GitHub ── -->
         <div class="settings-tab-body hidden" data-tab-body="project">
+          <div class="settings-section">
+            <div class="settings-section-title">🗓 Дела и роли</div>
+            <div class="field">
+              <label>Роль новых чатов</label>
+              <select id="s-default-role">
+                <option value="dev">🛠 Разработчик — код, файлы, git</option>
+                <option value="assistant">🧑💼 Ассистент — дела на этом ПК</option>
+                <option value="manager">📋 Менеджер — задачи и сроки</option>
+                <option value="researcher">🔎 Исследователь — поиск и разбор</option>
+              </select>
+              <div class="hint-block">Роль выбирается и прямо в чате — кнопкой у поля ввода. Она держится весь диалог и определяет, какие инструменты агент видит сразу.</div>
+            </div>
+            <div class="field">
+              <label class="check-row"><input id="s-task-reminders" type="checkbox" /> <span>Напоминать о делах в срок</span></label>
+              <div class="hint-block">Пока приложение открыто, о деле напомнит уведомление Windows и лента чата. Дела живут в приложении (не в проекте) и переживают перезапуск: панель «Дела» — в рельсе слева.</div>
+            </div>
+          </div>
           <div class="settings-section">
             <div class="settings-section-title">Проект</div>
             <div class="field">
@@ -833,6 +923,15 @@
                 <span class="check-row-text">
                   <b>Разрешить агенту выполнять git push</b>
                   <small>Выключено по умолчанию: инструмент gitPush у агента будет заблокирован, пока ты явно не разрешишь. Кнопка «Push» в панели проекта работает всегда — это твоё ручное действие.</small>
+                </span>
+              </label>
+            </div>
+            <div class="field">
+              <label class="check-row" title="Журнал действий агента лежит рядом с остальными данными приложения и открывается любым текстовым редактором.">
+                <input id="s-audit-log" type="checkbox" />
+                <span class="check-row-text">
+                  <b>Вести журнал действий агента</b>
+                  <small>Включено по умолчанию. В журнал пишутся подтверждённые и отклонённые опасные действия, команды оболочки, облачные операции и правки файлов — с временем и результатом. Ключи, пароли и токены в журнал не попадают. Файл: audit.log в папке данных приложения.</small>
                 </span>
               </label>
             </div>
@@ -1151,10 +1250,17 @@
       </div>
     </div>
   </div>
-<script src="agent-core.js"></script>
+  <script src="provider-config.js"></script>
+  <script src="provider-transport.js"></script>
+  <script src="context-window.js"></script>
+  <script src="web-tools.js"></script>
+  <script src="image-tools.js"></script>
+  <script src="agent-core.js"></script>
   <script src="markdown.js"></script>
   <script src="bootstrap.js"></script>
   <script src="mobile-api.js"></script>
+  <script src="yc-console.js"></script>
+  <script src="deploy-panel.js"></script>
   <script src="highlight.js"></script>
   <script src="app.js"></script>
 </body>

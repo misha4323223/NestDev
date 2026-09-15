@@ -7,12 +7,45 @@
      - "anthropic" — Claude (Anthropic Messages API /v1/messages, SSE-стрим)
    Работает и в Electron main (CommonJS), и в браузере (window.AgentCore). */
 (function (root, factory) {
+  // Ядро собирается из вынесенных модулей: подключение к провайдеру, транспорт
+  // (сообщения и стрим), контекст (бюджет и компакция), веб (поиск/чтение страниц)
+  // и вспомогательная модель (зрение + изображения). В Electron main они приходят
+  // через require, в окне — как одноимённые объекты в window (теги <script> ПЕРЕД
+  // agent-core.js, в порядке зависимостей: config → transport → context → agent).
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = factory();
+    module.exports = factory(
+      require("./provider-config.js"),
+      require("./provider-transport.js"),
+      require("./context-window.js"),
+      require("./web-tools.js"),
+      require("./image-tools.js")
+    );
   } else {
-    root.AgentCore = factory();
+    root.AgentCore = factory(root.ProviderConfig, root.ProviderTransport, root.ContextWindow, root.WebTools, root.ImageTools);
   }
-})(typeof self !== "undefined" ? self : this, function () {
+})(typeof self !== "undefined" ? self : this, function (ProviderConfig, ProviderTransport, ContextWindow, WebTools, ImageTools) {
+  // ── Подключение к провайдеру ───────────────────────────────────────────────
+  // Адреса, ключи, заголовки, лимиты и чтение ошибок живут в отдельном модуле
+  // src/renderer/provider-config.js. Он не знает ни о сообщениях агента, ни о
+  // настройках: каждое значение приходит ему аргументом. Объявления стоят в начале
+  // файла, чтобы код ниже — в том числе контекст и окно модели — видел их всегда.
+  const {
+    G4F_PROVIDERS,
+    splitG4fRoute,
+    baseFor,
+    proxiedBase,
+    apiKeyFor,
+    apiHeaders,
+    projectHeader,
+    jsonArgs,
+    genCallId,
+    readApiError,
+    friendlyRateLimitError,
+    classifyKeyError,
+    rateLimitInfo,
+    createRateLimiter,
+    fmtError,
+  } = ProviderConfig;
   const SYSTEM_PROMPT = `Ты — «Ассистент», AI-разработчик-агент, встроенный в приложение AI Developer Agent. Ты помогаешь пользователю с разработкой: создаёшь папки и файлы, читаешь их, работаешь с git-репозиториями. В начале диалога к твоему системному промпту приложение автоматически добавляет блок «САММАРИ ПРОЕКТА» — краткую визитку рабочей папки (имя проекта, скрипты package.json, структура, начало README). Используй её как отправную точку, не переспрашивай очевидное; детали смотри через listFiles / fileOutline / readFileLines, а актуальность проверяй поиском (searchProject / searchFile).
 
 Правила:
@@ -45,7 +78,7 @@
 26. Семантический поиск: semanticSearch(query) ищет по коду проекта по смыслу (стебли слов, camelCase/snake_case, BM25-ранжирование) и показывает сниппеты с номерами строк. Используй его для поиска «где находится X» и «как устроен Y» — быстрее и точнее, чем читать файлы подряд. Точный регулярный поиск — searchFile/searchProject.
 24. Память проекта и точки отката: заметки (noteSave/noteRead/noteList/noteDelete) — твоя долговременная память о проекте, она переживает перезапуск приложения. Сохраняй решения, архитектуру, договорённости и важные выводы; в начале новой сессии прочитай их через noteRead. Перед серией рискованных правок или рефакторингом создавай точку отката checkpointSave(label); если что-то сломалось — верни всё разом через checkpointRollback(id) (список — checkpointList). Память диалогов: когда контекст переполняется, старые шаги сворачиваются в памятку — если в настройках включена галочка «Память диалогов», приложение сохраняет такие памятки локально по датам. memoryList показывает дни и памятки за конкретный день (date: ГГГГ-ММ-ДД), memorySearch ищет по ним слова и фразы. Это помогает вспомнить прошлые сессии: «посмотри, что мы делали 5-го числа».
 27. Самоизменения и OTA: перед любой правкой собственного кода (src/, assets/) сначала создай точку отката checkpointSave(label — «перед самоизменением …»). Файлы src/bootstrap.js и src/ota.js и папка применённого OTA-бандла физически заблокированы: writeFile/editFile/applyPatch вернут ошибку — не пытайся их обойти. После сборки бандла (node scripts/make-ota.js) вызови otaStatus (видно ли обновление) и otaCheck (применить); после применения — validateProject; если после обновления что-то сломалось — otaRollback.
-28. Yandex Cloud: ycStatus (начни отсюда — авторизация, каталог, разрешения агента) / ycList / ycContainer (обзор, редактор, ревизии, откат — action: overview/revisions/revision/deploy/rollback/update) / ycCreate / ycDelete / ycDeploy / ycLogs / ycInstall. Создание, удаление и правка контейнеров — только по явной просьбе пользователя и при включённых чекбоксах разрешений (ресурсы платные, удаление необратимо). Токен и каталог подставляются автоматически (YC_IAM_TOKEN, YC_CLOUD_ID, YC_FOLDER_ID), yc init не нужен. Порядок работы, ключи сервисов и детали деплоя: agentGuide { name: "yc" }.
+28. Yandex Cloud: ycStatus (начни отсюда — авторизация, каталог, разрешения агента) / ycList / ycContainer (обзор, редактор, ревизии, откат — action: overview/revisions/revision/deploy/rollback/update) / ycCreate / ycDelete / ycDeploy / ycLogs / ycInstall. Создание, удаление и правка контейнеров — только по явной просьбе пользователя и при включённых чекбоксах разрешений (ресурсы платные, удаление необратимо). Перед созданием посмотри цену (ycCosts) и назови ориентир пользователю: платное создаётся лишь с confirm: true после его согласия. Токен и каталог подставляются автоматически (YC_IAM_TOKEN, YC_CLOUD_ID, YC_FOLDER_ID), yc init не нужен. Порядок работы, ключи сервисов и детали деплоя: agentGuide { name: "yc" }.
 29. ВКонтакте (vk.com/vk.ru — домены взаимозаменяемы): браузерные инструменты. Поле ввода — contenteditable, селектор [role=textbox]: browserClick по полю → browserFill(selector: [role=textbox], text: ...) → отправка browserPress(key: Enter) (Shift+Enter — перенос строки). Страницы грузятся лениво — после открытия жди 2–5 секунд и перечитывай browserText; проверка отправки — текст сообщения в конце переписки. Работай в СУЩЕСТВУЮЩЕЙ вкладке браузера (новые открываются без сессии); состояние читай через browserText, а не скриншоты (ВК их обрезает); текст приходит вместе с левым меню — фильтруй по именам/датам. Вход/сессия — только руками пользователя, не обходи. Маршруты, селекторы, сценарии и известные контакты — в гайде, прочитай перед работой: readFile(path: agent-guide:vk).
 30. Анализ переписок (ВК, чаты, письма, файлы): определи КТО человек по уликам в тексте (работа/задачи → коллега; семейное/личное → родственник/друг; услуги/цены/заказы → клиент/поставщик; «Вы» и официальный тон → деловой контакт), выдели СУТЬ (2–4 предложения: о чём разговор, что решено, что ждёт ответа, срочность) и оформи ТАБЛИЦЕЙ: «Человек (профиль) | Кто он | Суть переписки | Важность | Следующий шаг». Для КЛИЕНТОВ дополнительно: профиль (потребность его словами, что обсуждали, бюджет/сроки если видно, возражения, тон) + фундамент для КП (2–4 пункта, что включить в предложение, и следующий логичный шаг). Не выдумывай: чего нет в тексте — «не определено». Длинную историю читай частями (PageUp + browserText). Полная методология — readFile(path: agent-guide:chat-analysis).
 31. Почта (SMTP/IMAP, Настройки → «✉️ Почта»): mailList — прочитать последние письма (отправитель, тема, дата, найденный код), mailCode — вытащить код подтверждения (from — фильтр по отправителю, например «yandex»), mailSend — отправить письмо (КП клиенту, ответ на запрос). Начни с mailList: если почта не настроена или нет разрешения на отправку, инструмент вернёт подсказку — передай её пользователю. Письма уходят с его ящика, поэтому перед отправкой клиенту покажи готовый текст и спроси подтверждение, если пользователь не просил отправить сразу. Пароль приложения не показывай и не проси в чате. Если письмо с кодом ещё не пришло — повтори mailCode через 10–20 секунд (письмо доходит не мгновенно).
@@ -55,7 +88,9 @@
 34. Справочники и память маршрутов: перед работой на незнакомом сайте — agentGuide {} (список), agentGuide { url: "адрес" } (есть ли гайд для сайта), agentGuide { name: "..." } (полный текст): маршруты, подписи кнопок и грабли экономят десятки шагов. ВАЖНО: когда сложный путь пройден УСПЕШНО (регистрация, включение API, публикация, покупка, многошаговая форма) — сохрани его одним вызовом: agentGuide { save: "имя", title: "...", sites: "домен", steps: "1) … 2) подпись кнопки … 3) что ждать" }. Пиши конкретно: подписи кнопок, порядок, что ждать после шага, где грабли. В следующий раз гайд подхватится сам (при browserOpen придёт подсказка).
 35. БАТЧИНГ — не трать раунды на мелочи: несколько НЕЗАВИСИМЫХ операций чтения (2–5 файлов, список папок + поиск, git status + diff + log, несколько страниц) вызывай ВСЕ СРАЗУ в одном ответе — приложение выполнит их параллельно за время одного вызова. Не объединяй то, что зависит от результата предыдущего вызова, и НИКОГДА не объединяй инструменты, которые меняют файлы/состояние или требуют подтверждения: они выполняются строго по одному. Если нужного инструмента нет в списке ниже — вызови findTools { query: "что нужно сделать, словами" }: он найдёт его и включит на всю задачу.
 
-Доступные инструменты: createFolder, readFile, readFileLines, writeFile, editFile, searchFile, listDirectory, runCommand, webSearch, webFetch, gitClone, gitStatus, gitCommit, gitPush, gitPublish, gitPull, gitLog, gitRevert, askUser, startBackground, listBackground, backgroundOutput, sendInput, stopBackground, shellStart, shellSend, checkUrl, openUrl, showImage, checkPort, listPorts, dockerBuild, dockerRun, dockerExec, installPackage, lintProject, runTests, diffView, previewUI, screenshotCapture, envSet, envList, envUnset, fileOutline, readFileStructure, explainCode, undoEdit, refactorRename, runCommandOutput, retryCommand, timeoutCommand, shellsStatus, checkInstalledProgram, canExecute, installSystemPackage, runCommandAsAdmin, refreshEnv, getSystemInfo, explainError, downloadAndExtract, apiRequest, runScript, validateProject, gitBranch, gitDiff, gitUndoLastCommit, gitInit, getDependencies, formatCode, dbQuery, gitCheckout, findReferences, analyzeImage, generateImage, listProcesses, killProcess, clipboardRead, clipboardWrite, screenshotDesktop, registryRead, registryWrite, openPath, wingetSearch, installExe, browserConnect, browserOpen, browserSnapshot, browserFill, browserClick, browserSelect, browserPress, browserText, browserScreenshot, browserWait, browserEval, browserDOM, browserOverlays, browserAct, browserScroll, browserHover, browserNetwork, waitForIdle, agentGuide, browserClose, browserStatus, browserClearProfile, vaultList, vaultFill, mailSend, mailList, mailCode, appRead, appClick, appFill, appSelect, appPress, appWait, appScreenshot, noteSave, noteRead, noteList, noteDelete, memoryList, memorySearch, todoWrite, checkpointSave, checkpointList, checkpointRollback, applyPatch, waitUntil, gitStash, gitCherryPick, gitBlame, semanticSearch, otaStatus, otaCheck, otaRollback, ycStatus, ycList, ycContainer, ycCreate, ycDelete, ycDeploy, ycLogs, ycInstall.`;
+36. Роли чата: у диалога есть роль — Разработчик (обычная работа с кодом), Ассистент (дела на этом ПК: файлы, письма, сайты, порядок), Менеджер (задачи и сроки), Исследователь (поиск и разбор источников). Текущая роль и её правила приходят блоком «РЕЖИМ» в системном промпте — следуй ему: он важнее привычки писать код. Если просьба явно не про твою роль (например просят чинить код в режиме Менеджера) — сделай что можешь и предложи переключить роль кнопкой «Роль» у поля ввода.
+37. Дела и сроки (taskAdd / taskList / taskUpdate / taskDone / taskDelete): личный список задач пользователя со сроками — он живёт в приложении и виден в панели «Дела». Начинай с taskList, когда речь о планах, дедлайнах, «что сегодня» и отчётах. Любую задачу и договорённость превращай в дело с сроком; просроченное называй первым и прямо. Срок разбирается по-человечески («завтра 14:00», «в пятницу», «через 2 недели»). Закрывай дела только по словам пользователя.
+Доступные инструменты: createFolder, readFile, readFileLines, writeFile, editFile, searchFile, listDirectory, runCommand, webSearch, webFetch, gitClone, gitStatus, gitCommit, gitPush, gitPublish, gitPull, gitLog, gitRevert, askUser, startBackground, listBackground, backgroundOutput, sendInput, stopBackground, shellStart, shellSend, checkUrl, openUrl, showImage, checkPort, listPorts, dockerBuild, dockerRun, dockerExec, installPackage, lintProject, runTests, diffView, previewUI, screenshotCapture, envSet, envList, envUnset, fileOutline, readFileStructure, explainCode, undoEdit, refactorRename, runCommandOutput, retryCommand, timeoutCommand, shellsStatus, checkInstalledProgram, canExecute, installSystemPackage, runCommandAsAdmin, refreshEnv, getSystemInfo, explainError, downloadAndExtract, apiRequest, runScript, validateProject, gitBranch, gitDiff, gitUndoLastCommit, gitInit, getDependencies, formatCode, dbQuery, gitCheckout, findReferences, analyzeImage, generateImage, listProcesses, killProcess, clipboardRead, clipboardWrite, screenshotDesktop, registryRead, registryWrite, openPath, wingetSearch, installExe, browserConnect, browserOpen, browserSnapshot, browserFill, browserClick, browserSelect, browserPress, browserText, browserScreenshot, browserWait, browserEval, browserDOM, browserOverlays, browserAct, browserScroll, browserHover, browserNetwork, waitForIdle, agentGuide, browserClose, browserStatus, browserClearProfile, vaultList, vaultFill, mailSend, mailList, mailCode, appRead, appClick, appFill, appSelect, appPress, appWait, appScreenshot, noteSave, noteRead, noteList, noteDelete, memoryList, memorySearch, todoWrite, checkpointSave, checkpointList, checkpointRollback, applyPatch, waitUntil, gitStash, gitCherryPick, gitBlame, semanticSearch, otaStatus, otaCheck, otaRollback, ycStatus, ycList, ycContainer, ycCosts, ycCreate, ycDelete, ycDeploy, ycLogs, ycInstall, taskAdd, taskList, taskUpdate, taskDone, taskDelete.`;
 
   const TOOL_DEFINITIONS = [
     {
@@ -1764,10 +1799,10 @@
       type: "function",
       function: {
         name: "installExe",
-        description: "Скачать установщик по прямой ссылке и запустить его (ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ). Поддерживаются .exe (запуск), .msi (через msiexec) и .zip (распаковка + поиск установщика внутри). url — прямая ссылка; name — имя программы (для проверки после установки); silentArgs — аргументы тихой установки (для .exe по умолчанию /S, для .msi — /passive /norestart); run: true — сразу запустить найденный в архиве установщик. Если установка требует прав администратора — приложение подскажет runCommandAsAdmin.",
+        description: "Скачать установщик по прямой ссылке и запустить его (ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ). Поддерживаются .exe (запуск), .msi (через msiexec) и .zip (распаковка + поиск установщика внутри). url — прямая ссылка; name — имя программы (для проверки после установки); silentArgs — аргументы тихой установки (для .exe по умолчанию /S, для .msi — /passive /norestart); run: true — сразу запустить найденный в архиве установщик. Файл проверяется ДО запуска: в ответе видны размер, SHA-256 и подпись издателя (недействительная подпись останавливает установку, пока не передан allowUnsigned: true), а заданный sha256 не даёт запустить подменённый при загрузке файл. Если установка требует прав администратора — приложение подскажет runCommandAsAdmin.",
         parameters: {
           type: "object",
-          properties: { url: { type: "string", description: "Прямая ссылка на установщик .exe (https://...)" }, name: { type: "string", description: "Имя программы (необязательно)" }, silentArgs: { type: "string", description: "Аргументы тихой установки (по умолчанию /S)" } },
+          properties: { url: { type: "string", description: "Прямая ссылка на установщик .exe (https://...)" }, name: { type: "string", description: "Имя программы (необязательно)" }, silentArgs: { type: "string", description: "Аргументы тихой установки (по умолчанию /S)" }, sha256: { type: "string", description: "Ожидаемый хэш SHA-256 установщика: при несовпадении запуск не состоится" }, allowUnsigned: { type: "boolean", description: "Разрешить запуск файла без действительной подписи издателя (по умолчанию запрещено)" } },
           required: ["url"],
         },
       },
@@ -1846,6 +1881,86 @@
             title: { type: "string", description: "Название плана (необязательно), например «Починка ycLogs»" },
           },
           required: ["tasks"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "taskAdd",
+        description: "Добавить дело в личный список задач со сроком (таск-менеджер приложения). Срок разбирается по-человечески: «завтра 14:00», «сегодня вечером», «в пятницу», «через 2 недели», «15.09», «10 октября», «через 2 часа». Дата без времени = весь день (09:00). Указывай срок, если он звучит в словах пользователя; срока нет — спроси, не выдумывай.",
+        parameters: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "Что нужно сделать (коротко, по делу)" },
+            due: { type: "string", description: "Срок: «завтра 14:00», «в пятницу», «через 2 недели», «15.09» (можно пусто)" },
+            priority: { type: "string", enum: ["low", "normal", "high"], description: "Приоритет (по умолчанию normal)" },
+            project: { type: "string", description: "Проект или сфера дела: работа, личное, клиент X" },
+            note: { type: "string", description: "Детали дела (до 2000 символов)" },
+          },
+          required: ["title"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "taskList",
+        description: "Показать дела со сроками: активные (по умолчанию), выполненные или все. Просроченные и ближайшие — первыми, плюс сводка по срокам (просрочено / сегодня / завтра / неделя / без срока). Начинай с этого вызова любую работу про планы, сроки и отчёты.",
+        parameters: {
+          type: "object",
+          properties: {
+            status: { type: "string", enum: ["active", "done", "all"], description: "Какие дела показать (по умолчанию active)" },
+            due: { type: "string", enum: ["overdue", "today", "tomorrow", "week", "none"], description: "Фильтр по сроку (необязательно)" },
+            project: { type: "string", description: "Только дела этого проекта (необязательно)" },
+          },
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "taskUpdate",
+        description: "Изменить дело: срок, название, приоритет, проект, заметку или статус (todo/doing/done/canceled). Дело ищется по id (t7) или по куску названия — уточняй id, если под название подходит несколько дел.",
+        parameters: {
+          type: "object",
+          properties: {
+            key: { type: "string", description: "id дела (t7) или часть названия" },
+            title: { type: "string", description: "Новое название" },
+            due: { type: "string", description: "Новый срок (пустая строка — без срока)" },
+            priority: { type: "string", enum: ["low", "normal", "high"] },
+            status: { type: "string", enum: ["todo", "doing", "done", "canceled"] },
+            project: { type: "string" },
+            note: { type: "string" },
+          },
+          required: ["key"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "taskDone",
+        description: "Отметить дело выполненным. done: false снимает отметку (дело снова активное). Отмечай только по словам пользователя: сделанным дело считает он, а не ты.",
+        parameters: {
+          type: "object",
+          properties: {
+            key: { type: "string", description: "id дела (t7) или часть названия" },
+            done: { type: "boolean", description: "false — снять отметку «выполнено»" },
+          },
+          required: ["key"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "taskDelete",
+        description: "Удалить дело совсем. Используй, когда человек отменил задачу или просит убрать её из списка (вместо этого можно отметить status: canceled).",
+        parameters: {
+          type: "object",
+          properties: { key: { type: "string", description: "id дела или часть названия" } },
+          required: ["key"],
         },
       },
     },
@@ -2046,14 +2161,34 @@
       type: "function",
       function: {
         name: "ycCreate",
-        description: "Yandex Cloud: создать ресурс в выбранном каталоге. service — ключ сервиса (создание доступно для: ydb, lockbox, containerRegistry, storage, dns, serverlessContainers, vpc), name — имя ресурса (латиница, цифры, дефис). Создание может быть платным (YDB, Storage, Containers) — только по явной просьбе пользователя и при включённом разрешении «Разрешить агенту создавать ресурсы».",
+        description: "Yandex Cloud: создать ресурс в выбранном каталоге. service — ключ сервиса (создание доступно для: ydb, lockbox, containerRegistry, storage, dns, serverlessContainers, vpc), name — имя ресурса (латиница, цифры, дефис). Создание может быть платным (YDB, Storage, Containers) — только по явной просьбе пользователя и при включённом разрешении «Разрешить агенту создавать ресурсы». Сначала посмотри цену через ycCosts, назови её пользователю и получи согласие, затем вызови повторно с confirm: true — без него платный ресурс не создаётся.",
         parameters: {
           type: "object",
           properties: {
             service: { type: "string", description: "Ключ сервиса: ydb | lockbox | containerRegistry | storage | dns | serverlessContainers | vpc" },
             name: { type: "string", description: "Имя ресурса (2–63 символа, латиница/цифры/дефис)" },
+            confirm: { type: "boolean", description: "true — пользователь согласился на платный ресурс (цену показал ycCosts)" },
           },
           required: ["service", "name"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "ycCosts",
+        description: "Yandex Cloud: ориентир стоимости ресурса ДО создания (тарифы из официальной документации, ₽ с НДС). service — ключ сервиса (без него — сводка по всем ресурсам и предупреждение о дорогих). Дополнительно можно передать параметры: gb (объём данных), versions, zones, queriesMln, memoryMb и cores (для ревизии контейнера). Это оценка, а не счёт: перед созданием платного ресурса назови цену пользователю.",
+        parameters: {
+          type: "object",
+          properties: {
+            service: { type: "string", description: "Ключ сервиса: ydb | lockbox | containerRegistry | storage | dns | serverlessContainers | vpc (пусто — сводка)" },
+            gb: { type: "number", description: "Объём данных в ГБ (storage, containerRegistry)" },
+            versions: { type: "number", description: "Число версий секретов (lockbox)" },
+            zones: { type: "number", description: "Число DNS-зон (dns)" },
+            queriesMln: { type: "number", description: "Миллионы DNS-запросов в месяц (dns)" },
+            memoryMb: { type: "number", description: "Память ревизии контейнера в МБ" },
+            cores: { type: "number", description: "Ядра ревизии контейнера (1 = 100% vCPU, 0.2 = 20%)" },
+          },
         },
       },
     },
@@ -2152,339 +2287,47 @@
     },
   ];
 
-  // ── Контекст-окно: грубая оценка токенов и обрезка истории ──
-  // Русский текст ~ 3–4 символа на токен, код/англ ~ 4; берём 3.6 с запасом.
-  function estimateTokens(text) {
-    if (Array.isArray(text)) {
-      let n = 0;
-      for (const p of text) {
-        if (!p) continue;
-        if (p.type === "text") n += Math.ceil(String(p.text || "").length / 3.6);
-        else if (p.type === "image_url") n += 800; // изображение ~ 800 токенов
-        else n += 120;
-      }
-      return Math.ceil(n);
-    }
-    const s = String(text || "");
-    if (!s) return 0;
-    return Math.ceil(s.length / 3.6);
-  }
+  // ── Транспорт провайдеров ──────────────────────────────────────────────────
+  // Конвертация сообщений, кэш промпта, сборка запроса, стрим ответа, список
+  // моделей и окно модели живут в src/renderer/provider-transport.js. Ему нужны
+  // ровно две вещи: подключение к провайдеру и таблица инструментов выше.
+  const {
+    partsText,
+    buildChatRequest,
+    consumeProviderStream,
+    listModels,
+    normalizeUsage,
+    splitStaticSystem,
+    anthropicSystem,
+    modelWindow,
+    ollamaModelInfo,
+    ollamaNumCtx,
+  } = ProviderTransport({ config: ProviderConfig, toolDefinitions: TOOL_DEFINITIONS });
 
-  function estimateMessageTokens(m) {
-    if (!m) return 0;
-    let n = estimateTokens(m.content);
-    if (Array.isArray(m.tool_calls)) {
-      for (const tc of m.tool_calls) {
-        n += estimateTokens((tc.function && tc.function.name) || "");
-        n += estimateTokens((tc.function && tc.function.arguments) || "");
-      }
-    }
-    return n;
-  }
+  // ── Контекст и компакция ───────────────────────────────────────────────────
+  // Оценка токенов, бюджет, обрезка истории и сжатие старых витков в памятку живут
+  // в src/renderer/context-window.js. Ему нужны подключение к провайдеру (запрос к
+  // дешёвой модели за памяткой) и транспорт (разбор частей сообщения). Объявления
+  // стоят здесь, а не по месту использования: ниже таблица групп немедленно считает
+  // вес инструментов через estimateTokens.
+  const {
+    estimateTokens,
+    estimateMessageTokens,
+    contextBudget,
+    sanitizeToolPairs,
+    trimConversation,
+    truncateText,
+    compactRemote,
+    createContextManager,
+  } = ContextWindow({ config: ProviderConfig, transport: ProviderTransport });
 
-  // Бюджет контекста (токенов) для истории, без учёта system и результата текущего запроса.
-  // Локальные модели (qwen3:4b и др.) имеют 8–32k — даём запас на вывод и tool-результаты.
-  function contextBudget(provider, model) {
-    // Ollama: реальное окно узнаётся у сервера (/api/show → modelWindow), а в запрос
-    // уходит нужный num_ctx. Здесь — только потолок на случай, когда сервер молчит:
-    // прежние 14 000 не были ошибкой как потолок, но без реального окна и без num_ctx
-    // агент получал дефолтные 2048 токенов контекста и обрезание на середине задачи.
-    if (provider === "ollama") return 14000;
-    const m = String(model || "");
-    if (/deepseek|qwen/i.test(m)) return 26000;
-    if (provider === "anthropic") return 80000;
-    return 50000;
-  }
+  // ── Контекст-окно, бюджет и обрезка истории — в src/renderer/context-window.js ──
+  // estimateTokens, contextBudget, trimConversation, compactRemote и
+  // createContextManager получены в начале файла.
 
-  // Обрезает массив канонических сообщений так, чтобы их суммарная оценка токенов
-  // не превышала budget, сохраняя самые свежие сообщения (диалог идёт от старых к новым).
-  // Гарантирует: никогда не выкидываем последнее user-сообщение и не разрываем
-  // tool-цепочки в хвосте (assistant tool_calls + его результаты остаются целиком).
-  // Убирает «осиротевшие» tool-сообщения: role:"tool" допустим только сразу после
-  // assistant с tool_calls. После обрезки контекста хвост может начинаться с tool
-  // (или содержать tool без своего assistant) — такие сообщения ломают
-  // OpenAI-совместимые API (400 wrong_api_format «tool must be a response to tool_calls»).
-  function sanitizeToolPairs(messages) {
-    const out = [];
-    let expectTool = false;
-    for (const m of messages) {
-      if (m && m.role === "tool") {
-        if (!expectTool) continue; // сирота — выбрасываем
-        out.push(m);
-        continue;
-      }
-      expectTool = false;
-      if (m && m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
-        expectTool = true;
-      }
-      out.push(m);
-    }
-    return out;
-  }
-
-  function trimConversation(messages, budget) {
-    if (!Array.isArray(messages) || !messages.length) return messages || [];
-    const limit = Math.max(1500, budget || contextBudget("openai"));
-    // Считаем С КОНЦА: свежие сообщения важнее начала, а старое при переполнении
-    // сворачивается в памятку (compactRemote вызывается раньше и видит голову целиком).
-    // Прежний проход «с начала» тратил бюджет именно на СТАРЫЕ сообщения, а на длинном
-    // чате срез схлопывался до одного последнего сообщения — агент терял задачу.
-    let total = 0;
-    let start = messages.length - 1;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const w = estimateMessageTokens(messages[i]);
-      // Последнее сообщение оставляем всегда, даже если оно одно больше бюджета.
-      if (i < messages.length - 1 && total + w > limit) break;
-      total += w;
-      start = i;
-    }
-    // Текущий виток не рвём: последнее user-сообщение и всё после него остаются целиком.
-    let lastUser = -1;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "user") {
-        lastUser = i;
-        break;
-      }
-    }
-    if (lastUser >= 0 && start > lastUser) start = lastUser;
-    let kept = messages.slice(start);
-    // Не оставляем «висящий» assistant/tool в начале среза без его вопроса
-    // Ведущие system-заметки (перенос задачи, восстановление после сбоя) сохраняем:
-    // провайдеры принимают их в начале и склеивают в одну шапку.
-    while (kept.length > 1 && kept[0] && kept[0].role !== "user" && kept[0].role !== "system") kept = kept.slice(1);
-    // Санитайзер пар assistant(tool_calls)→tool: выкидывает осиротевшие tool-сообщения
-    // (в т.ч. одиночный tool, оставшийся после среза цепочки инструментов).
-    kept = sanitizeToolPairs(kept);
-    if (!kept.length) {
-      kept = sanitizeToolPairs(messages.slice(-2));
-    }
-    if (!kept.length && lastUser >= 0) kept = [messages[lastUser]];
-    return kept;
-  }
-
-  function truncateText(text, max) {
-    const s = String(text || "");
-    const cap = max || 6000;
-    if (s.length <= cap) return s;
-    return s.slice(0, cap) + "\n… (обрезано: " + s.length + " символов)";
-  }
-
-  // ═══════════════════ Веб: поиск и чтение страниц (без API-ключей) ═══════════════════
-  // Общие для Electron main, веб-режима и preview-сервера (server.js).
-
-  function stripHtml(s) {
-    return String(s || "")
-      .replace(/<[^>]*>/g, "")
-      .replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'")
-      .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ")
-      .trim();
-  }
-
-  // Скачивает HTML-страницу с таймаутом; { ok, text } или { ok:false, error }.
-  async function downloadHtml(url) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 20000);
-    try {
-      const res = await fetch(url, {
-        signal: ctrl.signal,
-        redirect: "follow",
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) AI-Developer-Agent/1.0",
-          "Accept-Language": "ru,en;q=0.8",
-        },
-      });
-      if (!res.ok) return { ok: false, error: "HTTP " + res.status };
-      const text = await res.text();
-      return { ok: true, text: text.slice(0, 2 * 1024 * 1024) }; // максимум 2 МБ на обработку
-    } catch (e) {
-      return { ok: false, error: e && e.name === "AbortError" ? "таймаут" : (e && e.message) || String(e) };
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  // Распаковывает ссылку DuckDuckGo: //duckduckgo.com/l/?uddg=<url>&rut=... → https://<url>
-  function ddgUrlToHttps(url) {
-    let u = String(url || "");
-    const ud = u.match(/[?&]uddg=([^&]+)/);
-    if (ud) {
-      try { u = decodeURIComponent(ud[1]); } catch { u = ud[1]; }
-    } else if (u.startsWith("//")) {
-      u = "https:" + u;
-    }
-    return u;
-  }
-
-  // Парсит html.duckduckgo.com/html: a.result__a + a.result__snippet
-  function parseDdgHtml(html) {
-    const results = [];
-    const re = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-    let m;
-    while ((m = re.exec(html)) && results.length < 5) {
-      const url = ddgUrlToHttps(m[1]);
-      if (!/^https?:\/\//i.test(url)) continue;
-      const title = stripHtml(m[2]);
-      if (!title) continue;
-      results.push({ title, url });
-    }
-    const snRe = /<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/g;
-    let sn;
-    let i = 0;
-    while ((sn = snRe.exec(html)) && i < results.length) {
-      results[i].snippet = stripHtml(sn[1]);
-      i++;
-    }
-    return results;
-  }
-
-  // Парсит lite.duckduckgo.com/lite: a.result-link + td.result-snippet
-  function parseDdgLite(html) {
-    const results = [];
-    const re = /<a[^>]*class="[^"]*result-link[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-    let m;
-    while ((m = re.exec(html)) && results.length < 5) {
-      const url = ddgUrlToHttps(m[1]);
-      if (!/^https?:\/\//i.test(url)) continue;
-      const title = stripHtml(m[2]);
-      if (!title) continue;
-      results.push({ title, url });
-    }
-    const snRe = /<td[^>]*class="[^"]*result-snippet[^"]*"[^>]*>([\s\S]*?)<\/td>/g;
-    let sn;
-    let i = 0;
-    while ((sn = snRe.exec(html)) && i < results.length) {
-      results[i].snippet = stripHtml(sn[1]);
-      i++;
-    }
-    return results;
-  }
-
-  // Бесплатный веб-поиск: DuckDuckGo без API-ключа. Пробуем html-версию,
-  // при пустом ответе (капча/изменение разметки) — lite-версию.
-  async function webSearchDDG(query) {
-    const q = encodeURIComponent(String(query || "").trim());
-    if (!q) return "Ошибка: пустой поисковый запрос";
-    let note = "";
-    let results = [];
-    const htmlRes = await downloadHtml("https://html.duckduckgo.com/html/?q=" + q);
-    if (htmlRes.ok) {
-      results = parseDdgHtml(htmlRes.text);
-    } else {
-      note = htmlRes.error || "";
-    }
-    if (!results.length) {
-      const liteRes = await downloadHtml("https://lite.duckduckgo.com/lite/?q=" + q);
-      if (liteRes.ok) results = parseDdgLite(liteRes.text);
-      else if (!note) note = liteRes.error || "";
-    }
-    if (!results.length) {
-      return "Поиск не дал результатов по запросу: " + query + (note ? " (" + note + ")" : "") + ". Попробуй переформулировать запрос или используй webFetch по известному адресу.";
-    }
-    return (
-      "Результаты поиска по «" + query + "»:\n\n" +
-      results
-        .map((r, idx) => (idx + 1) + ". " + (r.title || "—") + "\n   " + r.url + (r.snippet ? "\n   " + r.snippet.slice(0, 300) : ""))
-        .join("\n\n") +
-      "\n\nЧтобы прочитать страницу целиком, используй инструмент webFetch с её URL."
-    );
-  }
-
-  // Усиленный поиск: Google через Serper (нужен API-ключ из настроек).
-  // POST https://google.serper.dev/search с заголовком X-API-KEY → { organic: [...] }.
-  async function webSearchSerper(query, apiKey) {
-    const q = String(query || "").trim();
-    if (!q) return "Ошибка: пустой поисковый запрос";
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 20000);
-    try {
-      const res = await fetch("https://google.serper.dev/search", {
-        method: "POST",
-        signal: ctrl.signal,
-        headers: {
-          "X-API-KEY": String(apiKey || "").trim(),
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ q: q, num: 10, gl: "ru", hl: "ru" }),
-      });
-      if (res.status === 401 || res.status === 403) {
-        return "Ошибка поиска: Serper отклонил ключ (HTTP " + res.status + "). Проверь ключ в Настройках → 🔒 Секреты.";
-      }
-      if (!res.ok) return "Ошибка поиска: HTTP " + res.status;
-      const data = await res.json();
-      const organic = (data && data.organic) || [];
-      if (!organic.length) {
-        return "Поиск не дал результатов по запросу: " + query + ". Попробуй переформулировать запрос или используй webFetch по известному адресу.";
-      }
-      return (
-        "Результаты поиска по «" + query + "» (Google):\n\n" +
-        organic
-          .map((r, idx) => (idx + 1) + ". " + (r.title || "—") + "\n   " + (r.link || "") + (r.snippet ? "\n   " + String(r.snippet).slice(0, 300) : ""))
-          .join("\n\n") +
-        "\n\nЧтобы прочитать страницу целиком, используй инструмент webFetch с её URL."
-      );
-    } catch (e) {
-      return "Ошибка поиска: " + (e && e.name === "AbortError" ? "таймаут" : (e && e.message) || String(e));
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  // Классифицирует ошибку провайдера: лечится ли она сменой ключа.
-  // key=true только для «ключ/баланс/лимит»: 401/403 (неверный ключ), 402/insufficient
-  // (нет баланса/квоты), 429/rate limit (лимит запросов). Ошибки запроса (400),
-  // фильтра контента и сети — НЕ про ключ, менять его бессмысленно.
-  // cooldownMs — на сколько «отложить» провинившийся ключ, чтобы не долбить провайдера.
-  function classifyKeyError(errText) {
-    const t = String(errText || "");
-    if (/API error 401|API error 403|unauthorized|invalid[_ ]?api[_ ]?key|authentication|неверн\w* ключ/i.test(t)) {
-      return { key: true, reason: "auth", cooldownMs: 10 * 60 * 1000 };
-    }
-    if (/API error 402|insufficient|quota|balance|баланс|недостаточно средств|кончил\w* деньг/i.test(t)) {
-      return { key: true, reason: "quota", cooldownMs: 5 * 60 * 1000 };
-    }
-    if (/API error 429|rate[_ ]?limit|too many requests|per minute|ITPM|TPM|лимит/i.test(t)) {
-      return { key: true, reason: "rate", cooldownMs: 60 * 1000 };
-    }
-    return { key: false, reason: null, cooldownMs: 0 };
-  }
-
-  // Веб-поиск: Serper (Google), если задан API-ключ, иначе — DuckDuckGo.
-  async function webSearch(query, apiKey) {
-    if (String(apiKey || "").trim()) return await webSearchSerper(query, apiKey);
-    return await webSearchDDG(query);
-  }
-
-  // Превращает HTML в читаемый текст (убирает скрипты, стили, разметку).
-  function htmlToText(html) {
-    let s = String(html || "");
-    s = s.replace(/<script[\s\S]*?<\/script>/gi, " ");
-    s = s.replace(/<style[\s\S]*?<\/style>/gi, " ");
-    s = s.replace(/<noscript[\s\S]*?<\/noscript>/gi, " ");
-    s = s.replace(/<svg[\s\S]*?<\/svg>/gi, " ");
-    s = s.replace(/<!--[\s\S]*?-->/g, " ");
-    s = s.replace(/<(br|p|div|li|h[1-6]|tr|section|article|pre|blockquote|table)[^>]*>/gi, "\n");
-    s = s.replace(/<[^>]+>/g, " ");
-    s = s.replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
-    s = s.replace(/&quot;/g, '"').replace(/&#39;|&#x27;/g, "'").replace(/&mdash;|&ndash;/g, "—").replace(/&hellip;/g, "…");
-    s = s.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
-    return s;
-  }
-
-  // Читает веб-страницу по URL и возвращает её текст (для чтения документации целиком).
-  async function webFetchPage(url) {
-    const u = String(url || "").trim();
-    if (!/^https?:\/\//i.test(u)) return "Ошибка: укажи URL вида https://...";
-    const res = await downloadHtml(u);
-    if (!res.ok) return "Ошибка загрузки страницы: " + res.error;
-    let text = htmlToText(res.text);
-    if (text.length > 30000) {
-      text = text.slice(0, 30000) + "\n… (страница длиннее — показаны первые 30000 символов)";
-    }
-    if (!text.trim()) {
-      return "Страница загружена, но текст не извлёкся (возможно, это JS-приложение или страница-заглушка).";
-    }
-    return "Содержимое " + u + ":\n\n" + text;
-  }
+  // Веб: поиск и чтение страниц — в модуле src/renderer/web-tools.js.
+  // Имена не изменились, поэтому main.js, preview-сервер и инструменты не менялись.
+  const { downloadHtml, webSearchDDG, webSearch, htmlToText, webFetchPage } = WebTools;
 
   /* Стриппер думающих блоков <think>...</think> / <thought>...</thought>.
      Устойчив к стримингу: теги могут приходить по кусочкам.
@@ -3098,881 +2941,31 @@
     return calls;
   }
 
-  // ═══════════════════ Унифицированный транспорт провайдеров ═══════════════════
-  // Канонический формат сообщений внутри цикла агента — «OpenAI-стиль»:
-  //   { role: "system"|"user"|"assistant", content }
-  //   assistant с вызовами инструментов: { role:"assistant", content, tool_calls:[{ id, type:"function",
-  //     function:{ name, arguments: "<json-строка>" } }] }
-  //   результат инструмента:            { role:"tool", tool_call_id, content }
-  // Для каждого провайдера сообщения конвертируются на лету при отправке запроса.
 
-  const DEFAULT_BASES = {
-    ollama: "http://localhost:11434",
-    openai: "https://api.groq.com/openai/v1",
-    anthropic: "https://api.anthropic.com",
-  };
+  // ── Адреса, ключи и заголовки провайдеров — в src/renderer/provider-config.js ──
+  // baseFor, proxiedBase, apiKeyFor, apiHeaders, projectHeader, jsonArgs, genCallId
+  // и реестр G4F получены в начале файла: код ниже и остальное ядро не менялись.
 
-  // ── Реестр провайдеров G4F (маршрут «Провайдер:модель» в поле модели) ──
-  // rec: ★ рекомендованные — стабильные и работающие без ключа/логина.
-  // Список один на всех: его же использует транспорт buildChatRequest, чтобы
-  // передать провайдера современному g4f отдельным полем provider.
-  const G4F_PROVIDERS = [
-    { name: "default", desc: "Авто: G4F сам выберет модель и провайдера", rec: true },
-    { name: "DeepInfra", desc: "DeepSeek, Qwen, Kimi, GLM — стабильный OpenAI-совместимый API", rec: true , models: ["deepseek-ai/DeepSeek-V3.1","Qwen/Qwen2.5-72B-Instruct","Qwen/Qwen3-32B"] },
-    { name: "HuggingChat", desc: "DeepSeek, Qwen, GLM — бесплатный чат Hugging Face", rec: true , models: ["deepseek-ai/DeepSeek-V3","Qwen/Qwen2.5-72B-Instruct","meta-llama/Llama-3.3-70B-Instruct","Qwen/Qwen3-235B-A22B"] },
-    { name: "Together", desc: "DeepSeek, Qwen, Llama — быстрый API", rec: true , models: ["deepseek-ai/DeepSeek-V3","Qwen/Qwen2.5-72B-Instruct","meta-llama/Llama-3.3-70B-Instruct"] },
-    { name: "Pollinations", desc: "GPT-OSS, DeepSeek, Qwen — бесплатно", rec: true , models: ["openai/gpt-oss-120b","openai/gpt-oss-20b","deepseek/deepseek-v3.1"] },
-    { name: "OpenRouterFree", desc: "Бесплатные :free-модели OpenRouter", rec: true , models: ["deepseek/deepseek-r1:free","qwen/qwen3-235b-a22b:free","meta-llama/llama-3.3-70b-instruct:free"] },
-    { name: "Groq", desc: "Очень быстрые Llama / DeepSeek", rec: true , models: ["llama-3.3-70b-versatile","deepseek-r1-distill-llama-70b","llama-3.1-8b-instant"] },
-    { name: "Airforce", desc: "gpt-oss, kimi-k3, glm-5.3 — огромный каталог", rec: true , models: ["gpt-oss-120b","gpt-4o","kimi-k2","glm-4.5"] },
-    { name: "HuggingFace", desc: "Inference API Hugging Face" , models: ["Qwen/Qwen2.5-72B-Instruct","meta-llama/Llama-3.3-70B-Instruct"] },
-    { name: "HuggingSpace", desc: "Модели с HF Spaces: Command R, Qwen" , models: ["CohereForAI/c4ai-command-r-plus","Qwen/Qwen2.5-72B-Instruct"] },
-    { name: "OpenRouter", desc: "1000+ моделей (многие с суффиксом :free)" , models: ["openai/gpt-4o-mini","anthropic/claude-3.5-sonnet","deepseek/deepseek-chat"] },
-    { name: "Yqcloud", desc: "gpt-4 — работает без всего" , models: ["gpt-4"] },
-    { name: "KiloCode", desc: "Nemotron, MiniMax — для кода" , models: ["nvidia/Llama-3.1-Nemotron-70B-Instruct","minimax/MiniMax-M2"] },
-    { name: "ThebApi", desc: "Агрегатор TheB.AI" , models: ["gpt-4o","claude-3.5-sonnet","deepseek-chat"] },
-    { name: "Perplexity", desc: "Claude Opus / Sonnet через поиск (может просить вход)" , models: ["sonar-pro","sonar"] },
-    { name: "Copilot", desc: "Microsoft Copilot — GPT-4o, o1" , models: ["gpt-4o","o1"] },
-    { name: "OpenaiChat", desc: "ChatGPT бесплатно — gpt-4.1, o3" , models: ["gpt-4.1","gpt-4o-mini","o3-mini"] },
-    { name: "Gemini", desc: "Google Gemini 2.5/3 (иногда нужны куки)" , models: ["gemini-2.5-flash","gemini-2.0-flash"] },
-    { name: "Antigravity", desc: "Google Antigravity — Gemini + Claude" , models: ["gemini-2.5-flash","claude-3.5-sonnet"] },
-    { name: "Qwen", desc: "Модели Qwen напрямую" , models: ["qwen-max","qwen-plus","qwen-turbo"] },
-    { name: "DeepSeek", desc: "chat.deepseek.com — нужен HAR-логин" , models: ["deepseek-chat","deepseek-reasoner"] },
-    { name: "Claude", desc: "Anthropic Claude (обычно нужен ключ или аккаунт)" , models: ["claude-3-5-sonnet"] },
-    { name: "Anthropic", desc: "Официальный API Anthropic" , models: ["claude-sonnet-4-5","claude-opus-4-1","claude-haiku-4-5"] },
-    { name: "Grok", desc: "xAI Grok — рассуждения и код" , models: ["grok-3","grok-3-mini"] },
-    { name: "xAI", desc: "API xAI" , models: ["grok-3","grok-3-mini"] },
-    { name: "Nvidia", desc: "NVIDIA NIM — opensource-модели" , models: ["meta/llama-3.3-70b-instruct","deepseek-ai/deepseek-r1"] },
-    { name: "Cerebras", desc: "Очень быстрые Llama / Qwen" , models: ["llama-3.3-70b","llama-3.1-8b"] },
-    { name: "MiniMax", desc: "MiniMax M — сильный кодер" , models: ["MiniMax-M1-80k","MiniMax-M2"] },
-    { name: "GlhfChat", desc: "Модели Hugging Face через glhf.chat" , models: ["Qwen/Qwen3-235B-A22B","deepseek-ai/DeepSeek-R1"] },
-    { name: "LMArena", desc: "Публичные модели LMArena" , models: ["llama-3.3-70b"] },
-    { name: "MetaAI", desc: "Llama через Meta AI" , models: ["llama-3.3-70b-instruct"] },
-    { name: "Puter", desc: "Llama бесплатно" , models: ["llama-3.3-70b-instruct"] },
-    { name: "GigaChat", desc: "Сбер GigaChat" , models: ["GigaChat-Pro","GigaChat-Max"] },
-    { name: "Replicate", desc: "Open-source модели через Replicate" , models: ["meta/meta-llama-3-70b-instruct"] },
-    { name: "PhindAi", desc: "Phind — специалист по коду" , models: ["Phind-V2","Phind-V2-75B"] },
-    { name: "Cloudflare", desc: "Workers AI Cloudflare" , models: ["@cf/meta/llama-3.1-8b-instruct"] },
-    { name: "OperaAria", desc: "Opera Aria — GPT-4o" , models: ["gpt-4o"] },
-    { name: "WhiteRabbitNeo", desc: "WhiteRabbit Neo — безопасный кодер" , models: ["WhiteRabbitNeo-33B"] },
-    { name: "BlackboxPro", desc: "Blackbox AI — GPT, Claude" , models: ["blackboxai-3.5"] },
-    { name: "OrcaRouter", desc: "Роутер моделей (как OpenRouter)" , models: ["qwen3-max"] },
-    { name: "HailuoAI", desc: "MiniMax Hailuo" , models: ["MiniMax-M1"] },
-  ];
-  const G4F_PROVIDER_NAMES = new Set(G4F_PROVIDERS.map((p) => p.name));
+  // ── Сообщения, запрос и стрим — в src/renderer/provider-transport.js ──
+  // Конвертация сообщений, кэш промпта, сборка запроса, разбор потока и список
+  // моделей берутся оттуда (см. начало раздела выше).
 
-  // G4F-маршрут «Провайдер:модель» (например HuggingChat:gpt-4o-mini).
-  // Возвращает { provider, model } только если префикс — известный провайдер G4F
-  // (иначе не трогаем имя: у OpenRouter и других бывают свои двоеточия, например :free).
-  function splitG4fRoute(model) {
-    const m = String(model || "");
-    const i = m.indexOf(":");
-    if (i <= 0 || i === m.length - 1) return null;
-    const prefix = m.slice(0, i);
-    if (!G4F_PROVIDER_NAMES.has(prefix)) return null;
-    return { provider: prefix, model: m.slice(i + 1) };
-  }
-
-  function trimBase(url) {
-    return String(url || "").trim().replace(/\/+$/, "");
-  }
-
-  // Anthropic Messages API живёт под /v1; если пользователь вписал URL уже с /v1 — не дублируем.
-  function anthropicApiBase(url) {
-    return trimBase(url).replace(/\/v1\/?$/i, "");
-  }
-
-  function baseFor(provider, s) {
-    if (provider === "ollama") return trimBase(s.ollamaUrl || DEFAULT_BASES.ollama);
-    if (provider === "anthropic") return anthropicApiBase(s.anthropicUrl || DEFAULT_BASES.anthropic);
-    return trimBase(s.openaiUrl || s.externalUrl || DEFAULT_BASES.openai); // legacy externalUrl — миграция
-  }
-
-  // Веб-предпросмотр: Yandex AI Studio не отдаёт CORS-заголовки — браузер блокирует
-  // прямые запросы («Failed to fetch»). В браузерном режиме база переписывается на
-  // локальный прокси preview-сервера (/api/llm/...), который ходит в Яндекс сам.
-  // Веб-предпросмотр: Yandex AI Studio и Ollama Cloud не отдают CORS-заголовки —
-  // браузер блокирует прямые запросы («Failed to fetch»). В браузерном режиме база
-  // переписывается на локальный прокси preview-сервера (/api/llm/...), который ходит
-  // к провайдеру сам (server.js разрешает внешние https, внутренние сети — 403).
-  function proxiedBase(base) {
-    const b = String(base || "");
-    const local =
-      /^(https?:\/\/)?(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/i;
-    if (
-      typeof location !== "undefined" && location && location.origin &&
-      /^https:\/\//i.test(b) && !local.test(b)
-    ) {
-      return location.origin + "/api/llm/" + encodeURIComponent(b);
-    }
-    return b;
-  }
-
-  function apiKeyFor(provider, s) {
-    if (provider === "anthropic") return s.anthropicApiKey || s.apiKey || "";
-    if (provider === "openai") return s.openaiApiKey || s.apiKey || "";
-    return "";
-  }
-
-  function apiHeaders(provider, apiKey, fromBrowser, extra) {
-    const h = { "Content-Type": "application/json" };
-    if (provider === "ollama") return h;
-    if (provider === "anthropic") {
-      h["x-api-key"] = apiKey || "";
-      h["anthropic-version"] = "2023-06-01";
-      // Anthropic разрешает вызовы из браузера только с этим заголовком.
-      if (fromBrowser) h["anthropic-dangerous-direct-browser-access"] = "true";
-      return h;
-    }
-    if (apiKey) h.Authorization = "Bearer " + apiKey;
-    if (extra && typeof extra === "object") Object.assign(h, extra);
-    return h;
-  }
-
-  // Yandex AI Studio (OpenAI-совместимый эндпоинт): каталог (папка) передаётся заголовком OpenAI-Project.
-  function projectHeader(s) {
-    const f = s && s.openaiProject ? String(s.openaiProject).trim() : "";
-    return f ? { "OpenAI-Project": f } : null;
-  }
-
-  function jsonArgs(args) {
-    if (args && typeof args === "object") return args;
-    if (typeof args === "string") {
-      try {
-        return JSON.parse(args);
-      } catch {
-        return { raw: args };
-      }
-    }
-    return {};
-  }
-
-  function genCallId() {
-    return "call_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10);
-  }
-
-  // ── Канонический content сообщения: строка ИЛИ массив частей
-  // [{ type: "text", text }, { type: "image_url", image_url: { url: "data:image/png;base64,..." } }]
-  function partsText(parts) {
-    return (parts || []).filter((p) => p && p.type === "text").map((p) => p.text || "").join("\n");
-  }
-  function partsImages(parts) {
-    return (parts || []).filter((p) => p && p.type === "image_url" && p.image_url && p.image_url.url);
-  }
-  function contentForProvider(provider, content) {
-    if (!Array.isArray(content)) return content == null ? "" : content;
-    const text = partsText(content);
-    const imgs = partsImages(content);
-    if (provider === "ollama") {
-      // Ollama: content — строка, изображения — массив base64 (без префикса data:)
-      const images = imgs.map((p) => {
-        const url = String(p.image_url.url || "");
-        const idx = url.indexOf(";base64,");
-        return idx >= 0 ? url.slice(idx + 8) : url;
-      });
-      return { content: text, images };
-    }
-    if (provider === "anthropic") {
-      // Claude: content — массив блоков { type: "image", source: { type: "base64", media_type, data } }
-      const blocks = [];
-      if (text) blocks.push({ type: "text", text });
-      for (const p of imgs) {
-        const url = String(p.image_url.url || "");
-        const m = url.match(/^data:(image\/(?:png|jpeg|gif|webp));base64,(.+)$/);
-        if (m) blocks.push({ type: "image", source: { type: "base64", media_type: m[1], data: m[2] } });
-      }
-      return blocks;
-    }
-    return content; // OpenAI-совместимые: массив частей с image_url как есть
-  }
-
-  // ── Конвертация канонических сообщений в диалект провайдера ──
-  function messagesForProvider(provider, messages) {
-    if (provider === "ollama") {
-      // Ollama: tool_calls без id и type; arguments — объект (не строка); content — строка.
-      return messages.map((m) => {
-        if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
-          return {
-            role: "assistant",
-            content: m.content || "",
-            tool_calls: m.tool_calls.map((tc) => ({
-              function: {
-                name: (tc.function && tc.function.name) || "",
-                arguments: jsonArgs(tc.function && tc.function.arguments),
-              },
-            })),
-          };
-        }
-        if (Array.isArray(m.content)) {
-          const c = contentForProvider("ollama", m.content);
-          const msg = { role: m.role, content: c.content };
-          if (c.images && c.images.length) msg.images = c.images;
-          return msg;
-        }
-        return { role: m.role, content: m.content == null ? "" : m.content };
-      });
-    }
-    if (provider === "anthropic") {
-      const out = [];
-      for (let i = 0; i < messages.length; i++) {
-        const m = messages[i];
-        if (m.role === "system") continue; // уходит в верхнеуровневое поле system
-        if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
-          const blocks = [];
-          if (m.content) blocks.push({ type: "text", text: m.content });
-          const ids = [];
-          for (const tc of m.tool_calls) {
-            const id = tc.id || genCallId();
-            ids.push(id);
-            blocks.push({
-              type: "tool_use",
-              id,
-              name: (tc.function && tc.function.name) || "",
-              input: jsonArgs(tc.function && tc.function.arguments),
-            });
-          }
-          out.push({ role: "assistant", content: blocks });
-          // Следующие подряд tool-результаты группируем в ОДНО user-сообщение с tool_result-блоками
-          const results = [];
-          let used = 0;
-          while (i + 1 < messages.length && messages[i + 1].role === "tool") {
-            i++;
-            results.push({
-              type: "tool_result",
-              tool_use_id: messages[i].tool_call_id || ids[used] || genCallId(),
-              content: messages[i].content || "",
-            });
-            used++;
-          }
-          if (results.length) out.push({ role: "user", content: results });
-          continue;
-        }
-        if (m.role === "assistant") {
-          out.push({ role: "assistant", content: m.content || "" });
-          continue;
-        }
-        out.push({ role: "user", content: Array.isArray(m.content) ? contentForProvider("anthropic", m.content) : m.content });
-      }
-      return out;
-    }
-    return messages; // openai-совместимые — как есть (массив частей с image_url поддерживается нативно)
-  }
-
-  function systemText(messages) {
-    return messages
-      .filter((m) => m.role === "system")
-      .map((m) => m.content || "")
-      .filter(Boolean)
-      .join("\n\n");
-  }
-
-  function toolsForProvider(provider, tools) {
-    if (provider !== "anthropic") return tools || [];
-    return (tools || []).map((t) => ({
-      name: t.function && t.function.name,
-      description: (t.function && t.function.description) || "",
-      input_schema: (t.function && t.function.parameters) || { type: "object", properties: {} },
-    }));
-  }
-
-  // ── Кэш промпта (ускорение №2) ──────────────────────────────────────────
-  // Неизменяемый префикс запроса (системный промпт + схемы инструментов) — это
-  // десятки тысяч токенов, которые провайдер иначе пересчитывает на КАЖДОМ
-  // раунде. Точка кэша срезает время до первого токена с 5-8 с до 1-2 с на
-  // повторных раундах одной задачи. Поле отправляем только тем, кто его
-  // понимает: строгие OpenAI-совместимые API отвечают на него 400.
-  function cacheableProvider(provider, base, model) {
-    if (provider === "anthropic") return "anthropic";
-    if (provider !== "openai") return "";
-    if (!/openrouter\.ai/i.test(String(base || ""))) return "";
-    // OpenRouter кэширует префикс только у Claude и Gemini — другим не шлём.
-    return /anthropic\/|claude|gemini|google\//i.test(String(model || "")) ? "openrouter" : "";
-  }
-
-  // Граница «статичного» префикса системного промпта. Кэшируемый блок обязан
-  // накрывать ТОЛЬКО его: динамический «паспорт проекта» (дерево файлов, режим плана,
-  // подсказка после клонирования) меняется почти каждый виток, и если он попадёт ВНУТРЬ
-  // кэшируемого блока, промах обнуляет кэш целиком (кэш блоков у Anthropic/OpenRouter) —
-  // то есть мы платим полную цену за все ~30k токенов шапки вместо ~10%.
-  // Возвращает { head, tail } либо null, если текст не начинается со статичной части.
-  function splitStaticSystem(text, staticText) {
-    const full = String(text || "");
-    const head = String(staticText || "");
-    if (!head || !full.startsWith(head)) return null;
-    return { head: head, tail: full.slice(head.length) };
-  }
-
-  // Системный промпт для Anthropic: при кэше — массив блоков, где точка кэша стоит
-  // ровно на статичном префиксе, а динамика идёт следующим блоком без неё.
-  function anthropicSystem(sysText, cacheKind, staticText) {
-    const text = String(sysText || "");
-    if (!text) return null;
-    if (!cacheKind) return text;
-    const sp = splitStaticSystem(text, staticText);
-    if (!sp) return [{ type: "text", text: text, cache_control: { type: "ephemeral" } }];
-    const blocks = [{ type: "text", text: sp.head, cache_control: { type: "ephemeral" } }];
-    if (sp.tail) blocks.push({ type: "text", text: sp.tail });
-    return blocks;
-  }
-
-  function withCacheOnFirstSystem(msgs, staticText) {
-    const out = (msgs || []).slice();
-    for (let i = 0; i < out.length; i++) {
-      const m = out[i];
-      if (!m || m.role !== "system" || !m.content) continue;
-      if (typeof m.content === "string") {
-        const sp = splitStaticSystem(m.content, staticText);
-        const blocks = [{ type: "text", text: sp ? sp.head : m.content, cache_control: { type: "ephemeral" } }];
-        if (sp && sp.tail) blocks.push({ type: "text", text: sp.tail });
-        out[i] = { role: "system", content: blocks };
-      } else if (Array.isArray(m.content) && m.content.length) {
-        out[i] = {
-          role: "system",
-          content: m.content.map((b, j) =>
-            j === m.content.length - 1 ? Object.assign({}, b, { cache_control: { type: "ephemeral" } }) : b
-          ),
-        };
-      }
-      break; // только первый — он же самый стабильный
-    }
-    return out;
-  }
-
-  // Строгие OpenAI-совместимые API (G4F, Yandex AI Studio, DeepSeek, свой сервер) ждут
-  // system в начале диалога и часто ТОЛЬКО одним сообщением. Промпт, паспорт проекта и
-  // справочники групп идут несколькими system-сообщениями подряд — склеиваем именно
-  // ведущую серию. Текст, порядок и разделитель («\n\n», как у Anthropic) не меняются,
-  // поэтому автоматический кэш префикса OpenAI/DeepSeek/Groq продолжает попадать.
-  // Одиночный system и служебные заметки в середине диалога остаются ровно как были.
-  function mergeLeadingSystem(messages) {
-    const list = messages || [];
-    const heads = [];
-    let i = 0;
-    for (; i < list.length; i++) {
-      const m = list[i];
-      if (!m || m.role !== "system") break;
-      const text =
-        typeof m.content === "string"
-          ? m.content
-          : Array.isArray(m.content)
-            ? m.content.map((b) => (b && (b.text || b.content)) || "").join("")
-            : "";
-      if (text) heads.push(text);
-    }
-    if (heads.length <= 1) return list; // склеивать нечего — поведение прежнее
-    return [{ role: "system", content: heads.join("\n\n") }, ...list.slice(i)];
-  }
-
-  /**
-   * Собирает HTTP-запрос к нужному провайдеру.
-   * s — объект настроек: { provider, ollamaUrl, openaiUrl, anthropicUrl, openaiApiKey, anthropicApiKey }
-   * opts — { model, messages, tools, fromBrowser }
-   */
-  function buildChatRequest(s, opts) {
-    const provider = s && s.provider ? s.provider : "openai";
-    const model = opts && opts.model;
-    const messages = (opts && opts.messages) || [];
-    const tools = (opts && opts.tools) || TOOL_DEFINITIONS;
-    const fromBrowser = !!(opts && opts.fromBrowser);
-    const apiKey = apiKeyFor(provider, s);
-    const headers = apiHeaders(provider, apiKey, fromBrowser, projectHeader(s));
-
-    if (provider === "ollama") {
-      // num_ctx: без него Ollama берёт дефолт модели (часто 2048) и молча режет запрос,
-      // где только промпт ~6k и схемы инструментов ~6k. keep_alive: дефолтные 5 минут
-      // выгружали модель между раундами (загрузка = секунды на каждом).
-      const body = {
-        model,
-        messages: mergeLeadingSystem(messagesForProvider(provider, messages)),
-        tools,
-        stream: true,
-        keep_alive: OLLAMA_KEEP_ALIVE,
-      };
-      const numCtx = ollamaNumCtx(opts && opts.numCtxBudget, opts && opts.modelWindow);
-      if (numCtx > 0) body.options = { num_ctx: numCtx };
-      return { url: baseFor(provider, s) + "/api/chat", headers, body: JSON.stringify(body) };
-    }
-    const cacheKind = cacheableProvider(provider, baseFor(provider, s), model);
-    if (provider === "anthropic") {
-      const toolDefs = toolsForProvider(provider, tools);
-      // Точка кэша на последней схеме инструмента — кэширует весь блок tools.
-      if (cacheKind && toolDefs.length) {
-        toolDefs[toolDefs.length - 1] = Object.assign({}, toolDefs[toolDefs.length - 1], {
-          cache_control: { type: "ephemeral" },
-        });
-      }
-      const sys = systemText(messages);
-      const body = {
-        model,
-        max_tokens: 4096,
-        messages: messagesForProvider(provider, messages),
-        tools: toolDefs,
-        stream: true,
-      };
-      if (sys) body.system = anthropicSystem(sys, cacheKind, opts && opts.staticSystem);
-      return {
-        url: baseFor(provider, s) + "/v1/messages",
-        headers,
-        body: JSON.stringify(body),
-      };
-    }
-    // G4F-маршрут «Провайдер:модель» (например HuggingChat:gpt-4o-mini):
-    // современный g4f принимает провайдера отдельным полем provider, а имя модели — без префикса.
-    // Справочники/паспорт проекта идут несколькими system подряд: строгим серверам
-    // отдаём один ведущий system (текст и порядок те же).
-    let openaiMessages = mergeLeadingSystem(messagesForProvider("openai", messages));
-    if (cacheableProvider(provider, baseFor(provider, s), model) === "openrouter") {
-      openaiMessages = withCacheOnFirstSystem(openaiMessages, opts && opts.staticSystem);
-    }
-    const body = { model, messages: openaiMessages, tools, stream: true };
-    // Токены и попадание в кэш OpenAI-совместимые API отдают в стриме ТОЛЬКО по
-    // явному запросу stream_options.include_usage (последний чанк с usage).
-    // Строгий сервер может поля не знать — тогда main.js выключает его и повторяет.
-    if (opts && opts.includeUsage) body.stream_options = { include_usage: true };
-    const g4f = splitG4fRoute(model);
-    if (g4f) {
-      body.model = g4f.model;
-      body.provider = g4f.provider;
-    }
-    return {
-      url: proxiedBase(baseFor(provider, s)) + "/chat/completions",
-      headers,
-      body: JSON.stringify(body),
-    };
-  }
-
-  /**
-   * Читает стрим ответа провайдера и вызывает колбэки:
-   *   onText(text)     — очередной кусок текста (без обработки <think> — это делает вызывающий)
-   *   onToolCall(call) — завершённый вызов инструмента { id, name, args } (аргументы — объект)
-   *   onThinking(text) — нативные рассуждения модели: DeepSeek reasoning_content,
-   *                      Anthropic thinking_delta (мысли приходят отдельным потоком)
-   * Поддерживает NDJSON (Ollama), OpenAI-SSE и Anthropic-SSE.
-   */
-  // ── Чтение стрима ответа провайдера с защитой от «вечного ожидания» ──
-  // 1) Ошибки, которые провайдеры шлют прямо в стриме (data: {"error": ...} —
-  //    OpenAI-совместимые, {"type":"error"} — Anthropic, NDJSON-ошибки Ollama),
-  //    превращаются в исключение с понятным текстом, а не молча пропускаются
-  //    (раньше это выглядело как «бесконечное думание»).
-  // 2) Таймауты: первый байт (firstByteTimeoutMs, по умолчанию 90 с) и пауза
-  //    между чанками (idleTimeoutMs, по умолчанию 60 с) — зависший/молчащий
-  //    провайдер завершается ошибкой вместо бесконечного ожидания.
-  // Токен-отчёт провайдера → единый вид { prompt, completion, cached }: разные API
-  // кладут попадание в кэш в разные поля (OpenAI/OpenRouter — prompt_tokens_details,
-  // DeepSeek — prompt_cache_hit_tokens, Anthropic — cache_read_input_tokens).
-  function normalizeUsage(u) {
-    if (!u || typeof u !== "object") return null;
-    const det = u.prompt_tokens_details || u.input_tokens_details || null;
-    const prompt = u.prompt_tokens != null ? u.prompt_tokens : u.input_tokens != null ? u.input_tokens : 0;
-    const completion = u.completion_tokens != null ? u.completion_tokens : u.output_tokens != null ? u.output_tokens : 0;
-    const cached =
-      (det && det.cached_tokens) || u.prompt_cache_hit_tokens || u.cache_read_input_tokens || 0;
-    return { prompt: prompt || 0, completion: completion || 0, cached: cached || 0 };
-  }
-
-  async function consumeProviderStream({ response, provider, onText, onToolCall, onThinking, onUsage, firstByteTimeoutMs, idleTimeoutMs }) {
-    if (!response || !response.body) throw new Error("Пустой ответ от сервера (нет тела).");
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    // Аккумуляция по индексу блока (OpenAI: tool_calls по index; Anthropic: content_block по index)
-    const accum = new Map();
-    const seenOllamaCalls = new Set();
-    // Gemini 3.x: шифрованная подпись мысли (thought signature) приходит в
-    // extra_content.google.thought_signature — на самом tool-call или отдельной дельтой.
-    // Её нужно вернуть модели дословно в следующем запросе, иначе API отвечает 400
-    // «Function call is missing a thought_signature in functionCall parts».
-    let pendingExtra = null;
-    const finalizeAccum = () => {
-      for (const item of accum.values()) {
-        if (!item.name) continue;
-        const call = { id: item.id || genCallId(), name: item.name, args: jsonArgs(item.args) };
-        if (item.extra) call.extraContent = item.extra;
-        if (onToolCall) onToolCall(call);
-      }
-      accum.clear();
-      pendingExtra = null;
-    };
-    const firstMs = firstByteTimeoutMs || 90000;
-    const idleMs = idleTimeoutMs || 60000;
-    let gotFirst = false;
-    // reader.read() с таймером: зависший стрим не держит чат в «думании» вечно.
-    const readChunk = () =>
-      new Promise((resolve, reject) => {
-        const ms = gotFirst ? idleMs : firstMs;
-        const timer = setTimeout(() => {
-          reader.cancel().catch(() => {});
-          reject(
-            new Error(
-              gotFirst
-                ? "Провайдер замолчал — данные не приходили более " + Math.round(ms / 1000) + " с. Проверь сеть или выбери другого провайдера."
-                : "Провайдер не отвечает — первый байт не пришёл за " + Math.round(ms / 1000) + " с. Проверь, что сервер запущен и URL в настройках верный."
-            )
-          );
-        }, ms);
-        reader.read().then(
-          (v) => {
-            clearTimeout(timer);
-            resolve(v);
-          },
-          (e) => {
-            clearTimeout(timer);
-            reject(e);
-          }
-        );
-      });
-    const errText = (e) => {
-      if (!e) return "";
-      if (typeof e === "string") return e;
-      return e.message || e.detail || e.code || JSON.stringify(e).slice(0, 300);
-    };
-    try {
-      while (true) {
-        const { done, value } = await readChunk();
-        if (done) break;
-        // «Первый байт» засчитываем только при реальных данных: провайдер, который шлёт
-        // пустые keep-alive чанки, но так и не отвечает, тоже завершится по таймауту.
-        if (value && value.length) gotFirst = true;
-        buf += decoder.decode(value, { stream: true });
-        let nl;
-        while ((nl = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!line) continue;
-
-          if (provider === "ollama") {
-            // NDJSON: каждая строка — полный JSON-объект
-            let obj;
-            try { obj = JSON.parse(line); } catch { continue; }
-            if (obj && obj.error) throw new Error("Ошибка Ollama: " + errText(obj.error));
-            const msg = (obj && obj.message) || {};
-            if (msg.content && onText) onText(msg.content);
-            // Thinking-модели (qwen3, deepseek-r1, gpt-oss) кладут рассуждения в отдельное
-            // поле message.thinking. Без него размышления локальной модели не видны вовсе,
-            // и план, написанный в них, не попадал ни в блок мыслей, ни в панель плана.
-            if (msg.thinking && onThinking) onThinking(msg.thinking);
-            // Финальный чанк (done) несёт счётчики промпта и ответа.
-            if (onUsage && obj.done && (obj.prompt_eval_count != null || obj.eval_count != null)) {
-              onUsage({ prompt: obj.prompt_eval_count || 0, completion: obj.eval_count || 0, cached: 0 });
-            }
-            if (Array.isArray(msg.tool_calls)) {
-              for (const tc of msg.tool_calls) {
-                const f = tc.function || {};
-                if (!f.name) continue;
-                // Ollama в финальном (done:true) чанке может повторно прислать tool_calls —
-                // дедуплицируем одинаковые вызовы в пределах одного стрима, чтобы инструмент
-                // не выполнился дважды (двойное создание папки / двойной git commit).
-                const args = jsonArgs(f.arguments);
-                const sig = f.name + "|" + JSON.stringify(args);
-                if (seenOllamaCalls.has(sig)) continue;
-                seenOllamaCalls.add(sig);
-                if (onToolCall) onToolCall({ id: tc.id || genCallId(), name: f.name, args });
-              }
-            }
-            continue;
-          }
-
-          if (!line.startsWith("data:")) continue; // SSE (OpenAI/Anthropic): игнорируем event:-строки
-          const data = line.slice(5).trim();
-          if (!data || data === "[DONE]") continue;
-          let obj;
-          try { obj = JSON.parse(data); } catch { continue; }
-
-          if (provider === "openai") {
-            // Ошибка внутри стрима (частая беда бесплатных провайдеров G4F:
-            // «Зарегистрируйтесь и повторите свой запрос» и т.п.) — показываем её,
-            // а не ждём вечно молчания.
-            if (obj.error || (obj.type === "error" && obj.error)) {
-              throw new Error("Провайдер ответил ошибкой: " + (errText(obj.error) || errText(obj)));
-            }
-            // Финальный чанк при include_usage: choices пустой, а usage заполнен —
-            // поэтому читаем usage ДО выхода по отсутствию choice.
-            if (obj.usage && onUsage) onUsage(normalizeUsage(obj.usage));
-            const choice = obj.choices && obj.choices[0];
-            if (!choice) continue;
-            const delta = choice.delta || {};
-            if (delta.content && onText) onText(delta.content);
-            // DeepSeek и другие OpenAI-совместимые шлют рассуждения отдельным полем
-            if (delta.reasoning_content && onThinking) onThinking(delta.reasoning_content);
-            // Часть провайдеров (OpenRouter, vLLM, некоторые сборки-прокси) называет поле
-            // просто reasoning — раньше такие рассуждения пропадали целиком.
-            else if (delta.reasoning && onThinking) onThinking(delta.reasoning);
-            // Gemini может прислать подпись мысли отдельным полем delta.extra_content
-            // (до или вместо поля на самом tool-call) — запоминаем и подставляем вызовам без своей.
-            if (delta.extra_content && delta.extra_content.google && delta.extra_content.google.thought_signature) {
-              pendingExtra = delta.extra_content;
-            }
-            if (Array.isArray(delta.tool_calls)) {
-              for (const tc of delta.tool_calls) {
-                const i = tc.index || 0;
-                const cur = accum.get(i) || { id: "", name: "", args: "", extra: null };
-                if (tc.id) cur.id = tc.id;
-                const fn = tc.function || {};
-                if (fn.name) cur.name = fn.name;
-                if (fn.arguments) cur.args += fn.arguments;
-                if (tc.extra_content && tc.extra_content.google && tc.extra_content.google.thought_signature) {
-                  cur.extra = tc.extra_content;
-                } else if (pendingExtra && !cur.extra) {
-                  cur.extra = pendingExtra;
-                }
-                accum.set(i, cur);
-              }
-              pendingExtra = null;
-            }
-          } else if (provider === "anthropic") {
-            const type = obj.type;
-            if (type === "error" && obj.error) {
-              throw new Error("Claude ответил ошибкой: " + errText(obj.error));
-            }
-            // usage: message_start — входные токены (и чтение из кэша),
-            // message_delta — выходные. Собираются воедино в main.js.
-            if (onUsage && type === "message_start" && obj.message && obj.message.usage) {
-              onUsage(normalizeUsage(obj.message.usage));
-            }
-            if (onUsage && type === "message_delta" && obj.usage) onUsage(normalizeUsage(obj.usage));
-            if (type === "content_block_start") {
-              const block = obj.content_block || {};
-              const cur = accum.get(obj.index) || { id: "", name: "", args: "" };
-              if (block.type === "tool_use") {
-                if (block.id) cur.id = block.id;
-                if (block.name) cur.name = block.name;
-              }
-              accum.set(obj.index, cur);
-            } else if (type === "content_block_delta") {
-              const delta = obj.delta || {};
-              const cur = accum.get(obj.index) || { id: "", name: "", args: "" };
-              if (delta.type === "text_delta" && delta.text && onText) onText(delta.text);
-              else if (delta.type === "thinking_delta" && delta.thinking && onThinking) onThinking(delta.thinking);
-              else if (delta.type === "input_json_delta" && delta.partial_json) cur.args += delta.partial_json;
-              accum.set(obj.index, cur);
-            }
-            // content_block_stop / message_delta / message_stop: ничего не делаем, финализируем ниже
-          }
-        }
-      }
-    } finally {
-      try { reader.releaseLock(); } catch {}
-    }
-    finalizeAccum();
-  }
-
-  /** Возвращает список доступных моделей у выбранного провайдера (throws при ошибке). */
-  async function listModels(s, opts) {
-    const provider = s && s.provider ? s.provider : "openai";
-    const fromBrowser = !!(opts && opts.fromBrowser);
-    const apiKey = apiKeyFor(provider, s);
-    const timeout = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined;
-    const headers = apiHeaders(provider, apiKey, fromBrowser, projectHeader(s));
-
-    if (provider === "ollama") {
-      const res = await fetch(baseFor(provider, s) + "/api/tags", { headers, signal: timeout });
-      if (!res.ok) throw new Error("Ollama error " + res.status + ": " + (await res.text()).slice(0, 300));
-      const data = await res.json();
-      return (data.models || []).map((m) => m.name);
-    }
-    if (provider === "anthropic") {
-      const res = await fetch(baseFor(provider, s) + "/v1/models", { headers, signal: timeout });
-      if (!res.ok) throw new Error("Claude API error " + res.status + ": " + (await res.text()).slice(0, 300));
-      const data = await res.json();
-      return (data.data || []).map((m) => m.id);
-    }
-    const res = await fetch(proxiedBase(baseFor(provider, s)) + "/models", { headers, signal: timeout });
-    if (!res.ok) throw new Error("API error " + res.status + ": " + (await res.text()).slice(0, 300));
-    const data = await res.json();
-    return (data.data || []).map((m) => m.id);
-  }
-
-  /** Читает тело ошибочного ответа и возвращает человекочитаемый фрагмент. */
-  async function readApiError(res) {
-    const body = await res.text().catch(() => "");
-    let detail = (body || "").slice(0, 600);
-    try {
-      const j = JSON.parse(body);
-      const err = (j && j.error) || j;
-      detail = typeof err === "string" ? err.slice(0, 600) : JSON.stringify(err, null, 2).slice(0, 600);
-    } catch {}
-    return detail;
-  }
-
-  // Понятное объяснение лимитных ошибок провайдеров вместо сырого JSON.
-  // Groq free: ~7K входных токенов/мин (ITPM) для всех моделей, а системный
-  // промпт + схемы инструментов агента весят десятки тысяч токенов — обрезка
-  // истории не поможет, нужен другой провайдер или платный тир.
-  function friendlyRateLimitError(status, detail, settings) {
-    const s = settings || {};
-    const base = String(s.openaiUrl || s.externalUrl || "");
-    const isGroq = /groq\.com/i.test(base);
-    const d = String(detail || "");
-    const isTokenMinute =
-      /per minute|tokens per minute|ITPM|rate_limit_exceeded|reduce your message size/i.test(d);
-    if (isGroq && (status === 413 || status === 429) && isTokenMinute) {
-      return (
-        "API error " + status + ": Groq (бесплатный тариф) ограничивает входные токены ~7 000/мин, "
-        + "а запрос агента (системный промпт + схемы инструментов + контекст) весит десятки тысяч "
-        + "токенов — лимит исчерпывается ещё до ответа, и обрезка истории здесь не поможет.\n\n"
-        + "Как продолжить:\n"
-        + "1) переключись в Настройках → «🌐 OpenAI-совместимые» на чип Ollama Cloud (gpt-oss:120b), "
-        + "Yandex (DeepSeek V4 Flash) или Cerebras — они уже настроены и без этого лимита;\n"
-        + "2) либо включи Groq Dev Tier (console.groq.com/settings/billing) — лимит вырастет.\n"
-        + "Бесплатный Groq подходит только для коротких сообщений без инструментов."
-      );
-    }
-    return null;
-  }
-
-  // ── Лимиты провайдера: сколько ждать и как не бить в 429 вслепую ─────────
-  // Провайдеры сообщают лимит по-разному: заголовком Retry-After, текстом
-  // («Please retry in 12.3s», «try again in 5 seconds», retryDelay: "12s") или
-  // словами о частоте («8 requests per minute»). Раньше всё это просто
-  // превращалось в ошибку — раунд терялся, и агент ждал вслепую.
-  function rateLimitInfo(status, headers, detail) {
-    const h = headers && typeof headers.get === "function" ? headers : null;
-    let retryMs = 0;
-    if (h) {
-      const ra = parseFloat(h.get("retry-after"));
-      if (isFinite(ra) && ra > 0) retryMs = Math.min(ra * 1000, 120000);
-      if (!retryMs) {
-        const reset = parseFloat(h.get("x-ratelimit-reset-requests") || h.get("x-ratelimit-reset"));
-        if (isFinite(reset) && reset > 0) retryMs = Math.min(reset, 120000);
-      }
-    }
-    const d = String(detail || "");
-    if (!retryMs) {
-      const m = /(?:retry|try again|повтори\w*|через|retryDelay)\D{0,24}?(\d+(?:[.,]\d+)?)\s*(ms|мил\w*|сек\w*|sec\w*|s\b|мин\w*|min\w*)/i.exec(d);
-      if (m) {
-        const v = parseFloat(String(m[1]).replace(",", "."));
-        const unit = String(m[2]).toLowerCase();
-        const mult = /^ms|мил/.test(unit) ? 1 : /^мин|^min/.test(unit) ? 60000 : 1000;
-        if (isFinite(v) && v > 0) retryMs = Math.min(v * mult, 120000);
-      }
-    }
-    let rpm = 0;
-    const r = /(\d+)\s*(?:requests?|queries|rpm|req)\s*(?:per|\/)\s*(?:minute|min|мин)/i.exec(d);
-    if (r) rpm = parseInt(r[1], 10) || 0;
-    return { retryMs: Math.round(retryMs), rpm: rpm };
-  }
-
-  // Держатель темпа: узнали частоту — расставляем запросы по времени сами, чтобы
-  // вообще не получать 429 (каждый 429 — потерянный раунд и ожидание вслепую).
-  function createRateLimiter() {
-    let minIntervalMs = 0;
-    let nextAt = 0;
-    return {
-      pendingMs() {
-        return Math.max(0, nextAt - Date.now());
-      },
-      // Ждёт, если предыдущий запрос был слишком недавно. Возвращает, сколько ждал.
-      async take() {
-        const now = Date.now();
-        const wait = Math.max(0, nextAt - now);
-        nextAt = Math.max(now, nextAt) + minIntervalMs;
-        if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-        return wait;
-      },
-      // Запоминает лимит: частоту (rpm) и паузу после 429.
-      note(info) {
-        const i = info || {};
-        if (i.rpm > 0) {
-          const per = Math.min(Math.ceil(60000 / i.rpm), 30000);
-          if (per > minIntervalMs) minIntervalMs = per;
-        }
-        if (i.retryMs > 0) nextAt = Math.max(nextAt, Date.now() + Math.min(i.retryMs, 120000));
-      },
-    };
-  }
-
-  // Ошибка → читаемый текст. Отдельно ловим «промис вместо ошибки» (забыт await):
-  // иначе в интерфейс попадало бесполезное «[object Promise]» вместо причины сбоя.
-  function fmtError(e) {
-    if (e instanceof Error) return e.message || String(e);
-    if (e && typeof e.then === "function") return "Promise вместо ошибки (в коде забыт await)";
-    if (e == null) return String(e);
-    if (typeof e === "object") {
-      try {
-        return JSON.stringify(e).slice(0, 500) || String(e);
-      } catch {
-        return String(e);
-      }
-    }
-    return String(e);
-  }
-
-  // Google Gemini отдаёт OpenAI-совместимый API только под /v1beta/openai:
-  // с «голым» /v1 путь /chat/completions там не существует (404).
-  function normalizeAuxBase(url) {
-    const s = String(url || "").trim().replace(/\/+$/, "");
-    if (!s) return "";
-    const m = s.match(/^(https?:\/\/generativelanguage\.googleapis\.com)(?:\/.*)?$/i);
-    if (m) return m[1] + "/v1beta/openai";
-    return s;
-  }
+  // ── Чтение ошибок и лимиты провайдера — в src/renderer/provider-config.js ──
+  // readApiError, friendlyRateLimitError, classifyKeyError, rateLimitInfo,
+  // createRateLimiter и fmtError получены в начале файла.
 
   // ── Вспомогательная модель (второй ключ): зрение + генерация изображений ──
-  function auxConfig(s) {
-    s = s || {};
-    return {
-      enabled: !!s.visionEnabled,
-      auto: s.visionAuto !== false,
-      url: normalizeAuxBase((s.visionUrl || "").trim() || (s.openaiUrl || "").trim() || ""),
-      key: (s.visionKey || "").trim() || (s.openaiApiKey || "").trim() || "",
-      visionModel: (s.visionModel || "").trim(),
-      imageModel: (s.imageModel || "").trim(),
-      project: (s.openaiProject || "").trim(),
-    };
-  }
-
-  // Чтение изображения vision-моделью: dataUrl → текстовое описание.
-  async function describeImageRemote(cfg, imageDataUrl, prompt, model) {
-    const res = await fetch(proxiedBase(cfg.url) + "/chat/completions", {
-      method: "POST",
-      headers: apiHeaders("openai", cfg.key, false, cfg.project ? { "OpenAI-Project": cfg.project } : null),
-      body: JSON.stringify({
-        model,
-        max_tokens: 2048,
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "text", text: prompt || "Опиши подробно, что изображено на картинке: объекты, текст, UI, цвета, расположение элементов." },
-              { type: "image_url", image_url: { url: imageDataUrl } },
-            ],
-          },
-        ],
-      }),
-      signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(180000) : undefined,
-    });
-    // readApiError() асинхронная и читает тело ответа: сначала она, потом res.json().
-    // Без await в текст ошибки попадал сам промис («[object Promise]»).
-    if (!res.ok) throw new Error("Vision: " + (await readApiError(res)));
-    const data = await res.json().catch(() => ({}));
-    const c = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-    if (Array.isArray(c)) return c.map((p) => (p && p.text) || "").join("\n").trim();
-    return String(c == null ? "" : c).trim();
-  }
-
-  // Генерация изображения: prompt → { buf, mediaType, ext }. Эндпоинт OpenRouter /images.
-  async function generateImageRemote(cfg, prompt, model, opts) {
-    opts = opts || {};
-    const body = { model, prompt };
-    if (opts.aspectRatio) body.aspect_ratio = opts.aspectRatio;
-    if (opts.size) body.size = opts.size;
-    const res = await fetch(proxiedBase(cfg.url) + "/images", {
-      method: "POST",
-      headers: apiHeaders("openai", cfg.key, false, cfg.project ? { "OpenAI-Project": cfg.project } : null),
-      body: JSON.stringify(body),
-      signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(300000) : undefined,
-    });
-    if (!res.ok) throw new Error("Генерация изображения: " + (await readApiError(res)));
-    const data = await res.json().catch(() => ({}));
-    const d = data && data.data && data.data[0];
-    if (!d || !d.b64_json) {
-      throw new Error("Модель не вернула изображение" + (data && data.error ? ": " + (data.error.message || JSON.stringify(data.error)) : ""));
-    }
-    const buf = Buffer.from(d.b64_json, "base64");
-    const mediaType = String(d.media_type || "image/png").split(";")[0] || "image/png";
-    const ext = "." + (mediaType.split("/")[1] || "png");
-    return { buf, mediaType, ext };
-  }
+  // Логика живёт в src/renderer/image-tools.js: ядро даёт ей только транспортные
+  // помощники, поэтому модуль можно проверять без агента и без настроек.
+  const {
+    normalizeAuxBase,
+    auxConfig,
+    describeImageRemote,
+    generateImageRemote,
+    imageAttempts,
+    imageProviderLabel,
+    proxiedUrl,
+  } = ImageTools({ apiHeaders, proxiedBase, readApiError });
 
   // ── Динамические инструменты: при тесном контексте шлём только ядро ──
   const CORE_TOOL_NAMES = new Set([
@@ -4017,6 +3010,118 @@
   // вызов повторяется (main.js); B) мета-инструмент findTools — модель сама просит
   // нужную возможность; C) настройка «отправлять все инструменты» + авто-расширение
   // при ошибке «неизвестный инструмент».
+  // ── Роли агента ──────────────────────────────────────────────────────────
+  // Роль — это РЕЖИМ ЧАТА, а не одноразовый промпт: её текст подставляется в системный
+  // промпт каждый раунд, а её группы инструментов включены с первого раунда. Поэтому
+  // роль держится весь диалог (чип-промпт так не умеет) и заодно сужает набор схем —
+  // каждый раунд дешевле и префикс запроса стабильнее (кэш провайдера).
+  const DEFAULT_ROLE = "dev";
+  const AGENT_ROLES = [
+    {
+      id: "dev",
+      icon: "🛠",
+      title: "Разработчик",
+      hint: "Код, файлы, git, запуск проекта — обычный режим приложения.",
+      groups: [],
+      chips: [],
+      prompt: "",
+    },
+    {
+      id: "assistant",
+      icon: "🧑💼",
+      title: "Ассистент",
+      hint: "Помощник по делам на этом ПК: файлы, документы, письма, сайты, порядок.",
+      groups: ["notes", "mail", "system", "browser", "files", "terminal", "vault"],
+      chips: [
+        { t: "Спланируй мой день", send: true },
+        { t: "Разбери входящие", send: true },
+        { t: "Напиши письмо", send: false },
+        { t: "Наведи порядок в папке", send: false },
+        { t: "Сделай выжимку из файла", send: false },
+        { t: "Собери отчёт за неделю", send: true },
+      ],
+      prompt: [
+        "РЕЖИМ «АССИСТЕНТ»: ты личный помощник по делам на этом компьютере, а не разработчик.",
+        "1. Работаешь с файлами, документами, письмами, сайтами и порядком в папках; код пишешь только по прямой просьбе (иначе предложи роль «Разработчик»).",
+        "2. Решения, договорённости и важные выводы сохраняй в память проекта (noteSave) — в новой сессии прочитай их (noteRead/noteList).",
+        "3. Личные дела и сроки — это роль «Менеджер»: если человек говорит о дедлайнах и планах, предложи переключить роль и веди список дел.",
+        "4. Файлы и документы ищи поиском по рабочей папке, прежде чем спрашивать; выжимку из длинного файла делай сам и показывай коротко.",
+        "5. Письма и сообщения отправляй только по явной просьбе и после показа получателя и текста (mailSend).",
+        "6. Входы на сайты бери из менеджера паролей (vaultList/vaultFill), пароли в чат не печатай.",
+        "7. Заказ, бронь, формы на сайтах — через браузер; перед оплатой или отправкой данных остановись и спроси подтверждение.",
+        "8. Действия на ПК (программы, буфер, скриншот, процессы) — группа system: сначала посмотри, потом меняй.",
+      ].join("\n"),
+    },
+    {
+      id: "manager",
+      icon: "📋",
+      title: "Менеджер",
+      hint: "Дела и сроки: план дня, дедлайны, напоминания, отчёты.",
+      groups: ["tasks", "notes", "mail", "system"],
+      chips: [
+        { t: "Что у меня на сегодня?", send: true },
+        { t: "Что просрочено?", send: true },
+        { t: "Спланируй неделю", send: true },
+        { t: "Разбери входящие", send: true },
+        { t: "Собери отчёт за неделю", send: true },
+      ],
+      prompt: [
+        "РЕЖИМ «МЕНЕДЖЕР»: ты личный менеджер дел и сроков, а не разработчик.",
+        "1. В начале работы и когда речь о планах — вызывай taskList (просроченные и ближайшие первыми) и опирайся на список, а не на память.",
+        "2. Любую задачу, просьбу и договорённость превращай в дело: taskAdd(title, due, priority, project, note). Срок разбирается по-человечески: «завтра 14:00», «в пятницу», «через 2 недели», «15.09». Срок не назван — спроси, не выдумывай.",
+        "3. Закрывай и переноси дела только по словам человека: taskDone(id, false) снимает отметку, taskUpdate меняет срок или название.",
+        "4. Просроченное и «горит сегодня» говори прямо в начале ответа и предлагай, что важнее — человек не должен вычитывать список.",
+        "5. Отчёты (день, неделя, проект) собирай из дел и заметок (noteList), а не из общих слов.",
+        "6. Письма и напоминания наружу — только по явной просьбе и после подтверждения адресата.",
+        "7. Код и файлы проекта не трогай, пока не попросят: твоя работа — дела, сроки и порядок.",
+        "8. Если дел нет — так и скажи и предложи занести первое.",
+      ].join("\n"),
+    },
+    {
+      id: "researcher",
+      icon: "🔎",
+      title: "Исследователь",
+      hint: "Поиск и разбор: источники, сравнения, выжимки с сохранением выводов.",
+      groups: ["browser", "notes", "files"],
+      chips: [
+        { t: "Найди и разбери: ", send: false },
+        { t: "Сравни подходы: ", send: false },
+        { t: "Сделай выжимку из источника", send: false },
+        { t: "Сохрани выводы в заметки", send: false },
+      ],
+      prompt: [
+        "РЕЖИМ «ИССЛЕДОВАТЕЛЬ»: ты разбираешься в теме по источникам, а не пишешь код.",
+        "1. Сначала поиск (webSearch), затем чтение страниц (webFetch/browser) — свежие факты важнее памяти модели.",
+        "2. Каждый важный вывод подкрепляй источником: адрес и дата. Где источник один — так и скажи.",
+        "3. Отделяй факты от предположений и явно помечай предположения.",
+        "4. Итог — короткая структура: что выяснили, чем подтверждено, что осталось неизвестным.",
+        "5. Результат сохраняй в память проекта (noteSave), чтобы вернуться к нему в новой сессии.",
+        "6. Файлы проекта читай, но не меняй: правки — роль «Разработчик».",
+      ].join("\n"),
+    },
+  ];
+
+  function roleById(id) {
+    const key = String(id || "").trim().toLowerCase();
+    return AGENT_ROLES.find((r) => r.id === key) || AGENT_ROLES.find((r) => r.id === DEFAULT_ROLE);
+  }
+
+  // Роль целиком (для интерфейса и подсказок).
+  function rolesList() {
+    return AGENT_ROLES.map((r) => ({ id: r.id, icon: r.icon, title: r.title, hint: r.hint, chips: r.chips.slice(), groups: r.groups.slice() }));
+  }
+
+  // Что роль даёт прогону: группы с первого раунда, чипы и текст в системный промпт.
+  function rolePlan(id) {
+    const r = roleById(id);
+    return { id: r.id, icon: r.icon, title: r.title, groups: r.groups.slice(), chips: r.chips.slice(), prompt: r.prompt };
+  }
+
+  // Роль из чата: строка id, можно мусор — вернётся роль по умолчанию.
+  function roleOfChat(chat) {
+    return roleById(chat && chat.role).id;
+  }
+
   const BASE_TOOL_NAMES = [
     // файлы и папки
     "createFolder", "readFile", "readFileLines", "writeFile", "editFile", "listDirectory",
@@ -4101,6 +3206,14 @@
         "checkpointRollback"],
     },
     {
+      id: "tasks",
+      title: "дела и сроки (личный список задач)",
+      keywords: ["задач", "срок", "дедлайн", "deadline", "просроч", "напомни", "мои дела", "список дел",
+        "напомина", "расписан", "календар", "встреч", "план на", "чеклист", "менеджер",
+        "что сделать", "успеть", "перенес", "записать дело", "меня дела", "по делам", "на сегодня", "на неделю"],
+      names: ["taskAdd", "taskList", "taskUpdate", "taskDone", "taskDelete"],
+    },
+    {
       id: "mail",
       title: "почта агента",
       keywords: ["почт", "письм", "mail", "smtp", "imap", "ящик", "коммерческое предлож", "кп ",
@@ -4139,7 +3252,7 @@
       id: "cloud",
       title: "Yandex Cloud",
       keywords: ["yandex", "яндекс", "облак", "cloud", "серверлес", "serverless", "бакет", "s3"],
-      names: ["ycStatus", "ycList", "ycContainer", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"],
+      names: ["ycStatus", "ycList", "ycContainer", "ycCosts", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"],
     },
   ];
 
@@ -4292,10 +3405,13 @@
   }
 
   // Итоговый набор схем: база + липкие/найденные группы в КАНОНИЧЕСКОМ порядке.
-  // opts: { text, sticky (массив id), forceAll, maxTokens }
+  // opts: { text, sticky (массив id), roleGroups (id групп роли), forceAll, maxTokens }
   function routeTools(opts) {
     const o = opts || {};
     const sticky = new Set(o.sticky || []);
+    // Группы активной роли — с первого раунда (стабильный префикс запроса и никаких
+    // «дополнений на ходу», из-за которых промахивается кэш провайдера).
+    for (const g of o.roleGroups || []) if (g) sticky.add(g);
     if (o.forceAll) {
       return {
         tools: TOOL_DEFINITIONS,
@@ -4363,255 +3479,11 @@
     return b >= 26000 ? TOOL_DEFINITIONS : CORE_TOOL_DEFINITIONS;
   }
 
-  // ── Ollama: реальное окно модели и параметры запроса ───────────────────────
-  // Дефолт Ollama — контекст 2048 токенов, а приложение считало бюджет 14 000:
-  // сервер МОЛЧА резал запрос (терялись системный промпт, схемы инструментов и
-  // история), и агент работал «вслепую». Поэтому окно спрашиваем у сервера,
-  // выделяем ровно нужный контекст и держим модель в памяти между раундами.
-  const OLLAMA_KEEP_ALIVE = "30m"; // дефолт Ollama — 5 минут: модель выгружалась между раундами
-  const _ollamaInfoCache = new Map(); // base|model → { ts, window, tools, vision, known }
-  const _OLLAMA_INFO_TTL = 10 * 60 * 1000;
-  async function ollamaModelInfo(s, model) {
-    const name = String(model || "");
-    const base = baseFor("ollama", s);
-    const key = base + "|" + name;
-    const now = Date.now();
-    const hit = _ollamaInfoCache.get(key);
-    if (hit && now - hit.ts <= _OLLAMA_INFO_TTL) return hit;
-    const info = { ts: now, window: 0, tools: false, vision: false, known: false };
-    if (name) {
-      try {
-        const timeout = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined;
-        const res = await fetch(base + "/api/show", {
-          method: "POST",
-          headers: apiHeaders("ollama", apiKeyFor("ollama", s), false, projectHeader(s)),
-          signal: timeout,
-          body: JSON.stringify({ name: name, model: name }),
-        });
-        if (res.ok) {
-          const d = await res.json();
-          // capabilities есть только у новых сборок Ollama: если поля нет, про
-          // инструменты модели мы НИЧЕГО не знаем и молчим (иначе ложное предупреждение).
-          const caps = Array.isArray(d.capabilities) ? d.capabilities.map((c) => String(c).toLowerCase()) : null;
-          if (caps) {
-            info.known = true;
-            info.tools = caps.indexOf("tools") !== -1;
-            info.vision = caps.indexOf("vision") !== -1;
-          }
-          // model_info: "qwen3.context_length" (у старых сборок — "llama.context_length").
-          // Ключ архитектуры важнее: у мультимодальных моделей рядом лежат ключи
-          // подсистем (gemma4.audio.context_length), и максимум по всем подменил бы
-          // окно модели окном энкодера.
-          const mi = d.model_info || {};
-          const arch = String(mi["general.architecture"] || "");
-          let max = arch && Number(mi[arch + ".context_length"]) > 0 ? Number(mi[arch + ".context_length"]) : 0;
-          if (!max) {
-            for (const k of Object.keys(mi)) {
-              if (!/context_length$/i.test(k)) continue;
-              const n = Number(mi[k]);
-              if (n > 0 && n > max) max = n;
-            }
-          }
-          // Modelfile мог задать num_ctx вручную — осознанный потолок автора модели.
-          const mnum = /num_ctx\s+(\d+)/i.exec(String(d.parameters || ""));
-          const defCtx = mnum ? Number(mnum[1]) : 0;
-          info.window = max > 0 ? max : defCtx;
-          info.defaultCtx = defCtx;
-        }
-      } catch {}
-    }
-    _ollamaInfoCache.set(key, info);
-    return info;
-  }
+  // ── Окно модели и параметры Ollama — в src/renderer/provider-transport.js ──
+  // modelWindow, ollamaModelInfo, ollamaNumCtx и OLLAMA_KEEP_ALIVE живут там же.
 
-  // Сколько токенов контекста просить у Ollama: ровно столько, сколько нужно запросу
-  // (бюджет + запас на ответ и tool-результаты), но НИКОГДА больше реального окна.
-  // Без бюджета (0) дефолт модели не трогаем: уменьшать окно без причины нельзя.
-  function ollamaNumCtx(budget, window) {
-    const b = Math.round(Number(budget) || 0);
-    if (b <= 0) return 0;
-    const need = b + 4096;
-    const win = Math.round(Number(window) || 0);
-    return win > 0 ? Math.min(need, win) : need;
-  }
-  // ── Реальное окно модели (context_length / context_window из GET /models) ──
-  const _ctxModelsCache = new Map(); // base → { ts, byModel: Map<model, window> }
-  const _CTX_TTL = 10 * 60 * 1000;
-  async function modelWindow(s, model) {
-    const provider = s && s.provider ? s.provider : "openai";
-    if (provider === "ollama") return (await ollamaModelInfo(s, model)).window || 0;
-    if (provider !== "openai" || !model) return 0;
-    const base = baseFor(provider, s);
-    const now = Date.now();
-    let entry = _ctxModelsCache.get(base);
-    if (!entry || now - entry.ts > _CTX_TTL) {
-      let fetched = null;
-      try {
-        const timeout = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined;
-        const res = await fetch(proxiedBase(base) + "/models", {
-          headers: apiHeaders(provider, apiKeyFor(provider, s), false, projectHeader(s)),
-          signal: timeout,
-        });
-        if (res.ok) {
-          const d = await res.json();
-          const byModel = new Map();
-          for (const m of d.data || []) {
-            const id = m && m.id ? String(m.id) : "";
-            const win = (m && (m.context_length || m.context_window)) || 0;
-            if (id && win > 0) byModel.set(id, win);
-          }
-          fetched = { ts: now, byModel };
-        }
-      } catch {}
-      entry = fetched || { ts: now, byModel: new Map() };
-      _ctxModelsCache.set(base, entry);
-    }
-    if (!entry) return 0;
-    if (entry.byModel.has(model)) return entry.byModel.get(model);
-    // Суффиксные варианты id: "vendor/model:free", "vendor/model@date", "vendor/model-vN"
-    for (const [id, win] of entry.byModel) {
-      if (id.startsWith(model + ":") || id.startsWith(model + "@") || id.startsWith(model + "-")) return win;
-    }
-    return 0;
-  }
-
-  // ── Компакция: старые витки диалога сжимаются в памятку дешёвым вызовом модели ──
-  async function compactRemote(s, messages) {
-    try {
-      const provider = s && s.provider ? s.provider : "openai";
-      const model = (s && s.model) || "";
-      if (!model) return null;
-      let lastUser = -1;
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (messages[i] && messages[i].role === "user") {
-          lastUser = i;
-          break;
-        }
-      }
-      if (lastUser <= 0) return null; // нечего сжимать — только текущий виток
-      const head = messages.slice(0, lastUser);
-      let headTokens = 0;
-      for (const m of head) headTokens += estimateMessageTokens(m);
-      if (headTokens < 4000) return null; // голова маленькая — обычная обрезка дешевле вызова
-      const parts = [];
-      for (const m of head) {
-        const role = m && m.role;
-        const label = role === "user" ? "Пользователь" : role === "assistant" ? "Агент" : role === "system" ? "Система" : "Инструмент";
-        const c = m && m.content;
-        let txt = "";
-        if (typeof c === "string") txt = c;
-        else if (Array.isArray(c)) txt = partsText(c) || "[изображение]";
-        if (String(txt || "").trim()) parts.push(label + ": " + truncateText(txt, 1200));
-      }
-      const body = parts.join("\n\n").slice(0, 30000);
-      if (!body.trim()) return null;
-      const sys =
-        "Ты — менеджер памяти ИИ-агента-разработчика. Сожми переписку в краткую памятку на русском (до 700 слов): что просил пользователь, что уже сделано (файлы, команды, git), текущее состояние проекта, что осталось сделать. Памятка должна позволить агенту продолжить работу без исходных сообщений. Пиши только саму памятку, без пояснений.";
-      const timeout = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(30000) : undefined;
-      const headers = apiHeaders(provider, apiKeyFor(provider, s), false, projectHeader(s));
-      if (provider === "anthropic") {
-        const res = await fetch(baseFor(provider, s) + "/v1/messages", {
-          method: "POST",
-          headers,
-          signal: timeout,
-          body: JSON.stringify({ model, max_tokens: 900, system: sys, messages: [{ role: "user", content: body }], stream: false }),
-        });
-        if (!res.ok) return null;
-        const d = await res.json();
-        return (d.content || []).filter((b) => b && b.type === "text").map((b) => b.text || "").join("\n") || null;
-      }
-      if (provider === "ollama") {
-        const res = await fetch(baseFor(provider, s) + "/api/chat", {
-          method: "POST",
-          headers,
-          signal: timeout,
-          body: JSON.stringify({ model, messages: [{ role: "system", content: sys }, { role: "user", content: body }], stream: false }),
-        });
-        if (!res.ok) return null;
-        const d = await res.json();
-        return (d.message && d.message.content) || null;
-      }
-      const res = await fetch(proxiedBase(baseFor(provider, s)) + "/chat/completions", {
-        method: "POST",
-        headers,
-        signal: timeout,
-        body: JSON.stringify({ model, messages: [{ role: "system", content: sys }, { role: "user", content: body }], max_tokens: 900, stream: false }),
-      });
-      if (!res.ok) return null;
-      const d = await res.json();
-      return (d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content) || null;
-    } catch {
-      return null;
-    }
-  }
-
-  // Фабрика менеджера контекста: компакция (до 3 раз за запуск, памятки накапливаются)
-  // + обрезка хвоста.
-  function createContextManager(opts) {
-    const settings = (opts && opts.settings) || {};
-    const emit = (opts && opts.emit) || (() => {});
-    const planMode = !!(opts && opts.planMode);
-    // onMemo — необязательный хук: получает текст только что созданной памятки и
-    // сообщения, из которых она свёрнута. main.js пишет по нему локальный дневник
-    // (память диалогов по датам). Ошибка хука не должна ломать работу агента.
-    const onMemo = (opts && opts.onMemo) || null;
-    // Сжатий за прогон может быть несколько: на длинной задаче (браузер, обход
-    // страниц, большой рефакторинг) контекст переполняется повторно, а одиночной
-    // памятки не хватало — дальше шла молчаливая обрезка головы, вместе с целью
-    // задачи, и агент бросал работу («напишет что-то и отключается»).
-    let compactCount = 0;
-    const COMPACT_LIMIT = 3;
-    let compactMemo = null;
-    return {
-      async manage(messages, budget) {
-        if (!Array.isArray(messages) || !messages.length) return messages || [];
-        const memoWeight = compactMemo ? estimateTokens(compactMemo.content) : 0;
-        let total = 0;
-        for (const m of messages) total += estimateMessageTokens(m);
-        // Страховка: даже если обрезка не нужна, убираем осиротевшие tool-сообщения
-        // (role:"tool" без предшествующего assistant с tool_calls ломает API — 400 wrong_api_format).
-        if (total + memoWeight <= budget) {
-          return compactMemo ? [compactMemo, ...sanitizeToolPairs(messages)] : sanitizeToolPairs(messages);
-        }
-        if (compactCount < COMPACT_LIMIT && !planMode) {
-          try {
-            // Предыдущую памятку скармливаем вместе с новыми сообщениями: иначе
-            // повторное сжатие потеряло бы всё, что уже было свёрнуто в неё.
-            const memoText = await compactRemote(
-              settings,
-              compactMemo ? [compactMemo, ...messages] : messages
-            );
-            if (memoText && String(memoText).trim()) {
-              compactMemo = {
-                role: "system",
-                content:
-                  "ПАМЯТКА ПРЕДЫДУЩЕГО КОНТЕКСТА (сжато, чтобы экономить токены; это резюме старых шагов):\n" +
-                  String(memoText).trim(),
-              };
-              compactCount++;
-              if (onMemo) {
-                try {
-                  onMemo({
-                    text: String(memoText).trim(),
-                    messages,
-                    provider: settings.provider || "",
-                    model: settings.model || "",
-                    ts: Date.now(),
-                  });
-                } catch {}
-              }
-              if (emit) emit({ type: "compact", text: "🧠 Контекст сжат: старые шаги свернуты в памятку — токены экономятся." });
-            }
-          } catch {}
-        }
-        const rest = trimConversation(messages, Math.max(1500, budget - memoWeight - 400));
-        return compactMemo ? [compactMemo, ...rest] : rest;
-      },
-      memo() {
-        return compactMemo;
-      },
-    };
-  }
+  // ── Компакция старых витков — в src/renderer/context-window.js ──
+  // Сжатие истории в памятку берётся оттуда (см. начало раздела «Контекст»).
 
   // ── Парсеры для инструментов ОС (процессы, реестр, системная информация) ──
   // tasklist /FO CSV /NH (Windows) или ps -eo (macOS/Linux) → [{pid, name, mem, ...}]
@@ -4704,6 +3576,12 @@
     coldCacheInfo,
     UNAVAILABLE_MAX,
     searchTools,
+    AGENT_ROLES,
+    DEFAULT_ROLE,
+    roleById,
+    rolesList,
+    rolePlan,
+    roleOfChat,
     TOOL_GROUPS,
     BASE_TOOL_NAMES,
     groupOfTool,
@@ -4730,6 +3608,9 @@
     normalizeUsage,
     describeImageRemote,
     generateImageRemote,
+    imageAttempts,
+    imageProviderLabel,
+    proxiedUrl,
     // инструменты ОС
     parseProcessesCsv,
     registryPathAllowed,

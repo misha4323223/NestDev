@@ -184,10 +184,18 @@ function primeEndpoints() {
   return primePromise;
 }
 
+// Тестовый хук: живые тесты поднимают подменённый Yandex Cloud API и уводят туда
+// все сервисы, включая обмен OAuth → IAM. В обычной жизни переменная не задана.
+function testApiBase() {
+  return String(process.env.AI_AGENT_YC_BASE || "").trim().replace(/\/+$/, "");
+}
+
 // Адрес сервиса. Выверенный KNOWN_ENDPOINTS отдаётся сразу (он совпадает с
 // актуальным), а каталог догружается в фоне и потом используется для id, которых
 // в KNOWN нет. Так первый запрос не ждёт сеть вообще.
 async function endpoint(serviceId) {
+  const testBase = testApiBase();
+  if (testBase) return testBase;
   if (endpointsCache && Date.now() - endpointsTs < 12 * 3600 * 1000) {
     return endpointsCache[serviceId] || KNOWN_ENDPOINTS[serviceId] || null;
   }
@@ -919,6 +927,8 @@ async function addRoleOnFolder(oauthToken, folderId, saId, roleId) {
 
 module.exports = {
   SERVICES,
+  _fetchJson: fetchJson,
+  _testApiBase: testApiBase,
   CREATABLE,
   serviceByKey,
   creatableKeys,

@@ -20,6 +20,7 @@ const { execFile, spawn } = require("child_process");
 const {
   SYSTEM_PROMPT,
   TOOL_DEFINITIONS,
+  rolePlan,
   createThinkingStripper,
   extractToolCallsFromText,
   normalizeToolName,
@@ -76,12 +77,22 @@ const agentStore = require("./agent-store.js"); // память проекта (
 const unifiedPatch = require("./unified-patch.js"); // применение unified diff (applyPatch)
 const codeIndex = require("./code-index.js"); // семантический индекс кода (BM25 + стемминг)
 const yandexCloud = require("./yandex-cloud.js"); // Yandex Cloud REST API: авторизация, дашборд, создание ресурсов
+const ycConsole = require("./yc-console.js"); // Консоль YC: карточка ресурса и связанные объекты (своим модулем)
 const vault = require("./vault.js"); // пароли сайтов: поиск записи, безопасный текст, подстановка в форму
 const mail = require("./mail.js"); // почта агента: SMTP (отправка КП) + IMAP (коды подтверждения), на встроенных модулях
 const ycCli = require("./yc-cli.js"); // официальный yc CLI внутрь папки приложения: загрузка + PATH (без системных прав)
+const ycCosts = require("./yc-costs.js"); // стоимость облака: проверенные тарифы и оценка ДО создания
 const ycLogs = require("./yc-logs.js"); // логи Cloud Logging внутренним API (REST + gRPC) — внешний yc CLI не нужен
 const winPs = require("./win-ps.js"); // живая сессия PowerShell: системные справки без холодного старта
+const toolPolicy = require("./tool-policy.js"); // политика инструментов: capability/риск/подтверждение (одна точка правды)
+const { createAgentTools } = require("./agent-tools.js"); // агентские инструменты: 154 обработчиков своим модулем
+
+const audit = require("./audit-log.js");
+const deployRecipes = require("./deploy-recipes.js"); // рецепты сборки: тип проекта → Dockerfile, порт, путь проверки
+const cloudState = require("./cloud-state.js"); // состояние облака проекта: .cloud/project.json, infrastructure.json, deployments.json
+const { createDeployEngine } = require("./deploy-engine.js"); // конвейер деплоя: стадии, проверка после выката, откат // журнал действий агента (JSONL, без секретов)
 secrets.init(path.join(app.getPath("userData"), "secrets.json"));
+audit.init(path.join(app.getPath("userData"), "audit.log")); // журнал действий: подключается к userData
 const _ipcHandleOrig = ipcMain.handle.bind(ipcMain);
 const ipcHandlerMap = new Map();
 ipcMain.handle = (channel, fn) => {
@@ -133,6 +144,8 @@ const DEFAULT_SETTINGS = {
   visionKey: "",
   visionModel: "",
   imageModel: "",
+  defaultRole: "dev", // роль новых чатов: dev / assistant / manager / researcher
+  taskReminders: true, // напоминать о делах в срок, пока приложение открыто
   serperApiKey: "", // ключ Serper — усиленный Google-поиск для агента (webSearch)
   // Браузер агента: постоянный профиль (куки и входы на сайты переживают перезапуск приложения)
   browserProfile: true,
@@ -176,6 +189,10 @@ const DEFAULT_SETTINGS = {
   // согласия пользователя на диск ничего не пишется.
   contextMemory: false,
   contextMemoryDays: 30, // сколько дней хранить (старые дни удаляются автоматически)
+
+  // Журнал действий агента: опасные и требующие подтверждения действия пишутся
+  // в userData/audit.log (JSONL). Секреты в журнал не попадают. Включён по умолчанию.
+  auditLog: true,
 };
 
 const settingsFile = () => path.join(app.getPath("userData"), "settings.json");
@@ -272,6 +289,35 @@ function ycAutoEnv(s) {
 // Пересобрать окружение без сети (зовётся и по таймеру продления токена).
 function rebuildAgentEnv() {
   agentEnv = { ...userAgentEnv, ...ycAutoEnv(lastAgentEnvSettings) };
+  // Значения переменных агента не должны попадать в журнал действий — даже если
+  // команда честно их напечатала (printenv MY_KEY): журнал вырезает эти значения
+  // по подстроке из любой своей строки.
+  audit.setSecrets(Object.values(agentEnv));
+}
+
+// Ключи окружения, которые можно отдавать даже «слепым» процессам: это пути,
+// а не секреты. Всё остальное (ключи, пароли, токены) — только по назначению.
+function pathOnlyEnv() {
+  const safe = {};
+  for (const k of Object.keys(agentEnv)) {
+    if (/^(path|pathext|comspec|systemroot|temp|tmp)$/i.test(k)) safe[k] = agentEnv[k];
+  }
+  return safe;
+}
+
+// Окружение для команды, которую СОЧИНИЛ агент (runCommand, фоновые процессы, shell).
+// Обычные команды (npm, docker, yc, git) получают переменные агента как раньше, но
+// команда, которая просто печатает всё окружение (env, printenv, set, Get-ChildItem Env:),
+// секретов не получает — иначе модель одной строкой выводит пароли пользователя в чат.
+function commandEnv(command) {
+  const base = { ...process.env, GIT_TERMINAL_PROMPT: "0", FORCE_COLOR: "0" };
+  if (toolPolicy.commandDumpsEnv(command)) return { ...base, ...pathOnlyEnv() };
+  return { ...base, ...agentEnv };
+}
+
+// Служебные пробы (поиск программы в PATH, проверка версии) секретов не требуют.
+function probeEnv() {
+  return { ...process.env, ...pathOnlyEnv() };
 }
 
 // Фоновая синхронизация IAM-токена: обмен OAuth→IAM и продление за 5 минут до
@@ -345,6 +391,7 @@ function loadSettings() {
       if (sec[k] !== undefined) s[k] = sec[k];
     }
     applyAgentEnv(s);
+    audit.setEnabled(s.auditLog !== false); // журнал действий: по умолчанию включён
     // Постоянный профиль браузера агента: отдельная папка внутри userData.
     // Выключено — работаем как раньше, с чистым профилем на каждый запуск.
     applyBrowserSettings(s);
@@ -539,13 +586,11 @@ function sanitizePath(p) {
   return abs;
 }
 
-// Команды, которые агент может выполнять только после явного подтверждения пользователя
-// (удаление данных, принудительный push, очистка истории и т.п.).
-const DANGEROUS_CMD_RE =
-  /(^|\s)(rm\s+-[a-z]*r|rmdir\s+\/s|rd\s+\/s|del\s+\/f|format\s+[a-z]:|mkfs\.|dd\s+if=|git\s+push([\s;&|()]|$)|git\s+reset\s+--hard|git\s+clean\s+-f|git\s+checkout\s+--|shutdown\s|taskkill\s+\/f|:?\(\)\s*\{|chmod\s+-R\s+777|sudo\s+rm|powershell\s+.*remove-item|Remove-Item\s+-Recurse|\bdel\b.*\/s)/i;
-
-// Инструменты, требующие явного подтверждения пользователя (как опасные команды).
-const DANGEROUS_TOOLS = new Set(["killProcess", "registryWrite", "installExe"]);
+// Что опасно, а что нет — решает политика инструментов (src/tool-policy.js):
+// там же capability и риск каждого инструмента, оттуда их читает журнал действий.
+// Здесь остались только имена для совместимости с прежним кодом.
+const DANGEROUS_CMD_RE = toolPolicy.DANGEROUS_CMD_RE; // опасные команды оболочки
+const DANGEROUS_TOOLS = toolPolicy.CONFIRM_TOOLS; // инструменты, требующие подтверждения
 
 // Батчинг (правило 35): инструменты, которые безопасно выполнять ПАРАЛЛЕЛЬНО —
 // только чтение без побочных эффектов и без диалогов с пользователем. Если в одном
@@ -561,12 +606,9 @@ const PARALLEL_SAFE_TOOLS = new Set([
 ]);
 
 // Короткое описание аргументов для подтверждения опасного действия.
+// Тексты живут в политике (tool-policy.js) — здесь только обёртка.
 function describeToolArgs(name, a) {
-  const x = a || {};
-  if (name === "killProcess") return "завершить процесс «" + (x.name || x.pid || "?") + "»" + (x.force ? " (принудительно)" : "");
-  if (name === "registryWrite") return "записать значение реестра «" + (x.name || "") + "» в " + (x.path || "?");
-  if (name === "installExe") return "скачать и запустить установщик: " + String(x.url || "").slice(0, 120);
-  return name + " " + JSON.stringify(x).slice(0, 120);
+  return toolPolicy.describe(name, a);
 }
 
 // Чистит ANSI-escape-последовательности (цвета npm-сборок и т.п.) из вывода терминала.
@@ -766,7 +808,7 @@ function runTerminalCommand(command, cwd, timeoutMs, shellName) {
       timeout: timeoutMs || 120000,
       maxBuffer: 32 * 1024 * 1024,
       windowsHide: true,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...agentEnv },
+      env: commandEnv(command),
     }, (err, stdout, stderr) => {
       const secs = ((Date.now() - start) / 1000).toFixed(1);
       const timeNote = " (" + secs + " с)";
@@ -998,7 +1040,7 @@ function spawnCollect(command, cwd, timeoutMs, waitFor) {
       cwd,
       detached: !(process.platform === "win32"),
       windowsHide: true,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...agentEnv },
+      env: commandEnv(command),
     });
     const onData = (d) => {
       out += stripAnsi((d || "").toString());
@@ -1111,7 +1153,7 @@ function bgSpawn(command, opts) {
     detached: !isWin,
     windowsHide: true,
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0", FORCE_COLOR: "0", ...agentEnv },
+    env: commandEnv(command),
   });
   const rec = {
     id: "bg" + (++bgSeq).toString(36) + "-" + Date.now().toString(36),
@@ -1276,7 +1318,7 @@ async function checkUrlStatus(url) {
 }
 
 // ── Поиск по всему проекту (grep) и обзор структуры ──
-// Веб-поиск и чтение страниц (webSearchDDG / webFetchPage) — в agent-core.js.
+// Веб-поиск и чтение страниц (webSearchDDG / webFetchPage) — в renderer/web-tools.js.
 const SKIP_DIRS = new Set([
   "node_modules", ".git", "dist", "build", "out", "coverage", ".next", ".nuxt", ".output",
   ".venv", "venv", "env", "__pycache__", ".idea", ".vscode", ".dart_tool", ".flutter-plugins",
@@ -1572,451 +1614,50 @@ function buildProjectBrief(root) {
 }
 
 // ═══════════════════ Системные программы и окружение ═══════════════════
-// Получить PATH (с учётом agentEnv) — на Windows ключ может быть «Path».
-function envPathInfo() {
-  const e = { ...process.env, ...agentEnv };
-  const key = Object.keys(e).find((k) => k.toLowerCase() === "path");
-  return { e, key, value: key ? String(e[key] || "") : "" };
-}
-
-function setMergedPath(before, extra) {
-  const parts = [];
-  const push = (v) => {
-    for (const seg of String(v || "").split(path.delimiter)) {
-      const t = seg.trim();
-      if (t && !parts.includes(t)) parts.push(t);
-    }
-  };
-  push(before);
-  push(extra);
-  process.env.PATH = parts.join(path.delimiter);
-  return parts;
-}
-
-// Поиск исполняемого файла: PATH (+ PATHEXT на Windows) + типовые места установки.
-function findProgram(name) {
-  const prog = String(name || "").trim();
-  if (!prog) return { found: false, reason: "Пустое имя программы" };
-  if (prog.includes("/") || prog.includes("\\")) {
-    const abs = path.resolve(prog);
-    if (fs.existsSync(abs)) return { found: true, path: abs };
-    return { found: false, reason: "Не найден файл: " + abs };
-  }
-  const { e, value } = envPathInfo();
-  const dirs = (value || "").split(path.delimiter).filter(Boolean);
-  const exts = process.platform === "win32" ? String(e.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean) : [""];
-  const cands = [];
-  for (const d of dirs) {
-    for (const ext of exts) {
-      const cand = path.join(d, prog + (ext || ""));
-      if (!cands.includes(cand)) cands.push(cand);
-    }
-  }
-  if (process.platform === "win32") {
-    const home = e.USERPROFILE || "";
-    const pf = e.ProgramFiles || "C:\\Program Files";
-    const known = {
-      git: [path.join(pf, "Git", "cmd", "git.exe"), path.join(home, "AppData", "Local", "Programs", "Git", "cmd", "git.exe")],
-      node: [path.join(pf, "nodejs", "node.exe")],
-      python: [path.join(home, "AppData", "Local", "Programs", "Python", "python.exe")],
-      code: [path.join(home, "AppData", "Local", "Programs", "Microsoft VS Code", "Code.exe")],
-    };
-    for (const k of Object.keys(known)) {
-      if (prog.toLowerCase() === k || prog.toLowerCase().startsWith(k + ".") || prog.toLowerCase().startsWith(k + " ")) {
-        cands.push(...known[k]);
-      }
-    }
-  }
-  for (const cand of cands) {
-    try {
-      if (cand && fs.existsSync(cand) && fs.statSync(cand).isFile()) return { found: true, path: cand };
-    } catch {}
-  }
-  return { found: false, reason: "«" + prog + "» не найден в PATH" + (process.platform === "win32" ? " и в типовых местах установки" : "") };
-}
-
-function runProgVersion(bin) {
-  return new Promise((resolve) => {
-    execFile(bin, ["--version"], { timeout: 8000, windowsHide: true, maxBuffer: 1024 * 1024, env: { ...process.env, ...agentEnv } }, (err, stdout, stderr) => {
-      const text = stripAnsi((stdout || "") + "\n" + (stderr || "")).trim();
-      resolve(text ? text.split("\n")[0].slice(0, 180) : "");
-    });
-  });
-}
-
-function spawnRaw(args, opts) {
-  return new Promise((resolve) => {
-    const o = opts || {};
-    execFile(args[0], args.slice(1), {
-      cwd: o.cwd || os.homedir(),
-      timeout: o.timeoutMs || 60000,
-      maxBuffer: 16 * 1024 * 1024,
-      windowsHide: true,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", FORCE_COLOR: "0", ...agentEnv },
-    }, (err, stdout, stderr) => {
-      let code = 0;
-      let errText = stripAnsi(stderr || "");
-      if (err) {
-        if (typeof err.code === "number") code = err.code;
-        else if (err.killed) code = -1; // таймаут
-        else if (err.code === "ENOENT") code = 127;
-        // EINVAL, EPERM, EACCES и прочие системные коды — раньше все становились
-        // безликой «1» с пустым выводом, и диагноз был невозможен.
-        else if (typeof err.code === "string") code = err.code;
-        else code = 1;
-        // У ошибок запуска stderr пуст — отдаём сообщение, иначе агент видит пустоту.
-        if (!errText) errText = stripAnsi(String(err.message || err));
-      }
-      resolve({ ok: !err, code, out: stripAnsi(stdout || ""), err: errText });
-    });
-  });
-}
-
-// ── Системные запросы PowerShell через живую сессию (ускорение №5) ──────────
-// Разовый `powershell.exe -NoProfile -Command "..."` — это холодный старт .NET
-// (0,4–1,5 с) на КАЖДЫЙ запрос справки. Живая сессия держит ОДИН процесс;
-// при любом сбое (нет PowerShell, таймаут, процесс умер) — обычный разовый
-// запуск, то есть поведение инструментов не меняется ни в одном сценарии.
-async function psScript(script, timeoutMs) {
-  const ms = timeoutMs || 30000;
-  if (process.platform === "win32") {
-    const r = await winPs.exec(script, { timeoutMs: ms });
-    if (!r.noSession) return r;
-  }
-  return spawnRaw(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], {
-    cwd: os.homedir(),
-    timeoutMs: ms,
-  });
-}
-
-// Кэш системных справок: агент часто спрашивает одно и то же подряд (что за ПК,
-// жив ли процесс). Живёт коротким TTL, чтобы не отдавать протухшее состояние.
-// isBad(v) — «это не результат, а ошибка»: такое не кэшируем.
-const _sysCache = new Map(); // key → { t, val }
-async function cachedPs(key, ttlMs, fn, isBad) {
-  const hit = _sysCache.get(key);
-  if (hit && Date.now() - hit.t < ttlMs) return hit.val;
-  const val = await fn();
-  if (val && !(typeof isBad === "function" && isBad(val))) _sysCache.set(key, { t: Date.now(), val });
-  return val;
-}
-function invalidatePsCache(prefix) {
-  for (const k of Array.from(_sysCache.keys())) {
-    if (!prefix || k.indexOf(prefix) === 0) _sysCache.delete(k);
-  }
-}
-
-// Обновить PATH текущего процесса из системного окружения (после установок).
-async function refreshEnvFromOS() {
-  const before = envPathInfo().value;
-  let sysPath = "";
-  if (process.platform === "win32") {
-    const r = await psScript(
-      "$m=[Environment]::GetEnvironmentVariable('Path','Machine'); $u=[Environment]::GetEnvironmentVariable('Path','User'); Write-Output ($m + ';' + $u)",
-      30000
-    );
-    sysPath = (r.out || "").trim();
-  } else {
-    for (const shell of ["bash", "sh"]) {
-      const r = await spawnRaw([shell, "-lc", 'printf "%s" "$PATH"'], { cwd: os.homedir(), timeoutMs: 30000 });
-      if (r.ok && (r.out || "").trim()) {
-        sysPath = (r.out || "").trim();
-        break;
-      }
-    }
-  }
-  if (!sysPath) return "Не удалось прочитать системный PATH — вызови refreshEnv() ещё раз после перезапуска приложения.";
-  const all = setMergedPath(before, sysPath);
-  const beforeParts = (before || "").split(path.delimiter).map((x) => x.trim()).filter(Boolean);
-  const added = all.filter((x) => !beforeParts.includes(x));
-  return (
-    "PATH обновлён в текущей сессии (до перезапуска).\n" +
-    "Записей было: " + beforeParts.length + ", стало: " + all.length +
-    (added.length ? "\nДобавлено (новые пути):\n" + added.slice(0, 20).join("\n") + (added.length > 20 ? "\n… и ещё " + (added.length - 20) : "") : "\nНовых путей не появилось.") +
-    "\n\nПроверь установку: checkInstalledProgram(имя). Уже открытые shell-сессии PATH не меняют — обновляются только новые процессы приложения."
-  );
-}
-
-const WINGET_IDS = {
-  git: "Git.Git",
-  node: "OpenJS.NodeJS.LTS",
-  npm: "OpenJS.NodeJS.npm",
-  python: "Python.Python.3.12",
-  python3: "Python.Python.3.12",
-  ffmpeg: "Gyan.FFmpeg",
-  gh: "GitHub.cli",
-  "7zip": "7zip.7zip",
-  "7z": "7zip.7zip",
-  powershell: "Microsoft.PowerShell",
-  yarn: "Yarn.Yarn",
-  pnpm: "pnpm.pnpm",
-  bun: "Oven-sh.Bun",
-  docker: "Docker.DockerDesktop",
-  dotnet: "Microsoft.DotNet.SDK.8",
-  java: "EclipseAdoptium.Temurin.21.JDK",
-  jdk: "EclipseAdoptium.Temurin.21.JDK",
-  curl: "curl.curl",
-  wget: "GNU.Wget2",
-  make: "GnuWin32.Make",
-  cmake: "Kitware.CMake",
-  sqlite: "SQLite.SQLite",
-  redis: "Redis.Redis",
-  nginx: "Nginx.Nginx",
-  postgresql: "PostgreSQL.PostgreSQL.16",
-  postgres: "PostgreSQL.PostgreSQL.16",
-  mysql: "Oracle.MySQL",
-  mongodb: "MongoDB.Server",
-  ollama: "Ollama.Ollama",
-  chrome: "Google.Chrome",
-  chromium: "Chromium.Chromium",
-  firefox: "Mozilla.Firefox",
-  vscode: "Microsoft.VisualStudioCode",
-  notepadpp: "Notepad++.Notepad++",
-  vlc: "VideoLAN.VLC",
-  winrar: "RARLab.WinRAR",
-  powertoys: "Microsoft.PowerToys",
-  terminal: "Microsoft.WindowsTerminal",
-  imagemagick: "ImageMagick.ImageMagick",
-  telegram: "Telegram.TelegramDesktop",
-  discord: "Discord.Discord",
-  slack: "SlackTechnologies.Slack",
-  obs: "OBSProject.OBSStudio",
-  blender: "BlenderFoundation.Blender",
-  gimp: "GIMP.GIMP",
-  inkscape: "Inkscape.Inkscape",
-  figma: "Figma.Figma",
-  drawio: "JGraph.Draw",
-  obsidian: "Obsidian.Obsidian",
-  everything: "voidtools.Everything",
-  spotify: "Spotify.Spotify",
-  zoom: "Zoom.Zoom",
-  putty: "PuTTY.PuTTY",
-  wireshark: "WiresharkFoundation.Wireshark",
-};
-
-const EXIT_HINTS = {
-  0: "Успех — команда завершилась корректно (код 0).",
-  1: "Общая ошибка: команда упала. Смотри вывод выше — чаще всего ошибка в коде/конфигурации, а не в системе.",
-  2: "Неправильное использование команды: неверные аргументы или синтаксис.",
-  126: "Команда найдена, но не может выполниться: нет прав на запуск или файл не исполняемый.",
-  127: "Команда НЕ НАЙДЕНА: программы нет в PATH / она не установлена. Проверь через checkInstalledProgram, при необходимости установи (installSystemPackage) и обнови PATH (refreshEnv).",
-  130: "Прервано пользователем (Ctrl+C / SIGINT).",
-  137: "Процесс убит (SIGKILL) — обычно нехватка памяти или принудительная остановка.",
-  143: "Завершён по SIGTERM (мягкая остановка).",
-  9009: "Windows: команда не найдена (аналог кода 127).",
-  740: "Windows: нужны права администратора — используй runCommandAsAdmin или установи из-под администратора.",
-  5: "Windows: отказано в доступе — файл занят, нет прав или нужен администратор (runCommandAsAdmin).",
-  206: "Windows: слишком длинная командная строка — сократи команду.",
-};
-
-function explainExit(exitCode, cmdText) {
-  const code = typeof exitCode === "number" ? exitCode : NaN;
-  const lines = [];
-  if (cmdText) lines.push("Команда: " + String(cmdText).slice(0, 300));
-  lines.push("Код завершения: " + (Number.isNaN(code) ? "— (не число)" : code) + (code === -1 ? " (таймаут — процесс убит по времени)" : ""));
-  lines.push("");
-  lines.push(
-    EXIT_HINTS[code] ||
-      (Number.isNaN(code)
-        ? "Укажи exitCode числом, чтобы получить объяснение."
-        : "Код " + code + " не входит в типовую таблицу. Смотри текст ошибки: если там «not found» / «не является внутренней или внешней командой» — программа не установлена; «denied»/«доступ запрещён» — нужны права; иначе это ошибка самой команды.")
-  );
-  if (code === 127 || code === 9009) {
-    lines.push("Что делать: 1) canExecute(имя) — проверить наличие; 2) installSystemPackage(имя) — установить; 3) refreshEnv() — обновить PATH; 4) проверить заново.");
-  }
-  if (code === 740 || code === 5) {
-    lines.push("Что делать: запусти через runCommandAsAdmin (появится системный запрос прав) либо установи программу из-под администратора.");
-  }
-  return lines.join("\n");
-}
-
-async function installSystemPkg(pkg) {
-  const name = String(pkg || "").trim();
-  if (!name) return "Ошибка: укажи packageName (например git, node, python, ffmpeg или winget-ID вида Vendor.Name).";
-  const plat = process.platform;
-  const info = findProgram(name.split(/[\\/]/).pop() || name);
-  if (info.found) {
-    const v = await runProgVersion(info.path);
-    return "«" + name + "» уже установлен: " + info.path + (v ? "\n" + v : "") + "\nУстановка не нужна.";
-  }
-  if (plat === "win32") {
-    const id = name.includes(".") ? name : WINGET_IDS[name.toLowerCase()];
-    if (!id) {
-      return "Не знаю winget-ID для «" + name + "». Найди точный ID: wingetSearch(\"" + name + "\"), затем installSystemPackage('Vendor.Name'). Известные ID: " + Object.keys(WINGET_IDS).join(", ") + ". Либо укажи прямую ссылку на установщик: installExe(url, name).";
-    }
-    const wg = findProgram("winget");
-    if (!wg.found) {
-      const choco = findProgram("choco");
-      if (choco.found) {
-        const cmd = "choco install -y " + name.split(".").pop();
-        const out = await runTerminalCommand(cmd, os.homedir(), 300000);
-        return "$ " + cmd + "\n\n" + out + "\n\nДальше: 1) refreshEnv() — обновить PATH; 2) checkInstalledProgram(\"" + name + "\"). Если нужен администратор — повтори через runCommandAsAdmin(\"" + cmd + "\").";
-      }
-      const scoop = findProgram("scoop");
-      if (scoop.found) {
-        const cmd = "scoop install " + name.split(".").pop();
-        const out = await runTerminalCommand(cmd, os.homedir(), 300000);
-        return "$ " + cmd + "\n\n" + out + "\n\nДальше: 1) refreshEnv() — обновить PATH; 2) checkInstalledProgram(\"" + name + "\").";
-      }
-      return "winget не установлен (choco и scoop тоже не найдены). Установи winget из Microsoft Store («App Installer»), либо укажи прямую ссылку на установщик: installExe(url, name).";
-    }
-    const cmd = "winget install --id " + id + " --exact --accept-package-agreements --accept-source-agreements --disable-interactivity";
-    const out = await runTerminalCommand(cmd, os.homedir(), 300000);
-    return (
-      "$ " + cmd + "\n\n" + out +
-      "\n\nДальше: 1) refreshEnv() — обновить PATH; 2) checkInstalledProgram(имя) — проверить. " +
-      "Если установка потребовала UAC/администратора и прервалась — повтори через runCommandAsAdmin(\"" + cmd + "\") или установи вручную."
-    );
-  }
-  if (plat === "darwin") {
-    const brew = findProgram("brew");
-    if (!brew.found) return "На macOS установка идёт через Homebrew, но он не найден. Поставь Homebrew (brew.sh) и вызови installSystemPackage снова.";
-    const cmd = "brew install " + name;
-    const out = await runTerminalCommand(cmd, os.homedir(), 600000);
-    return "$ " + cmd + "\n\n" + out + "\n\nПроверь: checkInstalledProgram(" + name + ").";
-  }
-  const isRoot = typeof process.getuid === "function" && process.getuid && process.getuid() === 0;
-  let mgr = null;
-  for (const [bin, flag] of [["apt-get", "install -y"], ["dnf", "install -y"], ["apk", "add"]]) {
-    if (findProgram(bin).found) { mgr = bin + " " + flag; break; }
-  }
-  if (!mgr) return "Не нашёл пакетный менеджер (apt-get/dnf/apk). Установи " + name + " вручную.";
-  const sudo = isRoot ? "" : "sudo -n ";
-  const cmd = sudo + mgr + " " + name;
-  const out = await runTerminalCommand(cmd, os.homedir(), 600000);
-  const looksFailed = /кодом (1|100|127|126)|not found|E: |Unable to/i.test(out);
-  return (
-    "$ " + cmd + "\n\n" + out +
-    (looksFailed
-      ? "\n\nПохоже, установка не удалась: без sudo пакетный менеджер требует пароль. Запусти через runCommandAsAdmin(\"" + cmd + "\") — появится системный запрос прав."
-      : "\n\nПроверь: checkInstalledProgram(" + name + ").")
-  );
-}
-
-// Скачивает файл по URL в указанный путь с проверкой размера.
-async function downloadFileTo(url, dest, limitMb) {
-  let res;
-  try {
-    res = await fetch(url, { redirect: "follow", headers: { "User-Agent": "AI-Developer-Agent" } });
-  } catch (e) {
-    return { ok: false, error: "Ошибка загрузки " + url + ": " + (e.message || String(e)) };
-  }
-  if (!res.ok) return { ok: false, error: "Ошибка HTTP " + res.status + " при загрузке " + url };
-  const buf = Buffer.from(await res.arrayBuffer());
-  const limit = (limitMb || 800) * 1024 * 1024;
-  if (buf.length > limit) return { ok: false, error: "Файл слишком большой (> " + (limitMb || 800) + " МБ)." };
-  try {
-    fs.writeFileSync(dest, buf);
-  } catch (e) {
-    return { ok: false, error: "Не удалось сохранить файл: " + (e.message || String(e)) };
-  }
-  return { ok: true, size: buf.length };
-}
-
-// Ищет установщики в распакованном архиве (не глубже 3 уровней; сначала те,
-// что лежат ближе к корню — обычно это setup.exe верхнего уровня).
-function findInstallersIn(dir) {
-  const out = [];
-  const walk = (d, depth) => {
-    if (depth > 3 || out.length >= 40) return;
-    let entries;
-    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
-    for (const en of entries) {
-      const full = path.join(d, en.name);
-      if (en.isDirectory()) { walk(full, depth + 1); continue; }
-      if (/\.(exe|msi|bat|cmd)$/i.test(en.name)) out.push(full);
-    }
-  };
-  walk(dir, 0);
-  out.sort((a, b) => a.split(path.sep).length - b.split(path.sep).length);
-  return out;
-}
-
-async function downloadAndExtractTo(url, destDir) {
-  const u = String(url || "").trim();
-  if (!/^https?:\/\//i.test(u)) return "Ошибка: укажи полный URL (https://…/archive.zip, .tar.gz и т.п.)";
-  try {
-    fs.mkdirSync(destDir, { recursive: true });
-  } catch (e) {
-    return "Ошибка: не удалось создать папку " + destDir + ": " + (e.message || String(e));
-  }
-  let res;
-  try {
-    res = await fetch(u, { redirect: "follow", headers: { "User-Agent": "AI-Developer-Agent" } });
-  } catch (e) {
-    return "Ошибка загрузки " + u + ": " + (e.message || String(e));
-  }
-  if (!res.ok) return "Ошибка HTTP " + res.status + " при загрузке " + u;
-  const buf = Buffer.from(await res.arrayBuffer());
-  if (buf.length > 300 * 1024 * 1024) return "Архив слишком большой (>300 МБ): " + buf.length + " байт.";
-  const contentType = (res.headers.get("content-type") || "").toLowerCase();
-  const pathLow = u.toLowerCase();
-  const isZip = pathLow.endsWith(".zip") || contentType.includes("zip");
-  const isTar = /\.(tar\.gz|tgz|tar\.bz2|tbz2|tar)$/.test(pathLow) || contentType.includes("gzip") || contentType.includes("tar");
-  if (!isZip && !isTar) return "Не похоже на архив (.zip / .tar.gz / .tgz): " + u + ". Скачивать обычные файлы через runCommand (curl / Invoke-WebRequest).";
-  const tmpFile = path.join(os.tmpdir(), "ai-agent-dl-" + Date.now().toString(36) + (isZip ? ".zip" : ".tar"));
-  try {
-    fs.writeFileSync(tmpFile, buf);
-    let note = "";
-    if (process.platform === "win32") {
-      const ps = "Expand-Archive -Path '" + tmpFile.replace(/'/g, "''") + "' -DestinationPath '" + destDir.replace(/'/g, "''") + "' -Force";
-      const r = await spawnRaw(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps], { timeoutMs: 180000 });
-      if (!r.ok) return "Не удалось распаковать: " + ((r.err || r.out || "").trim() || "код " + r.code);
-    } else if (isZip) {
-      const r = await spawnRaw(["unzip", "-q", "-o", tmpFile, "-d", destDir], { timeoutMs: 180000 });
-      if (!r.ok) return "Не удалось распаковать (нужен unzip): " + ((r.err || r.out || "").trim() || "код " + r.code) + "\nВарианты: установи unzip (installSystemPackage) или скачай tar-архив (.tar.gz).";
-    } else {
-      const flag = /\.(tar\.gz|tgz)$/.test(pathLow) ? "-xzf" : "-xf";
-      const r = await spawnRaw(["tar", flag, tmpFile, "-C", destDir], { timeoutMs: 180000 });
-      if (!r.ok) return "Не удалось распаковать: " + ((r.err || r.out || "").trim() || "код " + r.code);
-    }
-    const names = [];
-    const walk = (d) => {
-      let entries;
-      try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
-      for (const en of entries) {
-        const full = path.join(d, en.name);
-        if (en.isDirectory()) walk(full);
-        else names.push(path.relative(destDir, full).split(path.sep).join("/"));
-      }
-    };
-    walk(destDir);
-    return "OK — скачано и распаковано в " + destDir + "\nФайлов: " + names.length + (names.length ? "\nПримеры:\n" + names.slice(0, 15).map((n) => "• " + n).join("\n") : "");
-  } finally {
-    try { fs.unlinkSync(tmpFile); } catch {}
-  }
-}
-
-async function runAsAdmin(cmd) {
-  const command = String(cmd || "").trim();
-  if (!command) return "Ошибка: укажи команду для запуска с правами администратора.";
-  if (process.platform === "win32") {
-    const tmp = path.join(os.tmpdir(), "ai-agent-elev-" + Date.now().toString(36) + ".cmd");
-    fs.writeFileSync(tmp, "@echo off\r\n" + command + "\r\n", "utf8");
-    try {
-      const ps = "Start-Process -FilePath $env:ComSpec -ArgumentList '/d','/c','" + tmp + "' -Verb RunAs -Wait";
-      const enc = Buffer.from(ps, "utf16le").toString("base64");
-      const r = await spawnRaw(["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", enc], { timeoutMs: 600000 });
-      return (r.ok
-        ? "OK — команда запущена с правами администратора (UAC подтверждён)."
-        : "Не удалось запустить с правами администратора: " + ((r.err || "").trim() || "код " + r.code) + " — возможно, запрос UAC отклонён.") +
-        "\nВывод администрируемого окна приложение не перехватывает. После установки: refreshEnv() → checkInstalledProgram(имя).";
-    } finally {
-      try { fs.unlinkSync(tmp); } catch {}
-    }
-  }
-  if (process.platform === "darwin") {
-    const esc = command.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/`/g, "\\`").replace(/\$/g, "\\$");
-    const r = await spawnRaw(["osascript", "-e", 'do shell script "' + esc + '" with administrator privileges'], { timeoutMs: 600000 });
-    return (r.ok ? "OK — команда выполнена с правами администратора." : "Не удалось: " + ((r.err || "").trim() || "код " + r.code)) + "\nВывод: " + ((r.out || r.err || "(пусто)").trim() || "(пусто)").slice(0, 2000);
-  }
-  const pkexec = findProgram("pkexec");
-  if (pkexec.found) {
-    const r = await spawnRaw(["pkexec", "/bin/sh", "-c", command], { timeoutMs: 600000 });
-    return (r.ok ? "OK — команда выполнена с правами администратора." : "Не удалось / отклонено: " + ((r.err || "").trim() || "код " + r.code)) + "\nВывод: " + ((r.out || r.err || "(пусто)").trim() || "(пусто)").slice(0, 2000);
-  }
-  return "На Linux нужен pkexec (policykit) или sudo с паролем. Установи pkexec либо выполни команду вручную в терминале с sudo.";
-}
+// Раздел вынесен в src/system-stack.js (1.5.78): PATH и поиск программ, живая
+// сессия PowerShell с кэшем справок, системные менеджеры пакетов, загрузка
+// файлов и архивов, запуск от администратора. Окружение агента (agentEnv)
+// меняется по ходу работы, поэтому модуль читает его живым: копия «застыла» бы
+// на пустом объекте, и команды остались бы без токенов и PATH.
+const { createSystemStack } = require("./system-stack.js");
+const systemStack = createSystemStack({
+  fs,
+  path,
+  os,
+  execFile,
+  winPs,
+  probeEnv,
+  stripAnsi,
+  runTerminalCommand,
+  live: {
+    get agentEnv() {
+      return agentEnv;
+    },
+  },
+});
+const {
+  envPathInfo,
+  setMergedPath,
+  findProgram,
+  runProgVersion,
+  spawnRaw,
+  psScript,
+  _sysCache,
+  cachedPs,
+  invalidatePsCache,
+  refreshEnvFromOS,
+  WINGET_IDS,
+  EXIT_HINTS,
+  explainExit,
+  installSystemPkg,
+  downloadFileTo,
+  verifyInstaller,
+  installerFacts,
+  installerGate,
+  findInstallersIn,
+  downloadAndExtractTo,
+  runAsAdmin,
+} = systemStack;
 
 // git add -A, но БЕЗ файлов секретов (env-файлы вида DOTENV*): агент
 // (авто-чекпоинт, gitCommit, публикация) не должен закоммитить ключи в git.
@@ -2158,6 +1799,71 @@ function agentGuideCall(args) {
   return "agentGuide: неизвестное действие «" + action + "». Доступно: list, read (name), match (url), save (name + steps).";
 }
 
+// Хранилище приложения (дела, заметки): вне рабочей папки, поэтому в git не попадает.
+function userDataDir() {
+  return app.getPath("userData");
+}
+
+// Дела изменились (агент, панель в окне или телефон) — обновляем панель везде.
+function emitTasksChanged() {
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("tasks:changed", { ts: Date.now() });
+  } catch {}
+}
+
+// Напоминания о делах: раз в минуту смотрим, не подошёл ли срок. Уведомление Windows
+// (Notification) + тост в ленте чата. Дело помечается напомненным — пристаём один раз,
+// повторно только после смены срока. Отключается галочкой в настройках.
+// Уведомление пользователю — только если канал уведомлений действительно есть.
+// В контейнерах и headless-сборках уведомление через libnotify завершает процесс
+// (D-Bus недоступен), а это фон: он обязан выживать.
+function canNotify() {
+  try {
+    if (!Notification || !Notification.isSupported()) return false;
+    if (process.platform === "linux") {
+      const bus = String(process.env.DBUS_SESSION_BUS_ADDRESS || "");
+      return /^(unix:path=|unix:abstract=)/.test(bus);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function notifyUser(title, body) {
+  if (!canNotify()) return false;
+  try {
+    new Notification({ title: String(title || ""), body: String(body || "") }).show();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function checkTaskReminders() {
+  let due = [];
+  try {
+    if (loadSettings().taskReminders === false) return;
+    due = agentStore.tasksTakeReminders(userDataDir()).tasks;
+  } catch {
+    return;
+  }
+  if (!due.length) return;
+  const now = Date.now();
+  for (const t of due) {
+    const at = new Date(t.due).getTime();
+    const late = at < now;
+    notifyUser((late ? "⚠ Дело просрочено: " : "⏰ Дело: ") + t.title, agentStore.humanDue(t, now));
+  }
+  emitTasksChanged();
+  try {
+    mainWindow.webContents.send("ai:event", {
+      type: "task-reminder",
+      tasks: due.map((t) => ({ id: t.id, title: t.title, due: t.due, late: new Date(t.due).getTime() < now })),
+    });
+  } catch {}
+}
+
 async function executeTool(name, args, settings) {
   args = args || {};
   try {
@@ -2165,2314 +1871,11 @@ async function executeTool(name, args, settings) {
     if (global.__agentStopRequested) {
       return "⏹ Остановлено пользователем (Esc / Стоп). Немедленно прекрати вызовы инструментов и заверши ответ КРАТКИМ итогом: что успел сделать и что осталось.";
     }
-    switch (name) {
-      // Предохранитель B: модель просит нужную возможность словами — включаем её
-      // группу в текущей задаче и перечисляем подходящие инструменты.
-      case "findTools": {
-        const query = String(args.query || "").trim();
-        if (!query) return "Укажи query — что нужно сделать словами (например «отправить письмо»).";
-        const found = searchTools(query, args.limit);
-        if (!found.length) {
-          return "Ничего не нашлось по запросу «" + query + "». Сформулируй иначе (действие + объект: «клик по элементу страницы», «запуш ветки») или используй runCommand.";
-        }
-        const groups = [...new Set(found.map((f) => f.group).filter(Boolean))];
-        if (activeToolRouter && groups.length) activeToolRouter.addGroups(groups);
-        return (
-          "Нашёл инструменты по запросу «" + query + "» (схемы уже добавлены в запрос — вызывай их как обычно):\n" +
-          found.map((f) => "• " + f.name + (f.group ? " [" + f.group + "]" : "") + " — " + truncateText(f.description, 160)).join("\n") +
-          (groups.length ? "\nВключены группы: " + groups.join(", ") + ". Список всех инструментов задачи — " + (activeToolRouter ? activeToolRouter.names().join(", ") : "") : "")
-        );
-      }
-      case "createFolder": {
-        const p = resolvePath(args.path, settings);
-        fs.mkdirSync(p, { recursive: true });
-        return "OK — папка создана: " + p;
-      }
-      case "readFile": {
-        // Специальный путь для встроенных справочников агента (не файлы проекта):
-        // readFile(path: "agent-guide:vk") → полный гайд по работе с ВКонтакте.
-        const guidePath = String(args.path || "").trim();
-        if (guidePath.startsWith("agent-guide:")) {
-          const guideName = guideSafeName(guidePath);
-          const guideFile = guideFilePath(guideName, false);
-          if (guideFile) {
-            return "СПРАВОЧНИК АГЕНТА: «" + guideName + "» (прочитай перед работой и следуй ему):\n\n" + fs.readFileSync(guideFile, "utf8");
-          }
-          const list = guideIndex().map((g) => g.name).join(", ") || "пусто";
-          return "Ошибка: справочник «" + guideName + "» не найден. Есть: " + list + ". Список в любой момент: agentGuide {}.";
-        }
-        const p = resolvePath(args.path, settings);
-        if (!fs.existsSync(p)) return "Ошибка: файл не найден: " + p;
-        const st = fs.statSync(p);
-        if (st.size > 5 * 1024 * 1024) return "Ошибка: файл слишком большой (" + st.size + " байт). Используй fileOutline для структуры и readFileLines для чтения по частям.";
-        let content = fs.readFileSync(p, "utf8");
-        const lines = content.split("\n");
-        // Большой файл — краткий обзор вместо выгрузки целиком (экономия токенов)
-        if (lines.length > 800) {
-          const head = numberedLines(lines, 1, Math.min(60, lines.length), lines.length);
-          const tail = numberedLines(lines, Math.max(1, lines.length - 14), lines.length, lines.length);
-          const outline = buildFileOutline(content, null, 200);
-          return (
-            "Файл большой: " + lines.length + " строк, " + st.size + " байт (" + langFromExt(p) + ").\n" +
-            "Не читай его целиком: используй fileOutline (структура), searchFile (поиск с context) и readFileLines (диапазон).\n\n" +
-            "─ СТРУКТУРА (первые " + outline.entries.length + " определений):\n" + outline.text + "\n\n" +
-            "─ НАЧАЛО ФАЙЛА:\n" + head + "\n\n" +
-            "─ КОНЕЦ ФАЙЛА:\n" + tail
-          );
-        }
-        return "Содержимое " + p + " (" + lines.length + " строк):\n" + content;
-      }
-      case "readFileLines": {
-        const p = resolvePath(args.path, settings);
-        if (!fs.existsSync(p)) return "Ошибка: файл не найден: " + p;
-        const st = fs.statSync(p);
-        if (!st.isFile()) return "Ошибка: это не файл";
-        const all = fs.readFileSync(p, "utf8").split("\n");
-        const start = Math.max(1, parseInt(args.start, 10) || 1);
-        const count = Math.min(500, Math.max(1, parseInt(args.count, 10) || 100));
-        const from = start - 1;
-        const chunk = all.slice(from, from + count);
-        if (!chunk.length) return "Файл закончился раньше строки " + start + ". Всего строк: " + all.length;
-        const numbered = chunk.map((line, i) => {
-          const n = start + i;
-          return String(n).padStart(String(all.length).length, " ") + " | " + line;
-        });
-        return "Строки " + start + "–" + (start + chunk.length - 1) + " из " + all.length + " файла " + p + ":\n" + numbered.join("\n");
-      }
-      case "editFile": {
-        const p = resolvePath(args.path, settings);
-        if (!fs.existsSync(p)) return "Ошибка: файл не найден: " + p;
-        if (selfDev.protectedSelfPath(p, { appSrcDir: __dirname, otaRoot: ota.resolveCurrent() })) {
-          return selfDev.protectedSelfPathMessage(p);
-        }
-        const newText = String(args.newText ?? "");
-        const content = fs.readFileSync(p, "utf8");
-        // Режим 2: замена диапазона строк по номерам (startLine..endLine) — для больших файлов
-        const startLine = parseInt(args.startLine, 10);
-        if (Number.isInteger(startLine) && startLine >= 1) {
-          const endLine = Number.isInteger(parseInt(args.endLine, 10)) ? Math.max(startLine, parseInt(args.endLine, 10)) : startLine;
-          const all = content.split("\n");
-          if (startLine > all.length) return "Ошибка: startLine=" + startLine + " больше числа строк файла (" + all.length + ").";
-          if (endLine > all.length) return "Ошибка: endLine=" + endLine + " больше числа строк файла (" + all.length + ").";
-          snapshotFileForUndo(p);
-          const before = all.slice(0, startLine - 1);
-          const after = all.slice(endLine); // endLine включительно — берём всё после неё
-          const updated = before.concat(newText === "" ? [] : newText.split("\n"), after).join("\n");
-          fs.writeFileSync(p, updated, "utf8");
-          const replaced = endLine === startLine ? "строку " + startLine : "строки " + startLine + "–" + endLine;
-          return "OK — заменены " + replaced + " (" + (endLine - startLine + 1) + " стр." + (endLine === startLine ? "а" : "") + " → " + newText.split("\n").length + " стр.) в " + p;
-        }
-        const oldText = String(args.oldText ?? "");
-        if (!oldText) return "Ошибка: укажи oldText (режим точной замены) или startLine (режим замены строк по номерам).";
-        const lineOf = (idx) => content.slice(0, idx).split("\n").length;
-        const positions = [];
-        let from = 0;
-        while (from <= content.length - oldText.length) {
-          const idx = content.indexOf(oldText, from);
-          if (idx === -1) break;
-          positions.push(idx);
-          from = idx + oldText.length;
-        }
-        if (!positions.length) {
-          return "Ошибка: фрагмент для замены не найден в файле. Перечитай файл (readFile / readFileLines) и повтори с точным текстом, включая отступы.";
-        }
-        const occurrence = parseInt(args.occurrence, 10);
-        if (positions.length > 1 && !args.replaceAll && !Number.isInteger(occurrence)) {
-          const lines = positions.map(lineOf).join(", ");
-          return "Ошибка: фрагмент встречается " + positions.length + " раз (строки: " + lines + "). Уточни контекст в oldText (добавь окружающие строки), укажи occurrence (номер вхождения, например 2) или replaceAll=true.";
-        }
-        snapshotFileForUndo(p);
-        let updated, where;
-        if (args.replaceAll) {
-          updated = content.split(oldText).join(newText);
-          where = "вхождений: " + positions.length;
-        } else {
-          const idx = Number.isInteger(occurrence) && occurrence >= 1
-            ? positions[Math.min(occurrence, positions.length) - 1]
-            : positions[0];
-          updated = content.slice(0, idx) + newText + content.slice(idx + oldText.length);
-          where = "строка " + lineOf(idx) + (positions.length > 1 ? " (вхождение " + (positions.indexOf(idx) + 1) + " из " + positions.length + ")" : "");
-        }
-        fs.writeFileSync(p, updated, "utf8");
-        return "OK — заменено (" + where + ") в " + p;
-      }
-      case "shellsStatus": {
-        const rows = shellsStatus().map((s) => {
-          if (s.available) return "✅ " + s.kind + (s.def ? " (по умолчанию)" : "") + " — " + (s.path || "найден в PATH");
-          return "❌ " + s.kind + " — " + (s.hint || "не найден");
-        });
-        const defLine = process.platform === "win32" ? "По умолчанию команды идут в cmd." : "По умолчанию команды идут в sh.";
-        const tip =
-          process.platform === "win32"
-            ? '\n\nПодсказка: PowerShell есть всегда — shell: "powershell" (кавычки, $ и 2>$null работают как в консоли). bash и sh появляются вместе с Git for Windows: installSystemPackage("git").'
-            : "";
-        return "Оболочки на этой машине:\n" + rows.join("\n") + "\n\n" + defLine + ' Выбор — параметр shell у runCommand и startBackground.' + tip;
-      }
-      case "runCommand": {
-        const cmd = String(args.command || "").trim();
-        if (!cmd) return "Ошибка: укажи команду";
-        const shellRaw = String(args.shell == null ? "" : args.shell).trim();
-        const shellName = normalizeShell(shellRaw);
-        if (shellRaw && !shellName) {
-          return "Ошибка: неизвестная оболочка «" + shellRaw + "». Доступно: cmd, powershell, pwsh, bash, sh.";
-        }
-        const cwd = agentWorkDir(settings);
-        const timeoutMs = Math.min(parseInt(args.timeoutMs, 10) || 120000, 300000);
-        termAgentEcho("$ " + cmd + "   (каталог: " + cwd + (shellName ? ", оболочка: " + shellName : "") + ")");
-        const out = await runTerminalCommand(cmd, cwd, timeoutMs, shellName);
-        termAgentEcho(out);
-        let out2 = out;
-        if (out.includes("кодом таймаут") && SERVER_CMD_RE.test(cmd)) {
-          out2 +=
-            "\n\n⏱ Команда не завершилась за " + timeoutMs + " мс — похоже, это длительный dev-сервер (он не завершается сам). Правильно: startBackground(\"" +
-            cmd.slice(0, 80) +
-            "\") — вернёт id БЕЗ блокировки; затем checkUrl/checkPort для проверки готовности, backgroundOutput(id) для логов, stopBackground(id) для остановки (освободит порт). НЕ жди завершения сервера через runCommand.";
-        }
-        return truncateText("$ " + cmd + "\n(каталог: " + cwd + ")\n\n" + out2, 9000);
-      }
-      case "startBackground": {
-        const cmd = String(args.command || "").trim();
-        if (!cmd) return "Ошибка: укажи command";
-        const shellRaw = String(args.shell == null ? "" : args.shell).trim();
-        const shellName = normalizeShell(shellRaw);
-        if (shellRaw && !shellName) {
-          return "Ошибка: неизвестная оболочка «" + shellRaw + "». Доступно: cmd, powershell, pwsh, bash, sh.";
-        }
-        const cwd = args.cwd ? resolvePath(args.cwd, settings) : agentWorkDir(settings);
-        const bgShell = resolveShell(cmd, shellName);
-        // Нет оболочки — spawn упадёт асинхронно, а инструмент успел бы отрапортовать
-        // «OK … PID: undefined». Отвечаем честно и сразу.
-        if (bgShell.missing) {
-          return (
-            "Ошибка: оболочка «" + (shellName || "?") + "» не найдена — фоновый процесс НЕ запущен.\n" +
-            bgShell.shellHint +
-            '\n\nПроверь доступные оболочки через shellsStatus, затем используй shell: "powershell" или "cmd".'
-          );
-        }
-        const rec = bgSpawn(cmd, { name: args.name, cwd, shell: bgShell.shell, shellArgs: bgShell.args });
-        termAgentEcho("$ " + cmd + "   (фоновый процесс " + rec.id + ", каталог: " + cwd + (shellName ? ", оболочка: " + shellName : "") + ")");
-        return "OK — фоновый процесс запущен:\nid: " + rec.id + "\nкоманда: " + cmd + "\nPID: " + rec.child.pid + "\n\nДальше: backgroundOutput(id) — логи, sendInput(id, текст) — ввод в процесс, stopBackground(id) — остановить, checkUrl/checkPort — проверить готовность сервера.";
-      }
-      case "listBackground": {
-        if (!bgProcesses.size) return "Фоновых процессов нет.";
-        const rows = [];
-        for (const rec of bgProcesses.values()) {
-          const alive = !rec.exited;
-          const pid = rec.child && rec.child.pid ? rec.child.pid : "—";
-          const secs = Math.round((Date.now() - rec.startedAt) / 1000);
-          const tail = bgTail(rec, 3).trim().slice(0, 140);
-          rows.push(
-            "• " + rec.id + " [" + (alive ? "работает" : "завершён, код " + rec.exitCode) + ", PID " + pid + ", " + secs + " c] " + rec.name +
-              (tail ? "\n    → " + tail : "")
-          );
-        }
-        return "Фоновые процессы (" + bgProcesses.size + "):\n" + rows.join("\n");
-      }
-      case "backgroundOutput": {
-        const rec = bgProcesses.get(String(args.id || ""));
-        if (!rec) return "Ошибка: процесс с id «" + args.id + "» не найден. Смотри listBackground.";
-        const status = rec.exited ? "ЗАВЕРШЁН (код " + rec.exitCode + ")" : "РАБОТАЕТ (PID " + (rec.child && rec.child.pid) + ")";
-        return "Фоновый процесс " + rec.id + " — " + status + "\nКоманда: " + rec.command + "\n\n" + (bgTail(rec, args.lines) || "(вывода пока нет)");
-      }
-      case "sendInput": {
-        const rec = bgProcesses.get(String(args.id || ""));
-        if (!rec) return "Ошибка: процесс с id «" + args.id + "» не найден. Смотри listBackground.";
-        if (rec.exited || !rec.child.stdin || !rec.child.stdin.writable) return "Ошибка: процесс завершён или его stdin закрыт.";
-        const input = String(args.input ?? "");
-        try {
-          rec.child.stdin.write(input + "\n");
-        } catch (e) {
-          return "Ошибка записи в процесс: " + e.message;
-        }
-        return "OK — отправлено в процесс " + rec.id + ": " + input;
-      }
-      case "stopBackground": {
-        const rec = bgProcesses.get(String(args.id || ""));
-        if (!rec) return "Ошибка: процесс с id «" + args.id + "» не найден. Смотри listBackground.";
-        bgKill(rec);
-        return "OK — процесс " + rec.id + " остановлен.";
-      }
-      case "shellStart": {
-        const isWin = process.platform === "win32";
-        const rec = bgSpawn("", {
-          shell: isWin ? process.env.ComSpec || "cmd.exe" : "/bin/sh",
-          shellArgs: isWin ? ["/Q"] : [],
-          name: args.name || "shell",
-          cwd: agentWorkDir(settings),
-        });
-        return "OK — постоянная shell-сессия запущена:\nid: " + rec.id + "\nPID: " + rec.child.pid + "\n\nОтправляй команды через shellSend(id, команда), смотри вывод через backgroundOutput(id), останови через stopBackground(id). Состояние (переменные, текущая папка) сохраняется между командами.";
-      }
-      case "shellSend": {
-        const rec = bgProcesses.get(String(args.id || ""));
-        if (!rec) return "Ошибка: shell-сессия с id «" + args.id + "» не найдена. Запусти её через shellStart.";
-        if (rec.exited) return "Ошибка: shell-сессия завершена.";
-        const cmd = String(args.command || "").trim();
-        if (!cmd) return "Ошибка: укажи command";
-        termAgentEcho("$ " + cmd + "   (shell-сессия " + rec.id + ")");
-        const from = rec.output.length;
-        try {
-          rec.child.stdin.write(cmd + "\n");
-        } catch (e) {
-          return "Ошибка записи в shell: " + e.message;
-        }
-        await waitOutputQuiet(rec, 8000);
-        const out = rec.output.slice(from).join("\n").trim();
-        termAgentEcho(out);
-        return "$ " + cmd + "\n" + (out || "(нет вывода)");
-      }
-      case "checkUrl": {
-        const url = String(args.url || "").trim();
-        if (!/^https?:\/\//i.test(url)) return "Ошибка: укажи полный URL, начинающийся с http:// или https:// (например http://localhost:3000)";
-        return await checkUrlStatus(url);
-      }
-      case "openUrl": {
-        const url = String(args.url || "").trim();
-        if (!/^(https?|file):\/\//i.test(url)) return "Ошибка: укажи полный URL";
-        shell.openExternal(url).catch(() => {});
-        return "OK — открыто в браузере: " + url;
-      }
-      case "showImage": {
-        const p = resolvePath(args.path, settings);
-        if (!fs.existsSync(p)) return "Ошибка: файл не найден: " + p;
-        const ext = path.extname(p).toLowerCase();
-        const IMG_EXTS = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".avif"];
-        if (!IMG_EXTS.includes(ext)) return "Ошибка: это не изображение (" + (ext || "без расширения") + "). Поддерживаются: " + IMG_EXTS.join(", ");
-        const st = fs.statSync(p);
-        if (st.size > 8 * 1024 * 1024) return "Ошибка: файл слишком большой (" + st.size + " байт). Максимум 8 МБ.";
-        const IMG_MIME = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp", ".ico": "image/x-icon", ".avif": "image/avif" };
-        const dataUrl = "data:" + (IMG_MIME[ext] || "image/png") + ";base64," + fs.readFileSync(p).toString("base64");
-        if (activeEmit) activeEmit({ type: "image", path: p, dataUrl });
-        return "OK — изображение показано пользователю: " + p + " (" + st.size + " байт)";
-      }
-      case "analyzeImage": {
-        const p = resolvePath(args.path, settings);
-        if (!fs.existsSync(p)) return "Ошибка: файл не найден: " + p;
-        const ext = path.extname(p).toLowerCase();
-        const IMG_EXTS_AN = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".avif"];
-        if (!IMG_EXTS_AN.includes(ext)) return "Ошибка: это не изображение (" + (ext || "без расширения") + "). Поддерживаются: " + IMG_EXTS_AN.join(", ");
-        const st = fs.statSync(p);
-        if (st.size > 8 * 1024 * 1024) return "Ошибка: файл слишком большой (" + st.size + " байт). Максимум 8 МБ.";
-        const dataUrl = "data:image/" + (ext === ".svg" ? "svg+xml" : ext.slice(1)) + ";base64," + fs.readFileSync(p).toString("base64");
-        if (activeEmit) activeEmit({ type: "image", path: p, dataUrl });
-        const cfg = auxConfig(settings);
-        if (!cfg.enabled) return "Ошибка: вспомогательная модель выключена. Включи «🖼 Зрение и генерация» в Настройках.";
-        if (!cfg.visionModel) return "Ошибка: не указана модель для чтения изображений (поле «Модель-зрение» в Настройках).";
-        const question = args.question || "Опиши подробно, что изображено на картинке: объекты, текст, UI, цвета, расположение. Это описание пойдёт программисту.";
-        try {
-          const desc = await describeImageRemote(cfg, dataUrl, question, cfg.visionModel);
-          return "Описание изображения (" + p + "):\n" + (desc || "(пусто)") + "\n\nЕсли пользователь ждёт правок по этой картинке — вноси изменения и сообщи итог.";
-        } catch (e) {
-          return "Ошибка анализа изображения: " + fmtError(e) + ". Проверь ключ и модель-зрение в Настройках → «🖼 Зрение и генерация».";
-        }
-      }
-      case "generateImage": {
-        const prompt = String(args.prompt || "").trim();
-        if (!prompt) return "Ошибка: укажи prompt — текстовое описание картинки.";
-        const cfg = auxConfig(settings);
-        if (!cfg.enabled) return "Ошибка: вспомогательная модель выключена. Включи «🖼 Зрение и генерация» в Настройках.";
-        if (!cfg.imageModel) return "Ошибка: не указана модель для генерации картинок (поле «Модель-генерация» в Настройках).";
-        let name = String(args.filename || "").trim();
-        if (!name) name = "generated-" + Date.now() + ".png";
-        name = path.basename(name).replace(/[^\w.\-]+/g, "_");
-        const extG = path.extname(name).toLowerCase();
-        if (![".png", ".jpg", ".jpeg", ".webp"].includes(extG)) name += ".png";
-        const out = path.join(agentWorkDir(settings), name);
-        try {
-          const { buf, mediaType } = await generateImageRemote(cfg, prompt, cfg.imageModel, { aspectRatio: args.aspect_ratio });
-          fs.mkdirSync(path.dirname(out), { recursive: true });
-          fs.writeFileSync(out, buf);
-          const dataUrl = "data:" + mediaType + ";base64," + buf.toString("base64");
-          if (activeEmit) activeEmit({ type: "image", path: out, dataUrl });
-          return "OK — изображение сгенерировано и сохранено: " + out + " (" + buf.length + " байт, " + mediaType + "). Превью уже показано пользователю. Встраивай файл в проект (относительный путь: " + name + ")."
-        } catch (e) {
-          return "Ошибка генерации изображения: " + fmtError(e) + ". Проверь ключ и модель-генерацию в Настройках → «🖼 Зрение и генерация».";
-        }
-      }
-      case "checkPort": {
-        const port = parseInt(args.port, 10);
-        if (!port || port < 1 || port > 65535) return "Ошибка: укажи корректный порт (1–65535)";
-        return await new Promise((resolve) => {
-          const sock = net.connect({ port, host: "127.0.0.1" });
-          sock.setTimeout(2000);
-          sock.once("connect", () => { sock.destroy(); resolve("Порт " + port + " занят — на нём что-то слушает."); });
-          sock.once("timeout", () => { sock.destroy(); resolve("Порт " + port + " свободен."); });
-          sock.once("error", () => { sock.destroy(); resolve("Порт " + port + " свободен (соединение отклонено)."); });
-        });
-      }
-      case "listPorts": {
-        const cmd = process.platform === "win32"
-          ? "netstat -ano -p tcp"
-          : "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null || lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null";
-        const out = await runTerminalCommand(cmd, os.homedir(), 15000);
-        const lines = String(out)
-          .split("\n")
-          .map((l) => l.trim())
-          .filter((l) => /LISTEN|LISTENING/i.test(l))
-          .slice(0, 40);
-        return "Слушающие порты:\n" + (lines.join("\n") || "не удалось получить список портов:\n" + String(out).slice(0, 1000));
-      }
-      case "dockerBuild": {
-        const dir = args.directory ? resolvePath(args.directory, settings) : agentWorkDir(settings);
-        if (!fs.existsSync(dir)) return "Ошибка: папка не найдена: " + dir;
-        const tag = String(args.tag || "").trim();
-        const cmd = "docker build" + (tag ? " -t " + tag : "") + " .";
-        const out = await runTerminalCommand(cmd, dir, 300000);
-        return truncateText(out, 6000);
-      }
-      case "dockerRun": {
-        const image = String(args.image || "").trim();
-        if (!image) return "Ошибка: укажи image";
-        const extra = String(args.args || "").trim();
-        const detached = args.detached !== false;
-        const cmd = "docker run " + (detached ? "-d " : "") + (extra ? extra + " " : "") + image;
-        const out = await runTerminalCommand(cmd, agentWorkDir(settings), 120000);
-        return truncateText(out, 4000);
-      }
-      case "dockerExec": {
-        const container = String(args.container || "").trim();
-        const command = String(args.command || "").trim();
-        if (!container || !command) return "Ошибка: укажи container и command";
-        const out = await runTerminalCommand("docker exec " + container + " " + command, agentWorkDir(settings), 60000);
-        return truncateText(out, 4000);
-      }
-      case "installPackage": {
-        const pkg = String(args.packageName || "").trim();
-        if (!pkg) return "Ошибка: укажи packageName (например «express» или «react@18.3.1»)";
-        const cwd = agentWorkDir(settings);
-        const pm = detectPackageManager(cwd);
-        const dev = !!args.dev;
-        const cmd = pm.bin + " " + pm.add + (dev ? " " + pm.flagDev : "") + " " + pkg;
-        const out = await runTerminalCommand(cmd, cwd, 300000);
-        return truncateText("$ " + cmd + "\n(менеджер пакетов: " + pm.name + ", каталог: " + cwd + ")\n\n" + out, 6000);
-      }
-      case "lintProject": {
-        const cwd = agentWorkDir(settings);
-        const parts = [];
-        const has = (name) => fs.existsSync(path.join(cwd, name));
-        if (has("tsconfig.json")) {
-          parts.push("$ npx -y tsc --noEmit\n" + (await runTerminalCommand("npx -y tsc --noEmit", cwd, 300000)));
-        }
-        if (has("eslint.config.js") || has("eslint.config.mjs") || has("eslint.config.cjs") || has(".eslintrc") || has(".eslintrc.json") || has(".eslintrc.js")) {
-          parts.push("$ npx -y eslint .\n" + (await runTerminalCommand("npx -y eslint .", cwd, 300000)));
-        }
-        if (!parts.length) {
-          return "Не нашёл конфигов проверки в " + cwd + " (tsconfig.json или eslint.config.* / .eslintrc). Можно запустить проверку вручную через runCommand.";
-        }
-        return truncateText(parts.join("\n\n"), 9000);
-      }
-      case "runTests": {
-        const cwd = agentWorkDir(settings);
-        const timeoutMs = Math.min(parseInt(args.timeoutMs, 10) || 180000, 600000);
-        let cmd = null;
-        try {
-          const pkg = JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8"));
-          if (pkg.scripts && pkg.scripts.test) cmd = "npm test";
-        } catch {}
-        if (!cmd) {
-          cmd = hasLock("bun") ? "bun test" : "npm test";
-        }
-        const out = await runTerminalCommand(cmd, cwd, timeoutMs);
-        const summary = summarizeTestOutput(out);
-        return truncateText("$ " + cmd + " (каталог: " + cwd + ")\n\n" + out + (summary ? "\n\n--- Итог ---\n" + summary : ""), 9000);
-      }
-      case "diffView": {
-        const p1 = resolvePath(args.path1, settings);
-        const p2 = resolvePath(args.path2, settings);
-        if (!fs.existsSync(p1)) return "Ошибка: не найден путь: " + p1;
-        if (!fs.existsSync(p2)) return "Ошибка: не найден путь: " + p2;
-        const r = await unifiedDiff(p1, p2);
-        if (!r.patch) return "Файлы идентичны: " + p1 + " = " + p2;
-        if (activeEmit) activeEmit({ type: "diff", a: p1, b: p2, patch: r.patch });
-        return "Дифф " + p1 + " ↔ " + p2 + " (открыт в просмотрщике приложения):\n\n" + truncateText(r.patch, 8000);
-      }
-      case "previewUI": {
-        const url = String(args.url || "").trim();
-        if (!/^https?:\/\//i.test(url)) return "Ошибка: укажи полный URL вида http://localhost:3000";
-        if (activeEmit) activeEmit({ type: "preview", url });
-        return "OK — открыт встроенный предпросмотр: " + url + " (закрывается кнопкой ✕ в углу окна предпросмотра)";
-      }
-      case "screenshotCapture": {
-        const url = String(args.url || "").trim();
-        if (!/^https?:\/\//i.test(url)) return "Ошибка: укажи полный URL вида http://localhost:3000";
-        const shot = await screenshotUrl(url);
-        if (!shot.ok) return "Ошибка скриншота: " + shot.err;
-        if (activeEmit) activeEmit({ type: "image", path: url, dataUrl: shot.dataUrl });
-        let saved = null;
-        try {
-          const buf = Buffer.from(String(shot.dataUrl).split(",")[1] || "", "base64");
-          if (buf.length) saved = saveScreenshotPng(buf, "page", shot.mime);
-        } catch {}
-        return "OK — скриншот " + url + " снят (1280×800), показан пользователю во встроенном просмотрщике" +
-          (saved ? " и сохранён: " + saved : "") +
-          ". Чтобы понять, что на экране, вызови analyzeImage(path: '" + (saved || "") + "') — вернёт описание вспомогательной vision-моделью.";
-      }
-      case "envSet": {
-        const key = String(args.key || "").trim();
-        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
-          return "Ошибка: имя переменной должно быть вида DATABASE_URL (латиница, цифры, подчёркивание)";
-        }
-        const value = String(args.value ?? "");
-        const s = loadSettings();
-        userAgentEnv[key] = value;
-        s.agentEnv = { ...userAgentEnv };
-        saveSettings(s);
-        applyAgentEnv(s);
-        return "OK — переменная " + key + " задана. Она доступна во всех следующих командах (runCommand, startBackground, shell, git, docker). Значение в чат не выводится.";
-      }
-      case "envList": {
-        const keys = Object.keys(agentEnv);
-        if (!keys.length) return "Переменные окружения агента не заданы. Задай через envSet(key, value).";
-        const auto = ycAutoEnv(loadSettings());
-        return "Доступные переменные (" + keys.length + "):\n" +
-          keys.map((k) => {
-            const v = String(agentEnv[k] || "");
-            return "• " + k + " — установлена (" + v.length + " симв.)" + (k in auto ? " [авто: Yandex Cloud]" : "");
-          }).join("\n") +
-          "\n\nЗначения скрыты — они подмешиваются в команды автоматически.";
-      }
-      case "envUnset": {
-        const key = String(args.key || "").trim();
-        if (!key) return "Ошибка: укажи key";
-        const auto = ycAutoEnv(loadSettings());
-        if (!(key in userAgentEnv)) {
-          if (key in auto) {
-            return "Переменная " + key + " подставляется автоматически из настроек Yandex Cloud (Настройки → Yandex Cloud) — вручную её убрать нельзя.";
-          }
-          return "Переменная «" + key + "» не задана.";
-        }
-        const s = loadSettings();
-        delete userAgentEnv[key];
-        s.agentEnv = { ...userAgentEnv };
-        saveSettings(s);
-        applyAgentEnv(s);
-        return "OK — переменная " + key + " удалена.";
-      }
-      case "writeFile": {
-        if (!args.path) return "Ошибка: укажи path";
-        const p = resolvePath(args.path, settings);
-        if (selfDev.protectedSelfPath(p, { appSrcDir: __dirname, otaRoot: ota.resolveCurrent() })) {
-          return selfDev.protectedSelfPathMessage(p);
-        }
-        const content = String(args.content ?? "");
-        fs.mkdirSync(path.dirname(p), { recursive: true });
-        const existed = fs.existsSync(p);
-        fs.writeFileSync(p, content, "utf8");
-        const lines = content ? content.split("\n").length : 0;
-        const sizeNote = content ? ", " + content.length + " символов" : "";
-        return "OK — файл " + (existed ? "перезаписан" : "создан") + ": " + p + " (" + lines + " строк" + sizeNote + ")";
-      }
-      case "webSearch": {
-        const q = String(args.query || args.q || "").trim();
-        // Serper (Google), если ключ задан в настройках; иначе — DuckDuckGo
-        return await webSearch(q, settings && settings.serperApiKey);
-      }
-      case "webFetch": {
-        return await webFetchPage(args.url);
-      }
-      // Браузерные инструменты (Playwright): видимое окно Chromium, которым агент управляет сам.
-      // browserConnect — переключение на СВОЙ Chrome пользователя через порт отладки (CDP).
-      case "browserConnect": {
-        return await browserTools.connect(args);
-      }
-      case "browserOpen": {
-        const opened = await browserTools.open(args);
-        // Есть справочник по этому сайту — говорим сразу, а не после блужданий.
-        if (typeof opened === "string" && !/^Ошибка/.test(opened)) {
-          const g = guideForUrl(args && args.url);
-          if (g) {
-            return (
-              opened +
-              "\n📘 По этому сайту есть справочник агента «" + g.name + "»" + (g.title ? " (" + g.title + ")" : "") +
-              " — прочитай ПЕРЕД действиями: agentGuide { name: \"" + g.name + "\" } (маршруты, подводные камни, селекторы)."
-            );
-          }
-        }
-        return opened;
-      }
-      case "browserSnapshot": {
-        return await browserTools.snapshot(args);
-      }
-      case "browserFill": {
-        return await browserTools.fill(args);
-      }
-      case "browserClick": {
-        return await browserTools.click(args);
-      }
-      // Несколько действий ОДНОЙ командой (клик → ввод → Enter → проверка):
-      // слабая модель не тратит ходы на каждый шаг и не «застревает».
-      case "browserAct": {
-        return await browserTools.act(args);
-      }
-      case "browserSelect": {
-        return await browserTools.select(args);
-      }
-      case "browserPress": {
-        return await browserTools.press(args);
-      }
-      case "browserText": {
-        return await browserTools.text(args);
-      }
-      case "browserScreenshot": {
-        // Скриншот сохраняем ФАЙЛОМ (data URL в контексте агента — это десятки
-        // тысяч токенов). Файл показываем пользователю и, если настроено зрение,
-        // разбираем vision-моделью. Модель может не ответить — тогда честно
-        // говорим об этом и оставляем агенту пути по DOM.
-        const shotDir = path.join(os.tmpdir(), "ai-agent-shots");
-        const shot = await browserTools.screenshotFile(Object.assign({}, args, { dir: shotDir }));
-        if (shot.error) return shot.error;
-        const shotData = "data:image/png;base64," + shot.buf.toString("base64");
-        if (activeEmit) activeEmit({ type: "image", path: shot.path, dataUrl: shotData });
-        let shotOut =
-          "OK — скриншот сохранён" + (shot.path ? ": " + shot.path : " (файл записать не удалось, картинка показана в чате)") +
-          "\nСтраница: " + (shot.url || "—") + (shot.title ? " («" + shot.title + "»)" : "");
-        const vcfg = auxConfig(settings);
-        if (args && args.analyze === false) {
-          shotOut += "\nДальше: analyzeImage { path: \"" + shot.path + "\" } при необходимости.";
-        } else if (vcfg.visionModel && vcfg.key) {
-          // Зрение включается, как только указана модель и есть ключ (галочка «Зрение»
-          // лишь разрешает авто-пре-пасс присланных картинок). Спрашиваем про кликабельное:
-          // карта DOM врёт на кастомных компонентах, а разбор скриншота — нет.
-          try {
-            const q =
-              args && args.question
-                ? String(args.question)
-                : "Разбери скриншот страницы как инструкцию к действию, коротко и по делу: 1) что это за экран (сайт, диалог, шаг); 2) какие элементы КЛИКАБЕЛЬНЫ (кнопки, ссылки, вкладки, чекбоксы) — их точные подписи; 3) какие поля ввода и что в них; 4) что мешает (баннеры, согласия, перекрытия) и что нажать, чтобы их убрать; 5) что находится ЗА пределами экрана (видно начало списка/край элемента). Без воды — это уйдёт программисту, который видит только текст.";
-            const desc = await describeImageRemote(vcfg, shotData, q, vcfg.visionModel);
-            shotOut += "\n\nЧто видно (vision-модель):\n" + (desc || "(пусто)");
-          } catch (e) {
-            shotOut +=
-              "\n\nVision-модель не ответила (" + String((e && e.message) || e).slice(0, 120) + ") — это не блокер: работай по DOM." +
-              "\nbrowserSnapshot (карта с ref) · browserDOM (HTML слоя) · browserEval (JS на странице) · browserOverlays (слои и помехи).";
-          }
-        } else {
-          shotOut +=
-            "\n\nЗрение не настроено — работай по DOM: browserSnapshot, browserDOM, browserEval, browserOverlays." +
-            "\nЧтобы я видел страницу: Настройки → вкладка «Зрение» → включи и укажи модель (например gemini-2.5-flash), затем повтори скриншот.";
-        }
-        return shotOut;
-      }
-      case "browserEval": {
-        return await browserTools.evalJs(args);
-      }
-      case "browserDOM": {
-        return await browserTools.domHtml(args);
-      }
-      case "browserOverlays": {
-        return await browserTools.overlays(args);
-      }
-      case "browserWait": {
-        return await browserTools.wait(args);
-      }
-      // Прокрутка (страница, внутренние контейнеры, «до элемента») и наведение мыши:
-      // без них половина элементов остаётся за экраном, а меню по hover не раскрыть.
-      case "browserScroll": {
-        return await browserTools.scroll(args);
-      }
-      case "browserHover": {
-        return await browserTools.hover(args);
-      }
-      // Что страница реально отправила и что вернул сервер (XHR/fetch).
-      case "browserNetwork": {
-        return await browserTools.network(args);
-      }
-      // Дождаться, когда DOM перестанет меняться и сеть опустеет (Angular-перерисовки).
-      case "waitForIdle": {
-        return await browserTools.waitForIdle(args);
-      }
-      // Справочники по сайтам: встроенные (src/agent-guides) + выученные агентом.
-      case "agentGuide": {
-        return agentGuideCall(args);
-      }
-      case "browserClose": {
-        return await browserTools.close(args);
-      }
-      case "browserStatus": {
-        return await browserTools.status();
-      }
-      case "browserClearProfile": {
-        return await browserTools.clearProfile();
-      }
-      // Менеджер паролей: список сайтов (без паролей) и подстановка входа в форму.
-      // Пароль идёт напрямую в браузер и никогда не попадает в текст ответа.
-      case "vaultList": {
-        return vault.listText(loadSettings().sitePasswords);
-      }
-      case "vaultFill": {
-        const site = args.site || args.name || args.url || "";
-        const entry = vault.findEntry(loadSettings().sitePasswords, site);
-        if (!entry) return vault.notFoundText(loadSettings().sitePasswords, site);
-        return await vault.fillLogin(entry, args, browserTools);
-      }
-      // Почта: отправка писем (КП клиентам) и чтение входящих (коды подтверждения).
-      case "mailSend": {
-        const cfg = mailConfig(loadSettings());
-        if (!cfg.allowSend) {
-          return "⛔ Отправка писем агентом ЗАПРЕЩЕНА. Скажи пользователю включить Настройки → «✉️ Почта» → чекбокс «Разрешить агенту отправлять письма».";
-        }
-        if (!cfg.address || !cfg.password || !cfg.smtpHost) {
-          return "Почта не настроена. Скажи пользователю: Настройки → «✉️ Почта» → адрес, пароль приложения, затем кнопка «Определить по адресу».";
-        }
-        const r = await mail.sendMail(
-          { host: cfg.smtpHost, port: cfg.smtpPort, user: cfg.user, password: cfg.password, secure: !cfg.starttls, starttls: cfg.starttls },
-          { fromName: cfg.fromName, to: args.to || args.recipient, subject: args.subject, text: args.text, html: args.html }
-        );
-        if (!r.ok) return "Ошибка отправки: " + r.error;
-        return "OK — письмо отправлено: " + (Array.isArray(r.to) ? r.to.join(", ") : r.to) + ". Тема: " + String(args.subject || "").slice(0, 120);
-      }
-      case "mailList": {
-        const cfg = mailConfig(loadSettings());
-        if (!cfg.address || !cfg.password || !cfg.imapHost) return "Почта не настроена — Настройки → «✉️ Почта».";
-        const r = await mail.listRecent(
-          { host: cfg.imapHost, port: cfg.imapPort, user: cfg.user, password: cfg.password, secure: true },
-          { limit: args.limit, unseenOnly: args.unseenOnly === true }
-        );
-        if (!r.ok) return "Ошибка чтения почты: " + r.error;
-        if (!r.messages.length) return "Входящих писем нет (ящик пуст).";
-        const rows = r.messages.map((m) => {
-          const code = mail.extractCode(m.text);
-          const preview = String(m.text || "").replace(/\s+/g, " ").trim().slice(0, 200);
-          return "• " + m.from + "\n  Тема: " + m.subject + "\n  Дата: " + m.date + (code ? "\n  Код: " + code : "") + "\n  " + preview;
-        });
-        return "Последние письма (" + r.messages.length + " из " + r.total + "):\n\n" + rows.join("\n\n") + "\n\nОтправить письмо: mailSend(to, subject, text).";
-      }
-      case "mailCode": {
-        const cfg = mailConfig(loadSettings());
-        if (!cfg.address || !cfg.password || !cfg.imapHost) return "Почта не настроена — Настройки → «✉️ Почта».";
-        const r = await mail.listRecent(
-          { host: cfg.imapHost, port: cfg.imapPort, user: cfg.user, password: cfg.password, secure: true },
-          { limit: Math.min(parseInt(args.limit, 10) || 5, 10) }
-        );
-        if (!r.ok) return "Ошибка чтения почты: " + r.error;
-        const want = String(args.from || args.query || "").trim().toLowerCase();
-        const list = want ? r.messages.filter((m) => (m.from + " " + m.subject).toLowerCase().includes(want)) : r.messages;
-        for (const m of list) {
-          const code = mail.extractCode(m.text);
-          if (code) return "Код подтверждения: " + code + "\nИз письма: " + m.subject + " (" + m.from + ", " + m.date + ")";
-        }
-        return "Код подтверждения не найден в последних " + r.messages.length + " письмах" + (want ? " от «" + want + "»" : "") + ". Вызови mailList — возможно, письмо ещё не пришло.";
-      }
-      // Инструменты управления собственным окном приложения (app-*): DOM внутри Electron-окна.
-      case "appRead": {
-        return await appUi.read(args, mainWindow);
-      }
-      case "appClick": {
-        return await appUi.click(args, mainWindow);
-      }
-      case "appFill": {
-        return await appUi.fill(args, mainWindow);
-      }
-      case "appSelect": {
-        return await appUi.select(args, mainWindow);
-      }
-      case "appPress": {
-        return await appUi.press(args, mainWindow);
-      }
-      case "appWait": {
-        return await appUi.wait(args, mainWindow);
-      }
-      case "appScreenshot": {
-        const dataUrl = await appUi.screenshot(args, mainWindow);
-        if (activeEmit) activeEmit({ type: "image", path: "app:window", dataUrl });
-        return "OK — скриншот окна приложения снят и показан во встроенном просмотрщике. Детали разбирай через analyzeImage.";
-      }
-      case "searchFile": {
-        const p = resolvePath(args.path, settings);
-        if (!fs.existsSync(p)) return "Ошибка: файл не найден: " + p;
-        const st = fs.statSync(p);
-        if (!st.isFile()) return "Ошибка: это не файл";
-        const pattern = String(args.pattern || args.regex || "").trim();
-        if (!pattern) return "Ошибка: укажи pattern (строку или регулярное выражение)";
-        const maxResults = Math.min(parseInt(args.maxResults, 10) || 40, 100);
-        const context = Math.min(Math.max(parseInt(args.context, 10) || 0, 0), 40);
-        const blocks = args.blocks === true || args.blocks === "true" || args.blocks === "1" || args.blocks === 1;
-        let re = null;
-        try {
-          re = new RegExp(pattern, args.caseSensitive ? "" : "i");
-        } catch {}
-        const all = fs.readFileSync(p, "utf8").split("\n");
-        const hits = [];
-        let total = 0;
-        for (let i = 0; i < all.length; i++) {
-          const line = all[i];
-          if (re ? re.test(line) : line.includes(pattern)) {
-            total++;
-            if (hits.length < maxResults) hits.push({ n: i + 1, text: line.trim().slice(0, 300) });
-          }
-        }
-        if (!total) return "Совпадений по «" + pattern + "» в " + p + " нет.";
-        const pad = String(all.length).length;
-        let shown;
-        if (blocks) {
-          // Режим «блоками»: вместо отдельных строк показываем целиком enclosing-определения
-          // (функции/классы/методы и т.п. по OUTLINE_RULES) с диапазоном строк.
-          const ranges = buildBlockRanges(all);
-          const byBlock = new Map();
-          for (const h of hits) {
-            let owner = null;
-            for (const r of ranges) {
-              if (r.start > h.n) break;
-              if (h.n <= r.end) owner = r; // последний подходящий = самый вложенный
-            }
-            if (!owner) owner = { start: h.n, end: h.n, kind: "строка", name: "строка " + h.n };
-            const key = owner.start + "|" + owner.name;
-            if (!byBlock.has(key)) byBlock.set(key, { owner, hits: [] });
-            byBlock.get(key).hits.push(h);
-          }
-          const MAX_BLOCK_LINES = 120;
-          const blockCap = Math.min(maxResults, 20); // блоки крупнее строк — лимит строже
-          const lines = [];
-          let blocksShown = 0;
-          for (const { owner, hits: hh } of byBlock.values()) {
-            if (blocksShown >= blockCap) break;
-            blocksShown++;
-            const from = owner.start;
-            const to = Math.min(owner.end, from + MAX_BLOCK_LINES - 1);
-            const hitSet = new Set(hh.map((x) => x.n));
-            lines.push("── " + owner.kind + " " + owner.name + " (строки " + owner.start + "–" + to + (to < owner.end ? "+" : "") + ") ──");
-            for (let i = from; i <= to; i++) {
-              lines.push((hitSet.has(i) ? ">" : " ") + String(i).padStart(pad, " ") + " | " + all[i - 1].slice(0, 300));
-            }
-            if (to < owner.end) lines.push("        … (блок обрезан: ещё " + (owner.end - to) + " строк)");
-          }
-          const more = total > hits.length ? "\n… и ещё " + (total - hits.length) + " совпадений (укажи maxResults больше)" : "";
-          return "Совпадения «" + pattern + "» в " + p + " — всего " + total + ", показано блоков: " + blocksShown + " (blocks: true):\n" + truncateText(lines.join("\n"), 9000) + more;
-        }
-        if (context > 0) {
-          // Окна вокруг совпадений: строки context до и после, с отметкой > для самой строки
-          shown = [];
-          let prevEnd = 0;
-          for (const h of hits) {
-            const from = Math.max(1, h.n - context);
-            const to = Math.min(all.length, h.n + context);
-            if (from > prevEnd + 1) shown.push("        … (пропущено)");
-            for (let i = from; i <= to; i++) {
-              const mark = i === h.n ? ">" : " ";
-              shown.push(mark + String(i).padStart(pad, " ") + " | " + all[i - 1].slice(0, 300));
-            }
-            prevEnd = to;
-          }
-          const more = total > hits.length ? "\n… и ещё " + (total - hits.length) + " совпадений (укажи maxResults больше)" : "";
-          return "Совпадения «" + pattern + "» в " + p + " — всего " + total + ", показано " + hits.length + " (контекст ±" + context + " строк):\n" + shown.join("\n") + more;
-        }
-        shown = hits.map((h) => String(h.n).padStart(pad, " ") + " | " + h.text);
-        const more = total > hits.length ? "\n… и ещё " + (total - hits.length) + " совпадений (укажи maxResults больше)" : "";
-        return "Совпадения «" + pattern + "» в " + p + " — всего " + total + ", показано " + hits.length + ":\n" + shown.join("\n") + more;
-      }
-      case "fileOutline": {
-        const p = resolvePath(args.path, settings);
-        if (!fs.existsSync(p)) return "Ошибка: файл не найден: " + p;
-        const st = fs.statSync(p);
-        if (!st.isFile()) return "Ошибка: это не файл";
-        const content = fs.readFileSync(p, "utf8");
-        const filter = String(args.pattern || "").trim();
-        const res = buildFileOutline(content, filter || null, 300);
-        if (!res.entries.length) {
-          return filter
-            ? "В структуре " + p + " нет определений, совпадающих с «" + filter + "»."
-            : "Определений (функции/классы/заголовки) в " + p + " не найдено. Файл: " + content.split("\n").length + " строк, " + st.size + " байт.";
-        }
-        return "Структура " + p + " (" + content.split("\n").length + " строк) — " + res.entries.length + " определений" + (filter ? " по фильтру «" + filter + "»" : "") + ":\n" + res.text;
-      }
-      case "listFiles": {
-        return listProjectFiles(settings, args.path);
-      }
-      case "searchProject": {
-        const pattern = String(args.pattern || args.regex || args.query || "").trim();
-        if (!pattern) return "Ошибка: укажи pattern (строку или регулярное выражение)";
-        return searchProjectFiles(pattern, settings, args.path);
-      }
-      case "askUser": {
-        return "Ошибка: askUser обрабатывается отдельно — дождись ответа пользователя.";
-      }
-      case "listDirectory": {
-        const p = resolvePath(args.path, settings);
-        if (!fs.existsSync(p)) return "Ошибка: папка не найдена: " + p;
-        const entries = fs.readdirSync(p, { withFileTypes: true });
-        const lines = entries.map((e) => (e.isDirectory() ? "[папка] " : "[файл]  ") + e.name);
-        return "Содержимое " + p + " (" + entries.length + "):\n" + lines.slice(0, 500).join("\n");
-      }
-      case "gitClone": {
-        const url = String(args.url || "").trim();
-        if (!url) return "Ошибка: укажи url репозитория";
-        const base = settings.workingDir || os.homedir();
-        const dir = args.directory
-          ? resolvePath(args.directory, settings)
-          : path.join(base, repoNameFromUrl(url));
-        const r = await runGit(base, ["clone", url, dir], settings);
-        if (r.ok) {
-          if (stripUrlCreds(url) !== url) {
-            await runGit(dir, ["remote", "set-url", "origin", stripUrlCreds(url)], settings);
-          }
-          lastAgentRepoDir = dir; // все следующие git/команды — внутри склонированного репозитория
-          clonedRepoPending = true; // следующий ответ агента начнётся с анализа нового проекта
-          return "OK — репозиторий клонирован: " + dir + "\nТеперь git-команды и терминал работают внутри этого репозитория.";
-        }
-        return "Ошибка git: " + r.err;
-      }
-      case "gitStatus": {
-        const r = await runGit(agentWorkDir(settings), ["status"], settings);
-        return r.ok ? (r.out || "Готово (без вывода).") : "Ошибка git: " + r.err;
-      }
-      case "gitCommit": {
-        if (!args.message) return "Ошибка: укажи message для коммита";
-        const cwd = agentWorkDir(settings);
-        const add = await stageAllSafe(cwd, settings);
-        if (!add.ok) return "Ошибка git add: " + add.err;
-        const commit = await runGit(
-          cwd,
-          ["-c", "user.name=AI Agent", "-c", "user.email=ai-agent@local", "commit", "-m", String(args.message)],
-          settings
-        );
-        return "git add -A:\n" + add.out + "\n\ngit commit:\n" + (commit.ok ? commit.out : "Ошибка git: " + commit.err);
-      }
-      case "gitPush": {
-        if (!settings.allowAgentPush) {
-          return (
-            "⛔ git push заблокирован: пользователь не разрешил агенту отправлять коммиты на GitHub.\n" +
-            "Как разрешить (на выбор пользователя):\n" +
-            "1. Настройки → GitHub → включить «Разрешить агенту git push» — после этого инструмент заработает;\n" +
-            "2. либо пользователь сам нажимает «Push» во вкладке «Изменения» панели проекта.\n" +
-            "Сообщи пользователю, что пуш не выполнен и почему — не пытайся обойти блокировку через runCommand."
-          );
-        }
-        const r = await runGit(agentWorkDir(settings), ["push"], settings);
-        return r.ok ? (r.out || "Готово (без вывода).") : "Ошибка git: " + r.err;
-      }
-      case "gitPublish": {
-        // Создание репозитория + push — та же политика безопасности, что и у gitPush.
-        if (!settings.allowAgentPush) {
-          return (
-            "⛔ gitPublish заблокирован: создание репозитория и отправка кода на GitHub запрещены, пока пользователь не разрешит.\n" +
-            "Как разрешить (на выбор пользователя):\n" +
-            "1. Настройки → GitHub → включить «Разрешить агенту git push»;\n" +
-            "2. либо пользователь сам нажимает «⬆ Опубликовать на GitHub» в панели проекта.\n" +
-            "Сообщи пользователю, что публикация не выполнена и почему — не пытайся обойти блокировку через runCommand."
-          );
-        }
-        const cwdP = args.directory ? resolvePath(args.directory, settings) : agentWorkDir(settings);
-        // Не-GitHub хостинг (GitLab, Bitbucket, свой сервер): создание репозитория
-        // делается на сайте хостинга, а мы сами прописываем remote и пушим ветку —
-        // без GitHub API и без ручных команд в терминале.
-        const remoteUrl = String(args.remoteUrl || "").trim();
-        if (remoteUrl) {
-          if (!/^(https?:\/\/|git@|ssh:\/\/)/i.test(remoteUrl)) {
-            return "Ошибка: remoteUrl должен быть git-адресом — https://gitlab.com/you/repo.git или git@bitbucket.org:you/repo.git.";
-          }
-          const remoteName = String(args.remoteName || "origin").trim() || "origin";
-          const existR = await runGit(cwdP, ["remote"], settings);
-          const hasRemote = String(existR.out || "").split("\n").map((x) => x.trim()).includes(remoteName);
-          const setR = await runGit(cwdP, hasRemote ? ["remote", "set-url", remoteName, remoteUrl] : ["remote", "add", remoteName, remoteUrl], settings);
-          if (!setR.ok) return "Ошибка git remote: " + setR.err;
-          const brR = await runGit(cwdP, ["rev-parse", "--abbrev-ref", "HEAD"], settings);
-          const branch = String(brR.out || "").trim() || "main";
-          const pushR = await runGit(cwdP, ["push", "-u", remoteName, branch], settings);
-          if (!pushR.ok) {
-            return (
-              "Remote «" + remoteName + "» → " + remoteUrl + " прописан, но push не прошёл:\n" + pushR.err +
-              "\n\nЧастые причины: репозиторий ещё не создан на сайте хостинга; нужен токен (для GitLab/Bitbucket — personal access token в адресе вида https://oauth2:TOKEN@host/…) или у аккаунта нет прав на запись."
-            );
-          }
-          return "✅ Отправлено на «" + remoteName + "» (" + remoteUrl + "), ветка " + branch + ".\n" + (pushR.out || "Готово (без вывода).");
-        }
-        const resP = await publishLocalToGithub(cwdP, settings, {
-          name: args.name,
-          description: args.description,
-          private: args.private !== false,
-          message: args.message,
-        });
-        return resP.ok
-          ? "✅ " + resP.message
-          : "Ошибка публикации: " + resP.error;
-      }
-      case "gitInit": {
-        const dir = args.directory ? resolvePath(args.directory, settings) : agentWorkDir(settings);
-        if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return "Ошибка: папка не найдена: " + dir;
-        const s = loadSettings();
-        const check = await runGit(dir, ["rev-parse", "--is-inside-work-tree"], s);
-        if (check.ok && String(check.out || "").trim() === "true") {
-          return "Эта папка уже git-репозиторий: " + dir + "\nСостояние смотри через gitStatus.";
-        }
-        let initR = await runGit(dir, ["init", "-b", "main"], s);
-        if (!initR.ok) initR = await runGit(dir, ["init"], s); // старые git без -b
-        if (!initR.ok) return "Ошибка git init: " + initR.err;
-        const msg = String(args.message || "").trim();
-        if (msg) {
-          const addR = await runGit(dir, ["add", "-A"], s);
-          if (!addR.ok) return "Репозиторий создан, но первый коммит не удался: " + addR.err;
-          const commitR = await runGit(dir, ["-c", "user.name=AI Agent", "-c", "user.email=ai-agent@local", "commit", "-m", msg], s);
-          if (!commitR.ok) return "Репозиторий создан, но первый коммит не удался: " + commitR.err;
-          return "✅ Создан локальный git-репозиторий: " + dir + " (ветка main), первый коммит «" + msg + "» сделан.\nGitHub НЕ задействован — это чисто локальный репозиторий.\nДальше можно: gitCommit — новые коммиты, gitBranch — ветки, gitPush — отправить в удалённый репозиторий (когда пользователь разрешит).";
-        }
-        return "✅ Создан локальный git-репозиторий: " + dir + " (ветка main).\nGitHub НЕ задействован — это чисто локальный репозиторий.\nДальше можно: gitCommit(message) — сделать первый коммит, gitBranch — ветки, gitPush — отправить в удалённый репозиторий (когда пользователь разрешит).";
-      }
-      case "gitPull": {
-        const r = await runGit(agentWorkDir(settings), ["pull"], settings);
-        return r.ok ? (r.out || "Готово (без вывода).") : "Ошибка git: " + r.err;
-      }
-      case "gitLog": {
-        const r = await runGit(agentWorkDir(settings), ["log", "--oneline", "-n", "30", "--decorate"], settings);
-        return r.ok ? (r.out || "Коммитов пока нет.") : "Ошибка git: " + r.err;
-      }
-      case "gitRevert": {
-        if (!args.commit) return "Ошибка: укажи commit (хэш, например HEAD~1)";
-        const r = await runGit(agentWorkDir(settings), ["revert", "--no-edit", String(args.commit)], settings);
-        return r.ok ? "OK — коммит отменён:\n" + (r.out || "") : "Ошибка git: " + r.err;
-      }
-      case "readFileStructure": {
-        const p = resolvePath(args.path, settings);
-        if (!fs.existsSync(p)) return "Ошибка: файл не найден: " + p;
-        if (!fs.statSync(p).isFile()) return "Ошибка: это не файл, а папка — укажи путь к файлу";
-        const r = buildFileStructure(p, args.pattern);
-        if (r.error) return "Ошибка: " + r.error;
-        if (!r.rows.length) return "В файле не найдено импортов/экспортов/объявлений" + (args.pattern ? " по фильтру «" + args.pattern + "»" : "") + ": " + p;
-        const pad = String(r.totalLines).length;
-        const text = r.rows.map((x) => String(x.line).padStart(pad, " ") + " | " + x.kind.padEnd(6, " ") + " | " + x.text).join("\n");
-        return "Структура " + p + " (" + r.totalLines + " строк, показано " + r.rows.length + "):\n" + truncateText(text, 9000) + "\n\nФрагмент читай через readFileLines(path, start, count).";
-      }
-      case "explainCode": {
-        const p = resolvePath(args.path, settings);
-        if (!fs.existsSync(p)) return "Ошибка: файл не найден: " + p;
-        if (!fs.statSync(p).isFile()) return "Ошибка: это не файл, а папка — укажи путь к файлу";
-        const st = fs.statSync(p);
-        if (st.size > 5 * 1024 * 1024) return "Ошибка: файл слишком большой (" + st.size + " байт). Смотри структуру через fileOutline, фрагменты — readFileLines.";
-        const all = fs.readFileSync(p, "utf8").split("\n");
-        const total = all.length;
-        const blocks = buildBlockRanges(all);
-        const pad = String(total).length;
-        const capWindow = 220; // максимум строк в одном окне
-        const focus = { how: "весь файл (по умолчанию — начало)", start: 1, end: Math.min(total, 120) };
-        if (args.symbol) {
-          const sym = String(args.symbol).trim();
-          const hits = blocks.filter((b) => sym && b.name && b.name.toLowerCase().includes(sym.toLowerCase()));
-          if (!hits.length) {
-            const outline = buildFileOutline(all.join("\n"), null, 300);
-            return "Не нашёл определение по имени «" + sym + "» в " + p + ". Структура файла:\n" + outline.text +
-              "\n\nУкажи точное имя (fileOutline / searchFile blocks:true помогут найти) или строку через line.";
-          }
-          const b = hits[0];
-          focus.how = "символ «" + sym + "» → блок «" + b.name + "» (" + b.kind + ", строки " + b.start + "–" + b.end + ")" +
-            (hits.length > 1 ? "; есть ещё совпадения на строках " + hits.slice(1).map((x) => x.start).join(", ") : "");
-          focus.start = b.start;
-          focus.end = b.end;
-        } else if (args.line != null || args.start != null) {
-          const raw = parseInt(args.line != null ? args.line : args.start, 10);
-          const want = Math.max(1, Math.min(raw || 1, total));
-          if (args.endLine != null) {
-            focus.how = "строки " + want + "–" + Math.max(want, Math.min(parseInt(args.endLine, 10) || want, total));
-            focus.start = want;
-            focus.end = Math.max(want, Math.min(parseInt(args.endLine, 10) || want, total));
-          } else {
-            // Без endLine расширяем до границ enclosing-блока (функция/класс/метод по OUTLINE_RULES)
-            let enc = null;
-            for (const b of blocks) if (b.start <= want) enc = b;
-            if (enc) {
-              focus.how = "строка " + want + " → внутри блока «" + enc.name + "» (" + enc.kind + ", строки " + enc.start + "–" + enc.end + ")";
-              focus.start = enc.start;
-              focus.end = enc.end;
-            } else {
-              focus.how = "строка " + want + " (вне определений — показано ±24 строки)";
-              focus.start = want;
-              focus.end = Math.min(total, want + 24);
-            }
-          }
-        }
-        if (focus.end - focus.start + 1 > capWindow) {
-          focus.end = focus.start + capWindow - 1;
-          focus.how += " (обрезано до " + capWindow + " строк — сузь диапазон endLine)";
-        }
-        // Импорты в шапке файла — до первой «рабочей» строки кода
-        const imports = [];
-        for (let i = 0; i < Math.min(total, 80); i++) {
-          const t = all[i].trim();
-          if (!t || t.startsWith("//") || t.startsWith("*") || t.startsWith("/*") || t.startsWith("#") || t.startsWith("<!--")) continue;
-          if (/^(import\b|from\s+["']|require\(|#include|use\s+[A-Za-z_:]+;|package\s+[A-Za-z_])/.test(t)) {
-            imports.push(String(i + 1).padStart(pad, " ") + " | " + all[i].trim().slice(0, 110));
-            if (imports.length >= 25) break;
-          } else if (imports.length) {
-            break; // импорты кончились
-          }
-        }
-        const inside = buildFileOutline(all.join("\n"), null, 400).entries.filter((e) => e.line >= focus.start && e.line <= focus.end);
-        const win = numberedLines(all, focus.start, focus.end, total);
-        const out = [];
-        out.push("Файл " + p + " (" + langFromExt(p) + ", " + total + " строк, " + st.size + " байт)");
-        out.push("Запрос: " + focus.how);
-        if (imports.length) out.push("\nИмпорты/зависимости (шапка файла, " + imports.length + "):\n" + imports.join("\n"));
-        out.push("\nКод (строки " + focus.start + "–" + focus.end + "):\n" + win);
-        if (inside.length) {
-          out.push("\nВ этом окне определено:\n" + inside.map((e) => String(e.line).padStart(pad, " ") + " | " + e.kind.padEnd(8, " ") + " | " + e.name).join("\n"));
-        }
-        const markers = [];
-        for (let i = focus.start - 1; i < focus.end && i < all.length; i++) {
-          const t = all[i] || "";
-          if (/TODO|FIXME|HACK|XXX/.test(t)) markers.push(String(i + 1).padStart(pad, " ") + " | " + t.trim().slice(0, 100));
-        }
-        if (markers.length) out.push("\nМаркеры TODO/FIXME в окне:\n" + markers.join("\n"));
-        out.push("\nОбъясни пользователю этот код своими словами. Больше контекста: fileOutline (структура), readFileLines (другой диапазон), searchFile с blocks:true, findReferences (где используется).");
-        return truncateText(out.join("\n"), 16000);
-      }
-      case "undoEdit": {
-        loadPersistedUndo();
-        const p = args.path ? resolvePath(args.path, settings) : null;
-        if (!p) {
-          if (!lastUndoLog.length && !activeRunUndo.length) return "Нет изменений для отката (undo-журнал пуст).";
-          const counts = new Map();
-          for (const u of [...activeRunUndo, ...lastUndoLog]) counts.set(u.path, (counts.get(u.path) || 0) + 1);
-          return "Можно откатить (по одному — undoEdit(path), шагами — undoEdit(path, steps: N)):\n" +
-            [...counts.entries()].map(([f, c]) => "• " + f + (c > 1 ? " — шагов в истории: " + c : "")).join("\n");
-        }
-        // Снимки файла: сначала свежие из текущего запуска, затем из сохранённого журнала.
-        const snaps = [];
-        for (let i = activeRunUndo.length - 1; i >= 0; i--) if (activeRunUndo[i].path === p) snaps.push(activeRunUndo[i]);
-        for (let i = lastUndoLog.length - 1; i >= 0; i--) if (lastUndoLog[i].path === p) snaps.push(lastUndoLog[i]);
-        if (!snaps.length) return "Нет снимка для отката: " + p + " (агент не менял этот файл в последних запусках).";
-        const steps = Math.min(Math.max(parseInt(args.steps, 10) || 1, 1), snaps.length);
-        const popped = snaps.slice(0, steps); // снимаем steps самых свежих
-        const target = popped[popped.length - 1]; // возвращаемся к состоянию до самой ранней из откатываемых правок
-        try {
-          if (target.content === null) {
-            if (fs.existsSync(p)) fs.unlinkSync(p);
-          } else {
-            fs.writeFileSync(p, target.content, "utf8");
-          }
-        } catch (e) {
-          return "Ошибка отката: " + (e.message || String(e));
-        }
-        const gone = new Set(popped);
-        activeRunUndo = activeRunUndo.filter((u) => !gone.has(u));
-        lastUndoLog = lastUndoLog.filter((u) => !gone.has(u));
-        persistUndo();
-        const how = popped.length === 1 ? "последнюю правку агента" : popped.length + " правки агента";
-        return target.content === null
-          ? "OK — файл удалён (он был создан агентом): " + p
-          : "OK — файл откачен на " + how + " назад: " + p + " (снимков осталось: " + Math.max(0, snaps.length - popped.length) + ")";
-      }
-      case "refactorRename": {
-        const oldName = String(args.oldName || "").trim();
-        const newName = String(args.newName || "").trim();
-        const dryRun = !!args.dryRun;
-        const root = args.path ? resolvePath(args.path, settings) : agentWorkDir(settings);
-        if (!fs.existsSync(root)) return "Ошибка: не найден путь: " + root;
-        const r = refactorRenameFiles(root, oldName, newName, dryRun);
-        if (r.error) return "Ошибка: " + r.error;
-        if (!r.changed.length) return "Совпадений «" + oldName + "» не найдено" + (args.path ? " в " + args.path : " по проекту") + ".";
-        const head = dryRun
-          ? "🔍 dryRun — ничего не изменено. Будет заменено «" + oldName + "» → «" + newName + "» (" + r.total + " вхожд.):"
-          : "OK — заменено " + r.total + " вхожд. «" + oldName + "» → «" + newName + "» в " + r.changed.length + " файлах:";
-        const lines = r.changed.slice(0, 40).map((c) => "• " + c.rel + " — " + c.count + " вхожд." + (c.sample ? "\n    " + c.sample : ""));
-        return truncateText(head + "\n" + lines.join("\n") + (r.changed.length > 40 ? "\n… и ещё " + (r.changed.length - 40) + " файлов" : ""), 9000);
-      }
-      case "runCommandOutput": {
-        const cmd = String(args.command || "").trim();
-        if (!cmd) return "Ошибка: укажи команду";
-        const cwd = agentWorkDir(settings);
-        const waitFor = args.waitFor ? String(args.waitFor) : "";
-        const retries = Math.min(Math.max(parseInt(args.retries, 10) || 0, 0), 5);
-        const timeoutMs = Math.min(parseInt(args.timeoutMs, 10) || 120000, 600000);
-        // Длительный dev-сервер (expo start, npm run dev, vite…): он не завершается сам,
-        // поэтому запускаем через bgSpawn — не блокируемся, регистрируем в bgProcesses
-        // (агент сможет остановить его через stopBackground и освободить порт) и ждём
-        // только маркер готовности, если waitFor задан. Сервер по таймауту НЕ убиваем.
-        if (SERVER_CMD_RE.test(cmd)) {
-          const rec = bgSpawn(cmd, { name: args.name || cmd.slice(0, 50), cwd });
-          termAgentEcho("$ " + cmd + "   (фоновый процесс " + rec.id + ", каталог: " + cwd + ")");
-          let head =
-            "OK — команда похожа на длительный dev-сервер, запущена в фоне БЕЗ ожидания завершения.\n" +
-            "id: " + rec.id + "\nкоманда: " + cmd + "\nPID: " + rec.child.pid + "\n";
-          if (waitFor) {
-            const r = await bgWaitFor(rec, waitFor, timeoutMs);
-            head += r.matched
-              ? "✅ в выводе появился маркер «" + waitFor + "» — сервер готов.\n"
-              : r.exited
-                ? "❌ процесс завершился раньше маркера (код " + r.code + ").\n"
-                : "⏱ маркер «" + waitFor + "» не появился за " + timeoutMs + " мс (сервер продолжает работать в фоне).\n";
-          } else {
-            head += "Дальше: checkUrl/checkPort — проверить готовность, backgroundOutput(id) — логи, stopBackground(id) — остановить (освободит порт).\n";
-          }
-          const tail = truncateText(bgTail(rec, args.lines) || "(вывода пока нет)", 6000);
-          return head + "\n--- вывод ---\n" + tail;
-        }
-        const log = [];
-        let last = null;
-        let attempt = 0;
-        for (; attempt <= retries; attempt++) {
-          if (attempt > 0) {
-            await new Promise((r2) => setTimeout(r2, 2000));
-            log.push("→ повторная попытка #" + (attempt + 1));
-          }
-          const res = await spawnCollect(cmd, cwd, timeoutMs, waitFor);
-          last = res;
-          if (res.matched) {
-            log.push("✅ в выводе появился текст «" + waitFor + "» (попытка #" + (attempt + 1) + ")");
-            break;
-          }
-          if (res.ok) {
-            log.push("✅ команда завершилась успешно (попытка #" + (attempt + 1) + ")");
-            break;
-          }
-          log.push((res.timedOut ? "⏱ таймаут (" + timeoutMs + " мс)" : "❌ команда упала (код " + res.code + ")") + " — попытка #" + (attempt + 1));
-        }
-        const tail = truncateText((last && stripAnsi(last.out || "")) || "(без вывода)", 8000);
-        return "$ " + cmd + "\n(каталог: " + cwd + ", попыток: " + (attempt + 1) + ")\n\n" + log.join("\n") + "\n\n--- вывод последней попытки ---\n" + tail;
-      }
-      case "checkInstalledProgram": {
-        const prog = String(args.programName || "").trim();
-        if (!prog) return "Ошибка: укажи programName (например git).";
-        const info = findProgram(prog);
-        if (!info.found) {
-          return "Установлено: нет\n" + info.reason + "\n\nУстанови через installSystemPackage(\"" + prog + "\"), затем вызови refreshEnv() и повтори проверку.";
-        }
-        const v = await runProgVersion(info.path);
-        return "Установлено: да\nПуть: " + info.path + "\nВерсия: " + (v || "не определилась (нет --version)") + "\n\nТочную проверку из командной строки: canExecute(\"" + prog + "\").";
-      }
-      case "canExecute": {
-        const prog = String(args.programName || args.command || "").trim().split(/\s+/)[0] || "";
-        if (!prog) return "Ошибка: укажи programName или command.";
-        const builtins = ["cd", "echo", "set", "exit", "cls", "dir", "type", "pwd", "export", "source", "alias", "if", "for", "while", "test", "true", "false"];
-        if (builtins.includes(prog.toLowerCase())) {
-          return "Можно выполнить: да\n«" + prog + "» — встроенная команда оболочки, отдельная программа не нужна.";
-        }
-        const info = findProgram(prog);
-        if (info.found) return "Можно выполнить: да\nПрограмма: " + prog + "\nПуть: " + info.path;
-        return "Можно выполнить: нет — «" + prog + "» не найден в PATH.\nУстанови: installSystemPackage(\"" + prog + "\"), затем refreshEnv().\nТочная проверка: checkInstalledProgram(\"" + prog + "\").";
-      }
-      case "getSystemInfo": {
-        const rows = [];
-        const osName = process.platform === "win32" ? "Windows" : process.platform === "darwin" ? "macOS" : process.platform === "linux" ? "Linux" : process.platform;
-        rows.push("ОС: " + osName + (process.arch ? " (" + process.arch + ")" : ""));
-        rows.push("Версия Node.js (приложение): " + (process.version || ""));
-        rows.push("Домашний каталог: " + os.homedir());
-        rows.push("Рабочая директория агента: " + agentWorkDir(settings));
-        rows.push("Записей в PATH: " + (envPathInfo().value || "").split(path.delimiter).filter(Boolean).length);
-        rows.push("");
-        // Расширенная информация: Windows — PowerShell/CIM, остальные — os.*
-        if (process.platform === "win32") {
-          const ps =
-            "[Console]::OutputEncoding=[Text.Encoding]::UTF8;" +
-            "$os=Get-CimInstance Win32_OperatingSystem; " +
-            "$cpu=Get-CimInstance Win32_Processor; " +
-            "$gpu=Get-CimInstance Win32_VideoController | Select-Object -First 1; " +
-            "$ips=@(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254*' } | ForEach-Object { $_.IPAddress }); " +
-            "$disks=@(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Root=$_.Root; UsedGB=[math]::Round($_.Used/1GB,1); FreeGB=[math]::Round($_.Free/1GB,1) } }); " +
-            "[pscustomobject]@{ os=$os.Caption; build=$os.Version; cpu=$cpu.Name; gpu=$gpu.Name; ramGB=[math]::Round($os.TotalVisibleMemorySize/1MB,1); ips=$ips; disks=$disks } | ConvertTo-Json -Compress -Depth 3";
-          // CIM-запрос конфигурации ПК — самый дорогой в инструменте, а меняется
-          // он раз в жизни машины: 30 с кэша снимают повторный обход системы.
-          const siRaw = await cachedPs("sysinfo", 30000, async () => {
-            const r = await psScript(ps, 30000);
-            return r.ok ? r.out : "";
-          });
-          const si = parseSysInfoJson(siRaw);
-          if (si.os) rows.push("Windows: " + si.os + (si.build ? " (build " + si.build + ")" : ""));
-          if (si.cpu) rows.push("CPU: " + truncateText(si.cpu, 100));
-          if (si.gpu) rows.push("GPU: " + truncateText(si.gpu, 100));
-          if (si.ramGB) rows.push("RAM: " + si.ramGB + " ГБ");
-          if (Array.isArray(si.ips) && si.ips.length) rows.push("IP-адреса (LAN): " + si.ips.join(", "));
-          if (Array.isArray(si.disks) && si.disks.length) {
-            rows.push("Диски:");
-            for (const d of si.disks) {
-              rows.push("• " + (d.Root || "?") + " — свободно " + (d.FreeGB != null ? d.FreeGB : "?") + " ГБ, занято " + (d.UsedGB != null ? d.UsedGB : "?") + " ГБ");
-            }
-          }
-        } else {
-          const cpus = os.cpus();
-          if (cpus && cpus.length) rows.push("CPU: " + truncateText(cpus[0].model, 100) + " (" + cpus.length + " ядер)");
-          rows.push("RAM: " + Math.round(os.totalmem() / 1024 / 1024 / 1024) + " ГБ всего, свободно " + Math.round(os.freemem() / 1024 / 1024 / 1024) + " ГБ");
-          const ips = [];
-          for (const k of Object.keys(os.networkInterfaces())) {
-            for (const a of os.networkInterfaces()[k] || []) {
-              if (a && a.family === "IPv4" && !a.internal && a.address && a.address.indexOf("127.") !== 0) ips.push(a.address);
-            }
-          }
-          if (ips.length) rows.push("IP-адреса (LAN): " + ips.join(", "));
-        }
-        rows.push("");
-        rows.push("Ключевые программы:");
-        for (const n of ["git", "node", "npm", "python", "docker"]) {
-          const f = findProgram(n);
-          if (!f.found) rows.push("• " + n + ": не установлен");
-          else {
-            const v = await runProgVersion(f.path);
-            rows.push("• " + n + ": " + (v || "установлен — " + f.path));
-          }
-        }
-        // Установленные программы через winget (кратко: количество + первые 10)
-        if (process.platform === "win32") {
-          const w = await spawnRaw(["winget", "list", "--accept-source-agreements", "--disable-interactivity"], { cwd: os.homedir(), timeoutMs: 25000 });
-          const wl = (w.out || "").split("\n").map((l) => l.trim()).filter((l) => l && !/^Name[ ]+Id[ ]+Version/i.test(l) && l.indexOf("---") !== 0 && !/^[0-9]+ package/i.test(l));
-          if (wl.length) {
-            rows.push("");
-            rows.push("Установленные программы (winget, всего ~" + wl.length + "):");
-            for (const l of wl.slice(0, 10)) rows.push("• " + l);
-          }
-        }
-        rows.push("");
-        rows.push("Советы: не установлено → installSystemPackage(имя) или wingetSearch(имя); не видно после установки → refreshEnv(); нужны права администратора → runCommandAsAdmin(команда); зависший процесс → listProcesses + killProcess; непонятная ошибка → explainError(код).");
-        return rows.join("\n");
-      }
-      case "installSystemPackage": {
-        return await installSystemPkg(args.packageName);
-      }
-      case "runCommandAsAdmin": {
-        return await runAsAdmin(args.command);
-      }
-      case "refreshEnv": {
-        return await refreshEnvFromOS();
-      }
-      case "explainError": {
-        const codeRaw = args.exitCode;
-        const code = codeRaw == null || codeRaw === "" ? NaN : parseInt(codeRaw, 10);
-        return explainExit(Number.isNaN(code) ? NaN : code, args.command);
-      }
-      case "timeoutCommand": {
-        const cmd = String(args.command || "").trim();
-        if (!cmd) return "Ошибка: укажи команду";
-        const ms = Math.min(Math.max(parseInt(args.timeoutMs, 10) || 15000, 1000), 600000);
-        const res = await spawnCollect(cmd, agentWorkDir(settings), ms, "");
-        const body = (res.out || "").trim();
-        if (res.ok) return "$ " + cmd + " (лимит " + ms + " мс)\n\n" + (body || "Готово (без вывода).");
-        if (res.timedOut) return "⏱ Команда не уложилась в " + ms + " мс и остановлена принудительно:\n$ " + cmd + "\n\n" + (body.slice(0, 3000) || "(вывода не было)") + "\n\nУвеличь timeoutMs или разбей команду на шаги.";
-        return "$ " + cmd + "\nКоманда упала (код " + res.code + "):\n" + (body.slice(0, 4000) || "(без вывода)") + "\n\nОбъяснение: " + explainExit(res.code, cmd);
-      }
-      case "retryCommand": {
-        const cmd = String(args.command || "").trim();
-        if (!cmd) return "Ошибка: укажи команду";
-        const retries = Math.min(Math.max(parseInt(args.maxRetries, 10) || 2, 0), 5);
-        const pauseMs = Math.min(Math.max(parseInt(args.pauseMs, 10) || 2000, 200), 30000);
-        const timeoutMs = Math.min(Math.max(parseInt(args.timeoutMs, 10) || 60000, 1000), 300000);
-        const log = [];
-        let last = null;
-        for (let attempt = 0; attempt <= retries; attempt++) {
-          const res = await spawnCollect(cmd, agentWorkDir(settings), timeoutMs, "");
-          last = res;
-          if (res.ok) {
-            return "$ " + cmd + "\n(попыток: " + (attempt + 1) + ")\n\n✅ успех с попытки #" + (attempt + 1) + "\n\n--- вывод ---\n" + ((res.out || "").trim().slice(0, 6000) || "(пусто)");
-          }
-          log.push("❌ попытка #" + (attempt + 1) + (res.timedOut ? " — таймаут " + timeoutMs + " мс" : " — код " + res.code) + (attempt < retries ? " → повтор через " + pauseMs + " мс" : ""));
-          if (attempt < retries) await new Promise((r2) => setTimeout(r2, pauseMs));
-        }
-        return "$ " + cmd + "\nНе удалось после " + (retries + 1) + " попыток:\n" + log.join("\n") + "\n\n--- вывод последней попытки ---\n" + ((last && (last.out || "").trim().slice(0, 5000)) || "(пусто)") + "\n\nОбъяснение: " + explainExit(last ? last.code : 1, cmd);
-      }
-      case "downloadAndExtract": {
-        const dest = args.path ? resolvePath(args.path, settings) : path.join(agentWorkDir(settings), "downloads");
-        return await downloadAndExtractTo(args.url, dest);
-      }
-      case "apiRequest": {
-        const url = String(args.url || "").trim();
-        if (!/^https?:\/\//i.test(url)) return "Ошибка: укажи полный URL (http/https)";
-        const method = String(args.method || "GET").toUpperCase();
-        const headers = args.headers && typeof args.headers === "object" ? { ...args.headers } : {};
-        let body = args.body;
-        if (body && typeof body === "object") {
-          body = JSON.stringify(body);
-          if (!headers["Content-Type"] && !headers["content-type"]) headers["Content-Type"] = "application/json";
-        }
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 30000);
-        try {
-          const res = await fetch(url, {
-            method,
-            headers,
-            body: body === undefined || body === null ? undefined : String(body),
-            signal: ctrl.signal,
-            redirect: "follow",
-          });
-          const text = await res.text();
-          const ct = res.headers.get("content-type") || "";
-          const isText = /text|json|xml|javascript|html|urlencoded/i.test(ct) || text.length === 0;
-          const shown = isText
-            ? truncateText(text, 6000)
-            : "(" + text.length + " байт, тип " + (ct || "неизвестен") + " — бинарное тело не показываю)";
-          return "HTTP " + res.status + " " + res.statusText + " — " + method + " " + url + "\n" +
-            "Content-Type: " + (ct || "—") + "\n" +
-            "Объём тела: " + Buffer.byteLength(text, "utf8") + " байт\n\n" + shown;
-        } catch (e) {
-          return "Ошибка " + method + " " + url + ": " + ((e && e.name === "AbortError") ? "таймаут (30 с)" : (e && e.message) || String(e));
-        } finally {
-          clearTimeout(timer);
-        }
-      }
-      case "runScript": {
-        const cwd = agentWorkDir(settings);
-        const name = String(args.scriptName || "").trim();
-        if (!name) return "Ошибка: укажи scriptName (имя скрипта из package.json)";
-        let pkg = null;
-        try { pkg = JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8")); } catch {}
-        if (!pkg) return "В каталоге " + cwd + " нет package.json.";
-        const scripts = pkg.scripts || {};
-        if (!(name in scripts)) return "Скрипта «" + name + "» нет. Доступные скрипты: " + (Object.keys(scripts).join(", ") || "нет");
-        const pm = detectPackageManager(cwd);
-        const extra = String(args.args || "");
-        const cmd = pm.name === "npm" ? "npm run " + name + (extra ? " " + extra : "") : pm.bin + " run " + name + (extra ? " " + extra : "");
-        const out = await runTerminalCommand(cmd, cwd, 300000);
-        return truncateText("$ " + cmd + "\n(каталог: " + cwd + ")\n\n" + out, 9000);
-      }
-      case "validateProject": {
-        const cwd = agentWorkDir(settings);
-        const has = (n) => fs.existsSync(path.join(cwd, n));
-        const steps = [];
-        if (has("tsconfig.json")) {
-          const out = await runTerminalCommand("npx -y tsc --noEmit", cwd, 300000);
-          steps.push({ name: "TypeScript (tsc --noEmit)", ok: !out.startsWith("Команда завершилась"), out });
-        }
-        if (has("eslint.config.js") || has("eslint.config.mjs") || has("eslint.config.cjs") || has(".eslintrc") || has(".eslintrc.json") || has(".eslintrc.js") || has(".eslintrc.cjs")) {
-          const out = await runTerminalCommand("npx -y eslint .", cwd, 300000);
-          steps.push({ name: "ESLint", ok: !out.startsWith("Команда завершилась"), out });
-        }
-        let pkg = null;
-        try { pkg = JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8")); } catch {}
-        if (pkg && pkg.scripts && pkg.scripts.test) {
-          const out = await runTerminalCommand("npm test", cwd, 300000);
-          const s = summarizeTestOutput(out);
-          steps.push({ name: "Тесты (npm test)", ok: !out.startsWith("Команда завершилась") && !/(failed|failing|упало)/i.test(s), out });
-        }
-        if (!steps.length) {
-          return "Не нашёл, что проверять в " + cwd + ": нет tsconfig.json, eslint-конфига и test-скрипта. Укажи задачи через runCommand или установи инструменты.";
-        }
-        const okCount = steps.filter((s) => s.ok).length;
-        const body = steps.map((s) => {
-          const icon = s.ok ? "✅" : "❌";
-          return icon + " " + s.name + (s.ok ? " — ок" : "") + "\n" + truncateText(s.out, 1400);
-        }).join("\n\n");
-        return "Проверка проекта (" + cwd + "): " + okCount + " из " + steps.length + " этапов успешно\n\n" + body;
-      }
-      case "gitBranch": {
-        const cwd = agentWorkDir(settings);
-        const cur = await runGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"], settings);
-        const list = await runGit(cwd, ["branch", "-a", "--no-color"], settings);
-        if (!cur.ok && !list.ok) return "Ошибка git: " + (cur.err || list.err);
-        return "Текущая ветка: " + (cur.ok ? cur.out : "(не git-репозиторий)") + "\n\nВсе ветки:\n" + (list.ok ? list.out : "(веток нет)");
-      }
-      case "gitCheckout": {
-        const cwdCh = agentWorkDir(settings);
-        const branch = String(args.branch || args.name || "").trim();
-        if (!branch) return "Ошибка: укажи branch — имя ветки (create: true, чтобы создать новую)";
-        const create = !!args.create;
-        const r = await runGit(cwdCh, ["checkout", ...(create ? ["-b", branch] : [branch])], settings);
-        if (!r.ok) {
-          const hint = create
-            ? ""
-            : "\n(Если ветки ещё нет — повтори с create: true. Если есть незакоммиченные изменения, мешающие переключению, — сначала закоммить их или отложи через git stash.)";
-          return "Ошибка git: " + r.err + hint;
-        }
-        return "OK — " + (create ? "создана и активирована ветка «" : "переключение на ветку «") + branch + "»:\n" + r.out;
-      }
-      case "findReferences": {
-        const symbol = String(args.symbol || "").trim();
-        if (!symbol) return "Ошибка: укажи symbol (имя функции/переменной/класса)";
-        let root = agentWorkDir(settings);
-        if (args.path) {
-          const rp = resolvePath(args.path, settings);
-          if (!fs.existsSync(rp)) return "Ошибка: путь не найден: " + rp;
-          root = rp;
-        }
-        const r = findSymbolReferences(root, symbol);
-        if (r.error) return "Ошибка: " + r.error;
-        if (!r.hits.length) return "Использований «" + symbol + "» не найдено в " + root + ".";
-        const files = new Set(r.hits.map((h) => h.file));
-        const defs = r.hits.filter((h) => h.kind === "определение").length;
-        const calls = r.hits.filter((h) => h.kind === "вызов").length;
-        const mark = { "определение": "◈", "импорт": "⤓", "вызов": "▸", "ссылка": "·" };
-        const pad = String(Math.max(...r.hits.map((h) => h.n))).length;
-        const text = r.hits.map((h) => (mark[h.kind] || "·") + " " + h.file + ":" + String(h.n).padStart(pad, " ") + "  [" + h.kind + "] " + h.text).join("\n");
-        return "Символ «" + symbol + "» — " + r.hits.length + " вхожд. в " + files.size + " файл. (◈ определений: " + defs + ", ▸ вызовов: " + calls + ")\n\n" + truncateText(text, 9000);
-      }
-      case "gitDiff": {
-        const cwd = agentWorkDir(settings);
-        const b1 = String(args.branch1 || "").trim();
-        const b2 = String(args.branch2 || "").trim();
-        const spec = b1 && b2 ? [b1, b2] : b1 ? [b1] : [];
-        if (!spec.length) {
-          const d = await runGit(cwd, ["diff", "--stat"], settings);
-          return d.ok ? (d.out || "Рабочее дерево чистое — нет незакоммиченных изменений.") : "Ошибка git: " + d.err;
-        }
-        const st = await runGit(cwd, ["diff", "--stat", ...spec], settings);
-        const ns = await runGit(cwd, ["diff", "--name-status", ...spec], settings);
-        const stat = st.ok ? st.out : "";
-        const names = ns.ok ? ns.out : "";
-        if (!stat && !names) return "Различий нет: " + spec.join(" … ") + " — ветки идентичны (или ветка не найдена).";
-        return "Сравнение " + spec.join(" … ") + " — изменено файлов: " + names.split("\n").filter(Boolean).length + "\n\n" + stat + "\n\n--- Файлы ---\n" + truncateText(names, 3000);
-      }
-      case "gitUndoLastCommit": {
-        const cwd = agentWorkDir(settings);
-        const r = await runGit(cwd, ["reset", "--soft", "HEAD~1"], settings);
-        if (!r.ok) return "Ошибка git: " + r.err + "\n(Частая причина — в истории нет коммитов для отмены.)";
-        return "OK — последний коммит отменён (git reset --soft HEAD~1): его изменения вернулись в рабочее дерево как незакоммиченные, ничего не потеряно.\n" + r.out;
-      }
-      case "getDependencies": {
-        const cwd = agentWorkDir(settings);
-        let pkg = null;
-        try { pkg = JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8")); } catch {}
-        if (!pkg) return "package.json не найден в " + cwd;
-        const deps = pkg.dependencies || {};
-        const dev = pkg.devDependencies || {};
-        const installed = (n) => {
-          try { return JSON.parse(fs.readFileSync(path.join(cwd, "node_modules", n, "package.json"), "utf8")).version; } catch { return null; }
-        };
-        const fmt = (o) => Object.keys(o).length
-          ? Object.keys(o).map((n) => "• " + n + "@" + o[n] + " → " + (installed(n) ? "установлено " + installed(n) : "НЕ установлено")).join("\n")
-          : "— пусто";
-        let out = "📦 dependencies (" + Object.keys(deps).length + ") в " + cwd + ":\n" + fmt(deps);
-        out += "\n\n🛠 devDependencies (" + Object.keys(dev).length + "):\n" + fmt(dev);
-        if (args.audit) {
-          if (!fs.existsSync(path.join(cwd, "package-lock.json"))) {
-            out += "\n\nnpm audit требует package-lock.json (создаётся npm install). Для bun/pnpm используй их audit-команды через runCommand.";
-          } else {
-            out += "\n\n--- npm audit (omit dev) ---\n" + truncateText(await runTerminalCommand("npm audit --omit=dev", cwd, 120000), 4000);
-          }
-        }
-        return truncateText(out, 9000);
-      }
-      case "formatCode": {
-        const cwd = agentWorkDir(settings);
-        const target = args.path ? resolvePath(args.path, settings) : "";
-        if (!target || !fs.existsSync(target)) return "Ошибка: укажи существующий path (файл или папка)";
-        const bin = path.join(cwd, "node_modules", ".bin", process.platform === "win32" ? "prettier.cmd" : "prettier");
-        if (!fs.existsSync(bin)) return "Prettier не установлен в проекте. Установи его: installPackage(\"prettier\", true), затем повтори formatCode.";
-        const check = !!args.check;
-        const out = await runTerminalCommand(bin + (check ? " --check " : " --write ") + "\"" + target + "\"", cwd, 120000);
-        return truncateText("$ prettier " + (check ? "--check" : "--write") + " " + path.relative(cwd, target) + "\n\n" + out, 6000);
-      }
-      case "dbQuery": {
-        const conn = String(args.connectionString || "").trim();
-        const sql = String(args.sql || "").trim();
-        if (!conn || !sql) return "Ошибка: укажи connectionString и sql";
-        let kind = "";
-        try {
-          const u = new URL(conn);
-          if (u.protocol === "postgres:" || u.protocol === "postgresql:") kind = "postgres";
-          else if (u.protocol === "mysql:") kind = "mysql";
-        } catch {}
-        if (!kind) return "Ошибка: поддерживаются строки подключения postgres://... и mysql://...";
-        return await new Promise((resolve) => {
-          const baseEnv = { ...process.env, ...agentEnv };
-          if (kind === "postgres") {
-            execFile("psql", [conn, "-v", "ON_ERROR_STOP=1", "-c", sql], { timeout: 60000, maxBuffer: 16 * 1024 * 1024, windowsHide: true, env: baseEnv }, (err, stdout, stderr) => {
-              const o = stripAnsi((stdout || "").toString());
-              const e = stripAnsi((stderr || "").toString());
-              if (err) {
-                if (err.code === "ENOENT") return resolve("Клиент psql не найден в системе. Установи PostgreSQL-клиент и добавь в PATH, затем повтори.");
-                return resolve(truncateText("Ошибка psql:\n" + (e || err.message || String(err)), 7000));
-              }
-              resolve(truncateText("psql OK:\n" + (o || "(без вывода)") + (e ? "\n[stderr]\n" + e : ""), 7000));
-            });
-          } else {
-            let u = null;
-            try { u = new URL(conn); } catch {}
-            if (!u) return resolve("Ошибка парсинга строки подключения");
-            const a = [];
-            if (u.hostname) a.push("--host=" + u.hostname);
-            if (u.port) a.push("--port=" + u.port);
-            if (u.username) a.push("--user=" + decodeURIComponent(u.username));
-            const db = decodeURIComponent((u.pathname || "").replace(/^\//, ""));
-            if (db) a.push(db);
-            a.push("-e", sql);
-            const menv = { ...baseEnv };
-            if (u.password) menv.MYSQL_PWD = decodeURIComponent(u.password);
-            execFile("mysql", a, { timeout: 60000, maxBuffer: 16 * 1024 * 1024, windowsHide: true, env: menv }, (err, stdout, stderr) => {
-              const o = stripAnsi((stdout || "").toString());
-              const e = stripAnsi((stderr || "").toString());
-              if (err) {
-                if (err.code === "ENOENT") return resolve("Клиент mysql не найден в системе. Установи MySQL-клиент и добавь в PATH, затем повтори.");
-                return resolve(truncateText("Ошибка mysql:\n" + (e || err.message || String(err)), 7000));
-              }
-              resolve(truncateText("mysql OK:\n" + (o || "(без вывода)") + (e ? "\n[stderr]\n" + e : ""), 7000));
-            });
-          }
-        });
-      }
-      case "listProcesses": {
-        const filter = String(args.filter || "").trim().toLowerCase();
-        let out = "";
-        if (process.platform === "win32") {
-          // Список процессов спрашивают подряд («сервер ещё жив?»): 2 с кэша
-          // снимают повторный tasklist, а короткий TTL не показывает мёртвое.
-          out = await cachedPs("proc:win", 2000, async () => {
-            const r = await spawnRaw(["tasklist", "/FO", "CSV", "/NH"], { cwd: os.homedir(), timeoutMs: 20000 });
-            return r.ok ? r.out : "";
-          });
-        } else {
-          const r = await spawnRaw(["ps", "-eo", "pid=,comm=,%cpu=,rss=,args="], { cwd: os.homedir(), timeoutMs: 20000 });
-          out = r.ok ? r.out : "";
-        }
-        let procs = parseProcessesCsv(out);
-        if (filter) {
-          procs = procs.filter((p) => (p.name || "").toLowerCase().indexOf(filter) !== -1 || (p.args || "").toLowerCase().indexOf(filter) !== -1);
-        }
-        procs = procs.slice(0, 60);
-        if (!procs.length) return "Процессы не найдены" + (filter ? " по фильтру «" + filter + "»" : "") + ".";
-        const head = "Процессы" + (filter ? " (фильтр «" + filter + "»)" : "") + " (" + procs.length + " из списка):\n";
-        return head + procs.map((p) => {
-          const mem = p.mem ? " " + p.mem : p.rss ? " " + Math.round(Number(p.rss) / 1024) + " КБ" : "";
-          const argsPart = p.args ? "  «" + truncateText(p.args, 110) + "»" : "";
-          return "• PID " + p.pid + " — " + (p.name || "") + mem + argsPart;
-        }).join("\n") + "\n\nЗависший процесс завершай через killProcess(pid или name).";
-      }
-      case "killProcess": {
-        const pid = parseInt(args.pid, 10);
-        const name = String(args.name || "").trim();
-        const force = args.force === true || args.force === "true" || args.force === 1;
-        if (!pid && !name) return "Ошибка: укажи pid (число из listProcesses) или name (например node).";
-        let cmd, label;
-        if (process.platform === "win32") {
-          cmd = "taskkill " + (pid ? "/PID " + pid : "/IM " + name) + " /T" + (force ? " /F" : "");
-          label = pid ? "PID " + pid : name;
-        } else if (pid) {
-          cmd = "kill " + (force ? "-9 " : "") + pid;
-          label = "PID " + pid;
-        } else {
-          cmd = "pkill " + (force ? "-9 " : "-TERM ") + JSON.stringify(name);
-          label = name;
-        }
-        const out = await runTerminalCommand(cmd, os.homedir(), 20000);
-        invalidatePsCache("proc:"); // мы только что убили процесс — старый список не отдаём
-        const failed = /не найден|ERROR|not found|No matching|No processes|кодом (1|128)/i.test(out);
-        return (failed ? "Возможно, процесс уже завершён или не найден:\n" : "OK — процесс " + label + " завершён.\n") + "$ " + cmd + "\n\n" + out;
-      }
-      case "clipboardWrite": {
-        const text = String(args.text == null ? "" : args.text);
-        try {
-          clipboard.writeText(text);
-        } catch (e) {
-          return "Ошибка: не удалось записать в буфер обмена: " + (e.message || String(e));
-        }
-        return "OK — текст скопирован в буфер обмена (" + text.length + " симв.).";
-      }
-      case "clipboardRead": {
-        let text = "";
-        try {
-          text = clipboard.readText() || "";
-        } catch (e) {
-          return "Ошибка: не удалось прочитать буфер обмена: " + (e.message || String(e));
-        }
-        if (!text.trim()) return "Буфер обмена пуст (текста нет).";
-        return "Содержимое буфера обмена:\n\n" + truncateText(text, 4000);
-      }
-      case "screenshotDesktop": {
-        const winFilter = String(args.window || "").trim().toLowerCase();
-        let sources = [];
-        try {
-          sources = await desktopCapturer.getSources({
-            types: winFilter ? ["window"] : ["screen"],
-            thumbnailSize: { width: 1920, height: 1080 },
-            fetchWindowIcons: false,
-          });
-        } catch (e) {
-          return "Ошибка захвата экрана: " + (e.message || String(e)) + " (работает только в десктоп-приложении).";
-        }
-        let src = sources[0];
-        if (winFilter) src = sources.find((s) => s.name.toLowerCase().indexOf(winFilter) !== -1) || sources[0];
-        if (!src) return "Не удалось получить источники экрана/окон.";
-        const shot = encodeShot(src.thumbnail, args);
-        if (!shot.buf || !shot.buf.length) return "Пустой скриншот «" + src.name + "» — не удалось захватить.";
-        const sz = src.thumbnail.getSize();
-        const dataUrl = "data:" + shot.mime + ";base64," + shot.buf.toString("base64");
-        if (activeEmit) activeEmit({ type: "image", path: "desktop:" + src.name, dataUrl });
-        let saved = null;
-        try {
-          if (shot.buf.length) saved = saveScreenshotPng(shot.buf, "screen", shot.mime);
-        } catch {}
-        return "OK — скриншот «" + src.name + "» (" + sz.width + "×" + sz.height + ") снят, показан пользователю во встроенном просмотрщике" +
-          (saved ? " и сохранён: " + saved : "") +
-          ". Чтобы понять, что на экране, вызови analyzeImage(path: '" + (saved || "") + "') — вернёт описание вспомогательной vision-моделью.";
-      }
-      case "registryRead": {
-        if (process.platform !== "win32") return "Ошибка: реестр Windows доступен только на Windows.";
-        const regPath = String(args.path || "").trim();
-        const name = String(args.name || "").trim();
-        const chk = registryPathAllowed(regPath, false);
-        if (!chk.ok) return "Ошибка: " + chk.error;
-        const esc = regPath.replace(/'/g, "''");
-        let ps;
-        if (name) {
-          const escName = name.replace(/'/g, "''");
-          ps =
-            "[Console]::OutputEncoding=[Text.Encoding]::UTF8;" +
-            "try { $v = Get-ItemPropertyValue -Path '" + esc + "' -Name '" + escName + "' -ErrorAction Stop; Write-Output (($v | Out-String).Trim()) } catch { Write-Output '__ERR__' }";
-        } else {
-          ps =
-            "[Console]::OutputEncoding=[Text.Encoding]::UTF8;" +
-            "$i = Get-Item -Path '" + esc + "' -ErrorAction SilentlyContinue; " +
-            "if ($null -eq $i) { Write-Output '__ERR__' } else { $d = $i.GetValue(''); if ($null -eq $d) { Write-Output '(раздел без значения по умолчанию)' } else { Write-Output ('Значение по умолчанию: ' + $d) } }";
-        }
-        // Реестр читают часто, а пишут редко — 5 с кэша на путь+значение;
-        // ошибку (нет раздела/нет прав) не кэшируем: её могут исправить сразу.
-        const rr = await cachedPs(
-          "reg:" + regPath + "|" + name,
-          5000,
-          async () => {
-            const r = await psScript(ps, 20000);
-            return { out: (r.out || "").trim(), err: r.err || "" };
-          },
-          (v) => /__ERR__|Cannot find|не найден|отказано/i.test(v.out)
-        );
-        const out = rr.out;
-        if (out.indexOf("__ERR__") !== -1 || /Cannot find|не найден|отказано/i.test(out + rr.err)) {
-          return "Раздел или значение не найдено: " + regPath + (name ? " → " + name : "") + ". Проверь путь — чтение разрешено только из SOFTWARE/ENVIRONMENT/SYSTEM/SECURITY.";
-        }
-        return "Реестр " + regPath + (name ? " → " + name : "") + ":\n" + out;
-      }
-      case "registryWrite": {
-        if (process.platform !== "win32") return "Ошибка: реестр Windows доступен только на Windows.";
-        const regPath = String(args.path || "").trim();
-        const name = String(args.name || "").trim();
-        if (!name) return "Ошибка: укажи name (имя значения).";
-        const value = String(args.value == null ? "" : args.value);
-        const type = String(args.type || "REG_SZ").toUpperCase();
-        if (["REG_SZ", "REG_DWORD", "REG_EXPAND_SZ"].indexOf(type) === -1) {
-          return "Ошибка: type должен быть REG_SZ, REG_DWORD или REG_EXPAND_SZ.";
-        }
-        const chk = registryPathAllowed(regPath, true);
-        if (!chk.ok) return "Ошибка: " + chk.error;
-        const esc = regPath.replace(/'/g, "''");
-        const escName = name.replace(/'/g, "''");
-        const valPs = type === "REG_DWORD" ? String(Number(value) || 0) : value.replace(/'/g, "''");
-        const ps =
-          "[Console]::OutputEncoding=[Text.Encoding]::UTF8;" +
-          "$p = '" + esc + "';" +
-          "New-Item -Path $p -Force | Out-Null;" +
-          "New-ItemProperty -Path $p -Name '" + escName + "' -Value '" + valPs + "' -PropertyType " + type + " -Force | Out-Null;" +
-          "Write-Output 'OK'";
-        const r = await psScript(ps, 20000);
-        if (!r.ok || (r.out || "").indexOf("OK") === -1) {
-          return "Ошибка записи: " + (((r.err || "") + " " + (r.out || "")).trim() || "неизвестная причина") + " — проверь права (HKCU не требует админа) или путь.";
-        }
-        invalidatePsCache("reg:"); // запись сделана — кэш чтения реестра больше не верен
-        return "OK — значение «" + name + "» = «" + value + "» (" + type + ") записано в " + regPath;
-      }
-      case "openPath": {
-        const p = resolvePath(args.path, settings);
-        if (!fs.existsSync(p)) return "Ошибка: путь не найден: " + p;
-        const err = await shell.openPath(p);
-        return err ? "Не удалось открыть: " + err : "OK — открыто системным приложением: " + p;
-      }
-      case "wingetSearch": {
-        if (process.platform !== "win32") return "Ошибка: winget доступен только на Windows.";
-        const q = String(args.query || "").trim();
-        if (!q) return "Ошибка: укажи query (например python, ffmpeg, ollama).";
-        const r = await spawnRaw(["winget", "search", q, "--accept-source-agreements", "--disable-interactivity"], { cwd: os.homedir(), timeoutMs: 60000 });
-        const out = (r.out || "").trim();
-        if (!r.ok && !out) {
-          return "winget недоступен: " + ((r.err || "").trim() || "код " + r.code) + ". Установи winget (Microsoft Store: «App Installer») или используй installSystemPackage — при отсутствии winget попробует choco/scoop.";
-        }
-        const lines = out.split("\n").filter((l) => l.trim() && !/^Name\s+Id\s+Version\s+Source/i.test(l));
-        return "Результаты winget search «" + q + "»:\n\n" + (lines.slice(0, 25).join("\n") || out || "ничего не найдено") + "\n\nУстановка: installSystemPackage(\"" + q + "\") — если ID уникален, или укажи полный ID вида Vendor.Name из списка.";
-      }
-      case "installExe": {
-        const url = String(args.url || "").trim();
-        const name = String(args.name || "").trim();
-        if (!/^https?:\/\//i.test(url)) {
-          return "Ошибка: укажи прямой URL установщика — .exe, .msi или .zip (https://...).";
-        }
-        const tmpDir = path.join(os.tmpdir(), "ai-agent-install");
-        try { fs.mkdirSync(tmpDir, { recursive: true }); } catch (e) { return "Ошибка: не удалось создать временную папку: " + (e.message || String(e)); }
-        // Расширение берём из URL без строки запроса и #якоря. Имя файла больше
-        // НЕ форсируется в .exe — иначе .msi и .zip скачивались как «installer.exe».
-        const pathOnly = url.split("#")[0].split("?")[0];
-        const ext = (path.extname(pathOnly) || "").toLowerCase();
-        const rawBase = (name || path.basename(pathOnly) || "installer").replace(/[^A-Za-z0-9._-]/g, "_").replace(/\.+$/, "") || "installer";
-        const withExt = /\.(exe|msi|zip|msix|appx)$/i.test(rawBase) ? rawBase : rawBase + (ext || ".exe");
-
-        // .zip — не установщик, а архив (portable-сборки): распаковываем и ищем
-        // внутри .exe/.msi, чтобы сразу предложить (или выполнить) установку.
-        if (ext === ".zip") {
-          const destDir = path.join(tmpDir, withExt.replace(/\.zip$/i, "") + "-files");
-          const res0 = await downloadAndExtractTo(url, destDir);
-          if (/^Ошибка/.test(res0)) return res0;
-          const found = findInstallersIn(destDir);
-          if (!found.length) {
-            return "Архив распакован: " + destDir + "\nУстановщика (.exe/.msi/.bat/.cmd) внутри не нашлось — это portable-сборка, запускай файлы прямо оттуда.\n" + res0;
-          }
-          const first = found[0];
-          if (args.run !== true) {
-            return (
-              "Архив распакован: " + destDir + "\nНайдены установщики:\n" +
-              found.slice(0, 10).map((f, i) => "  " + (i + 1) + ") " + f).join("\n") +
-              "\n\nЗапустить первый: installExe({ url: ..., run: true }) — или запусти нужный файл сам через runCommand."
-            );
-          }
-          const outZ = await runTerminalCommand('"' + first + '"', os.homedir(), 300000);
-          return "Архив распакован: " + destDir + "\n$ \"" + first + "\"\n\n" + outZ;
-        }
-
-        // .msi ставится только msiexec (прямой запуск даёт «не является приложением»).
-        if (ext === ".msi") {
-          if (process.platform !== "win32") return "Ошибка: .msi ставится только в Windows (msiexec). Возьми .zip или сборку для этой ОС.";
-          const destMsi = path.join(tmpDir, withExt);
-          const dl = await downloadFileTo(url, destMsi);
-          if (!dl.ok) return dl.error;
-          const silentMsi = String(args.silentArgs || "").trim() || "/passive /norestart";
-          const cmdMsi = "msiexec /i \"" + destMsi + "\" " + silentMsi;
-          const outM = await runTerminalCommand(cmdMsi, os.homedir(), 300000, "cmd");
-          const looksFailedM = /кодом (?!0$)[0-9]+|Access is denied|отказано в доступе|требуется повышение|administrator|1603|1722/i.test(outM);
-          return (
-            "Установщик скачан: " + destMsi + " (" + Math.round(dl.size / 1024 / 1024) + " МБ)\n" +
-            "$ " + cmdMsi + "\n\n" + outM +
-            (looksFailedM
-              ? "\n\nmsiexec вернул ошибку (1603/1722 — установка не прошла). Часто нужны права администратора: runCommandAsAdmin(\"" + cmdMsi.replace(/"/g, "") + "\")."
-              : "\n\nПроверь: checkInstalledProgram(\"" + (name || "программа") + "\").")
-          );
-        }
-
-        // .exe и всё остальное — как раньше: скачать и запустить с тихими ключами.
-        const silent = String(args.silentArgs || "").trim() || "/S";
-        const dest = path.join(tmpDir, withExt);
-        const dlx = await downloadFileTo(url, dest);
-        if (!dlx.ok) return dlx.error;
-        const cmd = '"' + dest + '" ' + silent;
-        const out = await runTerminalCommand(cmd, os.homedir(), 300000);
-        const looksFailed = /кодом [0-9]+|Access is denied|отказано в доступе|требуется повышение|administrator/i.test(out);
-        return (
-          "Установщик скачан: " + dest + " (" + Math.round(dlx.size / 1024 / 1024) + " МБ)\n" +
-          "$ " + cmd + "\n\n" + out +
-          (looksFailed
-            ? "\n\nЕсли установка требует прав администратора — повтори через runCommandAsAdmin(\"" + cmd.replace(/"/g, "") + "\")."
-            : "\n\nПроверь: checkInstalledProgram(\"" + (name || "программа") + "\").")
-        );
-      }
-      case "noteSave": {
-        const nKey = String(args.key || "").trim();
-        const nContent = String(args.content ?? "");
-        const nR = agentStore.noteSave(app.getPath("userData"), agentWorkDir(settings), nKey, nContent);
-        return nR.ok ? "OK — " + nR.message : "Ошибка: " + nR.error;
-      }
-      case "noteRead": {
-        const nrKey = String(args.key || "").trim();
-        const nrR = agentStore.noteRead(app.getPath("userData"), agentWorkDir(settings), nrKey);
-        if (!nrR.ok) return "Ошибка: " + nrR.error;
-        if (nrR.key) return "Заметка «" + nrR.key + "»:\n" + nrR.content;
-        if (!nrR.notes.length) {
-          return "Заметок проекта пока нет. Сохрани первую через noteSave(key, content) — они переживают перезапуск и помогают продолжать работу в новых сессиях.";
-        }
-        const nrRows = nrR.notes.map((n) => "• " + n.key + " (" + new Date(n.ts).toLocaleString() + "):\n  " + n.content.replace(/\n/g, "\n  "));
-        return "Заметки проекта (" + nrR.notes.length + "):\n" + nrRows.join("\n\n");
-      }
-      case "noteList": {
-        const nlR = agentStore.noteRead(app.getPath("userData"), agentWorkDir(settings), "");
-        if (!nlR.ok) return "Ошибка: " + nlR.error;
-        if (!nlR.notes.length) return "Заметок проекта пока нет. Сохрани первую через noteSave(key, content).";
-        return "Заметки проекта (" + nlR.notes.length + "):\n" + nlR.notes.map((n) => "• " + n.key).join("\n");
-      }
-      case "noteDelete": {
-        const ndKey = String(args.key || "").trim();
-        const ndR = agentStore.noteDelete(app.getPath("userData"), agentWorkDir(settings), ndKey);
-        return ndR.ok ? "OK — " + ndR.message : "Ошибка: " + ndR.error;
-      }
-      case "todoWrite": {
-        // План работ: приложение только нормализует и показывает его панелью-
-        // чеклистом — состояние (статусы, переживание перезапуска) хранит интерфейс.
-        const planTasks = normalizePlanTasks(args.tasks != null ? args.tasks : args.items != null ? args.items : args);
-        if (!planTasks.length) {
-          return "Ошибка: план пуст. Пришли непустой tasks — массив до 7 пунктов (строка или { text, status }).";
-        }
-        const planTitle = String(args.title || "").trim().slice(0, 80);
-        if (activeEmit) activeEmit({ type: "plan", tasks: planTasks, title: planTitle });
-        const ps = planSummary(planTasks);
-        activePlanSummary = { total: ps.total, done: ps.done, failed: ps.failed };
-        const planRows = planTasks.map((t) =>
-          (t.status === "done" ? "✅ " : t.status === "failed" ? "⚠️ " : t.status === "in_progress" ? "🔄 " : "⬜ ") +
-          t.text + (t.note ? " — " + t.note : "")
-        );
-        return (
-          "OK — план показан пользователю: " + ps.done + " из " + ps.total + " готово" +
-          (ps.failed ? ", сбоев: " + ps.failed : "") + ".\n" +
-          planRows.join("\n") + "\n" +
-          (ps.done === ps.total
-            ? "Все пункты готовы — подведи короткий итог без пересказа плана."
-            : "Продолжай со следующего пункта; после каждого шага вызывай todoWrite заново с ПОЛНЫМ списком.")
-        );
-      }
-      case "memoryList": {
-        // Настройки читаем в момент вызова: галочку могли включить только что.
-        const ms = loadSettings();
-        const memDir = agentStore.contextMemoryDir(app.getPath("userData"));
-        if (!ms.contextMemory) {
-          return (
-            "Память диалогов выключена. Включи галочку «Память диалогов» в Настройках → 🧠 Память диалогов: тогда сжатые памятки будут сохраняться локально по датам, и я смогу вспоминать прошлые сессии.\n" +
-            "Папка дневника: " + memDir
-          );
-        }
-        const mmDate = String(args.date || "").trim();
-        if (mmDate) {
-          const mr = agentStore.contextMemoryRead(app.getPath("userData"), mmDate);
-          if (!mr.ok) return "Ошибка: " + mr.error;
-          const rows = mr.memos.map((m) =>
-            "• " + m.time + " — " + (m.provider || "?") + (m.model ? "/" + m.model : "") +
-            (m.workDir ? "\n  папка: " + m.workDir : "") + "\n" + String(m.memo || "").replace(/^/gm, "  ")
-          );
-          return "Памятки контекста за " + mmDate + " (" + mr.count + "):\n\n" + rows.join("\n\n");
-        }
-        const md = agentStore.contextMemoryDays(app.getPath("userData"));
-        if (!md.length) {
-          return "Память диалогов включена, но памяток пока нет: они появляются, когда контекст переполняется и старые шаги сворачиваются в памятку.";
-        }
-        const mrows = md.map((d) =>
-          "• " + d.date + " — " + d.count + " памяток" + (d.last ? ", последняя в " + new Date(d.last).toLocaleTimeString() : "")
-        );
-        return (
-          "Дни в памяти диалогов (" + md.length + "):\n" + mrows.join("\n") +
-          '\n\nПамятки за конкретный день — memoryList(date: "ГГГГ-ММ-ДД"); поиск — memorySearch(query: "...").'
-        );
-      }
-      case "memorySearch": {
-        const ms2 = loadSettings();
-        if (!ms2.contextMemory) {
-          return "Память диалогов выключена — включи галочку «Память диалогов» в настройках (Настройки → 🧠).";
-        }
-        const mq = String(args.query || "").trim();
-        if (!mq) return "Ошибка: укажи query — что искать в памятках.";
-        const msr = agentStore.contextMemorySearch(app.getPath("userData"), {
-          query: mq,
-          date: String(args.date || "").trim(),
-          limit: Number(args.limit) || 20,
-        });
-        if (!msr.ok) return "Ошибка: " + msr.error;
-        if (!msr.matches.length) {
-          return "По запросу «" + mq + "» в памяти диалогов ничего не найдено. Список дней — memoryList.";
-        }
-        const srows = msr.matches.map((m) => "• " + m.date + " " + m.time + " (совпадений: " + m.hits + "): " + m.snippet);
-        return "Найдено в памяти диалогов (" + msr.count + "):\n" + srows.join("\n");
-      }
-      case "checkpointSave": {
-        const csR = agentStore.checkpointSave(app.getPath("userData"), agentWorkDir(settings), args.label);
-        return csR.ok ? "OK — " + csR.message : "Ошибка: " + csR.error;
-      }
-      case "checkpointList": {
-        const clR = agentStore.checkpointList(app.getPath("userData"));
-        if (!clR.checkpoints.length) {
-          return "Чекпоинтов пока нет. Создай первый через checkpointSave(label) перед серией правок — потом можно откатиться через checkpointRollback(id).";
-        }
-        const clRows = clR.checkpoints.map((c) => "• " + c.id + " — «" + c.label + "», " + c.files + " файлов, " + new Date(c.createdAt).toLocaleString());
-        return "Чекпоинты (" + clR.checkpoints.length + "):\n" + clRows.join("\n");
-      }
-      case "checkpointRollback": {
-        const crId = String(args.id || "").trim();
-        if (!crId) return "Ошибка: укажи id чекпоинта (смотри checkpointList).";
-        const crR = agentStore.checkpointRollback(app.getPath("userData"), crId);
-        if (!crR.ok) return "Ошибка: " + crR.error;
-        return "OK — " + crR.message + (crR.errors && crR.errors.length ? "\nОшибки: " + crR.errors.join("; ") : "");
-      }
-      case "otaStatus": {
-        const os = ota.status(loadSettings());
-        return (
-          "OTA-статус:\n" +
-          "• Включено: " + (os.enabled ? "да" : "нет — включи в настройках «🔄 Самосовершенствование (OTA)»\n") +
-          "• Установленная версия кода: " + os.installed + "\n" +
-          "• Папка OTA: " + os.dir + "\n" +
-          "• Источники бандлов: " + (os.sources && os.sources.length ? "\n  " + os.sources.join("\n  ") : "—")
-        );
-      }
-      case "otaCheck": {
-        const oc = await ota.check(loadSettings());
-        if (oc.status === "disabled") return "OTA отключено в настройках (галочка «Разрешить локальные обновления на ходу»).";
-        if (oc.status === "busy") return "Сейчас идёт работа агента — применять обновление нельзя. Бандл применится автоматически в течение минуты после завершения задачи.";
-        if (oc.status === "applied") return "✅ Обновление применено до версии " + oc.version + " — приложение перезапускается с новым кодом.";
-        if (oc.status === "error") return "Ошибка применения OTA: " + (oc.message || "неизвестная") + "\nПроверь синтаксис изменённых файлов (node --check) и пересобери бандл (node scripts/make-ota.js).";
-        return "Обновлений нет — код актуален.";
-      }
-      case "otaRollback": {
-        if (global.__agentRunning) return "Нельзя откатываться во время работы агента — дождись завершения текущей задачи.";
-        const or = ota.rollback();
-        return or.ok ? "↩ Откат выполнен — приложение перезапускается с предыдущей версией кода." : "Ошибка отката: " + (or.message || "предыдущей версии нет");
-      }
-      case "applyPatch": {
-        const patch = String(args.patch ?? "");
-        if (!patch.trim()) return "Ошибка: укажи patch — unified diff (формат git diff) с изменениями файлов.";
-        const base = args.basePath ? resolvePath(args.basePath, settings) : agentWorkDir(settings);
-        if (!fs.existsSync(base) || !fs.statSync(base).isDirectory()) return "Ошибка: базовой директории нет: " + base;
-        // Снимаем undo-снимки для всех файлов, которые затронет патч.
-        for (const f of unifiedPatch.parsePatch(patch)) {
-          const rel = unifiedPatch.safeRel(base, f.b || f.a);
-          if (!rel) continue;
-          const abs = path.join(base, rel);
-          if (selfDev.protectedSelfPath(abs, { appSrcDir: __dirname, otaRoot: ota.resolveCurrent() })) {
-            return "⛔ Патч затрагивает защищённый файл самообновления: " + abs + "\nПравка src/bootstrap.js, src/ota.js или папки применённого OTA-бандла заблокирована — убери этот файл из патча.";
-          }
-          if (fs.existsSync(abs) && fs.statSync(abs).isFile()) snapshotFileForUndo(abs);
-        }
-        const r = unifiedPatch.applyUnifiedPatch(base, patch);
-        if (!r.ok) {
-          return "Ошибка применения патча:\n" + r.errors.map((e) => "• " + e.path + " — " + e.error).join("\n") +
-            "\n\nПеречитай файлы (readFile) и сгенерируй патч заново с точным контекстом, либо правь файлы по одному через editFile.";
-        }
-        return "OK — патч применён, изменено файлов: " + r.changed.length + (r.changed.length ? "\n" + r.changed.map((f) => "• " + f).join("\n") : "");
-      }
-      case "waitUntil": {
-        const secs = Math.max(1, Math.min(parseInt(args.seconds, 10) || 5, 300));
-        if (args.reason) termAgentEcho("⏳ " + args.reason + " (жду " + secs + " с)");
-        await new Promise((res) => setTimeout(res, secs * 1000));
-        return "OK — подождал " + secs + " с" + (args.reason ? " (" + args.reason + ")" : "") + ". Теперь перепроверь состояние (например checkPort/checkUrl/backgroundOutput).";
-      }
-      case "gitStash": {
-        const cwd = agentWorkDir(settings);
-        const action = String(args.action || "push").toLowerCase();
-        const isList = action === "list";
-        const isPop = action === "pop";
-        const isPush = action === "push";
-        if (!isList && !isPop && !isPush) return "Ошибка: action может быть push (сохранить изменения), pop (вернуть) или list (показать).";
-        if (isList) {
-          const r = await runGit(cwd, ["stash", "list"], settings);
-          return r.ok ? (r.out || "Стеков stash нет.") : "Ошибка git: " + r.err;
-        }
-        if (isPop) {
-          const r = await runGit(cwd, ["stash", "pop"], settings);
-          if (!r.ok) return "Ошибка git: " + r.err + " (возможен конфликт — проверь gitStatus и разбери изменения вручную).";
-          return "OK — изменения возвращены из stash:\n" + r.out;
-        }
-        const msg = String(args.message || "").trim() || "Авто-stash агента";
-        const r = await runGit(cwd, ["stash", "push", "-m", msg], settings);
-        if (!r.ok) return "Ошибка git: " + r.err;
-        return "OK — изменения спрятаны в stash («" + msg + "»). Вернуть: gitStash(action: pop). Рабочее дерево теперь чистое.";
-      }
-      case "gitCherryPick": {
-        const cwd = agentWorkDir(settings);
-        const commit = String(args.commit || "").trim();
-        if (!commit) return "Ошибка: укажи commit — хэш или ссылку (например HEAD~1 или abc123).";
-        const r = await runGit(cwd, ["cherry-pick", commit], settings);
-        if (!r.ok) return "Ошибка git: " + r.err + " (возможен конфликт — разбери его, затем gitCherryPick не нужен, просто gitCommit после разрешения).";
-        return "OK — коммит " + commit + " перенесён на текущую ветку:\n" + r.out;
-      }
-      case "gitBlame": {
-        const cwd = agentWorkDir(settings);
-        const p = resolvePath(args.path, settings);
-        if (!fs.existsSync(p)) return "Ошибка: файл не найден: " + p;
-        const rel = path.relative(cwd, p) || path.basename(p);
-        const lines = parseInt(args.lines, 10);
-        const gitArgs = ["blame"];
-        if (Number.isInteger(lines) && lines >= 1) gitArgs.push("-L", "1," + Math.min(lines, 500));
-        gitArgs.push("--", rel);
-        const r = await runGit(cwd, gitArgs, settings);
-        if (!r.ok) return "Ошибка git: " + r.err;
-        return "История строк файла " + rel + " (git blame):\n" + truncateText(r.out, 9000);
-      }
-      case "semanticSearch": {
-        const query = String(args.query || "").trim();
-        if (!query) return "Ошибка: укажи query — что ищем по смыслу (например «валидация входа», «db подключение»).";
-        const base = args.path ? resolvePath(args.path, settings) : agentWorkDir(settings);
-        if (!fs.existsSync(base) || !fs.statSync(base).isDirectory()) return "Ошибка: директория не найдена: " + base;
-        const maxResults = Math.min(parseInt(args.maxResults, 10) || 8, 20);
-        const index = codeIndex.getIndex(app.getPath("userData"), base);
-        if (!index.docsCount) return "Нечего искать в " + base + " — текстовых файлов не найдено.";
-        const hits = codeIndex.searchIndex(index, query, maxResults);
-        if (!hits.length) {
-          return "По запросу «" + query + "» ничего не найдено в " + index.docsCount + " файлах (индекс: " + base + ").\nПопробуй другие слова (поиск работает по смыслу: auth → authenticate) или searchFile для точного регулярного поиска.";
-        }
-        const rows = hits.map((h, i) => {
-          const sn = codeIndex.snippetForFile(base, h.rel, query, 3);
-          return "#" + (i + 1) + " " + h.rel + " (релевантность " + h.score.toFixed(2) + ")\n" + sn.text;
-        });
-        return (
-          "Семантический поиск «" + query + "» — индексировано файлов: " + index.docsCount + ", топ-" + hits.length + ":\n\n" +
-          rows.join("\n\n") +
-          "\n\nДальше: readFileLines(path, start, count) — читать найденное, searchFile — точный регулярный поиск."
-        );
-      }
-      // ── Yandex Cloud (REST API): инструменты агента ──
-      case "ycStatus": {
-        const cfg = ycConfig(loadSettings());
-        if (!cfg.oauth) {
-          return "Yandex Cloud не подключён. Скажи пользователю: Настройки → «☁️ Yandex Cloud» → получить OAuth-токен и вставить его. После авторизации инструмент заработает.";
-        }
-        if (!cfg.folderId) return "Авторизация есть, но не выбран каталог. Открой Настройки → Yandex Cloud и выбери каталог (или дождись, пока приложение выберет первый автоматически).";
-        try {
-          const svcs = await yandexCloud.resourcesStatus(cfg.oauth, cfg.folderId);
-          const rows = svcs.map((s) => "• " + s.icon + " " + s.title + ": " + (s.ok ? s.count : "ошибка: " + String(s.error || "").slice(0, 120)));
-          return (
-            "Yandex Cloud · каталог «" + cfg.folderName + "» (" + cfg.folderId + ")\n" +
-            "Создание агентом: " + (cfg.allowCreate ? "разрешено" : "ЗАПРЕЩЕНО — включи в Настройках → Yandex Cloud") + "\n" +
-            "Удаление агентом: " + (cfg.allowDelete ? "разрешено" : "ЗАПРЕЩЕНО — включи в Настройках → Yandex Cloud") + "\n" +
-            "Правка контейнеров (ycContainer: ревизии, откат, настройки): " + (cfg.allowUpdate ? "разрешено" : "ЗАПРЕЩЕНО — включи в Настройках → Yandex Cloud") + "\n\nРесурсы:\n" +
-            rows.join("\n") +
-            "\n\nСоздание: ycCreate(service, name). Доступны: " + yandexCloud.creatableKeys().join(", ") + ". Удаление: ycDelete(service, id) — id виден в ycList."
-          );
-        } catch (e) {
-          return "Ошибка Yandex Cloud: " + ((e && e.message) || String(e));
-        }
-      }
-      case "ycList": {
-        const cfg = ycConfig(loadSettings());
-        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → Yandex Cloud.";
-        if (!cfg.folderId) return "Не выбран каталог — Настройки → Yandex Cloud.";
-        const serviceKey = String(args.service || args.key || "").trim();
-        const svcDef = serviceKey ? yandexCloud.serviceByKey(serviceKey) : null;
-        if (serviceKey && !svcDef) return "Неизвестный сервис: " + serviceKey + ". Доступны: " + yandexCloud.SERVICES.map((s) => s.key).join(", ") + ".";
-        try {
-          if (svcDef) {
-            const r = await yandexCloud.listService(cfg.oauth, cfg.folderId, svcDef);
-            // Каталог отдаёт объекты { id, name }, а Postbox (SES) — просто строки.
-            const items = r.items.slice(0, 30).map((it) => {
-              if (it == null) return "• —";
-              if (typeof it !== "object") return "• " + String(it);
-              return "• " + (it.name || it.id || "—") + (it.id ? "  (" + it.id + ")" : "");
-            });
-            return "«" + svcDef.title + "» в каталоге «" + cfg.folderName + "»: всего " + r.count + (r.count ? ":\n" + items.join("\n") : " — пусто.");
-          }
-          const all = await yandexCloud.resourcesStatus(cfg.oauth, cfg.folderId);
-          return all.map((s) => "• " + s.icon + " " + s.title + ": " + (s.ok ? s.count : "ошибка: " + String(s.error || "").slice(0, 100))).join("\n");
-        } catch (e) {
-          return "Ошибка Yandex Cloud: " + ((e && e.message) || String(e));
-        }
-      }
-      case "ycCreate": {
-        const cfg = ycConfig(loadSettings());
-        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → Yandex Cloud.";
-        if (!cfg.folderId) return "Не выбран каталог — Настройки → Yandex Cloud.";
-        if (!cfg.allowCreate) {
-          return "⛔ Создание ресурсов в Yandex Cloud агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту создавать ресурсы». (Удаление — отдельным чекбоксом.)";
-        }
-        const serviceKey = String(args.service || args.key || "").trim();
-        const name = String(args.name || "").trim();
-        if (!serviceKey || !name) return "Ошибка: укажи service (например ydb, serverlessContainers, storage, lockbox, containerRegistry, dns, vpc) и name. Создание платных ресурсов — только по явной просьбе пользователя.";
-        try {
-          const r = await yandexCloud.createResource(cfg.oauth, cfg.folderId, serviceKey, name);
-          return "OK — " + r.message + " (service=" + serviceKey + ", каталог «" + cfg.folderName + "»). Проверить список: ycList(service: \"" + serviceKey + "\").";
-        } catch (e) {
-          return "Ошибка создания: " + ((e && e.message) || String(e));
-        }
-      }
-      case "ycDelete": {
-        const cfg = ycConfig(loadSettings());
-        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → Yandex Cloud.";
-        if (!cfg.allowDelete) {
-          return "⛔ Удаление ресурсов в Yandex Cloud агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту удалять ресурсы».";
-        }
-        const serviceKey = String(args.service || args.key || "").trim();
-        const id = String(args.id || args.resourceId || "").trim();
-        if (!serviceKey || !id) return "Ошибка: укажи service и id (id ресурса виден в ycList). Удаление необратимо — только по явной просьбе пользователя.";
-        try {
-          const r = await yandexCloud.deleteResource(cfg.oauth, serviceKey, id);
-          return "OK — " + r.message + " (" + serviceKey + ").";
-        } catch (e) {
-          return "Ошибка удаления: " + ((e && e.message) || String(e));
-        }
-      }
-      case "ycDeploy": {
-        const cfg = ycConfig(loadSettings());
-        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → Yandex Cloud.";
-        if (!cfg.folderId) return "Не выбран каталог — Настройки → Yandex Cloud.";
-        const dir = args.directory ? resolvePath(args.directory, settings) : agentWorkDir(settings);
-        if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return "Ошибка: папка проекта не найдена: " + dir;
-        const name = String(args.name || "").trim() || path.basename(dir);
-        if (!cfg.allowCreate) {
-          return "⛔ Деплой создаёт ресурсы в Yandex Cloud (реестр, контейнер, SA). Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту создавать ресурсы». Деплой платный (Serverless Containers).";
-        }
-        // Прямой вызов общей логики деплоя (как кнопка «🚀 Задеплоить»)
-        const cfg2 = ycConfig(loadSettings());
-        const steps = [];
-        const step = (t) => steps.push(t);
-        try {
-          const docker = findProgram("docker");
-          if (!docker.found) return "Ошибка: Docker не найден на этом ПК. Установи Docker Desktop и повтори.";
-          const df = path.join(dir, "Dockerfile");
-          let dockerfile = df;
-          if (!fs.existsSync(df)) {
-            dockerfile = path.join(dir, "Dockerfile.yandexcloud");
-            ycGenerateDockerfile(dir, dockerfile);
-            step("Dockerfile сгенерирован");
-          }
-          const slug = yandexCloud.slugify(name);
-          const reg = await yandexCloud.ensureRegistry(cfg2.oauth, cfg2.folderId, slug + "-registry");
-          const image = "cr.yandex/" + reg.id + "/" + slug + ":latest";
-          step("Реестр: " + reg.id);
-          const iamTok = await yandexCloud.getIamToken(cfg2.oauth);
-          const loginOut = await runTerminalCommand("docker login cr.yandex -u iam -p " + iamTok, dir, 90000);
-          const loginTxt = String(loginOut || "");
-          if (/error|denied|failed/i.test(loginTxt) && !/login succeeded/i.test(loginTxt)) {
-            return "docker login не прошёл: " + truncateText(loginTxt, 500);
-          }
-          const buildOut = await runTerminalCommand('docker build -f "' + dockerfile + '" -t ' + image + ' .', dir, 600000);
-          const buildTxt = String(buildOut || "");
-          if (/error|failed|cannot/i.test(buildTxt) && !/successfully built/i.test(buildTxt)) {
-            return "docker build упал:\n" + truncateText(buildTxt, 2500);
-          }
-          const pushOut = await runTerminalCommand("docker push " + image, dir, 600000);
-          const pushTxt = String(pushOut || "");
-          if (/error|denied|failed/i.test(pushTxt) && !/digest/i.test(pushTxt)) {
-            return "docker push упал:\n" + truncateText(pushTxt, 1500);
-          }
-          step("Образ загружен: " + image);
-          const cont = await yandexCloud.ensureContainer(cfg2.oauth, cfg2.folderId, slug);
-          let saId = "";
-          if (args.public !== false) {
-            try {
-              const sa = await yandexCloud.ensureServiceAccount(cfg2.oauth, cfg2.folderId, "sa-" + slug);
-              saId = sa.id;
-              await yandexCloud.addRoleOnFolder(cfg2.oauth, cfg2.folderId, sa.id, "serverless.containers.invoker");
-              step("Публичный доступ настроен");
-            } catch (e) {
-              return "Не удалось настроить публичный доступ: " + ((e && e.message) || String(e));
-            }
-          }
-          await yandexCloud.deployContainerRevision(cfg2.oauth, {
-            containerId: cont.id,
-            folderId: cfg2.folderId,
-            imageUrl: image,
-            serviceAccountId: saId || undefined,
-            memoryMb: args.memoryMb || 256,
-            cores: args.cores || 1,
-            timeoutSec: args.timeoutSec || 30,
-            env: args.env || {},
-          });
-          const info = await yandexCloud.containerInfo(cfg2.oauth, cont.id);
-          return "✅ Приложение «" + name + "» задеплоено в Serverless Containers (каталог «" + cfg2.folderName + "»).\n\n" +
-            "URL: " + (info.url || "—") + "\nКонтейнер: " + cont.id + "\nОбраз: " + image + "\n\nШаги:\n" +
-            steps.map((s) => "• " + s).join("\n") +
-            "\n\nПроверь доступ: открыть URL в браузере или curl. Логи: ycLogs(service: \"serverlessContainers\", id: \"" + cont.id + "\"). Повторный деплой той же папки обновит ревизию.";
-        } catch (e) {
-          return "Деплой не завершился: " + ((e && e.message) || String(e));
-        }
-      }
-      case "ycContainer": {
-        const cfg = ycConfig(loadSettings());
-        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
-        const action = String(args.action || "overview").trim().toLowerCase();
-        const ref = String(args.container || args.id || "").trim();
-        if (!ref) return "Ошибка: укажи container — имя или id контейнера. Список: ycList(service: \"serverlessContainers\").";
-        // Чтение разрешено всегда; смена настроек и ревизии — только с чекбоксом.
-        if ((action === "deploy" || action === "rollback" || action === "update") && !cfg.allowUpdate) {
-          return "⛔ Менять контейнеры и деплоить ревизии агенту ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту менять контейнеры». Чтение доступно и сейчас: action overview / revisions / revision.";
-        }
-        try {
-          const cont = await ycFindContainerByRef(cfg, ref);
-          const who = "Контейнер «" + (cont.name || cont.id) + "» (" + cont.id + ")";
-          const line = "URL: " + (cont.url || "— (публичный доступ не настроен)");
-          const logsHint = "Логи: ycLogs(service: \"serverlessContainers\", id: \"" + cont.id + "\").";
-
-          if (action === "overview") {
-            const { revs, active } = await ycActiveRevision(cfg, cont.id);
-            const head = [
-              who,
-              "Статус: " + (cont.status || "—") + (cont.description ? " · " + cont.description : ""),
-              "Создан: " + (cont.createdAt || "—"),
-              line,
-              logsHint,
-            ];
-            if (!revs.length) {
-              return head.join("\n") + "\n\nРевизий нет: контейнер создан, но ни разу не деплоился. Создать ревизию: ycContainer { action: \"deploy\", container: \"" + (cont.name || cont.id) + "\", image: \"cr.yandex/<registry-id>/<image>:tag\" }.";
-            }
-            head.push("Ревизий: " + revs.length + " · активная — " + (active ? active.id : "—"));
-            return head.join("\n") + "\n\nНастройки активной ревизии (вкладка «Редактор»):\n" + ycRevisionDetails(yandexCloud.revisionSummary(active)) +
-              "\n\nСписок ревизий: ycContainer { action: \"revisions\", container: \"" + (cont.name || cont.id) + "\" }.";
-          }
-
-          if (action === "revisions") {
-            const revs = await yandexCloud.listRevisions(cfg.oauth, {
-              containerId: cont.id,
-              pageSize: 100,
-              filter: args.filter ? String(args.filter) : "",
-            });
-            if (!revs.length) return who + "\n\nРевизий нет (фильтр: " + (args.filter || "нет") + ").";
-            const activeId = (revs.find((r) => r.status === "ACTIVE") || revs[0]).id;
-            const limit = Math.min(Math.max(parseInt(args.limit, 10) || 15, 1), 100);
-            const rows = revs.slice(0, limit).map((r) => ycRevisionLine(yandexCloud.revisionSummary(r), r.id === activeId));
-            return who + "\n" + line + "\n\nРевизии (свежие сверху), всего " + revs.length + ":\n" + rows.join("\n") +
-              "\n\nДетали: ycContainer { action: \"revision\", container: \"…\", revisionId: \"…\" }. Откат: action \"rollback\" (нужно разрешение).";
-          }
-
-          if (action === "revision") {
-            const rid = String(args.revisionId || args.revision || "").trim();
-            if (!rid) return "Ошибка: укажи revisionId — id виден в action: revisions.";
-            const rev = await yandexCloud.getRevision(cfg.oauth, rid);
-            return who + "\n\n" + ycRevisionDetails(yandexCloud.revisionSummary(rev));
-          }
-
-          if (action === "deploy") {
-            const { active } = await ycActiveRevision(cfg, cont.id);
-            const opts = yandexCloud.revisionToDeployOpts(active, {
-              imageUrl: args.image || args.imageUrl,
-              memoryMb: args.memoryMb,
-              cores: args.cores,
-              coreFraction: args.coreFraction,
-              timeoutSec: args.timeoutSec,
-              concurrency: args.concurrency,
-              serviceAccountId: args.serviceAccountId,
-              networkId: args.networkId,
-              minInstances: args.minInstances,
-              maxInstancesPerZone: args.maxInstancesPerZone,
-              env: ycJsonArg(args.env),
-              envReplace: args.envReplace === true,
-              command: ycJsonArg(args.command),
-              args: ycJsonArg(args.args),
-              secrets: ycJsonArg(args.secrets),
-              mounts: ycJsonArg(args.mounts),
-              storageMounts: ycJsonArg(args.storageMounts),
-              runtime: args.runtime,
-              logGroupId: args.logGroupId,
-              logMinLevel: args.logMinLevel,
-              description: args.description,
-              folderId: cfg.folderId,
-            });
-            if (!opts.imageUrl) {
-              return "Ошибка: у новой ревизии нет образа. Контейнер «" + (cont.name || cont.id) + "» ещё не деплоился — укажи image, например cr.yandex/<registry-id>/<image>:latest (реестр: ycList(service: \"containerRegistry\")).";
-            }
-            await yandexCloud.deployContainerRevision(cfg.oauth, Object.assign({ containerId: cont.id }, opts));
-            const after = await ycActiveRevision(cfg, cont.id);
-            const src = active ? "настройки взяты из активной ревизии " + active.id + " (указанные поля переопределены)" : "первая ревизия контейнера";
-            return "✅ Ревизия контейнера «" + (cont.name || cont.id) + "» развёрнута: " + src + ".\n" + line + "\n\n" + ycRevisionDetails(yandexCloud.revisionSummary(after.active || {})) +
-              "\n\n" + logsHint + " Проверь вызов по URL. Откат: ycContainer { action: \"rollback\", container: \"" + (cont.name || cont.id) + "\", revisionId: \"" + (active ? active.id : "") + "\" }.";
-          }
-
-          if (action === "rollback") {
-            const rid = String(args.revisionId || args.revision || "").trim();
-            if (!rid) return "Ошибка: укажи revisionId, на которую откатить (список: action: revisions).";
-            await yandexCloud.rollbackContainer(cfg.oauth, cont.id, rid);
-            const after = await ycActiveRevision(cfg, cont.id);
-            return "✅ Контейнер «" + (cont.name || cont.id) + "» откачен на ревизию " + rid + ".\nАктивная ревизия теперь: " + ((after.active && after.active.id) || "—") + "\n" + line + "\n\n" + logsHint;
-          }
-
-          if (action === "update") {
-            const patchObj = {};
-            if (args.name != null) patchObj.name = args.name;
-            if (args.description != null) patchObj.description = args.description;
-            const labels = ycJsonArg(args.labels);
-            if (labels) patchObj.labels = labels;
-            const updated = await yandexCloud.updateContainer(cfg.oauth, cont.id, patchObj);
-            const labelKeys = Object.keys(updated.labels || {});
-            return "✅ Контейнер обновлён: «" + (updated.name || cont.name) + "»" + (updated.description ? " — " + updated.description : "") +
-              (labelKeys.length ? "\nМетки: " + labelKeys.map((k) => k + "=" + updated.labels[k]).join(", ") : "") +
-              "\n\nВажно: образ, переменные окружения и ресурсы правятся ТОЛЬКО новой ревизией — action \"deploy\" (текущие настройки подставятся сами). " + line;
-          }
-
-          return "Ошибка: неизвестное действие ycContainer «" + action + "». Доступно: overview, revisions, revision, deploy, rollback, update.";
-        } catch (e) {
-          return "Yandex Cloud (ycContainer, action=" + action + "): " + ((e && e.message) || String(e));
-        }
-      }
-      case "ycLogs": {
-        const cfg = ycConfig(loadSettings());
-        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → Yandex Cloud.";
-        if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud.";
-        const id = String(args.id || args.resourceId || "").trim();
-        if (!id) return "Ошибка: укажи id ресурса (виден в ycList).";
-        try {
-          return await readYcLogsText(cfg, String(args.service || "").trim(), id, args);
-        } catch (e) {
-          return "Логи (" + (args.service || "ресурс") + "): " + ((e && e.message) || String(e));
-        }
-      }
-      case "ycInstall": {
-        const cfg = ycConfig(loadSettings());
-        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → Yandex Cloud.";
-        const st = ycCliStatus();
-        if (st.installed && !args.force) {
-          // Пересобираем окружение: PATH и свежий YC_IAM_TOKEN — без перезапуска.
-          applyAgentEnv(loadSettings());
-          return "yc CLI уже встроен: " + st.path + " — доступен всем командам как «yc». YC_IAM_TOKEN (свежий IAM), YC_CLOUD_ID и YC_FOLDER_ID подставляются автоматически, yc init не нужен. Переустановить: ycInstall(force: true).";
-        }
-        try {
-          const r = await ycCliInstall();
-          if (!r.ok) return "Не удалось установить yc CLI: " + r.error;
-          applyAgentEnv(loadSettings());
-          const iamReady = !!ycIamEnvToken(ycConfig(loadSettings()));
-          return "yc CLI установлен: " + r.path + " (версия " + r.version + ", " + r.os + "/" + r.arch + ", " + r.sizeMb + " МБ).\n" +
-            "Папка добавлена в PATH всех команд агента — вызывай просто «yc ...». YC_IAM_TOKEN (свежий IAM), YC_CLOUD_ID и YC_FOLDER_ID подставляются автоматически, yc init не нужен. Проверка: yc config list" +
-            (iamReady ? "" : "\n⚠ Свежий IAM-токен ещё не получен (нет сети или токен не принят) — если первая команда yc скажет «The token is invalid», повтори её через минуту.");
-        } catch (e) {
-          return "Не удалось установить yc CLI: " + ((e && e.message) || String(e));
-        }
-      }
-      default:
-        return "Ошибка: неизвестный инструмент " + name;
-    }
+    // Обработчики вынесены в src/agent-tools.js (1.5.77): здесь только выбор
+    // инструмента и единая обработка ошибок — как и раньше.
+    const handler = agentToolHandlers[name];
+    if (!handler) return "Ошибка: неизвестный инструмент " + name;
+    return await handler(args, settings);
   } catch (e) {
     return "Ошибка: " + fmtError(e);
   }
@@ -4560,6 +1963,18 @@ function saveContextMemo(settings, entry, emit) {
 async function runAi(settings, messages, win, opts) {
   opts = opts || {};
   const planMode = !!(opts.plan || opts.planMode); // режим «сначала план»: инструменты не выполняются
+  // Роль чата (Разработчик / Ассистент / Менеджер / Исследователь). Текст роли уходит
+  // в системный промпт каждый раунд, а её группы инструментов включены с первого раунда:
+  // набор схем не меняется на ходу, префикс запроса стабилен, каждый раунд дешевле.
+  const role = rolePlan(opts.role);
+  const roleNote = role.prompt ? "\n\n" + role.prompt : "";
+  // Менеджеру сразу даём свежую сводку дел — чтобы он не гадал и не звал taskList впустую.
+  let tasksNote = "";
+  if (role.id === "manager" && !planMode) {
+    try {
+      tasksNote = "\n\n=== МОИ ДЕЛА (актуально на " + new Date().toLocaleString() + ") ===\n" + agentStore.tasksBrief(userDataDir(), 8);
+    } catch {}
+  }
   const emit = (ev) => {
     if (!win.isDestroyed()) win.webContents.send("ai:event", ev);
   };
@@ -4608,6 +2023,11 @@ async function runAi(settings, messages, win, opts) {
   let rateRetries = 0;
   // 5xx и «холодный» отказ пула: тоже повторяем ТОТ ЖЕ раунд, но с растущей паузой.
   let unavailableRetries = 0;
+  // Сколько всего разрешено простоять в ожидании лимита (429) за один запуск.
+  // Три паузы по 5 с лимит «8 запросов в минуту» не лечат: раньше прогон падал, и пользователь
+  // писал «продолжай» руками. Ждём сами, но с потолком — чтобы не висеть вечно.
+  const RATE_WAIT_BUDGET_MS = Math.max(60000, Number(process.env.AI_AGENT_RATE_WAIT_MS) || 10 * 60 * 1000);
+  let rateWaitedMs = 0;
   const rateLimiter = rateLimiterFor(settings);
   let reportRetried = false; // пустой финальный текст — один раз просим итоговый отчёт
   let planNudges = 0; // «план не закрыт, а модель замолчала» — просим продолжить делом (макс. 2)
@@ -4667,7 +2087,7 @@ async function runAi(settings, messages, win, opts) {
       // Потолок: не больше ROUTER_MAX_TOKENS и не больше того, что оставляет место
       // истории (system-промпт ~8k + минимум на диалог).
       const maxTokens = Math.max(baseWeight, Math.min(ROUTER_MAX_TOKENS, Math.max(baseWeight, budget - 12000)));
-      routeInfo = routeTools({ text: routerTask, sticky: [...stickyGroups], forceAll: forceAllTools, maxTokens: maxTokens });
+      routeInfo = routeTools({ text: routerTask, sticky: [...stickyGroups], roleGroups: role.groups, forceAll: forceAllTools, maxTokens: maxTokens });
       for (const id of routeInfo.groups) stickyGroups.add(id);
       activeTools = routeInfo.tools;
     }
@@ -4793,7 +2213,7 @@ async function runAi(settings, messages, win, opts) {
   let canonical = [
     {
       role: "system",
-      content: SYSTEM_PROMPT + wdNote + briefNote + cloneNote + (planMode ? "\n\nРЕЖИМ ПЛАНА: доступен только todoWrite — вызови его с планом работ (3–7 пунктов) и в тексте перечисли файлы, которые затронешь. НЕ изменяй файлы и НЕ выполняй другие инструменты. Жди команды пользователя." : ""),
+      content: SYSTEM_PROMPT + roleNote + tasksNote + wdNote + briefNote + cloneNote + (planMode ? "\n\nРЕЖИМ ПЛАНА: доступен только todoWrite — вызови его с планом работ (3–7 пунктов) и в тексте перечисли файлы, которые затронешь. НЕ изменяй файлы и НЕ выполняй другие инструменты. Жди команды пользователя." : ""),
     },
     ...sanitizeToolPairs(runHistory.map((m) => ({ role: m.role, content: m.content }))),
   ];
@@ -4910,19 +2330,33 @@ async function runAi(settings, messages, win, opts) {
       const friendly = friendlyRateLimitError(res.status, detail, settings);
       if (friendly) throw new Error(friendly);
       // 429 (лимит запросов): ждём столько, сколько просил провайдер, и повторяем ТОТ ЖЕ раунд.
-      // Раньше это падало ошибкой: пользователь терял раунд и ждал вслепую.
-      if (res.status === 429 && rateRetries < 3) {
+      // Ждём САМИ — до потолка RATE_WAIT_BUDGET_MS. Раньше после трёх коротких пауз прогон
+      // падал с ошибкой, и пользователю приходилось писать «продолжай» вручную — хотя всё,
+      // что нужно, это подождать окно лимита.
+      if (res.status === 429) {
         const info = rateLimitInfo(res.status, res.headers, detail);
-        rateRetries++;
         rateLimiter.note(info);
-        const waitMs = Math.max(1000, Math.min(info.retryMs || 5000, 60000));
-        termEmit({
-          type: "metrics",
-          text:
-            "⏳ Лимит провайдера (429): жду " + Math.round(waitMs / 1000) + " с (" + rateRetries + "/3) и повторяю запрос — раунд не потерян." +
-            (info.rpm ? " Учёл лимит " + info.rpm + " запросов/мин." : ""),
-        });
+        const wantMs = Math.max(2000, Math.min(info.retryMs || 5000, 60000));
+        const leftMs = RATE_WAIT_BUDGET_MS - rateWaitedMs;
+        if (leftMs < 1000) {
+          throw new Error(
+            "API error 429: лимит провайдера на запросы. Ждал сам " + Math.round(rateWaitedMs / 1000) +
+            " с, но лимит не отпускает — подожди минуту и напиши «продолжай» или выбери модель " +
+            "с большим лимитом в настройках."
+          );
+        }
+        const waitMs = Math.min(wantMs, leftMs);
+        rateRetries++;
+        rateWaitedMs += waitMs;
+        const sec = Math.max(1, Math.round(waitMs / 1000));
+        const note =
+          "⏳ Лимит провайдера на запросы: жду " + sec + " с и повторю сам (попытка " + rateRetries + ")" +
+          (info.rpm ? ", лимит ≈" + Math.round(info.rpm) + " запросов/мин" : "") +
+          ". Писать ничего не нужно.";
+        termEmit({ type: "metrics", text: note + " Всего в ожидании: " + Math.round(rateWaitedMs / 1000) + " с." });
+        emit({ type: "notice", text: note });
         await new Promise((r) => setTimeout(r, waitMs));
+        if (waitMs >= 15000) emit({ type: "notice", text: "▶ Продолжаю работу после лимита." });
         round--;
         continue;
       }
@@ -5213,35 +2647,40 @@ async function runAi(settings, messages, win, opts) {
       }
       emit({ type: "tool_start", name: c.name, args: c.args });
       let result;
+      // Как обошлось действие: auto — без вопросов, approved/denied — решал пользователь.
+      // Нужно журналу действий: подтверждения и отказы пишутся всегда.
+      let decision = "auto";
+      const confirmYes = (answer) =>
+        /^(да|yes|y|ok|го|ага|точно|конечно|давай|выполн)/i.test(String(answer || "").trim());
       if (c.name === "askUser") {
         const question = (c.args && c.args.question) || "Уточни, пожалуйста";
         const answer = await askUserWait(question);
         result = answer && String(answer).trim() ? String(answer).trim() : "(пользователь не дал ответ)";
-      } else if (c.name === "runCommand") {
-        // Потенциально опасные команды выполняем только после явного подтверждения.
+      } else if (c.name === "runCommand" && toolPolicy.isDangerousCommand((c.args && c.args.command) || "")) {
+        // Потенциально опасные команды выполняем только после явного подтверждения
+        // (что считать опасным — решает политика: src/tool-policy.js).
         const cmd = String((c.args && c.args.command) || "");
-        if (DANGEROUS_CMD_RE.test(cmd)) {
-          const answer = await askUserWait(
-            "⚠️ Команда потенциально опасна: «" + cmd.slice(0, 160) + "»\nВыполнить? (да / нет)"
-          );
-          const ok = /^(да|yes|y|ok|го|ага|точно|конечно|давай|выполн)/i.test(String(answer || "").trim());
-          if (!ok) {
-            result =
-              "Команда НЕ выполнена: пользователь не подтвердил опасную операцию. Сообщи, что действие пропущено, и предложи безопасную альтернативу.";
-          } else {
-            result = await executeTool(c.name, c.args, settings);
-          }
-        } else {
+        const answer = await askUserWait(
+          "⚠️ Команда потенциально опасна: «" + cmd.slice(0, 160) + "»\nВыполнить? (да / нет)"
+        );
+        if (confirmYes(answer)) {
+          decision = "approved";
           result = await executeTool(c.name, c.args, settings);
+        } else {
+          decision = "denied";
+          result =
+            "Команда НЕ выполнена: пользователь не подтвердил опасную операцию. Сообщи, что действие пропущено, и предложи безопасную альтернативу.";
         }
-      } else if (DANGEROUS_TOOLS.has(c.name)) {
+      } else if (toolPolicy.needsConfirm(c.name)) {
+        // Инструмент с высоким риском и без своей защиты — спрашиваем пользователя.
         const desc = describeToolArgs(c.name, c.args);
         const answer = await askUserWait("⚠️ Действие потенциально опасно: " + desc + "\nВыполнить? (да / нет)");
-        const ok = /^(да|yes|y|ok|го|ага|точно|конечно|давай|выполн)/i.test(String(answer || "").trim());
-        if (!ok) {
-          result = "Действие НЕ выполнено: пользователь не подтвердил. Сообщи, что действие пропущено, и предложи безопасную альтернативу.";
-        } else {
+        if (confirmYes(answer)) {
+          decision = "approved";
           result = await executeTool(c.name, c.args, settings);
+        } else {
+          decision = "denied";
+          result = "Действие НЕ выполнено: пользователь не подтвердил. Сообщи, что действие пропущено, и предложи безопасную альтернативу.";
         }
       } else {
         // Чекпоинт: до правки файла запоминаем его состояние (для отката изменений агента)
@@ -5250,6 +2689,9 @@ async function runAi(settings, messages, win, opts) {
         }
         result = await executeTool(c.name, c.args, settings);
       }
+      // Журнал действий: подтверждения, отказы, риск medium/high и незнакомые
+      // инструменты. Секреты в журнал не попадают (редакция в tool-policy.js).
+      audit.record({ tool: c.name, args: c.args, decision, result, source: activeRunOrigin });
       // Держим контекст в рамках бюджета: длинный вывод инструмента ужимаем
       const capped = truncateText(result, 8000);
       emit({ type: "tool_result", name: c.name, result: capped });
@@ -5343,8 +2785,20 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
+  // Напоминания о делах: проверяем раз в минуту (плюс сразу после старта, если что-то
+  // уже просрочено). Таймер живёт вместе с приложением, окно может быть свёрнуто.
+  // Интервал можно укоротить для живого теста: AI_AGENT_TASK_REMINDER_MS.
+  const taskReminderEvery = Math.max(2000, Number(process.env.AI_AGENT_TASK_REMINDER_MS) || 60000);
+  setTimeout(checkTaskReminders, Math.min(8000, taskReminderEvery));
+  setInterval(checkTaskReminders, taskReminderEvery);
+
   // Прокси webContents.send: все события (ai:event, term:event, dev:event, github:event)
   // дополнительно транслируются клиентам мобильного моста по WebSocket.
+  // Windows: без AppUserModelID уведомления приходят «от Electron» (или не приходят).
+  if (process.platform === "win32") {
+    try { app.setAppUserModelId("AI Developer Agent"); } catch {}
+  }
+
   const _wcSend = mainWindow.webContents.send.bind(mainWindow.webContents);
   mainWindow.webContents.send = (ch, ev) => {
     // Клиентов теперь несколько (окно на ПК + телефоны), и прогон агента может
@@ -5577,56 +3031,11 @@ ipcMain.handle("browser:connect", async (_e, opts) => {
 ipcMain.handle("browser:connectInfo", () => browserTools.connectInfo());
 
 // ─────────────────────────── Почта (SMTP/IMAP) ───────────────────────────
-// Проверка входа IMAP — кнопка «Проверить связь» в настройках. Письма не отправляются.
-ipcMain.handle("mail:test", async () => {
-  const cfg = mailConfig(loadSettings());
-  const servers = {
-    imapHost: cfg.imapHost, imapPort: cfg.imapPort,
-    smtpHost: cfg.smtpHost, smtpPort: cfg.smtpPort,
-    starttls: cfg.starttls, note: cfg.note,
-  };
-  if (!cfg.address) return { ok: false, error: "Укажи адрес почты.", servers };
-  if (!cfg.password) return { ok: false, error: "Укажи пароль приложения для почты.", servers };
-  const r = await mail.listRecent(
-    { host: cfg.imapHost, port: cfg.imapPort, user: cfg.user, password: cfg.password, secure: true },
-    { limit: 1 }
-  );
-  return { ok: r.ok, error: r.ok ? "" : r.error, total: r.ok ? r.total : 0, servers };
-});
-
-// Последние письма для интерфейса (кратко: без полного текста, но с найденным кодом).
-ipcMain.handle("mail:recent", async (_e, limit) => {
-  const cfg = mailConfig(loadSettings());
-  if (!cfg.address || !cfg.password) return { ok: false, error: "Почта не настроена." };
-  const r = await mail.listRecent(
-    { host: cfg.imapHost, port: cfg.imapPort, user: cfg.user, password: cfg.password, secure: true },
-    { limit: Math.min(parseInt(limit, 10) || 5, 10) }
-  );
-  if (!r.ok) return r;
-  return {
-    ok: true,
-    total: r.total,
-    messages: r.messages.map((m) => ({ from: m.from, subject: m.subject, date: m.date, code: mail.extractCode(m.text) })),
-  };
-});
-
-// Тестовое письмо самому себе — проверяет SMTP-отправку целиком.
-ipcMain.handle("mail:testSend", async () => {
-  const cfg = mailConfig(loadSettings());
-  if (!cfg.address) return { ok: false, error: "Укажи адрес почты." };
-  if (!cfg.password) return { ok: false, error: "Укажи пароль приложения для почты." };
-  const r = await mail.sendMail(
-    { host: cfg.smtpHost, port: cfg.smtpPort, user: cfg.user, password: cfg.password, secure: !cfg.starttls, starttls: cfg.starttls },
-    {
-      fromName: cfg.fromName,
-      to: cfg.address,
-      subject: "Проверка почты от AI-агента",
-      text: "Это тестовое письмо. Если ты его видишь — отправка писем настроена верно.\n\n— AI Developer Agent",
-    }
-  );
-  return r;
-});
-
+// Настройка подключения и каналы почты живут в src/mail-ipc.js (1.5.75): протокол
+// остаётся в чистом src/mail.js, а мост к интерфейсу — рядом с ним. Здесь только
+// подключение: mailConfig нужен агентским инструментам mailSend/mailRead.
+const { registerMailIpc } = require("./mail-ipc.js");
+const { mailConfig } = registerMailIpc({ ipcMain, mail, loadSettings });
 // ─────────────────────────── Мобильный доступ (LAN + PWA + PIN) ───────────────────────────
 ipcMain.handle("mobile:status", () => mobileBridge.status());
 ipcMain.handle("mobile:pinRegen", () => {
@@ -5639,6 +3048,30 @@ ipcMain.handle("mobile:pinRegen", () => {
 
 // ─────────────────────────── Проекты (до 10, переключение) ───────────────────────────
 // Возвращает список проектов (свежие сверху) и id активного.
+// Дела (личный список задач со сроками): панель в окне и на телефоне работают через это.
+ipcMain.handle("tasks:board", () => agentStore.tasksBoard(userDataDir()));
+ipcMain.handle("tasks:list", (_e, opts) => agentStore.tasksList(userDataDir(), opts || {}));
+ipcMain.handle("tasks:add", (_e, input) => {
+  const r = agentStore.tasksAdd(userDataDir(), input || {});
+  if (r.ok) emitTasksChanged();
+  return r;
+});
+ipcMain.handle("tasks:update", (_e, key, patch) => {
+  const r = agentStore.tasksUpdate(userDataDir(), key, patch || {});
+  if (r.ok) emitTasksChanged();
+  return r;
+});
+ipcMain.handle("tasks:done", (_e, key, done) => {
+  const r = agentStore.tasksDone(userDataDir(), key, done !== false);
+  if (r.ok) emitTasksChanged();
+  return r;
+});
+ipcMain.handle("tasks:delete", (_e, key) => {
+  const r = agentStore.tasksDelete(userDataDir(), key);
+  if (r.ok) emitTasksChanged();
+  return r;
+});
+
 ipcMain.handle("projects:list", () => {
   const s = loadSettings();
   const list = (Array.isArray(s.projects) ? s.projects : [])
@@ -6703,209 +4136,26 @@ ipcMain.handle("github:deviceStart", async () => {
 });
 
 // ─────────────────────────── Yandex Cloud (REST API) ───────────────────────────
-// Ссылка для получения OAuth-токена (клиентское приложение Yandex Cloud — как у yc CLI):
-const YANDEX_OAUTH_URL =
-  "https://oauth.yandex.ru/authorize?response_type=token&client_id=1a6990aa636648e9b2ef855fa7bec2fb";
-
-function ycConfig(s) {
-  s = s || loadSettings();
-  return {
-    oauth: String(s.yandexOauthToken || "").trim(),
-    cloudId: String(s.ycCloudId || "").trim(),
-    folderId: String(s.ycFolderId || "").trim(),
-    folderName: String(s.ycFolderName || "").trim(),
-    allowCreate: !!s.ycAllowAgentCreate,
-    allowDelete: !!s.ycAllowAgentDelete,
-    allowUpdate: !!s.ycAllowAgentUpdate,
-  };
-}
-
-// Ключ сервиса → тип ресурса Cloud Logging (нужен только как фильтр; по id точнее).
-const YC_RESOURCE_TYPES = {
-  apiGateway: "serverless.apigateway",
-  certificateManager: "certificate-manager.certificate",
-  cdn: "cdn.resource",
-  dns: "dns.zone",
-  iam: "iam.serviceAccount",
-  lockbox: "lockbox.secret",
-  logging: "logging.logGroup",
-  containerRegistry: "container-registry.registry",
-  storage: "storage.bucket",
-  serverlessContainers: "serverless.container",
-  vpc: "vpc.network",
-  ydb: "ydb.database",
-};
-
-// Чтение логов Cloud Logging ВНУТРЕННИМ API приложения — внешний yc CLI не нужен.
-// Лог-группы перечисляются по REST, записи читаются по gRPC: у LogReadingService
-// нет HTTP-привязки, поэтому «POST /logging/v1/logs/read» не существует.
-// ── Serverless Containers: обзор, редактор и ревизии для агента ──────────────
-// Контейнер ищется по имени (точное совпадение) или по id — как в консоли.
-async function ycFindContainerByRef(cfg, ref) {
-  const q = String(ref || "").trim();
-  if (!q) throw new Error("укажи имя или id контейнера (список: ycList(service: \"serverlessContainers\")).");
-  if (cfg.folderId) {
-    try {
-      const byName = await yandexCloud.findContainer(cfg.oauth, cfg.folderId, q);
-      if (byName) return byName;
-    } catch {}
-  }
-  return await yandexCloud.getContainer(cfg.oauth, q);
-}
-
-// Активная ревизия = та, что сейчас обслуживает трафик. Именно из неё консоль
-// (и мы) берём префилл для «Создать ревизию».
-async function ycActiveRevision(cfg, containerId) {
-  const revs = await yandexCloud.listRevisions(cfg.oauth, { containerId, pageSize: 100 });
-  const active = revs.find((r) => r.status === "ACTIVE") || revs[0] || null;
-  return { revs, active };
-}
-
-// Аргументы вида "{\"A\":\"1\"}" приходят от модели строкой так же часто, как
-// объектом — принимаем оба вида, но не падаем на мусоре.
-function ycJsonArg(v) {
-  if (v == null) return undefined;
-  if (typeof v === "object") return v;
-  if (typeof v === "string") {
-    const t = v.trim();
-    if (!t) return undefined;
-    try {
-      const j = JSON.parse(t);
-      return j && typeof j === "object" ? j : undefined;
-    } catch (e) {
-      return undefined;
-    }
-  }
-  return undefined;
-}
-
-// Одна строка списка ревизий: id, статус, дата, образ, ресурсы.
-function ycRevisionLine(s, isCurrent) {
-  const bits = [];
-  bits.push(isCurrent ? "★ активна" : s.status || "—");
-  bits.push(s.createdAt ? String(s.createdAt).replace("T", " ").slice(0, 19) : "—");
-  bits.push(s.image || "—");
-  const res = [];
-  if (s.memoryMb) res.push(s.memoryMb + " МБ");
-  if (s.cores) res.push(s.cores + (s.cores > 1 ? " ядра" : " ядро"));
-  if (res.length) bits.push(res.join(" / "));
-  bits.push("таймаут " + (s.timeoutSec || 30) + " с");
-  if (s.concurrency) bits.push("конкурентность " + s.concurrency);
-  return "• " + s.id + " — " + bits.join(" · ");
-}
-
-// Полные настройки ревизии — то, что в консоли видно во вкладке «Редактор».
-function ycRevisionDetails(s) {
-  const lines = [];
-  lines.push("Ревизия " + s.id + " — " + (s.status || "—") + (s.createdAt ? " · создана " + s.createdAt : ""));
-  if (s.description) lines.push("Описание: " + s.description);
-  lines.push("Образ: " + (s.image || "—"));
-  if (s.imageDigest) lines.push("Дайджест образа: " + s.imageDigest);
-  if (s.command.length) lines.push("ENTRYPOINT: " + s.command.join(" "));
-  if (s.args.length) lines.push("CMD: " + s.args.join(" "));
-  if (s.workingDir) lines.push("Рабочая папка: " + s.workingDir);
-  const res = [];
-  if (s.memoryMb) res.push(s.memoryMb + " МБ памяти");
-  if (s.cores) res.push(s.cores + " ядро(а)");
-  if (s.coreFraction) res.push("доля ядра " + s.coreFraction + "%");
-  lines.push("Ресурсы: " + (res.length ? res.join(", ") : "—"));
-  lines.push("Таймаут: " + (s.timeoutSec || 30) + " с" + (s.concurrency ? " · конкурентность " + s.concurrency : ""));
-  lines.push("Сервисный аккаунт: " + (s.serviceAccountId || "— (нет)"));
-  lines.push("Сеть: " + (s.networkId || "— (нет доступа в VPC)"));
-  lines.push("Мин. инстансов: " + (s.minInstances || 0) + (s.maxInstancesPerZone ? " · лимит инстансов на зону: " + s.maxInstancesPerZone : ""));
-  lines.push("Режим: " + (s.runtime === "task" ? "task (процесс на каждый запрос)" : "http (сервер внутри контейнера)"));
-  const envKeys = Object.keys(s.env || {});
-  lines.push("Переменные окружения (" + envKeys.length + "): " + (envKeys.length ? envKeys.join(", ") : "нет"));
-  if (s.secrets.length) {
-    lines.push("Секреты Lockbox (" + s.secrets.length + "): " + s.secrets.map((x) => (x.environmentVariable || "?") + " ← " + x.id + "/" + x.key).join(", "));
-  }
-  if (s.storageMounts.length) {
-    lines.push("Монтирования Object Storage: " + s.storageMounts.map((m) => m.bucketId + (m.prefix ? "/" + m.prefix : "") + " → " + m.path + (m.readOnly ? " (только чтение)" : "")).join(", "));
-  }
-  if (s.mounts.length) {
-    lines.push("Дополнительные диски: " + s.mounts.map((m) => (m.bucketId || "диск") + " → " + m.path + (m.mode ? " (" + m.mode + ")" : "")).join(", "));
-  }
-  lines.push("Логи: " + (s.logDisabled ? "выключены" : s.logGroupId ? "лог-группа " + s.logGroupId : "в группу каталога") + (s.logMinLevel ? ", уровень " + s.logMinLevel : ""));
-  return lines.join("\n");
-}
-
-async function readYcLogsText(cfg, serviceKey, resourceId, args) {
-  const a = args || {};
-  if (!cfg.folderId) throw new Error("не выбран каталог (Настройки → Yandex Cloud).");
-  const iam = await yandexCloud.getIamToken(cfg.oauth);
-  // REST-список групп и gRPC-чтение живут на РАЗНЫХ хостах: logGroups — на
-  // logging.api.cloud.yandex.net, а LogReadingService.Read — только на
-  // reader.logging.yandexcloud.net (см. yc-logs.js и KNOWN_ENDPOINTS).
-  const base = (await yandexCloud.endpoint("logging")) || "https://logging.api.cloud.yandex.net";
-  const grpcBase = (await yandexCloud.endpoint("log-reading")) || "https://reader.logging.yandexcloud.net";
-  const limit = Math.max(1, Math.min(parseInt(a.limit, 10) || 100, 500));
-  const sinceHours = Math.max(1, Math.min(parseInt(a.sinceHours, 10) || 3, 168));
-  const type = YC_RESOURCE_TYPES[serviceKey] || (a.type ? String(a.type) : "");
-  const res = await ycLogs.readLogs({
-    iamToken: iam,
-    baseUrl: base,
-    grpcBaseUrl: grpcBase,
-    folderId: cfg.folderId,
-    resourceIds: resourceId ? [resourceId] : [],
-    resourceTypes: type ? [type] : [],
-    sinceHours,
-    limit,
-    logGroupId: a.logGroupId ? String(a.logGroupId) : "",
-    filter: a.filter ? String(a.filter) : "",
-  });
-  const entries = res.entries || [];
-  const group = res.logGroupName || res.logGroupId || "—";
-  if (!entries.length) {
-    return "Логов за последние " + sinceHours + " ч нет (лог-группа «" + group + "»" + (resourceId ? ", ресурс " + resourceId : "") + ").";
-  }
-  return "Логи за последние " + sinceHours + " ч — " + entries.length + " записей, группа «" + group + "»:\n" + ycLogs.formatEntries(entries, { max: 50 }).join("\n");
-}
-
-// Встроенный yc CLI: он лежит в папке приложения, системных прав не требует.
-function ycCliStatus() {
-  const userData = app.getPath("userData");
-  const p = ycCli.installed(userData);
-  return { installed: !!p, path: p || "", dir: ycCli.binDir(userData) };
-}
-
-async function ycCliInstall() {
-  const r = await ycCli.install({ userData: app.getPath("userData") });
-  if (r && r.ok) ycEnsurePath();
-  return r;
-}
-
-// Почта: собирает рабочую конфигурацию из настроек. Пустые серверы берутся из
-// пресета провайдера (Gmail/Яндекс/Mail.ru/Outlook/Rambler), иначе — imap.<домен>.
-function mailConfig(s) {
-  s = s || loadSettings();
-  const address = String(s.mailAddress || "").trim();
-  const guess = mail.guessServers(address);
-  const num = (v, fallback) => {
-    const n = parseInt(v, 10);
-    return Number.isFinite(n) && n > 0 ? n : fallback;
-  };
-  return {
-    address,
-    user: String(s.mailUser || "").trim() || address,
-    fromName: String(s.mailFromName || "").trim(),
-    password: String(s.mailPassword || ""),
-    imapHost: String(s.mailImapHost || "").trim() || guess.imapHost,
-    imapPort: num(s.mailImapPort, guess.imapPort || 993),
-    smtpHost: String(s.mailSmtpHost || "").trim() || guess.smtpHost,
-    smtpPort: num(s.mailSmtpPort, guess.smtpPort || 465),
-    starttls: s.mailStarttls === true || guess.starttls === true,
-    allowSend: !!s.mailAllowAgentSend,
-    note: guess.note || "",
-  };
-}
-
-function ycRequireAuth(cfg) {
-  if (!cfg || !cfg.oauth) {
-    const e = new Error("Не выполнена авторизация Yandex Cloud. Открой Настройки → «☁️ Yandex Cloud», получи OAuth-токен и вставь его.");
-    e.status = 401;
-    throw e;
-  }
-}
+// Служебный слой и IPC-мост вынесены отдельными модулями (1.5.74): знание про
+// YC API живёт в src/yc-service.js, каналы «yc:*» — в src/yc-ipc.js. Здесь
+// остаётся только подключение, поэтому агентские инструменты и деплой видят те
+// же имена, что и раньше, и работают без изменений.
+const { createYcService } = require("./yc-service.js");
+const { registerYcIpc } = require("./yc-ipc.js");
+const ycService = createYcService({ app, path, net, secrets, yandexCloud, ycCli, ycLogs, ycEnsurePath, loadSettings });
+const {
+  ycConfig,
+  ycRequireAuth,
+  ycFindContainerByRef,
+  ycActiveRevision,
+  ycJsonArg,
+  ycRevisionLine,
+  ycRevisionDetails,
+  readYcLogsText,
+  ycCliStatus,
+  ycCliInstall,
+} = ycService;
+registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, loadSettings, saveSettings, svc: ycService });
 
 // ── 🧠 Память диалогов: локальный дневник сжатых памяток (папка по датам) ──────
 ipcMain.handle("memory:stats", () => {
@@ -6945,805 +4195,61 @@ ipcMain.handle("memory:clear", (_e, date) => {
   };
 });
 
-ipcMain.handle("yc:status", async () => {
-  const s = loadSettings();
-  const cfg = ycConfig(s);
-  const out = {
-    ok: true,
-    loggedIn: !!cfg.oauth,
-    cloudId: cfg.cloudId,
-    folderId: cfg.folderId,
-    folderName: cfg.folderName,
-    allowCreate: cfg.allowCreate,
-    allowDelete: cfg.allowDelete,
-    allowUpdate: cfg.allowUpdate,
-    oauthUrl: YANDEX_OAUTH_URL,
-    clouds: [],
-    folders: [],
-    iamOk: false,
-    error: "",
-  };
-  if (!cfg.oauth) return out;
-  try {
-    // Обмен токена — один раз, затем облака и каталоги идут ПАРАЛЛЕЛЬНО, когда
-    // каталог уже известен: последовательный путь складывал таймауты (20 с + 20 с)
-    // и автовыбор каталога занимал десятки секунд.
-    await yandexCloud.getIamToken(cfg.oauth);
-    const cloudsP = yandexCloud.listClouds(cfg.oauth);
-    const foldersP = cfg.cloudId ? yandexCloud.listFolders(cfg.oauth, cfg.cloudId) : null;
-    const clouds = await cloudsP;
-    out.clouds = clouds;
-    out.iamOk = true;
-    const cloudId = cfg.cloudId || (clouds[0] && clouds[0].id) || "";
-    const folders = foldersP ? await foldersP : await yandexCloud.listFolders(cfg.oauth, cloudId);
-    out.folders = folders;
-    if (!cfg.folderId && folders[0]) {
-      // Первый запуск: автоматически выбираем первый каталог первого облака.
-      const merged = { ...s, ycCloudId: cloudId, ycFolderId: folders[0].id, ycFolderName: folders[0].name };
-      saveSettings(merged);
-      out.cloudId = cloudId;
-      out.folderId = folders[0].id;
-      out.folderName = folders[0].name;
-    }
-  } catch (e) {
-    out.iamOk = false;
-    out.error = (e && e.message) || String(e);
-  }
-  return out;
+// ───────────────────── Деплой: рецепты, состояние, конвейер ─────────────────────
+// Мост деплоя вынесен в src/deploy-ipc.js (1.5.75): конвейер остаётся чистым в
+// deploy-engine.js, а здесь — подключение и две функции, которые нужны агентским
+// инструментам: сам запуск (ycDeploy) и сводка состояния облака проекта.
+const { registerDeployIpc } = require("./deploy-ipc.js");
+const { runCloudDeploy, cloudDeployBrief } = registerDeployIpc({
+  ipcMain,
+  path,
+  fs,
+  execFile,
+  browserTools,
+  cloudState,
+  deployRecipes,
+  createDeployEngine,
+  yandexCloud,
+  ycCosts,
+  audit,
+  commandEnv,
+  loadSettings,
+  agentWorkDir,
+  stripAnsi,
+  resolveShell,
+  findProgram,
+  ycConfig,
+  ycRequireAuth,
+  getEmit: () => activeEmit,
+  getWindow: () => mainWindow,
 });
-
-ipcMain.handle("yc:setToken", async (_e, token) => {
-  const t = String(token || "").trim();
-  if (!t) return { ok: false, error: "Вставь OAuth-токен со страницы авторизации Yandex." };
-  try {
-    yandexCloud.resetIamCache();
-    const clouds = await yandexCloud.listClouds(t);
-    const cloudId = (clouds[0] && clouds[0].id) || "";
-    const folders = await yandexCloud.listFolders(t, cloudId);
-    const folder = folders[0] || null;
-    const merged = {
-      ...loadSettings(),
-      yandexOauthToken: t,
-      ycCloudId: cloudId,
-      ycFolderId: folder ? folder.id : "",
-      ycFolderName: folder ? folder.name : "",
-    };
-    saveSettings(merged);
-    return {
-      ok: true,
-      account: clouds[0] ? clouds[0].name : "аккаунт Yandex",
-      cloudId,
-      folderId: folder ? folder.id : "",
-      folderName: folder ? folder.name : "",
-      clouds,
-      folders,
-    };
-  } catch (e) {
-    yandexCloud.resetIamCache();
-    return { ok: false, error: (e && e.message) || String(e) };
-  }
-});
-
-ipcMain.handle("yc:folders", async () => {
-  const cfg = ycConfig();
-  try {
-    ycRequireAuth(cfg);
-    const clouds = await yandexCloud.listClouds(cfg.oauth);
-    const cloudId = cfg.cloudId || (clouds[0] && clouds[0].id) || "";
-    const folders = await yandexCloud.listFolders(cfg.oauth, cloudId);
-    return { ok: true, clouds, folders, cloudId };
-  } catch (e) {
-    return { ok: false, error: (e && e.message) || String(e) };
-  }
-});
-
-ipcMain.handle("yc:setFolder", (_e, folderId, folderName, cloudId) => {
-  const merged = {
-    ...loadSettings(),
-    ycFolderId: String(folderId || "").trim(),
-    ycFolderName: String(folderName || "").trim(),
-    ycCloudId: String(cloudId || "").trim(),
-  };
-  saveSettings(merged);
-  return { ok: true };
-});
-
-ipcMain.handle("yc:setPermissions", (_e, allowCreate, allowDelete, allowUpdate) => {
-  const merged = {
-    ...loadSettings(),
-    ycAllowAgentCreate: !!allowCreate,
-    ycAllowAgentDelete: !!allowDelete,
-    ycAllowAgentUpdate: !!allowUpdate,
-  };
-  saveSettings(merged);
-  return { ok: true };
-});
-
-ipcMain.handle("yc:logout", () => {
-  const s = loadSettings();
-  delete s.yandexOauthToken;
-  s.ycCloudId = "";
-  s.ycFolderId = "";
-  s.ycFolderName = "";
-  saveSettings(s);
-  yandexCloud.resetIamCache();
-  return { ok: true };
-});
-
-// Дашборд: счётчики ресурсов по всем сервисам выбранного каталога.
-ipcMain.handle("yc:resources", async () => {
-  const cfg = ycConfig();
-  try {
-    ycRequireAuth(cfg);
-    if (!cfg.folderId) {
-      return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
-    }
-    const services = await yandexCloud.resourcesStatus(cfg.oauth, cfg.folderId);
-    const total = services.reduce((acc, s) => acc + (s.ok ? s.count : 0), 0);
-    const activeServices = services.filter((s) => s.ok && s.count > 0).length;
-    return { ok: true, folderId: cfg.folderId, folderName: cfg.folderName, services, total, activeServices };
-  } catch (e) {
-    return { ok: false, error: (e && e.message) || String(e) };
-  }
-});
-
-ipcMain.handle("yc:create", async (_e, serviceKey, name) => {
-  const cfg = ycConfig();
-  try {
-    ycRequireAuth(cfg);
-    if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder)." };
-    const r = await yandexCloud.createResource(cfg.oauth, cfg.folderId, String(serviceKey || ""), String(name || ""));
-    return { ok: true, message: r.message, resourceId: r.resourceId, name: r.name };
-  } catch (e) {
-    return { ok: false, error: (e && e.message) || String(e) };
-  }
-});
-
-ipcMain.handle("yc:delete", async (_e, serviceKey, resourceId) => {
-  const cfg = ycConfig();
-  try {
-    ycRequireAuth(cfg);
-    const r = await yandexCloud.deleteResource(cfg.oauth, String(serviceKey || ""), String(resourceId || ""));
-    return { ok: true, message: r.message };
-  } catch (e) {
-    return { ok: false, error: (e && e.message) || String(e) };
-  }
-});
-
-// Генерирует Dockerfile по типу проекта (node / python / статика), если своего нет.
-function ycGenerateDockerfile(dir, outPath) {
-  const has = (f) => fs.existsSync(path.join(dir, f));
-  let docker = "";
-  if (has("package.json")) {
-    docker = [
-      "FROM node:20-alpine",
-      "WORKDIR /app",
-      "COPY package*.json ./",
-      "RUN npm install --no-audit --no-fund 2>/dev/null || npm install",
-      "COPY . .",
-      "ENV PORT=8080",
-      "EXPOSE 8080",
-      'CMD ["sh", "-c", "PORT=8080 node server.js || PORT=8080 npm start || PORT=8080 npm run start || npm run dev -- --port 8080 --host 0.0.0.0"]',
-    ].join("\n");
-  } else if (has("requirements.txt") || has("pyproject.toml") || has("Pipfile")) {
-    const req = has("requirements.txt") ? "COPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt" : "";
-    docker = [
-      "FROM python:3.12-slim",
-      "WORKDIR /app",
-      req,
-      "COPY . .",
-      "ENV PORT=8080",
-      "EXPOSE 8080",
-      'CMD ["sh", "-c", "PORT=8080 python app.py || PORT=8080 python main.py || pip install gunicorn && gunicorn -b 0.0.0.0:8080 app:app || gunicorn -b 0.0.0.0:8080 main:app"]',
-    ].filter(Boolean).join("\n");
-  } else if (has("index.html")) {
-    docker = [
-      "FROM nginx:alpine",
-      "COPY . /usr/share/nginx/html",
-      "EXPOSE 80",
-    ].join("\n");
-  } else {
-    throw new Error("Не смог определить тип проекта для Dockerfile. Создай в папке проекта свой Dockerfile — деплой использует его.");
-  }
-  fs.writeFileSync(outPath, docker, "utf8");
-}
-
-// Деплой одной кнопкой: папка проекта → Container Registry → Serverless Containers → URL.
-ipcMain.handle("yc:deploy", async (_e, folderDir, appName, opts) => {
-  opts = opts || {};
-  const cfg = ycConfig();
-  try {
-    ycRequireAuth(cfg);
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
-  if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
-  const dir = String(folderDir || "").trim() || agentWorkDir(loadSettings());
-  if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
-    return { ok: false, error: "Папка проекта не найдена: " + dir };
-  }
-  const name = String(appName || "").trim() || path.basename(dir);
-  const steps = [];
-  const step = (text) => {
-    steps.push(text);
-    if (activeEmit) activeEmit({ type: "yc_step", text });
-  };
-  try {
-    const docker = findProgram("docker");
-    if (!docker.found) {
-      return { ok: false, error: "Docker не найден на этом ПК. Установи Docker Desktop (https://www.docker.com/products/docker-desktop/) и перезапусти приложение.", steps };
-    }
-    step("1/6 ✓ Docker найден");
-
-    const df = path.join(dir, "Dockerfile");
-    let dockerfile = df;
-    if (!fs.existsSync(df)) {
-      dockerfile = path.join(dir, "Dockerfile.yandexcloud");
-      try {
-        ycGenerateDockerfile(dir, dockerfile);
-      } catch (e) {
-        return { ok: false, error: (e && e.message) || String(e), steps };
-      }
-      step("2/6 ✓ Dockerfile сгенерирован (" + path.basename(dockerfile) + ") — если приложению нужна особая сборка, поправь его и задеплой снова");
-    } else {
-      step("2/6 ✓ Использую Dockerfile проекта");
-    }
-
-    const slug = yandexCloud.slugify(name);
-    const reg = await yandexCloud.ensureRegistry(cfg.oauth, cfg.folderId, slug + "-registry");
-    const image = "cr.yandex/" + reg.id + "/" + slug + ":latest";
-    step("3/6 ✓ Реестр готов: " + reg.id);
-
-    const iamTok = await yandexCloud.getIamToken(cfg.oauth);
-    const loginOut = await runTerminalCommand("docker login cr.yandex -u iam -p " + iamTok, dir, 90000);
-    const loginTxt = String(loginOut || "");
-    if (/error|denied|failed|unauthorized/i.test(loginTxt) && !/login succeeded/i.test(loginTxt)) {
-      return { ok: false, error: "docker login к cr.yandex не прошёл:\n" + truncateText(loginTxt, 800), steps };
-    }
-    step("4/6 ✓ docker login к cr.yandex выполнен");
-
-    const buildOut = await runTerminalCommand('docker build -f "' + dockerfile + '" -t ' + image + ' .', dir, 600000);
-    const buildTxt = String(buildOut || "");
-    if (/error|failed|cannot|denied|no such file/i.test(buildTxt) && !/successfully built/i.test(buildTxt)) {
-      return { ok: false, error: "docker build упал:\n" + truncateText(buildTxt, 3000), steps };
-    }
-    step("5/6 ✓ Образ собран: " + image);
-
-    const pushOut = await runTerminalCommand("docker push " + image, dir, 600000);
-    const pushTxt = String(pushOut || "");
-    if (/error|denied|failed|unauthorized/i.test(pushTxt) && !/digest/i.test(pushTxt)) {
-      return { ok: false, error: "docker push упал:\n" + truncateText(pushTxt, 2000), steps };
-    }
-    step("6/6 ✓ Образ загружен в Container Registry");
-
-    const cont = await yandexCloud.ensureContainer(cfg.oauth, cfg.folderId, slug);
-    step("Контейнер готов: " + cont.id);
-
-    let saId = "";
-    if (opts.public !== false) {
-      try {
-        const sa = await yandexCloud.ensureServiceAccount(cfg.oauth, cfg.folderId, "sa-" + slug);
-        saId = sa.id;
-        await yandexCloud.addRoleOnFolder(cfg.oauth, cfg.folderId, sa.id, "serverless.containers.invoker");
-        step("Публичный доступ настроен (SA + роль invoker)");
-      } catch (e) {
-        return {
-          ok: false,
-          error:
-            "Не удалось настроить публичный доступ: " + ((e && e.message) || String(e)) +
-            ". Проверь, что у твоего аккаунта есть роль editor на каталог, или задеплой с public=false (URL будет требовать авторизацию).",
-          steps,
-        };
-      }
-    }
-
-    step("⏳ Деплой ревизии… это может занять 1–3 минуты");
-    await yandexCloud.deployContainerRevision(cfg.oauth, {
-      containerId: cont.id,
-      folderId: cfg.folderId,
-      imageUrl: image,
-      serviceAccountId: saId || undefined,
-      memoryMb: opts.memoryMb || 256,
-      cores: opts.cores || 1,
-      timeoutSec: opts.timeoutSec || 30,
-      env: opts.env || {},
-    });
-    const info = await yandexCloud.containerInfo(cfg.oauth, cont.id);
-    const fin = "✅ Готово! URL контейнера: " + (info.url || "—");
-    steps.push(fin);
-    if (activeEmit) activeEmit({ type: "yc_step", text: fin });
-    return { ok: true, url: info.url, containerId: cont.id, name: slug, image, steps };
-  } catch (e) {
-    return { ok: false, error: "Деплой не завершился: " + ((e && e.message) || String(e)), steps };
-  }
-});
-
-// Логи ресурса — внутренним API Cloud Logging (REST для лог-групп + gRPC для записей).
-ipcMain.handle("yc:logs", async (_e, serviceKey, resourceId) => {
-  const cfg = ycConfig();
-  try {
-    ycRequireAuth(cfg);
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
-  if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder)." };
-  const id = String(resourceId || "").trim();
-  if (!id) return { ok: false, error: "Не указан id ресурса." };
-  try {
-    const text = await readYcLogsText(cfg, String(serviceKey || "").trim(), id, { limit: 100, sinceHours: 3 });
-    return { ok: true, logs: text.split("\n").slice(1), raw: text };
-  } catch (e) {
-    return { ok: false, error: "Логи: " + ((e && e.message) || String(e)) };
-  }
-});
-
-// Встроенный yc CLI: статус (стоит ли и где) и установка внутрь приложения.
-ipcMain.handle("yc:cliStatus", () => ycCliStatus());
-ipcMain.handle("yc:installCli", async () => {
-  const cfg = ycConfig();
-  try {
-    ycRequireAuth(cfg);
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
-  const st = ycCliStatus();
-  if (st.installed) return { ok: true, already: true, installed: true, path: st.path, dir: st.dir, version: "" };
-  const r = await ycCliInstall();
-  if (!r || !r.ok) return { ok: false, error: (r && r.error) || "не удалось установить yc CLI" };
-  return { ok: true, installed: true, path: r.path, dir: r.dir, version: r.version, sizeMb: r.sizeMb };
-});
-
-
 // ─────────────────────────── Файлы (панель проекта) ───────────────────────────
-const BINARY_EXT = new Set([
-  "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "svg", "avif", "heic",
-  "exe", "dll", "so", "dylib", "bin", "dat", "db", "sqlite", "sqlite3",
-  "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "jar", "apk", "ipa",
-  "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods",
-  "mp3", "mp4", "avi", "mov", "mkv", "wav", "ogg", "flac", "webm",
-  "woff", "woff2", "ttf", "otf", "eot", "wasm", "pyc", "class", "lock",
-]);
-
-ipcMain.handle("fs:listTree", (_e, dir) => {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  try {
-    const entries = fs
-      .readdirSync(d, { withFileTypes: true })
-      .filter((e) => e.name !== ".git")
-      .map((e) => {
-        let size = 0;
-        let mtime = 0;
-        try {
-          const st = fs.statSync(path.join(d, e.name));
-          size = e.isFile() ? st.size : 0;
-          mtime = st.mtimeMs;
-        } catch {}
-        return { name: e.name, isDir: e.isDirectory(), size, mtime };
-      })
-      .sort((a, b) => (a.isDir !== b.isDir ? (a.isDir ? -1 : 1) : a.name.localeCompare(b.name, "ru")));
-    return { ok: true, entries };
-  } catch (e) {
-    return { ok: false, error: e.message || String(e) };
-  }
-});
-
-ipcMain.handle("fs:readFile", (_e, p) => {
-  const abs = sanitizePath(p);
-  if (!abs) return { ok: false, error: "Файл не найден" };
-  try {
-    const st = fs.statSync(abs);
-    if (!st.isFile()) return { ok: false, error: "Это не файл" };
-    const ext = path.extname(abs).toLowerCase().replace(".", "");
-    if (BINARY_EXT.has(ext)) return { ok: false, error: "Бинарный файл — предпросмотр недоступен", binary: true };
-    let content = fs.readFileSync(abs, "utf8");
-    if (content.includes("\u0000")) return { ok: false, error: "Бинарный файл — предпросмотр недоступен", binary: true };
-    let truncated = false;
-    if (content.length > 300000) {
-      content = content.slice(0, 300000);
-      truncated = true;
-    }
-    return { ok: true, content, size: st.size, truncated };
-  } catch (e) {
-    return { ok: false, error: e.message || String(e) };
-  }
-});
-
-ipcMain.handle("fs:readImage", (_e, p) => {
-  const abs = sanitizePath(p);
-  if (!abs) return { ok: false, error: "Файл не найден" };
-  try {
-    const st = fs.statSync(abs);
-    if (!st.isFile()) return { ok: false, error: "Это не файл" };
-    if (st.size > 8 * 1024 * 1024) return { ok: false, error: "Файл слишком большой (максимум 8 МБ)" };
-    const ext = path.extname(abs).toLowerCase();
-    const IMG = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".avif"];
-    if (!IMG.includes(ext)) return { ok: false, error: "Не изображение" };
-    const mime = ext === ".svg" ? "image/svg+xml" : "image/" + ext.slice(1);
-    const dataUrl = "data:" + mime + ";base64," + fs.readFileSync(abs).toString("base64");
-    return { ok: true, dataUrl, size: st.size };
-  } catch (e) {
-    return { ok: false, error: e.message || String(e) };
-  }
-});
-
-// ── Файлы: ручное создание / редактирование / удаление / импорт перетаскиванием ──
-function fsNameError(name) {
-  const n = String(name || "").trim();
-  if (!n) return "Пустое имя";
-  if (n === "." || n === "..") return "Недопустимое имя: " + n;
-  if (/[\\/:*?"<>|\u0000-\u001f]/.test(n)) return "Имя содержит недопустимые символы: " + n;
-  if (n.length > 150) return "Имя слишком длинное (максимум 150 символов)";
-  return null;
-}
-
-ipcMain.handle("fs:createFile", (_e, dir, name, content) => {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  const err = fsNameError(name);
-  if (err) return { ok: false, error: err };
-  const target = path.join(d, String(name).trim());
-  if (fs.existsSync(target)) return { ok: false, error: "Файл уже существует: " + target };
-  try {
-    fs.writeFileSync(target, content == null ? "" : String(content), "utf8");
-    return { ok: true, path: target };
-  } catch (e) {
-    return { ok: false, error: (e.message || String(e)) + " — проверь права на запись в папку." };
-  }
-});
-
-ipcMain.handle("fs:createFolder", (_e, dir, name) => {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  const err = fsNameError(name);
-  if (err) return { ok: false, error: err };
-  const target = path.join(d, String(name).trim());
-  if (fs.existsSync(target)) return { ok: false, error: "Папка уже существует: " + target };
-  try {
-    fs.mkdirSync(target, { recursive: false });
-    return { ok: true, path: target };
-  } catch (e) {
-    return { ok: false, error: (e.message || String(e)) + " — проверь права на запись в папку." };
-  }
-});
-
-ipcMain.handle("fs:writeFile", (_e, p, content) => {
-  const abs = sanitizePath(p);
-  if (!abs) return { ok: false, error: "Файл не найден" };
-  try {
-    const st = fs.statSync(abs);
-    if (!st.isFile()) return { ok: false, error: "Это не файл" };
-    const text = content == null ? "" : String(content);
-    if (Buffer.byteLength(text, "utf8") > 2 * 1024 * 1024) return { ok: false, error: "Слишком большой файл для сохранения из панели (максимум 2 МБ)" };
-    fs.writeFileSync(abs, text, "utf8");
-    return { ok: true, path: abs };
-  } catch (e) {
-    return { ok: false, error: (e.message || String(e)) + " — проверь права на запись." };
-  }
-});
-
-ipcMain.handle("fs:delete", (_e, p) => {
-  const abs = sanitizePath(p);
-  if (!abs) return { ok: false, error: "Путь не найден" };
-  try {
-    const isDir = fs.statSync(abs).isDirectory();
-    fs.rmSync(abs, { recursive: true, force: true });
-    return { ok: true, deleted: abs, isDir };
-  } catch (e) {
-    return { ok: false, error: e.message || String(e) };
-  }
-});
-
-// Импорт перетаскиванием: items = [{ src, rel }] — src абсолютный путь на диске,
-// rel — относительный путь внутри targetDir (может содержать подпапки).
-ipcMain.handle("fs:importDropped", async (_e, targetDir, items) => {
-  const d = sanitizeDir(targetDir);
-  if (!d) return { ok: false, error: "Папка назначения не найдена" };
-  if (!Array.isArray(items)) return { ok: false, error: "Нет данных для импорта" };
-  const created = [];
-  const errors = [];
-  for (const it of items) {
-    const src = it && typeof it.src === "string" ? it.src : "";
-    const rel = String((it && it.rel) || "").split(/[\\/]/).map((x) => x.trim()).filter(Boolean).join("/");
-    if (!src || !fs.existsSync(src) || !fs.statSync(src).isFile()) {
-      if (src) errors.push((it.name || src) + " — источник не найден");
-      continue;
-    }
-    if (!rel) continue;
-    const bad = rel.split("/").some((part) => fsNameError(part));
-    if (bad) { errors.push(rel + " — недопустимое имя"); continue; }
-    const dest = path.join(d, rel);
-    if (!dest.startsWith(d + path.sep)) { errors.push(rel + " — недопустимый путь"); continue; }
-    if (fs.existsSync(dest)) {
-      // не перезаписываем молча — добавляем суффикс -2, -3…
-      const ext = path.extname(dest);
-      const base = dest.slice(0, dest.length - ext.length);
-      let i = 2;
-      let final = path.join(path.dirname(dest), path.basename(base) + "-" + i + ext);
-      while (fs.existsSync(final)) { i++; final = path.join(path.dirname(dest), path.basename(base) + "-" + i + ext); }
-      try {
-        fs.mkdirSync(path.dirname(final), { recursive: true });
-        fs.copyFileSync(src, final);
-        created.push(final);
-      } catch (e) {
-        errors.push(path.basename(final) + " — " + (e.message || String(e)));
-      }
-      continue;
-    }
-    try {
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.copyFileSync(src, dest);
-      created.push(dest);
-    } catch (e) {
-      errors.push(rel + " — " + (e.message || String(e)));
-    }
-  }
-  return { ok: created.length > 0 || errors.length === 0, created, errors };
-});
-
-ipcMain.handle("fs:openInExplorer", (_e, p) => {
-  const abs = sanitizePath(p);
-  if (abs) shell.showItemInFolder(abs);
-  return true;
-});
-
-ipcMain.handle("shell:openExternal", (_e, url) => {
-  if (typeof url === "string" && /^https?:\/\//i.test(url)) shell.openExternal(url);
-  return true;
-});
-
+// Каналы файловой панели вынесены в src/fs-ipc.js (1.5.76). Список бинарных
+// расширений оттуда же — чтобы не держать вторую копию (её использует агент).
+const { registerFsIpc } = require("./fs-ipc.js");
+const { BINARY_EXT } = registerFsIpc({ ipcMain, shell, path, fs, sanitizeDir, sanitizePath });
 // ─────────────────────────── Git (панель проекта) ───────────────────────────
-ipcMain.handle("git:repoInfo", async (_e, dir) => {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  const s = loadSettings();
-  const root = await runGit(d, ["rev-parse", "--show-toplevel"], s);
-  if (!root.ok) return { ok: true, isRepo: false, message: "Не git-репозиторий" };
-  const rootDir = (root.out || "").trim();
-  const [branchR, remoteR] = await Promise.all([
-    runGit(rootDir, ["branch", "--show-current"], s),
-    runGit(rootDir, ["remote", "get-url", "origin"], s),
-  ]);
-  let remote = remoteR.ok ? remoteR.out.trim() : "";
-  // Никогда не показываем токен, если он оказался зашит в URL
-  remote = remote.replace(/^https?:\/\/[^@\/]+@/i, "https://");
-  return { ok: true, isRepo: true, root: rootDir, branch: branchR.ok ? branchR.out.trim() : "", remote };
+// Каналы git-панели вынесены в src/git-ipc.js (1.5.76). Состояние агента (папка
+// последнего клона и флаг «после клона») остаётся здесь — модуль пишет в него
+// сеттерами, поэтому значение не «застывает» на null.
+const { registerGitIpc } = require("./git-ipc.js");
+registerGitIpc({
+  ipcMain,
+  path,
+  fs,
+  loadSettings,
+  runGit,
+  sanitizeDir,
+  cloneRepoTo,
+  pickCloneBase,
+  stageAllSafe,
+  setLastAgentRepoDir: (v) => {
+    lastAgentRepoDir = v;
+  },
+  setClonedRepoPending: (v) => {
+    clonedRepoPending = v;
+  },
 });
-
-ipcMain.handle("git:status", async (_e, dir) => {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  const r = await runGit(d, ["status", "--porcelain=v1", "-b", "-uall"], loadSettings());
-  if (!r.ok) return { ok: false, error: r.err };
-  const staged = [];
-  const unstaged = [];
-  const untracked = [];
-  let branch = "HEAD";
-  let ahead = 0;
-  let behind = 0;
-  let detached = false;
-  for (const line of r.out.split("\n")) {
-    if (line.startsWith("## ")) {
-      const m = line.match(/^## (\S+?)(?:\.\.\.\S+)?(?: \[(.*)\])?$/);
-      branch = (m && m[1]) || "HEAD";
-      if (branch === "HEAD") detached = true;
-      if (m && m[2]) {
-        const am = m[2].match(/ahead (\d+)/);
-        if (am) ahead = parseInt(am[1], 10);
-        const bm = m[2].match(/behind (\d+)/);
-        if (bm) behind = parseInt(bm[1], 10);
-      }
-      continue;
-    }
-    const X = line[0] || " ";
-    const Y = line[1] || " ";
-    const name = line.slice(3).replace(/^"|"$/g, "");
-    if (X === "?" && Y === "?") untracked.push(name);
-    else {
-      if (X !== " " && X !== "?") staged.push(name);
-      if (Y !== " ") unstaged.push(name);
-    }
-  }
-  return {
-    ok: true,
-    branch,
-    ahead,
-    behind,
-    detached,
-    staged: staged.slice(0, 200),
-    unstaged: unstaged.slice(0, 200),
-    untracked: untracked.slice(0, 200),
-  };
-});
-
-ipcMain.handle("git:log", async (_e, dir, n) => {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  const count = Math.max(1, Math.min(parseInt(n, 10) || 50, 200));
-  const r = await runGit(d, ["log", "-n", String(count), "--pretty=format:%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s"], loadSettings());
-  if (!r.ok) return { ok: false, error: r.err };
-  const commits = r.out
-    ? r.out.split("\n").map((line) => {
-        const parts = line.split("\x1f");
-        return {
-          hash: parts[0] || "",
-          short: parts[1] || "",
-          author: parts[2] || "",
-          email: parts[3] || "",
-          date: parts[4] || "",
-          message: parts[5] || "",
-        };
-      })
-    : [];
-  return { ok: true, commits };
-});
-
-ipcMain.handle("git:commitDetail", async (_e, dir, hash) => {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  const r = await runGit(
-    d,
-    ["show", "--numstat", "--format=%H%x1f%s%x1f%an%x1f%aI", String(hash)],
-    loadSettings()
-  );
-  if (!r.ok) return { ok: false, error: r.err };
-  const lines = r.out.split("\n");
-  const meta = lines[0] ? lines[0].split("\x1f") : [];
-  const files = [];
-  for (let i = 1; i < lines.length; i++) {
-    const parts = lines[i].split("\t");
-    if (parts.length < 3) continue;
-    const add = parts[0] === "-" ? 0 : parseInt(parts[0], 10) || 0;
-    const del = parts[1] === "-" ? 0 : parseInt(parts[1], 10) || 0;
-    let p = parts.slice(2).join("\t");
-    let status = "mod";
-    if (p.includes("=>")) status = "renamed";
-    else if (add > 0 && del === 0) status = "added";
-    else if (del > 0 && add === 0) status = "deleted";
-    files.push({ path: p, additions: add, deletions: del, status });
-  }
-  return { ok: true, hash: meta[0] || "", message: meta[1] || "", author: meta[2] || "", date: meta[3] || "", files };
-});
-
-// Путь файла внутри репозитория: принимаем абсолютный или относительный, но
-// никогда не выходим за пределы рабочей папки — «удалить» не должно трогать чужое.
-function gitRelFile(dir, file) {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  const raw = String(file || "").trim();
-  if (!raw) return { ok: false, error: "Файл не указан" };
-  const abs = path.resolve(path.isAbsolute(raw) ? raw : path.join(d, raw));
-  const rel = path.relative(d, abs);
-  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
-    return { ok: false, error: "Файл вне рабочей папки: " + raw };
-  }
-  return { ok: true, dir: d, rel: rel.split(path.sep).join("/") };
-}
-
-// Подтянуть изменения с GitHub (кнопка в панели проекта). Только fast-forward:
-// конфликтный merge из интерфейса — это молча потерянная работа агента.
-ipcMain.handle("git:pull", async (_e, dir) => {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  const r = await runGit(d, ["pull", "--ff-only"], loadSettings());
-  return r.ok ? { ok: true, out: r.out || "Изменения подтянуты." } : { ok: false, error: r.err || "Не удалось подтянуть изменения" };
-});
-
-// Убрать файл из индекса (кнопка «Убрать из staged»): git reset HEAD -- <файл>.
-ipcMain.handle("git:unstage", async (_e, dir, file) => {
-  const prep = gitRelFile(dir, file);
-  if (!prep.ok) return prep;
-  const r = await runGit(prep.dir, ["reset", "HEAD", "--", prep.rel], loadSettings());
-  return r.ok ? { ok: true, out: "Файл убран из индекса." } : { ok: false, error: r.err };
-});
-
-// Удалить выбранные файлы с диска и из git (кнопка «Удалить выбранные»).
-ipcMain.handle("git:rm", async (_e, dir, file) => {
-  const prep = gitRelFile(dir, file);
-  if (!prep.ok) return prep;
-  const r = await runGit(prep.dir, ["rm", "-f", "--", prep.rel], loadSettings());
-  if (r.ok) return { ok: true, out: "Файл удалён." };
-  const abs = path.join(prep.dir, prep.rel);
-  try {
-    if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
-      fs.unlinkSync(abs);
-      return { ok: true, out: "Файл удалён с диска (в git его не было)." };
-    }
-  } catch (e) {
-    return { ok: false, error: (e && e.message) || String(e) };
-  }
-  return { ok: false, error: r.err };
-});
-
-ipcMain.handle("git:revert", async (_e, dir, hash) => {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  const r = await runGit(d, ["revert", "--no-edit", String(hash)], loadSettings());
-  return r.ok ? { ok: true, out: r.out || "Коммит отменён." } : { ok: false, error: r.err || "Не удалось откатить (возможен конфликт)" };
-});
-
-ipcMain.handle("git:resetHard", async (_e, dir, hash) => {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  const r = await runGit(d, ["reset", "--hard", String(hash)], loadSettings());
-  return r.ok ? { ok: true, out: "Сброшено к " + String(hash) } : { ok: false, error: r.err };
-});
-
-ipcMain.handle("git:restore", async (_e, dir) => {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  const r = await runGit(d, ["restore", "."], loadSettings());
-  return r.ok ? { ok: true, out: "Изменения отменены." } : { ok: false, error: r.err };
-});
-
-// Мягкая отмена последнего коммита: reset --soft HEAD~1 — изменения коммита
-// возвращаются в рабочее дерево как незакоммиченные, ничего не теряется.
-ipcMain.handle("git:undoLastCommit", async (_e, dir) => {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  const s = loadSettings();
-  const log = await runGit(d, ["log", "-1", "--pretty=%h"], s);
-  if (!log.ok || !String(log.out || "").trim()) {
-    return { ok: false, error: "В истории нет коммитов для отмены" };
-  }
-  const r = await runGit(d, ["reset", "--soft", "HEAD~1"], s);
-  if (!r.ok) return { ok: false, error: r.err || "Не удалось отменить коммит" };
-  return { ok: true, out: "Последний коммит " + String(log.out).trim() + " отменён (reset --soft): его изменения вернулись как незакоммиченные, ничего не потеряно." };
-});
-
-// Дифф файла (или пометка, что файл новый и не отслеживается)
-ipcMain.handle("git:diff", async (_e, dir, file) => {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  if (!file || typeof file !== "string" || !file.trim()) return { ok: false, error: "Файл не указан" };
-  const rel = path.isAbsolute(file) ? path.relative(d, file) : file;
-  const r = await runGit(d, ["diff", "--", rel], loadSettings());
-  if (r.ok && r.out) return { ok: true, diff: r.out, untracked: false };
-  const abs = path.isAbsolute(file) ? file : path.join(d, rel);
-  if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
-    return { ok: true, untracked: true, size: fs.statSync(abs).size, path: abs };
-  }
-  return { ok: false, error: "Нет изменений или файл не найден" };
-});
-
-// Коммит всех изменений с указанным сообщением
-ipcMain.handle("git:commit", async (_e, dir, message) => {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  const msg = String(message || "").trim();
-  if (!msg) return { ok: false, error: "Укажи сообщение коммита" };
-  const s = loadSettings();
-  const add = await stageAllSafe(d, s);
-  if (!add.ok) return { ok: false, error: add.err };
-  const commit = await runGit(
-    d,
-    ["-c", "user.name=AI Agent", "-c", "user.email=ai-agent@local", "commit", "-m", msg],
-    s
-  );
-  if (!commit.ok) return { ok: false, error: commit.err || "Коммит не создан (нет изменений?)" };
-  return { ok: true, out: commit.out || "Коммит создан." };
-});
-
-ipcMain.handle("git:push", async (_e, dir) => {
-  const d = sanitizeDir(dir);
-  if (!d) return { ok: false, error: "Папка не найдена" };
-  const r = await runGit(d, ["push"], loadSettings());
-  return r.ok ? { ok: true, out: r.out || "Отправлено на GitHub." } : { ok: false, error: r.err };
-});
-
-ipcMain.handle("git:clone", async (_e, base, url) => {
-  const u = String(url || "").trim();
-  if (!/^(https?:\/\/|git@)/i.test(u)) return { ok: false, error: "URL должен начинаться с https:// или git@" };
-  const prep = pickCloneBase(base, loadSettings());
-  if (!prep.ok) return prep;
-  const r = await cloneRepoTo(u, prep.dir, loadSettings());
-  if (r.ok) {
-    lastAgentRepoDir = r.dir; // агент тоже работает внутри склонированного репозитория
-    clonedRepoPending = true; // следующий ответ агента начнётся с анализа нового проекта
-  }
-  return r.ok ? { ok: true, out: r.message || "Клонировано", dir: r.dir, cloned: r.cloned } : r;
-});
-
 // ─────────────────────────── Жизненный цикл ───────────────────────────
 // ─────────────────────────── Auto Updater ───────────────────────────
 // Показываем прогресс в строке заголовка и уведомляем, когда обновление готово.
@@ -7829,4 +4335,170 @@ app.on("before-quit", () => {
     bgKill(rec);
   }
   mobileBridge.stop();
+});
+
+// ─────────────────────── Реестр агентских инструментов ───────────────────────
+// Собираем обработчики один раз при загрузке: к этому месту все константы уже
+// инициализированы, а функции поднимаются объявлениями. Вызов инструментов идёт
+// только после старта приложения, поэтому порядок безопасен.
+const agentToolHandlers = createAgentTools({
+  shell,
+  path,
+  fs,
+  os,
+  net,
+  browserTools,
+  appUi,
+  secrets,
+  yandexCloud,
+  vault,
+  mail,
+  ycLogs,
+  ota,
+  selfDev,
+  ycIamEnvToken,
+  ycAutoEnv,
+  applyAgentEnv,
+  loadSettings,
+  saveSettings,
+  resolvePath,
+  runGit,
+  agentWorkDir,
+  repoNameFromUrl,
+  stripUrlCreds,
+  normalizeShell,
+  resolveShell,
+  shellsStatus,
+  runTerminalCommand,
+  detectPackageManager,
+  hasLock,
+  summarizeTestOutput,
+  unifiedDiff,
+  buildFileStructure,
+  screenshotUrl,
+  saveScreenshotPng,
+  bgProcesses,
+  bgSpawn,
+  bgKill,
+  SERVER_CMD_RE,
+  waitOutputQuiet,
+  bgTail,
+  checkUrlStatus,
+  listProjectFiles,
+  searchProjectFiles,
+  snapshotFileForUndo,
+  numberedLines,
+  langFromExt,
+  buildFileOutline,
+  buildBlockRanges,
+  stageAllSafe,
+  guideSafeName,
+  guideFilePath,
+  guideIndex,
+  guideForUrl,
+  agentGuideCall,
+  termAgentEcho,
+  mailConfig,
+  // Реестр инструментов работает в своём модуле: всё, что он использует из main.js,
+  // приходит сюда аргументами. Пропустить имя здесь — значит получить у пользователя
+  // «X is not defined» в конкретном инструменте, поэтому список сверяется разбором.
+  // окно и система: скриншот экрана, буфер обмена, установка программ
+  app,
+  clipboard,
+  desktopCapturer,
+  execFile,
+  // пояс проекта: заметки и дела, индекс кода, откат правок, журнал действий
+  agentStore,
+  unifiedPatch,
+  codeIndex,
+  audit,
+  // стоимость облака до создания ресурса
+  ycCosts,
+  // терминал: запуск процессов, разбор вывода, помощь при коде возврата
+  stripAnsi,
+  spawnCollect,
+  spawnRaw,
+  explainExit,
+  installSystemPkg,
+  downloadFileTo,
+  verifyInstaller,
+  installerFacts,
+  installerGate,
+  findInstallersIn,
+  downloadAndExtractTo,
+  runAsAdmin,
+  envPathInfo,
+  findProgram,
+  runProgVersion,
+  psScript,
+  cachedPs,
+  invalidatePsCache,
+  refreshEnvFromOS,
+  userDataDir,
+  emitTasksChanged,
+  // фоновые процессы и снимки экрана
+  bgWaitFor,
+  encodeShot,
+  // откат изменений
+  persistUndo,
+  loadPersistedUndo,
+  // разбор кода
+  refactorRenameFiles,
+  findSymbolReferences,
+  // вспомогательная модель и поиск
+  auxConfig,
+  describeImageRemote,
+  generateImageRemote,
+  webSearch,
+  webFetchPage,
+  fmtError,
+  truncateText,
+  searchTools,
+  // планирование и системные сведения
+  normalizePlanTasks,
+  planSummary,
+  parseProcessesCsv,
+  parseSysInfoJson,
+  registryPathAllowed,
+  // облако: конфигурация, контейнеры, ревизии, логи
+  ycConfig,
+  ycFindContainerByRef,
+  ycActiveRevision,
+  ycJsonArg,
+  ycRevisionLine,
+  ycRevisionDetails,
+  readYcLogsText,
+  ycCliStatus,
+  ycCliInstall,
+  runCloudDeploy,
+  cloudDeployBrief,
+  live: {
+    agentEnv: () => agentEnv,
+    userAgentEnv: () => userAgentEnv,
+    lastAgentRepoDir: () => lastAgentRepoDir,
+    setLastAgentRepoDir: (v) => {
+      lastAgentRepoDir = v;
+    },
+    clonedRepoPending: () => clonedRepoPending,
+    setClonedRepoPending: (v) => {
+      clonedRepoPending = v;
+    },
+    activeEmit: () => activeEmit,
+    activeToolRouter: () => activeToolRouter,
+    mainWindow: () => mainWindow,
+    // Откат правок и сводка плана: инструменты их не только читают, но и меняют —
+    // поэтому запись идёт через сеттер, а не копией значения.
+    activeRunUndo: () => activeRunUndo,
+    setActiveRunUndo: (v) => {
+      activeRunUndo = v;
+    },
+    lastUndoLog: () => lastUndoLog,
+    setLastUndoLog: (v) => {
+      lastUndoLog = v;
+    },
+    activePlanSummary: () => activePlanSummary,
+    setActivePlanSummary: (v) => {
+      activePlanSummary = v;
+    },
+  },
 });

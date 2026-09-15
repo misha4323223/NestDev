@@ -2617,6 +2617,8 @@ body::after {
   min-height: 14px;
   font-size: 11.5px;
   color: rgba(165, 195, 235, 0.65);
+  /* Подсказка бывает многострочной (например, оценка стоимости ресурса) */
+  white-space: pre-line;
 }
 /* Поиск репозиториев GitHub */
 .gh-repo-search {
@@ -3367,4 +3369,120 @@ body { display: flex; flex-direction: column; }
 
 @media (max-width: 720px) {
   #plan-panel { padding: 0 10px 6px; }
+}
+
+/* ─── Роли чата (панель ролей у поля ввода) ─────────────────────────────── */
+.role-btn { white-space: nowrap; }
+.role-btn.active { background: rgba(154, 154, 162, 0.18); border-color: var(--accent-violet); color: var(--text); }
+.role-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 2px 8px; }
+.role-chips .chip { font-size: 12px; padding: 4px 11px; }
+.role-popover {
+  position: absolute; right: 10px; bottom: calc(100% - 4px); z-index: 40;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 10px; width: min(580px, 94vw); box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+}
+.role-popover.hidden { display: none; }
+.role-popover-head { grid-column: 1 / -1; font-size: 11.5px; color: var(--text-faint); line-height: 1.45; }
+.role-card { display: flex; gap: 10px; align-items: flex-start; text-align: left; background: var(--bg-input);
+  border: 1px solid var(--border-soft); border-radius: 10px; padding: 10px; cursor: pointer; color: var(--text); font-family: inherit; }
+.role-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+.role-card.active { border-color: var(--accent-violet); background: rgba(154, 154, 162, 0.16); }
+.role-card-ic { font-size: 20px; line-height: 1.1; }
+.role-card-title { font-size: 13px; font-weight: 600; }
+.role-card-hint { font-size: 11.5px; color: var(--text-dim); line-height: 1.4; margin-top: 2px; }
+
+/* ─── Дела: задачи и сроки ──────────────────────────────────────────────── */
+#rail-tasks { position: relative; }
+.rail-badge { position: absolute; top: 3px; right: 3px; min-width: 15px; height: 15px; padding: 0 4px;
+  border-radius: 8px; background: var(--danger); color: #101012; font-size: 10px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center; }
+.rail-badge.hidden { display: none; }
+/* ── Панель «Дела» (роль Менеджер): сводка, фильтры, добавление, список ── */
+#sp-tasks { display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding: 12px 14px 18px; }
+.tk-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.tk-top-text { min-width: 0; }
+.tk-title { font-size: 13.5px; font-weight: 600; letter-spacing: 0.01em; }
+.tasks-counts { display: block; margin-top: 3px; font-size: 11.5px; color: var(--text-dim); }
+.tasks-counts .tc-late { color: var(--danger); font-weight: 600; }
+
+/* Фильтры со счётчиками: клик сужает список */
+.tk-filters { display: flex; flex-wrap: wrap; gap: 6px; }
+.tk-chip { display: inline-flex; align-items: center; gap: 6px; background: var(--bg-card);
+  border: 1px solid var(--border-soft); border-radius: 999px; padding: 4px 10px;
+  color: var(--text-dim); font: inherit; font-size: 11.5px; cursor: pointer;
+  transition: color 0.15s, background 0.15s, border-color 0.15s; }
+.tk-chip:hover { color: var(--text); border-color: var(--border); }
+.tk-chip.active { background: var(--bg-hover); border-color: var(--border); color: var(--text); }
+.tk-chip .tk-n { font-weight: 600; font-variant-numeric: tabular-nums; color: var(--text); }
+.tk-chip.late { border-color: rgba(255, 107, 107, 0.36); }
+.tk-chip.late .tk-n { color: var(--danger); }
+.tk-chip.zero { opacity: 0.5; }
+
+/* Добавление дела */
+.tk-composer { display: flex; flex-direction: column; gap: 6px; background: var(--bg-card);
+  border: 1px solid var(--border-soft); border-radius: 12px; padding: 8px; }
+.tk-composer-line { display: flex; align-items: center; gap: 6px; }
+.tk-new-title { flex: 1; min-width: 0; background: none; border: none; outline: none;
+  color: var(--text); font: inherit; font-size: 13.5px; padding: 5px 4px; }
+.tk-new-title::placeholder { color: var(--text-faint); }
+.tk-composer .tasks-due-input { flex: 1; min-width: 0; }
+.tk-add { flex-shrink: 0; width: 32px; height: 30px; padding: 0; font-size: 15px; line-height: 1; }
+.tk-quick { display: flex; flex-wrap: wrap; gap: 5px; padding-top: 2px; }
+.tk-quick button { background: none; border: 1px dashed var(--border); color: var(--text-faint);
+  border-radius: 7px; padding: 2px 7px; font: inherit; font-size: 11px; cursor: pointer; }
+.tk-quick button:hover { color: var(--text); border-color: var(--text-faint); border-style: solid; }
+
+/* Список дел */
+.tasks-groups { display: flex; flex-direction: column; gap: 6px; }
+.tk-list { flex: 1 1 auto; }
+.tasks-group-head { display: flex; align-items: center; gap: 8px; margin: 8px 2px 2px;
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); }
+.tasks-group-head::after { content: ""; flex: 1; height: 1px; background: var(--border-soft); }
+.tasks-group-head.overdue { color: var(--danger); }
+.tasks-group-head.overdue::after { background: rgba(255, 107, 107, 0.28); }
+
+/* Строка дела: галочка → текст со сроком → действия */
+.task-row { display: flex; align-items: flex-start; gap: 9px; background: var(--bg-card);
+  border: 1px solid var(--border-soft); border-radius: 11px; padding: 8px 10px;
+  transition: border-color 0.14s; }
+.task-row:hover { border-color: var(--border); }
+.task-row.done { opacity: 0.5; }
+.task-row.high { border-left: 3px solid var(--warn); }
+.task-row.late { border-color: rgba(255, 107, 107, 0.34); }
+.task-check { flex-shrink: 0; margin-top: 2px; cursor: pointer; accent-color: var(--accent); }
+.task-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.task-title { font-size: 13px; line-height: 1.35; cursor: text; word-break: break-word; }
+.task-row.done .task-title { text-decoration: line-through; }
+.task-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.task-due { font-size: 11.5px; color: var(--text-dim); white-space: nowrap; cursor: text; }
+.task-due.late { color: var(--danger); font-weight: 600; }
+.task-due.none { color: var(--text-faint); }
+.task-tag { font-size: 10.5px; color: var(--text-faint); background: var(--bg-input);
+  border: 1px solid var(--border-soft); border-radius: 999px; padding: 1px 7px; white-space: nowrap; }
+.task-tag.high { color: var(--warn); border-color: rgba(217, 180, 91, 0.34); }
+.task-actions { display: flex; align-items: center; gap: 2px; opacity: 0; transition: opacity 0.14s; }
+.task-row:hover .task-actions, .task-row:focus-within .task-actions { opacity: 1; }
+.task-edit { background: none; border: none; color: var(--text-faint); cursor: pointer;
+  font-size: 12px; line-height: 1; padding: 3px 4px; border-radius: 6px; }
+.task-edit:hover { color: var(--text); background: var(--bg-hover); }
+.task-edit-input { flex: 1; min-width: 0; background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); font-family: inherit; font-size: 13px; padding: 4px 6px; }
+.task-meta .task-edit-input { width: 100%; }
+
+/* Пусто и выполненные */
+.tasks-empty { font-size: 12.5px; color: var(--text-dim); padding: 10px 2px; line-height: 1.5; }
+.tk-empty { text-align: center; padding: 24px 12px 18px; }
+.tk-empty-ic { display: block; font-size: 24px; opacity: 0.5; margin-bottom: 8px; }
+.tk-empty-t { font-size: 13px; color: var(--text-dim); }
+.tk-empty-s { margin-top: 6px; font-size: 11.5px; color: var(--text-faint); line-height: 1.55; }
+.tk-done-block { border-top: 1px solid var(--border-soft); padding-top: 6px; }
+.tk-done-toggle { display: flex; align-items: center; gap: 6px; background: none; border: none;
+  color: var(--text-dim); font: inherit; font-size: 12px; cursor: pointer; padding: 4px 2px; }
+.tk-done-toggle:hover, .tk-done-toggle.active { color: var(--text); }
+.tk-done-arrow { display: inline-block; font-size: 10px; transition: transform 0.15s; }
+.tk-done-toggle.active .tk-done-arrow { transform: rotate(90deg); }
+.tasks-hint { font-size: 11px; color: var(--text-faint); line-height: 1.5; }
+@media (max-width: 900px) {
+  .role-popover { grid-template-columns: 1fr; right: 4px; left: 4px; width: auto; }
 }

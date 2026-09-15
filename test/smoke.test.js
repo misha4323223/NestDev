@@ -16,6 +16,7 @@
    - vault: менеджер паролей (поиск, отсутствие утечек паролей, подстановка входа, интерфейс).
    - yandex: логи внутренним API (REST+gRPC), автоматические YC_TOKEN/YC_CLOUD_ID/YC_FOLDER_ID, встроенный yc CLI;
      адреса сервисов (postbox/logging), повторы и пачечный опрос дашборда, свежие настройки у инструментов.
+   - tasks: дела со сроками (разбор «завтра 14:00», CRUD, панель по срокам, напоминания).
    - app-ui: стабильные ref вместо номеров [N] (клик не уезжает после перерисовки окна).
    - стрим/печать: DOM и автопрокрутка обновляются не чаще кадра, фон под стеклянными
      панелями статичен (иначе блюры пересчитываются в каждом кадре и интерфейс «жуёт»).
@@ -46,6 +47,43 @@ function test(name, fn) {
     });
 }
 
+// ── Исходники бэкенда целиком ───────────────────────────────────────────────
+// Yandex Cloud вынесен из main.js в отдельные модули (yc-service.js, yc-ipc.js).
+// Проверки «в приложении есть канал/помощник» читают бэкенд целиком: тот же код,
+// что раньше лежал в main.js, просто теперь в своём файле.
+// Только main.js: нужен там, где проверка говорит именно про него. Остальные
+// проверки читают бэкенд целиком — код мог переехать в свой модуль.
+// Инструмент агента: раньше каждая ветка была `case "имя": {` внутри switch в
+// main.js, теперь это запись реестра `"имя": async (args, settings) => {` в
+// agent-tools.js (1.5.77). Проверяем НАЛИЧИЕ инструмента, а не место, где он лежал.
+function hasTool(src, name) {
+  return src.includes('case "' + name + '"') || src.includes('"' + name + '": async (args, settings) =>');
+}
+
+// Тело инструмента: срез от его начала до начала следующего — в любом из двух видов.
+function toolBody(src, from, to) {
+  const at = (name) => {
+    const a = src.indexOf('case "' + name + '"');
+    const b = src.indexOf('"' + name + '": async (args, settings) =>');
+    if (a < 0) return b;
+    if (b < 0) return a;
+    return Math.min(a, b);
+  };
+  const start = at(from);
+  const end = at(to);
+  return start >= 0 && end > start ? src.slice(start, end) : "";
+}
+
+function mainOnlySrc() {
+  return fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+}
+
+function backendSrc() {
+  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js"]
+    .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
+    .join("\n");
+}
+
 function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -56,7 +94,7 @@ function tmpdir(prefix) {
 // «эффективный промпт» = SYSTEM_PROMPT + автоподключаемые справочники, а не только
 // текст agent-core.js: иначе тест требует вернуть в промпт то, что сознательно убрали.
 function autoGuideNames() {
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const m = /const GROUP_GUIDES = \{([^}]*)\}/.exec(mainSrc);
   assert.ok(m, "в main.js нет карты GROUP_GUIDES — справочники групп не подключаются");
   const names = m[1]
@@ -500,6 +538,171 @@ async function testAgentCore() {
     assert.strictEqual(g2.url, "https://generativelanguage.googleapis.com/v1beta/openai");
     const other = core.auxConfig({ visionEnabled: true, visionUrl: "https://api.openai.com/v1", visionModel: "gpt-4o-mini" });
     assert.strictEqual(other.url, "https://api.openai.com/v1", "чужая база изменена");
+  });
+
+  await test("изображения: провайдер определяется по адресу, версия пути достраивается", () => {
+    assert.strictEqual(core.normalizeAuxBase("https://api.openai.com"), "https://api.openai.com/v1");
+    assert.strictEqual(core.normalizeAuxBase("https://api.openai.com/v1/"), "https://api.openai.com/v1");
+    assert.strictEqual(core.normalizeAuxBase("https://openrouter.ai"), "https://openrouter.ai/api/v1");
+    assert.strictEqual(core.normalizeAuxBase("https://openrouter.ai/api/v1"), "https://openrouter.ai/api/v1");
+    assert.strictEqual(
+      core.normalizeAuxBase("https://generativelanguage.googleapis.com/v1beta"),
+      "https://generativelanguage.googleapis.com/v1beta/openai"
+    );
+    assert.strictEqual(core.normalizeAuxBase("https://llm.api.cloud.yandex.net/v1"), "https://llm.api.cloud.yandex.net/v1", "чужой путь изменён");
+    assert.strictEqual(core.normalizeAuxBase("https://my.proxy.example/openai"), "https://my.proxy.example/openai", "прокси-путь изменён");
+    assert.strictEqual(core.imageProviderLabel("https://openrouter.ai/api/v1"), "OpenRouter");
+    assert.strictEqual(core.imageProviderLabel("https://api.openai.com/v1"), "OpenAI");
+    assert.strictEqual(core.imageProviderLabel("https://generativelanguage.googleapis.com/v1beta/openai"), "Gemini (OpenAI-совместимо)");
+    assert.strictEqual(core.imageProviderLabel("https://llm.api.cloud.yandex.net/v1"), "YandexART (Яндекс AI Studio)");
+    assert.strictEqual(core.imageProviderLabel("http://127.0.0.1:7860"), "Stable Diffusion (локально, A1111)");
+    assert.ok(/незнаком/.test(core.imageProviderLabel("https://my.proxy.example/openai")), "незнакомый адрес не распознан");
+  });
+
+  await test("изображения: попытки — свой путь первым, тела под провайдера", () => {
+    const open = core.imageAttempts({ url: "https://api.openai.com/v1", key: "k" }, "кот", "gpt-image-1", { aspectRatio: "16:9" });
+    assert.strictEqual(open[0].kind, "openai_images");
+    assert.strictEqual(open[0].url, "https://api.openai.com/v1/images/generations");
+    assert.strictEqual(open[0].body.size, "1536x1024", "размер под gpt-image-1 не подставлен");
+    assert.strictEqual(open[0].body.response_format, undefined, "gpt-image-1 получил неподдерживаемый response_format");
+    assert.strictEqual(open[0].headers.Authorization, "Bearer k");
+
+    const dalle = core.imageAttempts({ url: "https://api.openai.com/v1", key: "k" }, "кот", "dall-e-3", { aspectRatio: "16:9" });
+    assert.strictEqual(dalle[0].body.size, "1792x1024", "размер под dall-e-3 не подставлен");
+    assert.strictEqual(dalle[0].body.response_format, "b64_json");
+
+    const gemini = core.imageAttempts({ url: "https://generativelanguage.googleapis.com/v1beta", key: "g" }, "кот", "gemini-2.5-flash-image", {});
+    assert.strictEqual(gemini[0].url, "https://generativelanguage.googleapis.com/v1beta/openai/images/generations");
+    assert.strictEqual(gemini[0].body.size, undefined, "Gemini получил чужой size");
+
+    const or = core.imageAttempts({ url: "https://openrouter.ai/api/v1", key: "o" }, "кот", "openai/dall-e-3", { aspectRatio: "1:1" });
+    assert.strictEqual(or[0].kind, "openrouter");
+    assert.strictEqual(or[0].url, "https://openrouter.ai/api/v1/images");
+    assert.strictEqual(or[0].body.aspect_ratio, "1:1");
+    assert.strictEqual(or[0].body.size, undefined, "OpenRouter получил чужой size");
+
+    const unknown = core.imageAttempts({ url: "https://my.proxy.example/openai", key: "p" }, "кот", "m", {});
+    assert.strictEqual(unknown[0].kind, "openai_images", "незнакомый сервер: первым должен идти OpenAI-совместимый путь");
+    assert.strictEqual(unknown[0].url, "https://my.proxy.example/openai/images/generations");
+
+    const sd = core.imageAttempts({ url: "http://127.0.0.1:7860", key: "" }, "кот", "", { aspectRatio: "16:9" });
+    assert.strictEqual(sd[0].kind, "sd_webui");
+    assert.strictEqual(sd[0].url, "http://127.0.0.1:7860/sdapi/v1/txt2img");
+    assert.deepStrictEqual([sd[0].body.width, sd[0].body.height], [1024, 576]);
+
+    const yandex = core.imageAttempts({ url: "https://llm.api.cloud.yandex.net/v1", key: "AQVN", project: "b1gfolder" }, "кот", "yandex-art/latest", { aspectRatio: "9:16" });
+    assert.strictEqual(yandex[0].kind, "yandex_art");
+    assert.strictEqual(yandex[0].headers.Authorization, "Api-Key AQVN");
+    assert.strictEqual(yandex[0].body.modelUri, "art://b1gfolder/yandex-art/latest");
+    assert.deepStrictEqual(yandex[0].body.generationOptions.aspectRatio, { widthRatio: "9", heightRatio: "16" });
+    assert.strictEqual(yandex[0].body.messages[0].text, "кот");
+  });
+
+  const realFetchImg = global.fetch;
+  await test("изображения: незнакомый шлюз — перебор путей и памятка удачного", async () => {
+    const calls = [];
+    global.fetch = async (url, init) => {
+      calls.push(String(url));
+      if (/\/images\/generations$/.test(String(url))) {
+        return { ok: false, status: 404, text: async () => JSON.stringify({ error: { message: "Not Found" } }), json: async () => ({}) };
+      }
+      return { ok: true, status: 200, json: async () => ({ data: [{ b64_json: "AAAA" }] }), text: async () => "" };
+    };
+    try {
+      const cfg = { url: "https://gw-one.example/v1", key: "k" };
+      const r1 = await core.generateImageRemote(cfg, "кот", "model-x", {});
+      assert.strictEqual(r1.b64, "AAAA");
+      assert.strictEqual(r1.kind, "openrouter", "удачный путь определён неверно");
+      assert.strictEqual(calls.length, 2, "перебор не сработал: " + calls.join(", "));
+      assert.ok(/\/images\/generations$/.test(calls[0]) && /\/images$/.test(calls[1]), calls.join(", "));
+      calls.length = 0;
+      const r2 = await core.generateImageRemote(cfg, "кот", "model-x", {});
+      assert.strictEqual(r2.kind, "openrouter");
+      assert.strictEqual(calls.length, 1, "памятка не сработала: " + calls.join(", "));
+      assert.ok(/\/images$/.test(calls[0]), calls.join(", "));
+    } finally {
+      global.fetch = realFetchImg;
+    }
+  });
+
+  await test("изображения: пустой ответ больше не даёт пустую ошибку", async () => {
+    global.fetch = async () => ({ ok: false, status: 404, text: async () => "", json: async () => ({}) });
+    try {
+      await assert.rejects(
+        () => core.generateImageRemote({ url: "https://gw-two.example/v1", key: "k" }, "кот", "model-y", {}),
+        (e) => {
+          assert.ok(/Не удалось сгенерировать/.test(e.message), "нет заголовка: " + e.message);
+          assert.ok(/HTTP 404/.test(e.message), "нет кода ответа: " + e.message);
+          assert.ok(/gw-two\.example/.test(e.message), "нет адреса: " + e.message);
+          assert.ok(/images\/generations/.test(e.message) && /\/images\b/.test(e.message), "попытки не перечислены: " + e.message);
+          assert.ok(/\(пустой ответ\)/.test(e.message), "пустое тело не объяснено: " + e.message);
+          return true;
+        }
+      );
+    } finally {
+      global.fetch = realFetchImg;
+    }
+  });
+
+  await test("изображения: ЯндексART — запуск и опрос операции", async () => {
+    const seen = [];
+    global.fetch = async (url, init) => {
+      seen.push(String(url) + " " + ((init && init.method) || "GET"));
+      if (/imageGenerationAsync$/.test(String(url))) {
+        return { ok: true, status: 200, json: async () => ({ id: "op-1" }), text: async () => "" };
+      }
+      return { ok: true, status: 200, json: async () => ({ done: true, response: { image: "BBBB" } }), text: async () => "" };
+    };
+    try {
+      const r = await core.generateImageRemote({ url: "https://llm.api.cloud.yandex.net/v1", key: "AQVN", project: "b1g" }, "кот", "yandex-art/latest", {});
+      assert.strictEqual(r.b64, "BBBB");
+      assert.strictEqual(r.mediaType, "image/jpeg");
+      assert.strictEqual(r.ext, ".jpg");
+      assert.ok(/imageGenerationAsync POST/.test(seen[0]), seen.join(" | "));
+      assert.ok(/\/operations\/op-1 GET/.test(seen[1]), seen.join(" | "));
+    } finally {
+      global.fetch = realFetchImg;
+    }
+  });
+
+  await test("изображения: ответ со ссылкой скачивается в base64", async () => {
+    global.fetch = async (url) => {
+      if (/\/images/.test(String(url)) && !/cdn\.example/.test(String(url))) {
+        return { ok: true, status: 200, json: async () => ({ data: [{ url: "https://cdn.example/pic.png" }] }), text: async () => "" };
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "image/png" },
+        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+        json: async () => ({}),
+        text: async () => "",
+      };
+    };
+    try {
+      const r = await core.generateImageRemote({ url: "https://gw-three.example/v1", key: "k" }, "кот", "m", {});
+      assert.strictEqual(r.mediaType, "image/png");
+      assert.strictEqual(r.b64, Buffer.from([1, 2, 3]).toString("base64"));
+    } finally {
+      global.fetch = realFetchImg;
+    }
+  });
+
+  await test("main.js: файл пишется из base64 ядра, ошибка называет адрес и модель", () => {
+    const mainSrc = backendSrc();
+    assert.ok(/Buffer\.from\(img\.b64, "base64"\)/.test(mainSrc), "main.js не пишет файл из base64");
+    assert.ok(/провайдер: " \+ img\.label/.test(mainSrc), "в отчёте агента нет определённого провайдера");
+    assert.ok(/Тип подключения приложение определяет по адресу само/.test(mainSrc), "ошибка не объясняет автоопределение");
+    const appSrc2 = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    const htmlSrc2 = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    assert.ok(/id="vision-detect-hint"/.test(htmlSrc2), "нет строки «определено» в настройках");
+    assert.ok(/AgentCore\.imageProviderLabel\(url\)/.test(appSrc2), "настройки не показывают определённого провайдера");
+    // Генерация изображений живёт в отдельном модуле (agent-core только раздаёт её наружу).
+    const imgSrc2 = fs.readFileSync(path.join(ROOT, "src", "renderer", "image-tools.js"), "utf8");
+    // Прокси браузерного режима ждёт «/api/llm/<кодированная база>/<путь>»: если закодировать
+    // адрес целиком, server.js отвечает 400 «Bad proxy path» (ловил живой тест).
+    assert.ok(/res = await fetch\(proxiedUrl\(a\.url\)/.test(imgSrc2), "запрос генерации кодирует адрес целиком");
+    assert.ok(/function proxiedUrl\(fullUrl\)/.test(imgSrc2), "нет сборщика прокси-адреса");
   });
 }
 
@@ -1477,7 +1680,7 @@ async function testAppUiRefs() {
 // ── Yandex Cloud по отчёту песочницы: адреса, повторы, пачки, UX ────────────
 async function testYcDiagnosis() {
   const yc = require(path.join(ROOT, "src", "yandex-cloud.js"));
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
   const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
   const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
@@ -1758,12 +1961,12 @@ async function testVault() {
   });
 
   await test("vault: инструменты агента, тексты и интерфейс связаны", () => {
-    const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    const mainSrc = backendSrc();
     const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
     const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
 
-    assert.ok(mainSrc.includes('case "vaultList"') && mainSrc.includes('case "vaultFill"'), "нет обработчиков vault-инструментов");
+    assert.ok(hasTool(mainSrc, "vaultList") && hasTool(mainSrc, "vaultFill"), "нет обработчиков vault-инструментов");
     assert.ok(mainSrc.includes("sitePasswords: []"), "нет настройки sitePasswords");
     assert.ok(mainSrc.includes("vault.sanitizeList(s.sitePasswords)"), "список не чистится при загрузке настроек");
     assert.ok(mainSrc.includes("merged.sitePasswords = prev.sitePasswords"), "нет защиты паролей от затирания при сохранении");
@@ -1897,7 +2100,7 @@ async function testVaultUi() {
 
 // ── 4c. Сессия и контекст: индикатор, профиль браузера, «Дописать ответ» ───
 async function testSessionExtras() {
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
   const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
   const preSrc = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
@@ -2150,7 +2353,7 @@ async function testMobileBridge() {
   await test("mobile-api: покрывает все методы интерфейса и знает все каналы IPC", () => {
     const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
     const mob = fs.readFileSync(path.join(ROOT, "src", "renderer", "mobile-api.js"), "utf8");
-    const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    const main = backendSrc();
     const keys = new Set([...mob.matchAll(/^\s{4}([a-zA-Z0-9_]+):/gm)].map((m) => m[1]));
     // Совпадения с адресами (api.deepseek.com и т.п.) и сознательно отсутствующий
     // синхронный канал сохранения чатов: sendSync по WebSocket невозможен, при
@@ -2169,7 +2372,7 @@ async function testMobileBridge() {
   });
 
   await test("синхронизация: история чатов с другого устройства подхватывается сама", () => {
-    const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    const main = backendSrc();
     const pre = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
     const mob = fs.readFileSync(path.join(ROOT, "src", "renderer", "mobile-api.js"), "utf8");
     const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
@@ -2408,7 +2611,7 @@ async function testHighlight() {
 // ── 11. Хранение чатов: атомарная запись, .bak-восстановление, автосейв ──────
 async function testChatPersistence() {
   // Функции хранения берём прямо из main.js (реальный код, не копия).
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const s0 = mainSrc.indexOf("// Чтение чатов:");
   const s1 = mainSrc.indexOf("// ─────────────────────────── Пути и файлы");
   assert.ok(s0 > 0 && s1 > s0, "не нашёл функции хранения чатов в main.js");
@@ -2676,11 +2879,10 @@ async function testMail() {
     assert.ok(/Почта \(SMTP\/IMAP/.test(prompt), "в промпте нет правила про почту");
     const preload = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
     for (const s of ["mail:test", "mail:recent", "mail:testSend"]) assert.ok(preload.includes(s), "в preload нет " + s);
-    const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    const main = backendSrc();
     assert.ok(main.includes('require("./mail.js")'), "main.js не подключает mail.js");
-    for (const s of ['case "mailSend"', 'case "mailList"', 'case "mailCode"', 'ipcMain.handle("mail:test"']) {
-      assert.ok(main.includes(s), "в main.js нет " + s);
-    }
+    for (const tool of ["mailSend", "mailList", "mailCode"]) assert.ok(hasTool(main, tool), "в бэкенде нет инструмента " + tool);
+    assert.ok(main.includes('ipcMain.handle("mail:test"'), "в бэкенде нет канала mail:test");
     const secrets = fs.readFileSync(path.join(ROOT, "src", "secrets.js"), "utf8");
     assert.ok(secrets.includes('"mailPassword"'), "пароль почты не в списке секретов");
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
@@ -2701,7 +2903,7 @@ async function testYandexCloud() {
   const http2 = require("http2");
   const yc = require(path.join(ROOT, "src", "yandex-cloud.js"));
   const ycSrc = fs.readFileSync(path.join(ROOT, "src", "yandex-cloud.js"), "utf8");
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
   // Тот же простой мок сети, что и в yc-тестах выше: считает запросы и «в полёте».
   const makeFetch = (route) => {
@@ -2920,7 +3122,7 @@ async function testYandexCloud() {
   });
 
   await test("Yandex Cloud: токен и каталог автоматически уходят в окружение команд", () => {
-    const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    const main = backendSrc();
     assert.ok(main.includes('require("./yc-cli.js")') && main.includes('require("./yc-logs.js")'), "модули не подключены");
     assert.ok(/function ycAutoEnv\(s\)/.test(main), "нет ycAutoEnv");
     // yc CLI принимает в YC_TOKEN/YC_IAM_TOKEN только IAM-токен: OAuth там даёт
@@ -2946,14 +3148,14 @@ async function testYandexCloud() {
   });
 
   await test("Yandex Cloud: ycLogs идёт через внутренний API — внешний yc CLI больше не нужен", () => {
-    const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    const main = backendSrc();
     assert.ok(/async function readYcLogsText\(/.test(main), "нет чтения логов внутренним API");
     assert.ok(main.includes('yandexCloud.endpoint("logging")'), "нет адреса сервиса логирования");
     assert.ok(main.includes("ycLogs.readLogs("), "не вызывается модуль логов");
     assert.ok(!main.includes("yc logging read"), "остался вызов внешнего yc CLI");
     assert.ok(!main.includes('findProgram("yc")'), "логи всё ещё ищут внешний yc");
     assert.ok(main.includes('ipcMain.handle("yc:logs"') && main.includes("readYcLogsText(cfg,"), "IPC логов не переведён");
-    assert.ok(main.includes('case "ycLogs"') && main.includes('case "ycInstall"'), "нет инструментов ycLogs/ycInstall");
+    assert.ok(hasTool(main, "ycLogs") && hasTool(main, "ycInstall"), "нет инструментов ycLogs/ycInstall");
     assert.ok(main.includes('ipcMain.handle("yc:cliStatus"') && main.includes('ipcMain.handle("yc:installCli"'), "нет IPC встроенного yc CLI");
     assert.ok(main.includes("const YC_RESOURCE_TYPES") && main.includes("serverless.container"), "нет карты типов ресурсов");
   });
@@ -2983,8 +3185,8 @@ async function testYandexCloud() {
     assert.ok(app.includes('$("btn-yc-install-cli")'), "в app.js нет обработчика кнопки");
   });
 
-  await test("readYcLogsText: берёт реальный код main.js и собирает запрос из настроек", async () => {
-    const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  await test("readYcLogsText: берёт реальный код модуля и собирает запрос из настроек", async () => {
+    const main = fs.readFileSync(path.join(ROOT, "src", "yc-service.js"), "utf8");
     const s0 = main.indexOf("// Ключ сервиса → тип ресурса Cloud Logging");
     const s1 = main.indexOf("// Встроенный yc CLI:");
     assert.ok(s0 > 0 && s1 > s0, "не нашёл helpers логирования в main.js");
@@ -3486,8 +3688,8 @@ async function testYandexCloud() {
     const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
     assert.ok(/s-yc-allow-update"\)\.onchange/.test(app), "app.js не слушает третий чекбокс");
     assert.ok(/api\.ycSetPermissions\(create, del, upd\)/.test(app), "app.js не сохраняет третье разрешение");
-    const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
-    assert.ok(main.includes('case "ycContainer"'), "нет обработчика ycContainer");
+    const main = backendSrc();
+    assert.ok(hasTool(main, "ycContainer"), "нет обработчика ycContainer");
     assert.ok(/allowUpdate \? "разрешено"/.test(main), "ycStatus не сообщает про право менять контейнеры");
     assert.ok(/ycAllowAgentUpdate: !!allowUpdate/.test(main), "IPC не сохраняет право менять контейнеры");
     assert.ok(
@@ -3523,7 +3725,7 @@ async function testYandexCloud() {
 // ── 5. Оболочка (shell), коды ошибок, установщики и свой Chrome по CDP ─────
 async function testShellAndCdp() {
   const http = require("http");
-  const mainFull = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainFull = backendSrc();
   const core2 = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
   const pre2 = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
   const html2 = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
@@ -3563,10 +3765,10 @@ async function testShellAndCdp() {
     const cmdCode = mainFull.slice(mainFull.indexOf("function runTerminalCommand(command, cwd, timeoutMs, shellName)"));
     assert.ok(/sh\.shellHint/.test(cmdCode), "подсказка оболочки не попадает в ответ");
     assert.ok(/const sh = resolveShell\(command, shellName\)/.test(cmdCode), "runTerminalCommand не использует выбор оболочки");
-    const rc = mainFull.slice(mainFull.indexOf('case "runCommand"'), mainFull.indexOf('case "startBackground"'));
+    const rc = toolBody(mainFull, "runCommand", "startBackground");
     assert.ok(/normalizeShell\(shellRaw\)/.test(rc), "runCommand не проверяет оболочку");
     assert.ok(/runTerminalCommand\(cmd, cwd, timeoutMs, shellName\)/.test(rc), "runCommand не передаёт оболочку");
-    const bg = mainFull.slice(mainFull.indexOf('case "startBackground"'), mainFull.indexOf('case "listBackground"'));
+    const bg = toolBody(mainFull, "startBackground", "listBackground");
     assert.ok(/shellArgs: bgShell\.args/.test(bg), "startBackground не передаёт оболочку");
     assert.ok(mainFull.includes('shell: { type: "string", description: "Оболочка: cmd') === false, "описание в main.js не нужно");
     assert.ok(/shell: "powershell"/.test(core2) || /shell: \\"powershell\\"/.test(core2), "нет описания shell у инструмента runCommand");
@@ -3635,12 +3837,12 @@ async function testShellAndCdp() {
     assert.ok(/"shellsStatus",/.test(core2), "нет в ядре инструментов (тесный контекст)");
     assert.ok(/shells_status: "shellsStatus"/.test(core2), "нет алиаса");
     assert.ok(/вызови shellsStatus/.test(modelPrompt()), "промпт не велит проверять доступные оболочки");
-    assert.ok(/case "shellsStatus": \{/.test(mainFull), "нет диспетчера в main.js");
+    assert.ok(hasTool(mainFull, "shellsStatus"), "нет обработчика shellsStatus");
     assert.ok(/parts\.push\("Оболочки: " \+ shellsBrief\(\)\)/.test(mainFull), "нет строки оболочек в САММАРИ проекта");
   });
 
   await test("startBackground: без оболочки честная ошибка, а не «OK, PID undefined»", () => {
-    const bg = mainFull.slice(mainFull.indexOf('case "startBackground"'), mainFull.indexOf('case "listBackground"'));
+    const bg = toolBody(mainFull, "startBackground", "listBackground");
     assert.ok(/if \(bgShell\.missing\)/.test(bg), "нет предпроверки оболочки");
     assert.ok(/фоновый процесс НЕ запущен/.test(bg), "нет понятного текста отказа");
     assert.ok(bg.indexOf("bgShell.missing") < bg.indexOf("bgSpawn("), "предпроверка должна идти до запуска процесса");
@@ -3657,19 +3859,24 @@ async function testShellAndCdp() {
   });
 
   // ── spawnRaw: системные коды ошибок сохраняются ─────────────────────────
-  const r0 = mainFull.indexOf("function spawnRaw(args, opts) {");
-  const r1 = mainFull.indexOf("\n}\n", mainFull.indexOf("resolve({ ok: !err, code, out", r0));
-  assert.ok(r0 > 0 && r1 > r0, "не нашёл spawnRaw");
   let pendingErr = null;
-  const spawnRaw = new Function(
-    "execFile", "os", "stripAnsi", "agentEnv",
-    mainFull.slice(r0, r1 + 2) + "; return spawnRaw;"
-  )(
-    (bin, args, opts, cb) => { setTimeout(() => cb(pendingErr, pendingErr ? "" : "ok", ""), 0); },
-    os,
-    (x) => String(x || ""),
-    {}
-  );
+  // Раздел «Системные программы и окружение» вынесен в src/system-stack.js
+  // (1.5.78). Проверка берёт НАСТОЯЩИЙ модуль, а не срез текста main.js: срез
+  // проверял бы код, которого в main.js уже нет, и «зеленел» бы впустую.
+  const mkSystemStack = (over) =>
+    require(path.join(ROOT, "src", "system-stack.js")).createSystemStack({
+      fs,
+      path,
+      os,
+      execFile: (bin, args, opts, cb) => { setTimeout(() => cb(pendingErr, pendingErr ? "" : "ok", ""), 0); },
+      winPs: { exec: async () => ({ noSession: true, ok: true, code: 0, out: "", err: "" }) },
+      probeEnv: () => ({ ...process.env }),
+      stripAnsi: (x) => String(x || ""),
+      runTerminalCommand: async () => "",
+      live: { get agentEnv() { return {}; } },
+      ...(over || {}),
+    });
+  const spawnRaw = mkSystemStack().spawnRaw;
 
   await test("spawnRaw: EINVAL/EACCES/EPERM и текст ошибки больше не теряются", async () => {
     const cases = [
@@ -3695,10 +3902,8 @@ async function testShellAndCdp() {
   });
 
   // ── installExe: .exe / .msi / .zip ──────────────────────────────────────
-  const i0 = mainFull.indexOf("function findInstallersIn(dir) {");
-  const i1 = mainFull.indexOf("\nasync function downloadAndExtractTo", i0);
-  assert.ok(i0 > 0 && i1 > i0, "не нашёл findInstallersIn");
-  const findInstallersIn = new Function("fs", "path", mainFull.slice(i0, i1) + "; return findInstallersIn;")(fs, path);
+  // Поиск установщиков тоже живёт в src/system-stack.js — берём его оттуда.
+  const findInstallersIn = mkSystemStack().findInstallersIn;
 
   await test("installExe: установщик ищется в распакованном архиве (сначала из корня)", () => {
     const dir = tmpdir("inst-test-");
@@ -3716,7 +3921,7 @@ async function testShellAndCdp() {
   });
 
   await test("installExe: ветки .msi (msiexec) и .zip на месте, .exe не форсируется", () => {
-    const inst = mainFull.slice(mainFull.indexOf('case "installExe"'), mainFull.indexOf('case "noteSave"'));
+    const inst = toolBody(mainFull, "installExe", "noteSave");
     assert.ok(inst.includes("msiexec /i"), "нет ветки .msi");
     assert.ok(inst.includes("/passive /norestart"), "нет тихих ключей msiexec по умолчанию");
     assert.ok(inst.includes("downloadAndExtractTo(url, destDir)"), "нет распаковки .zip");
@@ -3727,9 +3932,218 @@ async function testShellAndCdp() {
     assert.ok(core2.includes("msiexec") && core2.includes(".zip (распаковка"), "описание installExe не обновлено");
   });
 
+  // ── installExe: файл проверяется ДО запуска ─────────────────────────────
+  // Это НАСТОЯЩИЕ функции из src/system-stack.js, а не срез текста: хэш,
+  // подпись, отчёт и решение «запускать или нет» проверяются по факту.
+  const instStack = mkSystemStack();
+
+  await test("проверка установщика: хэш файла, «sha256:» и регистр не мешают", async () => {
+    const dir = tmpdir("inst-verify-");
+    const f = path.join(dir, "setup.exe");
+    fs.writeFileSync(f, "payload");
+    const want = crypto.createHash("sha256").update("payload").digest("hex");
+    const v = await instStack.verifyInstaller(f, want);
+    assert.strictEqual(v.ok, true, "проверка не прошла: " + (v.error || ""));
+    assert.strictEqual(v.sha256, want, "хэш посчитан не по файлу");
+    assert.strictEqual(v.size, 7);
+    assert.strictEqual(v.hashOk, true);
+    const loud = await instStack.verifyInstaller(f, "SHA256:" + want.toUpperCase());
+    assert.strictEqual(loud.hashOk, true, "приставка sha256: и регистр сломали сверку");
+    const noWant = await instStack.verifyInstaller(f, "");
+    assert.strictEqual(noWant.hashOk, true, "без заданного хэша запуск не должен блокироваться");
+    assert.strictEqual(noWant.expected, "");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test("проверка установщика: другой хэш — отказ с обоими хэшами, allowUnsigned не помогает", async () => {
+    const dir = tmpdir("inst-mismatch-");
+    const f = path.join(dir, "setup.exe");
+    fs.writeFileSync(f, "payload");
+    const other = "0".repeat(64);
+    const v = await instStack.verifyInstaller(f, other);
+    assert.strictEqual(v.hashOk, false, "подмена хэша не замечена");
+    const why = instStack.installerGate(v, {});
+    assert.ok(why.includes(other) && why.includes(v.sha256), "в отказе нет обоих хэшей: " + why);
+    assert.ok(why.includes("остановлена"), "отказ не говорит словами: " + why);
+    assert.strictEqual(instStack.installerGate(v, { allowUnsigned: true }), why, "allowUnsigned не отменяет сверку хэша");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test("проверка установщика: файла нет — понятная ошибка, а не исключение", async () => {
+    const v = await instStack.verifyInstaller(path.join(os.tmpdir(), "нет-такого-установщика.exe"), "");
+    assert.strictEqual(v.ok, false);
+    assert.ok(/не найден/i.test(v.error || ""), "ошибка без объяснения: " + v.error);
+  });
+
+  await test("подпись: недействительная останавливает запуск, allowUnsigned разрешает", () => {
+    const base = { ok: true, size: 2048, sha256: "a".repeat(64), expected: "", hashOk: true };
+    const bad = Object.assign({}, base, { sig: { status: "NotSigned", signer: "" } });
+    const why = instStack.installerGate(bad, {});
+    assert.ok(why.includes("подпись"), "нет объяснения про подпись: " + why);
+    assert.ok(why.includes("allowUnsigned"), "нет подсказки, как продолжить: " + why);
+    assert.strictEqual(instStack.installerGate(bad, { allowUnsigned: true }), "", "allowUnsigned не разрешил запуск");
+    const good = Object.assign({}, base, { sig: { status: "Valid", signer: "CN=Издатель" } });
+    assert.strictEqual(instStack.installerGate(good, {}), "", "действительная подпись не должна мешать");
+    assert.strictEqual(instStack.installerGate(Object.assign({}, base, { sig: null }), {}), "", "без данных о подписи запуск не блокируется");
+    assert.strictEqual(instStack.installerGate(base, {}), "", "решение без поля sig должно быть разрешающим");
+  });
+
+  await test("отчёт о файле: размер, хэш и подпись видны до запуска", () => {
+    const v = { ok: true, size: 2048, sha256: "b".repeat(64), expected: "", hashOk: true, sig: null };
+    const t = instStack.installerFacts("C:\\tmp\\setup.exe", v);
+    assert.ok(t.includes(v.sha256), "в отчёте нет хэша");
+    assert.ok(t.includes("2 КБ"), "размер подан странно: " + t);
+    assert.ok(t.includes("нет данных"), "отсутствие подписи подано как проверка: " + t);
+    const signed = instStack.installerFacts("C:\\tmp\\setup.exe", Object.assign({}, v, { sig: { status: "Valid", signer: "CN=Издатель" } }));
+    assert.ok(signed.includes("действительна") && signed.includes("CN=Издатель"), "подпись не показана: " + signed);
+    const mismatch = instStack.installerFacts("C:\\tmp\\setup.exe", Object.assign({}, v, { expected: "c".repeat(64), hashOk: false }));
+    assert.ok(mismatch.includes("НЕ совпал"), "несовпадение хэша не видно в отчёте: " + mismatch);
+    const big = instStack.installerFacts("C:\\tmp\\setup.exe", Object.assign({}, v, { size: 12 * 1024 * 1024 }));
+    assert.ok(big.includes("12 МБ"), "крупный файл показан странно: " + big);
+  });
+
+  await test("подпись читается через Get-AuthenticodeSignature (Windows), без сессии — «нет данных»", async () => {
+    const realPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    let sawScript = "";
+    const stack = mkSystemStack({
+      winPs: { exec: async (script) => { sawScript = script; return { ok: true, out: '{"Status":"Valid","Signer":"CN=Test Publisher"}', err: "" }; } },
+    });
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    try {
+      const dir = tmpdir("inst-sig-");
+      const f = path.join(dir, "setup.exe");
+      fs.writeFileSync(f, "payload");
+      const v = await stack.verifyInstaller(f, "");
+      assert.ok(/Get-AuthenticodeSignature/.test(sawScript), "подпись не запрашивалась: " + sawScript);
+      assert.ok(v.sig && v.sig.status === "Valid", "статус подписи не разобран: " + JSON.stringify(v.sig));
+      assert.strictEqual(v.sig.signer, "CN=Test Publisher");
+      const noSession = mkSystemStack({ winPs: { exec: async () => ({ noSession: true, ok: true, code: 0, out: "", err: "" }) } });
+      const v2 = await noSession.verifyInstaller(f, "");
+      assert.strictEqual(v2.sig, null, "без живой сессии PowerShell подпись придумана");
+      const junk = mkSystemStack({ winPs: { exec: async () => ({ ok: true, out: "не json", err: "" }) } });
+      const v3 = await junk.verifyInstaller(f, "");
+      assert.ok(v3.sig && v3.sig.status === "Unknown", "неразобранный ответ не помечен как неизвестный: " + JSON.stringify(v3.sig));
+      fs.rmSync(dir, { recursive: true, force: true });
+    } finally {
+      Object.defineProperty(process, "platform", realPlatform);
+    }
+  });
+
+  await test("installExe: проверка стоит ДО запуска во всех трёх ветках", () => {
+    const inst = toolBody(mainFull, "installExe", "noteSave");
+    assert.strictEqual((inst.match(/await verifyInstaller\(/g) || []).length, 3, "проверка хэша стоит не во всех ветках");
+    assert.strictEqual((inst.match(/installerGate\(/g) || []).length, 3, "решение о запуске не во всех ветках");
+    const pairs = [
+      ["архив", inst.indexOf("const stopZip = installerGate"), inst.indexOf("const outZ = await runTerminalCommand(")],
+      [".msi", inst.indexOf("const stopMsi = installerGate"), inst.indexOf("const outM = await runTerminalCommand(")],
+      [".exe", inst.indexOf("const stopExe = installerGate"), inst.indexOf("const out = await runTerminalCommand(")],
+    ];
+    for (const row of pairs) {
+      assert.ok(row[1] > 0 && row[2] > 0, "не нашёл проверку или запуск: " + row[0]);
+      assert.ok(row[1] < row[2], row[0] + ": запуск идёт раньше проверки");
+    }
+    assert.ok(!/function installerGate|const installerGate/.test(inst), "копия помощников вернулась в инструмент");
+    for (const name of ["factsZip", "factsMsi", "factsExe"]) {
+      const decl = inst.indexOf("const " + name + " = installerFacts(");
+      const use = inst.indexOf(name + " +");
+      assert.ok(decl > 0, "нет объявления " + name);
+      assert.ok(use > decl, name + " используется раньше объявления (TDZ)");
+    }
+    assert.ok(/sha256/.test(core2), "описание installExe не знает про sha256");
+    assert.ok(/allowUnsigned/.test(core2), "описание installExe не знает про allowUnsigned");
+  });
+
+  // ── system-stack: PATH, коды выхода, загрузка файлов ─────────────────────
+  await test("system-stack: слитый PATH без дублей, порядок «своё, потом системное»", () => {
+    const stack = mkSystemStack();
+    const before = process.env.PATH;
+    try {
+      // Пути без буквы диска и «:»: на Windows разделитель «;», на Unix «:», а
+      // «C:\one» сломал бы разбор на Unix (колонка после буквы диска).
+      const all = stack.setMergedPath(
+        ["/opt/one", "/opt/two"].join(path.delimiter),
+        ["/opt/two", "/opt/three"].join(path.delimiter)
+      );
+      assert.deepStrictEqual(all, ["/opt/one", "/opt/two", "/opt/three"], "дубль пути не убран: " + JSON.stringify(all));
+      assert.strictEqual(process.env.PATH, all.join(path.delimiter), "PATH процесса не обновлён");
+      assert.deepStrictEqual(stack.setMergedPath("", ""), [], "пустые пути должны давать пустой список");
+    } finally {
+      process.env.PATH = before;
+    }
+  });
+
+  await test("system-stack: 127 и 9009 объясняются установкой, 0 — «успех»", () => {
+    const stack = mkSystemStack();
+    const notFound = stack.explainExit(127, "node -v");
+    assert.ok(/НЕ НАЙДЕНА/.test(notFound), "код 127 не объяснён: " + notFound.slice(0, 120));
+    assert.ok(/installSystemPackage/.test(notFound) && /refreshEnv/.test(notFound), "нет пути решения для 127");
+    assert.ok(/команда не найдена/.test(stack.explainExit(9009, "x")), "нет объяснения 9009");
+    assert.ok(/Успех/.test(stack.explainExit(0, "x")), "код 0 должен быть «успех»");
+    assert.ok(/права администратора/.test(stack.explainExit(740, "x")), "740 не объяснён");
+    assert.ok(/числом/.test(stack.explainExit("x", "")), "нечисловой код должен просить число");
+    assert.ok(/Команда: node -v/.test(notFound), "текст команды потерян");
+  });
+
+  await test("system-stack: downloadFileTo уважает лимит и HTTP-ошибку", async () => {
+    const stack = mkSystemStack();
+    const server = http.createServer((req, res) => {
+      if (req.url === "/big") {
+        res.writeHead(200, { "Content-Type": "application/octet-stream" });
+        res.end(Buffer.alloc(3 * 1024 * 1024));
+        return;
+      }
+      if (req.url === "/ok") {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("привет");
+        return;
+      }
+      res.writeHead(404);
+      res.end("no");
+    });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    const base = "http://127.0.0.1:" + server.address().port;
+    const dir = tmpdir("dl-test-");
+    try {
+      const big = await stack.downloadFileTo(base + "/big", path.join(dir, "big.bin"), 1);
+      assert.strictEqual(big.ok, false, "файл больше лимита скачан");
+      assert.ok(/слишком большой/.test(big.error), "нет объяснения про размер: " + big.error);
+      assert.ok(!fs.existsSync(path.join(dir, "big.bin")), "слишком большой файл всё же записан на диск");
+      const bad = await stack.downloadFileTo(base + "/nope", path.join(dir, "nope.bin"), 10);
+      assert.strictEqual(bad.ok, false, "404 отдан как успех");
+      assert.ok(/HTTP 404/.test(bad.error), "нет кода ошибки: " + bad.error);
+      const ok = await stack.downloadFileTo(base + "/ok", path.join(dir, "ok.txt"), 10);
+      assert.strictEqual(ok.ok, true, "нормальная загрузка сорвалась: " + ok.error);
+      assert.strictEqual(fs.readFileSync(path.join(dir, "ok.txt"), "utf8"), "привет");
+      assert.ok(ok.size > 0, "размер не посчитан");
+    } finally {
+      server.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test("system-stack: findProgram не выдумывает путь и разбирает абсолютный", () => {
+    const stack = mkSystemStack();
+    assert.strictEqual(stack.findProgram("").found, false, "пустое имя считается найденным");
+    const abs = stack.findProgram(process.execPath);
+    assert.strictEqual(abs.found, true, "абсолютный путь к node не найден");
+    const gone = stack.findProgram(path.join(os.tmpdir(), "нет-такого-файла-9f8e.exe"));
+    assert.strictEqual(gone.found, false, "несуществующий путь считается найденным");
+    assert.ok(/Не найден файл/.test(gone.reason), "нет причины отказа: " + gone.reason);
+  });
+
+  await test("system-stack: установленное не ставится повторно и не трогает команды", async () => {
+    const calls = [];
+    const stack = mkSystemStack({ runTerminalCommand: async (cmd) => { calls.push(cmd); return "не должно вызываться"; } });
+    const out = await stack.installSystemPkg("node");
+    assert.ok(/уже установлен/.test(out), "установленный node не распознан: " + out.slice(0, 120));
+    assert.strictEqual(calls.length, 0, "на установленную программу запущена команда установки");
+    const empty = await stack.installSystemPkg("");
+    assert.ok(/укажи packageName/.test(empty), "пустое имя не отклонено");
+  });
+
   // ── gitPublish вне GitHub ───────────────────────────────────────────────
   await test("gitPublish: публикация на GitLab/Bitbucket по remoteUrl", () => {
-    const gp = mainFull.slice(mainFull.indexOf('case "gitPublish"'), mainFull.indexOf('case "gitInit"'));
+    const gp = toolBody(mainFull, "gitPublish", "gitInit");
     assert.ok(gp.includes("args.remoteUrl"), "нет ветки remoteUrl");
     assert.ok(/remote", "set-url"/.test(gp) || gp.includes('"remote", "set-url"'), "нет обновления существующего remote");
     assert.ok(gp.includes('"remote", "add"'), "нет добавления remote");
@@ -3823,7 +4237,7 @@ async function testShellAndCdp() {
     assert.ok(/browser_connect: "browserConnect"/.test(core2), "нет алиаса browser_connect");
     assert.ok(/начни с browserConnect/.test(modelPrompt()), "промпт не объясняет, когда подключаться к своему Chrome");
     assert.ok(pre2.includes("browserConnect: (opts) =>"), "preload не пробрасывает browserConnect");
-    assert.ok(mainFull.includes('case "browserConnect": {'), "нет диспетчера инструмента");
+    assert.ok(hasTool(mainFull, "browserConnect"), "нет обработчика browserConnect");
     assert.ok(mainFull.includes("function applyBrowserSettings(s)"), "нет единой точки применения браузерных настроек");
     assert.ok(/browserConnect === true/.test(mainFull), "настройка не читается");
     for (const id of ["s-browser-connect", "s-browser-connect-port", "btn-browser-connect", "browser-connect-info"]) {
@@ -3839,7 +4253,7 @@ async function testShellAndCdp() {
 // ── Память диалогов: сжатые памятки контекста по датам ─────────────────────
 async function testContextMemory() {
   const store = require(path.join(ROOT, "src", "agent-store.js"));
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
   const preloadSrc = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
   const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
@@ -3848,7 +4262,7 @@ async function testContextMemory() {
   await test("память: выключено по умолчанию, инструменты, IPC и UI на месте", () => {
     assert.ok(/contextMemory: false,/.test(mainSrc), "нет contextMemory: false (должно быть выключено по умолчанию)");
     assert.ok(/contextMemoryDays: 30/.test(mainSrc), "нет contextMemoryDays");
-    assert.ok(/case "memoryList"/.test(mainSrc) && /case "memorySearch"/.test(mainSrc), "нет диспетчера memoryList/memorySearch");
+    assert.ok(hasTool(mainSrc, "memoryList") && hasTool(mainSrc, "memorySearch"), "нет обработчиков memoryList/memorySearch");
     assert.ok(/onMemo: \(m\) => saveContextMemo\(settings, m, emit\)/.test(mainSrc), "runAi не подключает onMemo");
     assert.ok(/function saveContextMemo\(settings, entry, emit\)/.test(mainSrc), "нет saveContextMemo");
     for (const ch of ["memory:stats", "memory:days", "memory:openDir", "memory:clear"]) {
@@ -4017,7 +4431,7 @@ async function testContextMemory() {
 // дважды. Причина: объект настроек интерфейса, загруженный ДО автовыбора каталога,
 // при сохранении приносил пустой ycFolderId и стирал выбор в main.
 async function testYcFolderPersistence() {
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
 
   const a = mainSrc.indexOf('ipcMain.handle("settings:set"');
@@ -4090,7 +4504,7 @@ async function testYcFolderPersistence() {
     assert.ok(/settings\.ycFolderId = st\.folderId/.test(appSrc), "UI не синхронизирует каталог из статуса");
     assert.ok(/settings\.ycFolderId = sel\.value/.test(appSrc), "UI не синхронизирует каталог при выборе");
     // Инструменты по-прежнему читают свежие настройки, а не снимок начала ответа
-    const ycCases = mainSrc.slice(mainSrc.indexOf('case "ycStatus"'), mainSrc.indexOf('case "ycInstall"'));
+    const ycCases = toolBody(mainSrc, "ycStatus", "ycInstall");
     assert.ok(/ycConfig\(loadSettings\(\)\)/.test(ycCases), "yc-инструменты читают устаревший снимок настроек");
   });
 }
@@ -4100,7 +4514,7 @@ async function testYcFolderPersistence() {
 // ─────────────────────────────────────────────────────────────────────────────
 async function testPlanPanel() {
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
   const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
   const cssSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "styles.css"), "utf8");
@@ -4336,7 +4750,7 @@ async function testPlanPanel() {
   });
 
   await test("план: инструмент связан с интерфейсом (main → событие plan → панель)", () => {
-    assert.ok(/case "todoWrite": \{/.test(mainSrc), "в main.js нет обработчика todoWrite");
+    assert.ok(hasTool(mainSrc, "todoWrite"), "нет обработчика todoWrite");
     assert.ok(/activeEmit\(\{ type: "plan", tasks: planTasks, title: planTitle \}\)/.test(mainSrc), "main.js не отправляет событие plan");
     assert.ok(/normalizePlanTasks\(/.test(mainSrc) && /planSummary\(/.test(mainSrc), "main.js не нормализует план");
     assert.ok(/normalizePlanTasks,\n  planSummary,/.test(mainSrc), "нормализатор не импортирован в main.js");
@@ -4708,7 +5122,7 @@ async function testBrowserOverlays() {
   const bt = require(path.join(ROOT, "src", "browser-tools.js"));
   const dom = require(path.join(ROOT, "src", "dom-map.js"));
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
   const AgentCore = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
 
@@ -5105,7 +5519,7 @@ async function testBrowserOverlays() {
 
   await test("слои поверх страницы: инструменты, промпт и main.js согласованы", () => {
     for (const t of ["browserEval", "browserDOM", "browserOverlays"]) {
-      assert.ok(new RegExp('case "' + t + '": \\{').test(mainSrc), "в main.js нет обработчика " + t);
+      assert.ok(hasTool(mainSrc, t), "нет обработчика " + t);
       assert.ok(coreSrc.indexOf('name: "' + t + '"') !== -1, "нет определения " + t + " в ядре");
       assert.ok(AgentCore.SYSTEM_PROMPT.indexOf(t) !== -1, t + " нет в списке доступных инструментов");
     }
@@ -5130,7 +5544,7 @@ async function testBrowserOverlays() {
 // ── Ускорение агента: батчинг, скриншоты JPEG, порог компакции ──────────────
 async function testAgentSpeedups() {
   const core = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const appUiSrc = fs.readFileSync(path.join(ROOT, "src", "app-ui-tools.js"), "utf8");
   const browserSrc = fs.readFileSync(path.join(ROOT, "src", "browser-tools.js"), "utf8");
 
@@ -5344,7 +5758,7 @@ async function testStreamThrottle() {
 // умеют отправлять Enter вместе с вводом и выполняют цепочку шагов одной командой.
 async function testBrowserSpeed() {
   const bt = require(path.join(ROOT, "src", "browser-tools.js"));
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
   const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
 
@@ -5512,7 +5926,7 @@ async function testBrowserSpeed() {
     });
 
     await test("browserAct: подключён к интерфейсу, промпту и подписям инструментов", () => {
-      assert.ok(/case "browserAct"/.test(mainSrc), "main.js не обрабатывает browserAct");
+      assert.ok(hasTool(mainSrc, "browserAct"), "бэкенд не обрабатывает browserAct");
       assert.ok(/name: "browserAct"/.test(coreSrc), "нет определения инструмента browserAct");
       assert.ok(/browserAct: "⚡"/.test(appSrc), "нет иконки browserAct в интерфейсе");
       assert.ok(/browserAct: "Цепочка действий в браузере"/.test(appSrc), "нет подписи browserAct");
@@ -5531,7 +5945,7 @@ async function testBrowserSpeed() {
 // Проверяем поведенчески на подставном Playwright и мини-DOM страницы.
 async function testBrowserSenses() {
   const bt = require(path.join(ROOT, "src", "browser-tools.js"));
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
   const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
   const AgentCore = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
@@ -5815,7 +6229,7 @@ async function testBrowserSenses() {
 
     await test("browserScroll/browserHover/browserNetwork/waitForIdle связаны с приложением", () => {
       for (const t of ["browserScroll", "browserHover", "browserNetwork", "waitForIdle", "agentGuide"]) {
-        assert.ok(new RegExp('case "' + t + '"').test(mainSrc), "main.js не обрабатывает " + t);
+        assert.ok(hasTool(mainSrc, t), "бэкенд не обрабатывает " + t);
         const def = AgentCore.TOOL_DEFINITIONS.find((x) => x.function && x.function.name === t);
         assert.ok(def, "нет определения инструмента " + t);
         assert.ok(AgentCore.SYSTEM_PROMPT.indexOf(t) !== -1, t + " нет в списке инструментов промпта");
@@ -5845,7 +6259,7 @@ async function testBrowserSenses() {
     });
 
     await test("зрение на скриншоте: включается по модели с ключом и спрашивает про кликабельное", () => {
-      const shot = mainSrc.slice(mainSrc.indexOf('case "browserScreenshot"'), mainSrc.indexOf('case "browserEval"'));
+      const shot = toolBody(mainSrc, "browserScreenshot", "browserEval");
       assert.ok(/vcfg.visionModel && vcfg.key/.test(shot), "зрение не подключается без галочки «Зрение»");
       assert.ok(/КЛИКАБЕЛЬНЫ/.test(shot), "вопрос зрению не про кликабельные элементы");
       assert.ok(/ЗА пределами экрана/.test(shot), "зрение не спрашивают про то, что за экраном");
@@ -5891,7 +6305,7 @@ async function testPowerShellSession() {
   const ps = require(path.join(ROOT, "src", "win-ps.js"));
   const markers = ps.__markers();
   const { EventEmitter } = require("events");
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
 
   // Фальшивый powershell.exe: считает, сколько раз его запускали, и отвечает
   // так же, как настоящая обёртка (маркеры BEGIN/END + код).
@@ -6021,7 +6435,7 @@ async function testPowerShellSession() {
 // ── Кэш промпта: статичный префикс и метрики токенов ─────────────────────────
 async function testPromptCacheAndUsage() {
   const core = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
   const cssSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "styles.css"), "utf8");
   const orSettings = { provider: "openai", openaiUrl: "https://openrouter.ai/api/v1", openaiApiKey: "k" };
@@ -6451,7 +6865,7 @@ async function testToolRouter() {
     assert.strictEqual(longText, core.routerTaskText(many), "текст роутера не детерминирован");
     assert.ok(/сообщение номер 39/.test(longText), "в текст роутера не попала последняя фраза");
     // И это подключено в main.js вместо старого разбора трёх фраз.
-    const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    const mainSrc = backendSrc();
     assert.ok(/const routerTask = routerTaskText\(messages\)/.test(mainSrc), "main.js не берёт текст роутера из истории");
     assert.ok(
       !/for \(let i = messages\.length - 1; i >= 0 && parts\.length < 3/.test(mainSrc),
@@ -6487,7 +6901,7 @@ async function testToolRouter() {
     assert.strictEqual(core.coldCacheInfo(500, "internal error", 1), null, "любой 500 стал повтором");
     assert.ok(core.coldCacheInfo(500, "cache_only_cold", 1).cold, "холодный отказ под 500 не распознан");
     // И это подключено в main.js: повтор ТОГО ЖЕ раунда вместо падения с сырым JSON.
-    const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    const mainSrc = backendSrc();
     assert.ok(/const cold = coldCacheInfo\(res\.status, detail, unavailableRetries \+ 1\)/.test(mainSrc), "503 не обрабатывается");
     assert.ok(/unavailableRetries\+\+;/.test(mainSrc), "нет счётчика повторов 503");
     assert.ok(
@@ -6498,7 +6912,7 @@ async function testToolRouter() {
   });
 
   await test("роутер: предохранители подключены в main.js и в настройках", () => {
-    const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    const mainSrc = backendSrc();
     const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
     const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
@@ -6506,7 +6920,7 @@ async function testToolRouter() {
     assert.ok(/const gid = groupOfTool\(c\.name\);/.test(mainSrc), "нет предохранителя A");
     assert.ok(/stickyGroups\.add\(gid\);\s*\n\s*refreshTools\(\);/.test(mainSrc), "группа вызова не добавляется на ходу");
     // B: findTools исполняется и включает группы текущей задачи.
-    assert.ok(/case "findTools": \{/.test(mainSrc), "findTools не исполняется");
+    assert.ok(hasTool(mainSrc, "findTools"), "findTools не исполняется");
     assert.ok(/activeToolRouter\.addGroups\(groups\)/.test(mainSrc), "findTools не включает группы");
     assert.ok(/activeToolRouter = \{/.test(mainSrc), "нет роутера текущего запуска");
     // C: чекбокс «Отправить все инструменты» + полный набор без роутера.
@@ -6524,7 +6938,7 @@ async function testToolRouter() {
 // ── Ollama: реальное окно модели, num_ctx и удержание модели в памяти ────────
 async function testOllamaWindow() {
   const core = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const realFetch = global.fetch;
   const calls = [];
   const mkRes = (payload) => ({ ok: true, status: 200, json: async () => payload, text: async () => JSON.stringify(payload) });
@@ -6679,7 +7093,7 @@ async function testChatContextTransfer() {
 // ── Выросший чат: агент не должен «писать что-то и отключаться» ─────────────
 async function testLongChatRecovery() {
   const core = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const GUARD_START = "// Модель ответила текстом без вызова инструментов, но план работ не закрыт";
   const GUARD_END = "// Пустой финальный ответ — не молчим";
 
@@ -7202,7 +7616,7 @@ async function testLeftRail() {
 async function testSandboxObstacles() {
   const core = require("../src/renderer/agent-core");
   const tools = require("../src/browser-tools");
-  const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+  const mainSrc = backendSrc();
   const toolsSrc = fs.readFileSync(path.join(ROOT, "src", "browser-tools.js"), "utf8");
 
   await test("лимит 429: пауза читается из заголовка, текста и частоты", () => {
@@ -7215,6 +7629,16 @@ async function testSandboxObstacles() {
     assert.strictEqual(core.rateLimitInfo(429, null, "8 requests per minute").rpm, 8, "частота запросов не разобрана");
     // Ничего лимитного в тексте — не выдумываем паузу.
     assert.strictEqual(core.rateLimitInfo(500, null, "internal error").retryMs, 0, "пауза придумана из ничего");
+
+    // Окно лимита: провайдеры пишут его по-разному, а ждать надо именно окно.
+    // Реальная ошибка OpenRouter-подобного пула (z-ai/glm): три короткие паузы её не лечат.
+    const zai = "You have reached the request limit[z-ai/glm-5.3-free]: Maximum 8 requests within 1 minutes. (request id: 20260913223056261579680h7bsHtrz)";
+    assert.strictEqual(core.rateLimitInfo(429, null, zai).rpm, 8, "«within 1 minutes» не разобрано");
+    assert.strictEqual(core.rateLimitInfo(429, null, zai).retryMs, 60000, "пауза не равна окну лимита");
+    assert.strictEqual(core.rateLimitInfo(429, null, "Maximum 30 requests in 1 minute").rpm, 30, "«in 1 minute» не разобрано");
+    assert.strictEqual(core.rateLimitInfo(429, null, "10 запросов в минуту").rpm, 10, "русский лимит не разобран");
+    assert.strictEqual(core.rateLimitInfo(429, null, "60 requests per hour").rpm, 1, "часовое окно не разобрано");
+    assert.strictEqual(core.rateLimitInfo(429, null, "60 requests per hour").retryMs, 120000, "часовое окно без потолка");
   });
 
   await test("лимит 429: темп держится заранее, а не после отказа", async () => {
@@ -7232,19 +7656,35 @@ async function testSandboxObstacles() {
     assert.ok(l2.pendingMs() >= 600, "пауза после 429 не запомнена");
   });
 
-  await test("main.js: 429 больше не роняет раунд (ждём и повторяем)", () => {
+  await test("main.js: 429 больше не роняет раунд (ждём сами и повторяем)", () => {
     assert.ok(/rateLimiter = rateLimiterFor\(settings\)/.test(mainSrc), "нет держателя темпа в main.js");
     assert.ok(/const paced = await rateLimiter\.take\(\);/.test(mainSrc), "запросы не расставляются по темпу заранее");
-    assert.ok(/res\.status === 429 && rateRetries < 3/.test(mainSrc), "429 не повторяется");
+    assert.ok(/res\.status === 429\) \{/.test(mainSrc), "429 не обрабатывается");
+    // Предела «не больше 3 попыток» больше нет: именно он заставлял пользователя
+    // писать «продолжай» руками при лимите «8 запросов в минуту».
+    assert.ok(!/rateRetries < 3/.test(mainSrc), "вернулся жёсткий предел в 3 попытки");
     assert.ok(/rateRetries\+\+;/.test(mainSrc) && /round--;\s*\n\s*continue;/.test(mainSrc), "повтор не возвращает раунд на перезапуск");
     assert.ok(
       /if \(res\.ok\) \{\s*rateRetries = 0;\s*unavailableRetries = 0;\s*\}/.test(mainSrc),
       "счётчики повторов не сбрасываются на успехе"
     );
+    // Ждём до бюджета, и бюджет ограничивает паузу сверху — иначе прогон висел бы вечно.
+    assert.ok(/RATE_WAIT_BUDGET_MS/.test(mainSrc), "нет бюджета ожидания лимита");
+    assert.ok(/rateWaitedMs \+= waitMs/.test(mainSrc), "ожидание не накапливается");
+    assert.ok(/Math\.min\(wantMs, leftMs\)/.test(mainSrc), "пауза не ограничена бюджетом");
+    // Пользователь должен видеть, что прогон жив и ждёт сам.
+    assert.ok(/type: "notice"/.test(mainSrc), "пользователю не сообщают об ожидании");
     // Порядок важен: сначала совет по токенному лимиту Groq (повтор там бессмысленен).
     const i = mainSrc.indexOf("const friendly = friendlyRateLimitError(res.status, detail, settings);");
-    const j = mainSrc.indexOf("if (res.status === 429 && rateRetries < 3)");
+    const j = mainSrc.indexOf("if (res.status === 429) {");
     assert.ok(i > 0 && j > i, "повтор 429 стоит раньше совета по токенному лимиту");
+
+    // Веб-режим (превью и телефон) раньше падал на 429 сразу: своей обработки там не было
+    // вовсе, и прогон заканчивался ошибкой до всякого ожидания.
+    const webSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    assert.ok(/if \(res\.status === 429\) \{/.test(webSrc), "в веб-режиме 429 не обрабатывается");
+    assert.ok(/RATE_WAIT_BUDGET_MS = 10 \* 60 \* 1000/.test(webSrc), "в веб-режиме нет бюджета ожидания");
+    assert.ok(/rateWaitedMs \+= waitMs;/.test(webSrc), "в веб-режиме ожидание не накапливается");
   });
 
   await test("догрузка ленивого списка: останавливается сама, когда новое кончилось", async () => {
@@ -7315,6 +7755,2284 @@ async function testSandboxObstacles() {
   });
 }
 
+// ── 1.65 дела: сроки, CRUD, панель по срокам, напоминания ─────────────────────
+async function testTasks() {
+  const store = require(path.join(ROOT, "src", "agent-store.js"));
+  // Фиксированное «сейчас»: воскресенье, 13 сентября 2026, 12:00 — тесты не зависят от дня запуска.
+  const NOW = new Date(2026, 8, 13, 12, 0, 0).getTime();
+
+  await test("tasks: разбор сроков — ISO, dd.mm, слова, «через», день недели, время", () => {
+    const due = (v) => {
+      const r = store.parseDue(v, NOW);
+      assert.ok(r.ok, "не понял срок «" + v + "»: " + (r.error || ""));
+      return r.due;
+    };
+    assert.strictEqual(due(""), "");
+    assert.strictEqual(due("2026-09-15"), "2026-09-15T09:00");
+    assert.strictEqual(due("15.09"), "2026-09-15T09:00");
+    assert.strictEqual(due("15.09.2026 14:30"), "2026-09-15T14:30");
+    assert.strictEqual(due("завтра 14:00"), "2026-09-14T14:00");
+    assert.strictEqual(due("сегодня 20:00"), "2026-09-13T20:00");
+    assert.strictEqual(due("послезавтра"), "2026-09-15T09:00");
+    assert.strictEqual(due("через 2 часа"), "2026-09-13T14:00");
+    assert.strictEqual(due("через 3 дня"), "2026-09-16T09:00");
+    assert.strictEqual(due("в пятницу"), "2026-09-18T09:00");
+    assert.strictEqual(due("10 октября"), "2026-10-10T09:00");
+    assert.strictEqual(due("14:30"), "2026-09-13T14:30");
+    assert.strictEqual(due("вечером"), "2026-09-13T19:00");
+    // 15.08 уже прошло — значит речь о следующем годе; 14.30 — это время, а не дата.
+    assert.strictEqual(due("15.08"), "2027-08-15T09:00");
+    assert.strictEqual(due("14.30"), "2026-09-13T14:30");
+    assert.ok(!store.parseDue("мусор", NOW).ok, "мусор принят за срок");
+    assert.strictEqual(store.parseDue("15.09", NOW).allDay, true, "дата без времени — «весь день»");
+    assert.strictEqual(store.parseDue("15.09 14:00", NOW).allDay, false, "со временем — не весь день");
+  });
+
+  await test("tasks: добавление, поиск по названию, правка, выполнение, удаление", () => {
+    const ud = tmpdir("tasks-crud-");
+    const add = (o) => {
+      const r = store.tasksAdd(ud, o, NOW);
+      assert.ok(r.ok, "tasksAdd: " + (r.error || ""));
+      return r.task;
+    };
+    const t1 = add({ title: "Позвонить в банк", due: "завтра 14:00", priority: "high", project: "Личное" });
+    assert.strictEqual(t1.id, "t1");
+    assert.strictEqual(t1.status, "todo");
+    assert.strictEqual(t1.due, "2026-09-14T14:00");
+    assert.ok(store.tasksAdd(ud, { title: "   " }).ok === false, "пустое название принято");
+    assert.ok(store.tasksAdd(ud, { title: "Плохой срок", due: "когда-нибудь" }).ok === false, "непонятный срок принят");
+
+    // Дело ищется по куску названия, а не только по id — так удобнее человеку и модели.
+    const byName = store.tasksUpdate(ud, "банк", { priority: "low" });
+    assert.ok(byName.ok && byName.task.id === "t1", "поиск по названию: " + (byName.error || ""));
+    assert.strictEqual(byName.task.priority, "low");
+    assert.strictEqual(byName.task.due, "2026-09-14T14:00");
+
+    add({ title: "Отчёт за неделю", due: "15.09" });
+    add({ title: "Разобрать почту" });
+    assert.ok(store.tasksAdd(ud, { title: "Дело", project: "Личное" }).ok, "проект в деле");
+
+    const active = store.tasksList(ud, { status: "active", nowMs: NOW });
+    assert.strictEqual(active.tasks.length, 4, "активных дел должно быть 4");
+    assert.strictEqual(active.summary.summary.tomorrow, 1);
+    assert.strictEqual(active.summary.summary.week, 1);
+    assert.strictEqual(active.summary.summary.noDue, 2, "без срока — два дела");
+
+    const done = store.tasksDone(ud, "Позвонить в банк");
+    assert.ok(done.ok && done.task.status === "done", "отметка «выполнено»: " + (done.error || ""));
+    assert.strictEqual(store.tasksList(ud, { status: "active", nowMs: NOW }).tasks.length, 3);
+    assert.strictEqual(store.tasksList(ud, { status: "done", nowMs: NOW }).tasks.length, 1);
+    assert.ok(store.tasksDone(ud, "банк", false).task.status === "todo", "снятие отметки");
+
+    assert.ok(store.tasksDelete(ud, "почту").ok, "удаление по названию");
+    assert.strictEqual(store.tasksList(ud, { status: "all", nowMs: NOW }).tasks.length, 3);
+    assert.ok(!store.tasksDelete(ud, "нет такого дела").ok, "удаление несуществующего прошло молча");
+    // Дела лежат ОДНИМ файлом в userData, вне рабочей папки — в git не попадут.
+    assert.ok(fs.existsSync(path.join(ud, "tasks.json")), "нет tasks.json в userData");
+  });
+
+  await test("tasks: панель по срокам, сводка, напоминания (однократные), текст для модели", () => {
+    const ud = tmpdir("tasks-board-");
+    const at = (shiftDays, clock) => {
+      const d = new Date(NOW);
+      d.setDate(d.getDate() + shiftDays);
+      d.setHours(clock, 0, 0, 0);
+      return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0") + "T" + String(clock).padStart(2, "0") + ":00";
+    };
+    store.tasksAdd(ud, { title: "Просроченное", due: at(-1, 10) });
+    store.tasksAdd(ud, { title: "Сегодняшнее", due: at(0, 23) });
+    store.tasksAdd(ud, { title: "Завтрашнее", due: at(1, 10) });
+    store.tasksAdd(ud, { title: "На неделе", due: at(4, 10) });
+    store.tasksAdd(ud, { title: "Позже", due: at(20, 10) });
+    store.tasksAdd(ud, { title: "Без срока" });
+
+    const board = store.tasksBoard(ud, NOW);
+    const count = (id) => (board.groups.find((g) => g.id === id) || { tasks: [] }).tasks.length;
+    assert.strictEqual(count("overdue"), 1, "просрочено");
+    assert.strictEqual(count("today"), 1, "сегодня");
+    assert.strictEqual(count("tomorrow"), 1, "завтра");
+    assert.strictEqual(count("week"), 1, "на неделе");
+    assert.strictEqual(count("later"), 1, "позже");
+    assert.strictEqual(count("none"), 1, "без срока");
+    // Просроченное — всегда первым: о нём нельзя забыть.
+    assert.strictEqual(board.groups[0].tasks[0].title, "Просроченное");
+    assert.strictEqual(board.summary.overdue, 1);
+    assert.strictEqual(board.summary.active, 6);
+
+    assert.ok(store.tasksFormatText(store.tasksList(ud, { status: "active" }).tasks, NOW).includes("Просроченное"));
+    assert.strictEqual(store.tasksFormatText([], NOW), "Дел нет.");
+    assert.ok(store.tasksBrief(ud, 3, NOW).includes("Просрочено: 1"), "сводка для промпта: " + store.tasksBrief(ud, 3, NOW));
+
+    // Просроченное напоминаем сразу и ровно один раз; далёкие дела — не трогаем.
+    const first = store.tasksTakeReminders(ud, NOW).tasks.map((t) => t.title);
+    assert.deepStrictEqual(first, ["Просроченное"], "напоминание о просроченном: " + JSON.stringify(first));
+    assert.strictEqual(store.tasksTakeReminders(ud, NOW).tasks.length, 0, "напоминание повторилось");
+
+    // 22:50 — за 10 минут до срока «Сегодняшнее» (23:00): напоминание приходит.
+    const soon = NOW + (10 * 60 + 50) * 60 * 1000;
+    const later = store.tasksTakeReminders(ud, soon).tasks.map((t) => t.title);
+    assert.deepStrictEqual(later, ["Сегодняшнее"], "напоминание за 15 минут до срока: " + JSON.stringify(later));
+    assert.ok(!later.includes("Позже"), "напомнили о деле через 20 дней");
+
+    // Новый срок — напоминаем заново (remindedAt сбрасывается вместе со сроком).
+    store.tasksUpdate(ud, "Без срока", { due: at(0, 23) });
+    assert.ok(store.tasksTakeReminders(ud, soon).tasks.map((t) => t.title).includes("Без срока"), "после смены срока напоминания нет");
+  });
+
+  await test("tasks: человеческий срок и строка дела (для панели и отчёта модели)", () => {
+    const ud = tmpdir("tasks-human-");
+    const t = store.tasksAdd(ud, { title: "Отчёт", due: "завтра 14:00", priority: "high", project: "Работа", note: "сверить цифры" }, NOW).task;
+    const human = store.humanDue(t, NOW);
+    assert.ok(human.includes("завтра") && human.includes("14:00"), "человеческий срок: " + human);
+    const line = store.taskLine(t, NOW);
+    assert.ok(line.includes("t1") && line.includes("Отчёт") && line.includes("Работа"), "строка дела: " + line);
+    assert.ok(line.includes("сверить цифры"), "заметка дела не попала в строку");
+    // Просроченное помечается явно — иначе в списке его легко не заметить.
+    const late = store.tasksAdd(ud, { title: "Старое", due: "2026-09-10" }).task;
+    assert.ok(store.humanDue(late, NOW).includes("просрочено"), "просрочка не помечена: " + store.humanDue(late, NOW));
+    assert.strictEqual(store.humanDue(store.tasksAdd(ud, { title: "Без срока" }).task, NOW), "без срока");
+  });
+}
+
+// ── 1.66 консоль Yandex Cloud: карточка ресурса и связанные объекты ─────────
+async function testYcConsole() {
+  const yc = require(path.join(ROOT, "src", "yandex-cloud.js"));
+  const c = require(path.join(ROOT, "src", "yc-console.js"));
+  const NOW = new Date(2026, 8, 13, 12, 0, 0).getTime();
+
+  await test("yc-консоль: подписи и значения полей читаются человеком, а не как JSON", () => {
+    assert.strictEqual(c.labelFor("folderId"), "Каталог");
+    assert.strictEqual(c.labelFor("v4CidrBlocks"), "Диапазоны IPv4");
+    // Незнакомое поле не должно выглядеть как ключ API — только читаемо.
+    assert.strictEqual(c.labelFor("someWeirdField"), "Some Weird Field");
+    assert.strictEqual(c.formatField("mountType", true, NOW), "да");
+    assert.strictEqual(c.formatField("mountType", false, NOW), "нет");
+    assert.strictEqual(c.formatField("description", "", NOW), "");
+    assert.strictEqual(c.formatField("labels", { env: "prod", team: "" }, NOW), "env: prod");
+    assert.strictEqual(c.formatField("image", { imageUrl: "cr.yandex/cr1/api:2" }, NOW), "cr.yandex/cr1/api:2");
+    assert.strictEqual(c.formatField("resources", { memory: 131072, cores: 2 }, NOW), "Память: 128 КБ · Ядра: 2");
+    assert.strictEqual(c.formatField("v4CidrBlocks", ["10.0.0.0/24", "10.0.1.0/24"], NOW), "10.0.0.0/24, 10.0.1.0/24");
+    // Локальное время, чтобы проверка не зависела от часового пояса машины.
+    const created = c.formatField("createdAt", new Date(2026, 7, 1, 10, 0, 0).toISOString(), NOW);
+    assert.ok(created.indexOf("01.08.2026 10:00") >= 0 && created.indexOf("назад") >= 0, "дата создания: " + created);
+  });
+
+  await test("yc-консоль: «3 дня назад» и размеры считаются без вранья", () => {
+    const iso = (ms) => new Date(NOW - ms).toISOString();
+    assert.strictEqual(c.humanAgo(iso(20 * 1000), NOW), "только что");
+    assert.strictEqual(c.humanAgo(iso(5 * 60 * 1000), NOW), "5 мин назад");
+    assert.strictEqual(c.humanAgo(iso(3 * 3600 * 1000), NOW), "3 ч назад");
+    assert.strictEqual(c.humanAgo(iso(25 * 3600 * 1000), NOW), "вчера");
+    assert.strictEqual(c.humanAgo(iso(5 * 86400 * 1000), NOW), "5 дн назад");
+    assert.strictEqual(c.humanAgo(iso(-60 * 1000), NOW), "", "будущее не должно выглядеть «назад»");
+    assert.strictEqual(c.humanAgo("мусор", NOW), "");
+    assert.strictEqual(c.humanBytes(0), "0 Б");
+    assert.strictEqual(c.humanBytes(512), "512 Б");
+    assert.strictEqual(c.humanBytes(131072), "128 КБ");
+    assert.strictEqual(c.humanBytes(134217728), "128 МБ");
+    assert.strictEqual(c.humanBytes("2048"), "2 КБ");
+    assert.strictEqual(c.humanBytes(-1), "", "отрицательный размер — не размер");
+  });
+
+  await test("yc-консоль: обзор ресурса — служебное скрыто, уточнение из карточки подмешано", () => {
+    const item = {
+      ok: true, error: "служебное", count: 5, items: [], title: "дубль",
+      id: "net1", name: "default", createdAt: "2026-08-01T10:00:00Z",
+      labels: { env: "prod" }, addresses: ["10.0.0.1"],
+    };
+    const built = c.buildFields("vpc", item, { defaultSecurityGroupId: "sg0", connectivity: { some: { deep: 1 } } }, NOW);
+    const fields = built.fields;
+    const labels = fields.map((f) => f.label);
+    assert.deepStrictEqual(labels.slice(0, 2), ["Название", "Идентификатор"], "порядок полей: " + labels.join(", "));
+    assert.ok(labels.indexOf("Ok") < 0 && labels.indexOf("Error") < 0 && labels.indexOf("Count") < 0, "служебное поле попало в карточку");
+    assert.strictEqual((fields.find((f) => f.label === "Метки") || {}).value, "env: prod");
+    assert.strictEqual((fields.find((f) => f.label === "Группа безопасности по умолчанию") || {}).value, "sg0", "уточнение из карточки не подмешалось");
+    // Сложное поле не выдумывается строкой — уходит отдельным блоком.
+    assert.ok(built.extra.some((x) => x.key === "connectivity"), "сложное поле потерялось: " + JSON.stringify(built.extra.map((x) => x.key)));
+  });
+
+  await test("yc-консоль: таблица связанных объектов — колонки по смыслу, пустое и сложное не ломают", () => {
+    const subnets = c.buildTable("vpc", "subnets", [{ name: "app-subnet", zoneId: "ru-central1-a", v4CidrBlocks: ["10.0.0.0/24"], status: "READY" }], NOW);
+    assert.strictEqual(subnets.columns.map((x) => x.label).join("|"), "Название|Зона|Диапазоны IPv4|Статус");
+    assert.deepStrictEqual(subnets.rows[0], ["app-subnet", "ru-central1-a", "10.0.0.0/24", "READY"]);
+    // Отсутствующее значение — прочерк, а не «undefined».
+    const sparse = c.buildTable("vpc", "subnets", [{ name: "only-name" }], NOW);
+    assert.strictEqual(sparse.rows[0][1], "—");
+    // Образ — вложенный объект, а в таблице — адрес.
+    const revs = c.buildTable("serverlessContainers", "revisions", [{ id: "rev1", status: "ACTIVE", createdAt: "2026-08-01T10:00:00Z", image: { imageUrl: "cr.yandex/cr1/api:2" } }], NOW);
+    assert.ok(revs.rows[0].indexOf("cr.yandex/cr1/api:2") >= 0, "образ в таблице: " + JSON.stringify(revs.rows[0]));
+    // Незнакомая связь: колонки выводятся из первой строки, без выдуманных полей.
+    const guess = c.buildTable("vpc", "unknown", [{ status: "OK", name: "x", zoneId: "z", size: 2048, extra: { deep: 1 } }], NOW);
+    assert.deepStrictEqual(guess.columns.map((x) => x.key), ["name", "status", "size", "zoneId"], "вывод колонок: " + guess.columns.map((x) => x.key).join(","));
+  });
+
+  await test("yc-консоль: реестр связей и возможностей согласован с сервисами и yandex-cloud.js", () => {
+    const serviceKeys = yc.SERVICES.map((s) => s.key).sort();
+    assert.deepStrictEqual(c.capabilities().map((x) => x.serviceKey).sort(), serviceKeys, "консоль и дашборд видят разные сервисы");
+    for (const key of Object.keys(c.RELATIONS)) {
+      assert.ok(serviceKeys.indexOf(key) >= 0, "связи для неизвестного сервиса: " + key);
+      for (const r of c.RELATIONS[key]) {
+        assert.ok(r.key && r.title, "у связи нет ключа или подписи");
+        assert.ok(Array.isArray(r.attempts) && r.attempts.length > 0, "связь без вариантов запроса: " + key + ":" + r.key);
+        for (const a of r.attempts) {
+          assert.strictEqual(typeof a.path, "function", "вариант без пути: " + key + ":" + r.key);
+          assert.ok(String(a.path({ id: "r1", folderId: "f1" })).startsWith("/"), "путь не от корня: " + key + ":" + r.key);
+        }
+      }
+    }
+    for (const key of Object.keys(c.DETAIL_PATHS)) {
+      assert.ok(String(c.DETAIL_PATHS[key]({ id: "r1" })).startsWith("/"), "путь карточки не от корня: " + key);
+    }
+    assert.deepStrictEqual(c.capabilities().find((x) => x.serviceKey === "vpc").relations.map((r) => r.title), ["Подсети", "Группы безопасности", "Таблицы маршрутизации"]);
+    assert.ok(c.capabilities().find((x) => x.serviceKey === "serverlessContainers").relations.some((r) => r.key === "revisions"));
+  });
+}
+// ── Политика инструментов и журнал действий ─────────────────────────────────
+// Риск каждого инструмента живёт в одном месте (src/tool-policy.js): оттуда его
+// берут и подтверждения, и журнал. Проверяем, что таблица не разошлась с ядром,
+// что подтверждения не дублируются с чекбоксами настроек и что секреты не попадают
+// в журнал, а сам журнал не ломает прогон агента.
+async function testToolPolicy() {
+  const policy = require(path.join(ROOT, "src", "tool-policy.js"));
+  const audit = require(path.join(ROOT, "src", "audit-log.js"));
+  const core = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
+
+  const coreToolNames = () => {
+    const pick = (defs) => (defs || [])
+      .map((d) => (d && d.function && d.function.name) || (d && d.name) || "")
+      .filter(Boolean);
+    return Array.from(new Set([
+      ...pick(core.TOOL_DEFINITIONS),
+      ...pick(core.PLAN_MODE_TOOL_DEFINITIONS),
+      ...(core.BASE_TOOL_NAMES || []),
+    ]));
+  };
+
+  await test("политика: у каждого инструмента ядра есть capability и риск, лишних записей нет", () => {
+    const names = coreToolNames();
+    assert.ok(names.length > 100, "инструменты ядра не найдены: " + names.length);
+    const unknown = names.filter((n) => policy.capabilityOf(n) === "unknown");
+    assert.deepStrictEqual(unknown, [], "без политики остались: " + unknown.join(", "));
+    const known = new Set(names);
+    const bogus = policy.CAPABILITIES.reduce((acc, c) => acc.concat(c.tools || []), []).filter((n) => !known.has(n));
+    assert.deepStrictEqual(bogus, [], "политика описана для несуществующих инструментов: " + bogus.join(", "));
+    const confirmCaps = policy.CAPABILITIES.filter((c) => c.confirm);
+    assert.ok(confirmCaps.length >= 7, "потерялись подтверждения: " + confirmCaps.map((c) => c.cap).join(", "));
+    assert.ok(policy.allCapabilities().indexOf("cloud.deploy") >= 0, "нет capability облачного деплоя");
+    assert.strictEqual(policy.riskOf("readFile"), "low");
+    assert.strictEqual(policy.riskOf("ycDelete"), "high");
+  });
+
+  await test("подтверждения: старые на месте, опасные спрашивают, безопасные — нет", () => {
+    for (const t of ["killProcess", "registryWrite", "installExe"]) {
+      assert.strictEqual(policy.needsConfirm(t), true, "потеряно подтверждение: " + t);
+    }
+    for (const t of ["installSystemPackage", "runCommandAsAdmin", "otaRollback", "browserClearProfile", "checkpointRollback"]) {
+      assert.strictEqual(policy.needsConfirm(t), true, "не спрашивает: " + t);
+    }
+    // У этих инструментов своя защита — чекбокс в настройках (push, почта, облако,
+    // вход в свой Chrome). Второй диалог только мешал бы, поэтому confirm: false.
+    for (const t of ["gitPush", "mailSend", "ycDelete", "ycDeploy", "ycCreate", "browserConnect"]) {
+      assert.strictEqual(policy.needsConfirm(t), false, "двойной диалог: " + t);
+    }
+    for (const t of ["runCommand", "writeFile", "readFile", "browserClick", "taskAdd"]) {
+      assert.strictEqual(policy.needsConfirm(t), false, "лишний диалог: " + t);
+    }
+  });
+
+  await test("опасные команды и дампы окружения распознаются", () => {
+    assert.strictEqual(policy.isDangerousCommand("rm -rf dist"), true);
+    assert.strictEqual(policy.isDangerousCommand("git push origin main"), true);
+    assert.strictEqual(policy.isDangerousCommand("git reset --hard HEAD~1"), true);
+    assert.strictEqual(policy.isDangerousCommand("git status"), false);
+    assert.strictEqual(policy.isDangerousCommand("npm run build"), false);
+    // Дампы окружения секретов не получают: иначе модель одной строкой выводит в чат
+    // все ключи и пароли, которые пользователь положил в переменные агента.
+    for (const c of ["env", "printenv", "set", "env | grep KEY", "export -p", "Get-ChildItem Env:", "cat /proc/self/environ"]) {
+      assert.strictEqual(policy.commandDumpsEnv(c), true, "не распознан дамп окружения: " + c);
+    }
+    // Явный запрос переменной — осознанное действие: переменные агента доходят,
+    // и это видно в переписке. Секретом рискует только «голый» дамп.
+    for (const c of ["npm run build", "node -e 1", "docker ps", "printenv MY_KEY", "env FOO=1 node x.js", "docker run --env FOO=1 img", "python -m venv .venv"]) {
+      assert.strictEqual(policy.commandDumpsEnv(c), false, "ложное срабатывание на команде: " + c);
+    }
+  });
+
+  await test("редакция секретов: ключи, токены и длинные тексты не утекают в журнал", () => {
+    const r = policy.redact({
+      password: "hunter2",
+      openaiApiKey: "sk-abcdefghijkl",
+      mobilePin: "4821",
+      folderId: "b1g",
+      nested: { githubToken: "ghp_0123456789abcdefghij" },
+    });
+    assert.strictEqual(r.password, "***");
+    assert.strictEqual(r.openaiApiKey, "***");
+    assert.strictEqual(r.mobilePin, "***");
+    assert.strictEqual(r.folderId, "b1g", "обычное поле испорчено");
+    assert.strictEqual(r.nested.githubToken, "***", "вложенный секрет не вычищен");
+    assert.ok(policy.scrub("ключ sk-abcdefghijklmnopqr").indexOf("sk-abcdefghijklmnopqr") === -1, "ключ не вырезан из текста");
+    assert.ok(policy.scrub("token=abcdef123456").indexOf("abcdef123456") === -1, "значение token=… не вырезано");
+    assert.strictEqual(policy.scrub("обычный текст"), "обычный текст", "scrub портит обычный текст");
+    // Содержимое файла (writeFile) в журнал целиком не пишем — только начало и размер.
+    const big = policy.redact({ content: "x".repeat(500) });
+    assert.ok(big.content.length < 260, "длинный текст не сжат: " + big.content.length);
+    assert.ok(big.content.indexOf("всего 500") >= 0, "нет пометки о размере: " + big.content);
+  });
+
+  await test("журнал: опасное и отказы пишет, чтение игнорирует, секретов не содержит", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "audit-test-"));
+    const file = path.join(dir, "audit.log");
+    audit.init(file, true);
+    assert.strictEqual(audit.setSecrets(["live-secret-value-42", "abc"]), 1, "короткие значения в список секретов не берём");
+
+    assert.strictEqual(audit.record({ tool: "readFile", args: { path: "a.js" }, decision: "auto" }), null, "чтение попало в журнал");
+    assert.strictEqual(audit.record({ tool: "taskAdd", args: { title: "дело" }, decision: "auto" }), null, "мелкое действие попало в журнал");
+    const denied = audit.record({ tool: "installExe", args: { url: "http://x/setup.exe" }, decision: "denied", result: "не выполнено" });
+    assert.ok(denied && denied.capability === "system.install" && denied.risk === "high", "отказ не записан как надо");
+    assert.strictEqual(denied.outcome, "denied", "отказ не помечен исходом");
+    const row = audit.record({ tool: "runCommand", args: { command: "npm ci", githubToken: "ghp_0123456789abcdefghij" }, decision: "auto", result: "TOKEN=abcdef123456 готово" });
+    assert.ok(row && row.capability === "terminal.execute" && row.decision === "auto", "команда не записана");
+    const unknown = audit.record({ tool: "придуманныйИнструмент", args: {}, decision: "auto" });
+    assert.ok(unknown && unknown.capability === "unknown", "незнакомый инструмент не попал в журнал");
+    // Живая проверка нашла эту дыру: команда честно печатает значение переменной,
+    // а журнал его сохранял. Теперь известно значение — известно и как его вырезать.
+    const printed = audit.record({ tool: "runCommand", args: { command: "printenv LIVE_LIVE_SECRET" }, decision: "auto", result: "live-secret-value-42" });
+    assert.ok(printed && printed.outcome === "ok", "команда с переменной не записана");
+    // Текста результата в журнале нет вообще — только исход и заметка об ошибке.
+    assert.ok(!("result" in printed), "журнал всё ещё хранит вывод команды");
+    const failed = audit.record({ tool: "dockerBuild", args: {}, decision: "auto", result: "Ошибка: Docker не найден\nподробности" });
+    assert.strictEqual(failed.outcome, "error", "ошибка не распознана");
+    assert.ok(/"note":"Ошибка: Docker не найден"/.test(JSON.stringify(failed)), "заметка об ошибке потерялась: " + JSON.stringify(failed.note));
+
+    const text = fs.readFileSync(file, "utf8");
+    assert.ok(text.indexOf("ghp_0123456789abcdefghij") === -1, "секрет попал в файл журнала");
+    assert.ok(text.indexOf("abcdef123456") === -1, "секрет из результата попал в файл журнала");
+    assert.ok(text.indexOf("live-secret-value-42") === -1, "значение переменной агента попало в журнал");
+    assert.ok(text.indexOf("***") >= 0, "вместо секрета нет пометки");
+    const lines = audit.tail(20);
+    assert.ok(lines.length >= 3, "журнал пуст: " + lines.length);
+    assert.ok(lines.every((l) => l.time && l.ts && l.tool && l.risk), "записи журнала неполные");
+
+    audit.setEnabled(false);
+    assert.strictEqual(audit.record({ tool: "ycDelete", args: {}, decision: "approved" }), null, "выключенный журнал пишет");
+    audit.setEnabled(true);
+
+    // Битый путь не должен ломать прогон агента.
+    audit.init(path.join(dir, "нет", "такой", "папки", "audit.log"), true);
+    assert.strictEqual(audit.record({ tool: "ycDelete", args: {}, decision: "approved" }), null, "битый путь бросил исключение");
+
+    // Ротация: журнал не растёт бесконечно.
+    fs.writeFileSync(file, "x".repeat(audit.MAX_BYTES + 10), "utf8");
+    audit.init(file, true);
+    audit.record({ tool: "ycDelete", args: { id: "r1" }, decision: "approved" });
+    assert.ok(fs.existsSync(file + ".1"), "старый журнал не сдвинут в .1");
+    assert.ok(fs.statSync(file).size < 1000, "новый журнал не начат заново");
+
+    audit.clear();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test("main.js спрашивает по политике, пишет в журнал и не отдаёт секреты дампам", () => {
+    const src = backendSrc();
+    assert.ok(src.indexOf("toolPolicy.needsConfirm(c.name)") >= 0, "подтверждение не привязано к политике");
+    assert.ok(src.indexOf("toolPolicy.isDangerousCommand(") >= 0, "опасные команды проверяются мимо политики");
+    assert.ok(src.indexOf("audit.record({ tool: c.name") >= 0, "журнал не подключён к прогону");
+    assert.ok(src.indexOf("audit.setEnabled(") >= 0, "настройка журнала не читается");
+    assert.ok(src.split("commandEnv(command)").length - 1 >= 3, "команды агента идут без сужения окружения");
+    assert.ok(src.indexOf("probeEnv()") >= 0, "служебные пробы получают секреты");
+    // Знание об опасных командах должно жить ровно в одном месте — в политике.
+    assert.ok(src.indexOf("const DANGEROUS_CMD_RE = toolPolicy.DANGEROUS_CMD_RE;") >= 0, "регулярка опасных команд раздвоилась");
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    assert.ok(html.indexOf('id="s-audit-log"') >= 0, "нет переключателя журнала в настройках");
+    const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    assert.ok(app.indexOf('$("s-audit-log")') >= 0, "переключатель журнала не подключён к форме");
+  });
+}
+
+// ── Деплой: рецепты, состояние, движок ──
+// Проверяем то, что раньше выводилось моделью заново и потому ломалось молча:
+// какой образ собирать, что писать в историю и что делать, если после выката
+// приложение не отвечает.
+async function testDeploy() {
+  const recipes = require(path.join(ROOT, "src", "deploy-recipes.js"));
+  const cloudState = require(path.join(ROOT, "src", "cloud-state.js"));
+  const { createDeployEngine } = require(path.join(ROOT, "src", "deploy-engine.js"));
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-deploy-"));
+  const mkproj = (name, files) => {
+    const d = path.join(tmpRoot, name);
+    fs.mkdirSync(d, { recursive: true });
+    for (const [f, c] of Object.entries(files)) {
+      const p = path.join(d, f);
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, c);
+    }
+    return d;
+  };
+
+  // ── рецепты ──
+  await test("деплой-рецепты: тип проекта распознаётся по файлам, а не по догадке", () => {
+    const vite = recipes.detectProject(
+      mkproj("r-vite", {
+        "package.json": JSON.stringify({ devDependencies: { vite: "5" }, scripts: { build: "vite build" } }),
+        "package-lock.json": "{}",
+      })
+    );
+    assert.strictEqual(vite.kind, "vite");
+    assert.strictEqual(vite.buildCmd, "npm run build");
+    assert.strictEqual(vite.outputDir, "dist");
+
+    const next = recipes.detectProject(
+      mkproj("r-next", { "package.json": JSON.stringify({ dependencies: { next: "14" }, scripts: { build: "next build" } }) })
+    );
+    assert.strictEqual(next.kind, "next");
+    assert.strictEqual(next.label, "Next.js");
+
+    const express = recipes.detectProject(
+      mkproj("r-express", { "package.json": JSON.stringify({ dependencies: { express: "4" } }), "server.js": "" })
+    );
+    assert.strictEqual(express.kind, "node-server");
+    assert.strictEqual(express.startCmd, "node server.js");
+
+    const py = recipes.detectProject(mkproj("r-py", { "requirements.txt": "fastapi\nuvicorn\n", "main.py": "" }));
+    assert.strictEqual(py.kind, "python");
+    assert.strictEqual(py.startCmd, "uvicorn main:app --host 0.0.0.0 --port $PORT");
+
+    const flask = recipes.detectProject(mkproj("r-flask", { "requirements.txt": "flask\n", "app.py": "" }));
+    assert.ok(flask.startCmd.includes("gunicorn"), "flask должен запускаться через gunicorn, а не голым скриптом");
+
+    const go = recipes.detectProject(mkproj("r-go", { "go.mod": "module x\n" }));
+    assert.strictEqual(go.kind, "go");
+
+    const staticSite = recipes.detectProject(mkproj("r-static", { "index.html": "<h1>x</h1>" }));
+    assert.strictEqual(staticSite.kind, "static");
+
+    const empty = recipes.detectProject(mkproj("r-empty", { "README.md": "ничего" }));
+    assert.strictEqual(empty.kind, "unknown");
+    assert.ok(empty.warnings.length > 0, "непонятный проект должен предупредить, а не молчать");
+  });
+
+  await test("деплой-рецепты: сборка многоэтапная, контейнер слушает порт из окружения", () => {
+    const vite = { kind: "vite", packageManager: "npm", installCmd: "npm ci", buildCmd: "npm run build", outputDir: "dist", port: 8080, healthPaths: ["/"] };
+    const df = recipes.dockerfileFor(vite);
+    assert.ok(df.includes("FROM node:20-alpine AS builder"), "сборка статики идёт в отдельном этапе");
+    assert.ok(df.includes("FROM nginx:alpine"), "раздавать статику должен nginx, а не dev-сервер");
+    assert.ok(df.includes("COPY --from=builder /app/dist/ /usr/share/nginx/html/"), "в образ попадает собранная папка");
+    assert.ok(df.includes("listen ${PORT}"), "Serverless Containers передаёт порт переменной — nginx обязан её слушать");
+    assert.ok(!df.includes("npm run dev"), "dev-сервер в контейнере — заведомо сломанный выкат");
+
+    // Статический сайт без сборки: один этап и всё же слушатель на $PORT.
+    const st = recipes.dockerfileFor({ kind: "static", port: 8080 });
+    assert.ok(st.includes("FROM nginx:alpine") && st.includes("listen ${PORT}"));
+    assert.ok(!st.includes("AS builder"));
+
+    // Next.js: сборка в builder, запуск в runtime.
+    const next = recipes.dockerfileFor({ kind: "next", packageManager: "npm", installCmd: "npm ci", buildCmd: "npm run build", port: 3000, nodeVersion: 22 });
+    assert.ok(next.includes("node:22-alpine"), "версия Node берётся из engines проекта");
+    assert.ok(next.includes("next start"), "Next запускается своим сервером");
+
+    // Go: статический бинарь в минимальный образ.
+    const go = recipes.dockerfileFor({ kind: "go", port: 8080 });
+    assert.ok(go.includes("golang:1.22-alpine") && go.includes("CGO_ENABLED=0"));
+    assert.ok(go.includes("FROM alpine:3.19"));
+
+    // Пакетные менеджеры, которых нет в node:alpine, ставятся явно.
+    assert.ok(recipes.dockerfileFor({ kind: "vite", packageManager: "pnpm", installCmd: "pnpm install --frozen-lockfile", buildCmd: "pnpm run build", outputDir: "dist" }).includes("corepack enable"));
+    assert.ok(recipes.dockerfileFor({ kind: "vite", packageManager: "bun", installCmd: "bun install", buildCmd: "bun run build", outputDir: "dist" }).includes("install -g bun"));
+
+    // Python: копируем только файлы зависимостей, которых у проекта нет — не копируем.
+    const pyWith = recipes.dockerfileFor({ kind: "python", pythonVersion: "3.12", hasRequirements: true, installCmd: "pip install -r requirements.txt", startCmd: "uvicorn main:app" });
+    assert.ok(pyWith.includes("COPY requirements.txt ./"));
+    const pyWithout = recipes.dockerfileFor({ kind: "python", pythonVersion: "3.12", installCmd: "pip install .", startCmd: "python app.py" });
+    assert.ok(!pyWithout.includes("COPY requirements.txt"), "копирование несуществующего файла ломает сборку");
+
+    // Непонятный проект: честная ошибка вместо выдуманного Dockerfile.
+    assert.throws(() => recipes.dockerfileFor({ kind: "unknown" }), /Dockerfile/);
+  });
+
+  await test("деплой-рецепты: секреты и мусор в образ не попадают, свой Dockerfile не трогаем", () => {
+    const ignore = recipes.dockerignoreFor({ kind: "vite" });
+    assert.ok(ignore.includes(".env"), ".env не должен уезжать в образ");
+    assert.ok(ignore.includes(".env.*"));
+    assert.ok(ignore.includes("node_modules"));
+    assert.ok(ignore.includes(".cloud"), "состояние деплоя — не часть приложения");
+    assert.ok(ignore.includes("Dockerfile*"), "две копии Dockerfile внутри образа не нужны");
+
+    const proj = mkproj("r-own", { "package.json": JSON.stringify({ scripts: { build: "vite build" }, devDependencies: { vite: "5" } }) });
+    const first = recipes.prepareDockerContext(proj);
+    assert.ok(first.generated, "своего Dockerfile нет — значит генерируем");
+    assert.strictEqual(path.basename(first.dockerfile), "Dockerfile.yandexcloud", "генерированный файл не подменяет имя Dockerfile");
+    assert.ok(fs.existsSync(path.join(proj, ".dockerignore")));
+
+    fs.writeFileSync(path.join(proj, "Dockerfile"), "FROM scratch\n");
+    const second = recipes.prepareDockerContext(proj);
+    assert.strictEqual(second.generated, false);
+    assert.strictEqual(path.basename(second.dockerfile), "Dockerfile", "свой Dockerfile всегда в приоритете");
+    assert.strictEqual(second.ignoreWritten, false, "существующий .dockerignore не перезаписываем");
+    assert.strictEqual(fs.readFileSync(path.join(proj, "Dockerfile"), "utf8"), "FROM scratch\n");
+  });
+
+  // ── состояние ──
+  await test("состояние облака: деплои нумеруются, откат находит прошлую рабочую версию", () => {
+    const d = mkproj("s-num", {});
+    assert.strictEqual(cloudState.readState(d).deployments.length, 0);
+    const a = cloudState.recordDeployment(d, { status: "ok", revisionId: "rev-a" });
+    const b = cloudState.recordDeployment(d, { status: "failed" });
+    assert.strictEqual(a.number, 1);
+    assert.strictEqual(b.number, 2, "нумерация как в консоли: #1, #2, #3");
+    cloudState.updateDeployment(d, b.id, { status: "failed", error: "health упал" });
+
+    const target = cloudState.rollbackTarget(d, b.id);
+    assert.strictEqual(target.revisionId, "rev-a", "откатываться нужно на рабочую ревизию, а не на провалившуюся");
+
+    // Секреты в состояние не пишем — только ключи.
+    cloudState.writeInfrastructure(d, { envKeys: ["DATABASE_URL"], container: { id: "c1" } });
+    const text = fs.readFileSync(path.join(d, ".cloud", "deployments.json"), "utf8") + fs.readFileSync(path.join(d, ".cloud", "infrastructure.json"), "utf8");
+    assert.ok(!/password|secret-token/i.test(text));
+    const cfg = cloudState.toCloudConfig(d);
+    assert.strictEqual(cfg.resources.container, "c1");
+    assert.deepStrictEqual(cfg.envKeys, ["DATABASE_URL"]);
+    assert.strictEqual(cfg.deployment.number, 2);
+  });
+
+  await test("состояние облака: битый файл откладывается, деплой не падает", () => {
+    const d = mkproj("s-broken", {});
+    cloudState.recordDeployment(d, { status: "ok" });
+    fs.writeFileSync(path.join(d, ".cloud", "deployments.json"), "{ это не json");
+    const st = cloudState.readState(d);
+    assert.strictEqual(st.deployments.length, 0, "битый файл не роняет приложение");
+    assert.ok(st.issues.length === 1 && /Повреждён/.test(st.issues[0]), "о потере надо сказать вслух, а не молча начать заново");
+    const files = fs.readdirSync(path.join(d, ".cloud"));
+    assert.ok(files.some((f) => f.startsWith("deployments.json.bak-")), "испорченный файл сохраняется рядом");
+    assert.ok(!files.some((f) => f.endsWith(".tmp")), "временных файлов после записи не остаётся");
+  });
+
+  // ── движок ──
+  const makeEngine = (opts) => {
+    const o = opts || {};
+    const calls = { run: [], yandex: [], health: 0, audit: 0 };
+    const run = (command, cwd, timeoutMs, runOpts) => {
+      calls.run.push({ command, input: runOpts && runOpts.input });
+      if (command === "docker --version") return { code: 0, out: "Docker version 25.0.3" };
+      if (command.includes("docker build")) return { code: o.buildCode == null ? 0 : o.buildCode, out: o.buildCode ? "error: COPY failed" : "Successfully built" };
+      if (command.includes("docker push")) return { code: 0, out: "digest: sha256:deadbeef size: 1" };
+      if (command.includes("docker login")) return { code: 0, out: "Login Succeeded" };
+      return { code: 0, out: "ok" };
+    };
+    const yandex = {
+      slugify: (s) => String(s).toLowerCase().replace(/[^a-z0-9-]/g, "-"),
+      getIamToken: async () => "t1.IAMTOKEN",
+      ensureRegistry: async () => ({ id: "crp1" }),
+      ensureContainer: async () => ({ id: "cont1" }),
+      ensureServiceAccount: async () => ({ id: "sa1" }),
+      addRoleOnFolder: async () => ({}),
+      deployContainerRevision: async (_a, args) => {
+        calls.yandex.push("revision:" + args.imageUrl);
+        return { revisionId: "rev-" + calls.yandex.length };
+      },
+      containerInfo: async () => ({ url: "https://app.test" }),
+      rollbackContainer: async (_a, cid, rev) => {
+        calls.yandex.push("rollback:" + cid + ":" + rev);
+        return {};
+      },
+    };
+    const plan = (o.health || [200]).slice();
+    // Раньше при исчерпании плана подставлялся 200, и тест незаметно превращался
+    // в успешный прогон. Теперь держится последнее значение: план задаёт всё.
+    const nextStatus = () => (plan.length > 1 ? plan.shift() : plan[0]);
+    const engine = createDeployEngine({
+      run,
+      yandex,
+      fetch: async () => {
+        calls.health++;
+        return { status: nextStatus() };
+      },
+      emit: () => {},
+      findProgram: () => ({ found: true }),
+      browserAudit: o.browserAudit
+        ? async (u) => {
+            calls.audit++;
+            return typeof o.browserAudit === "function" ? o.browserAudit(u) : o.browserAudit;
+          }
+        : undefined,
+    });
+    return { engine, calls };
+  };
+
+  const projFiles = {
+    "package.json": JSON.stringify({ dependencies: { react: "18", vite: "5" }, scripts: { build: "vite build" } }),
+    "package-lock.json": "{}",
+    ".env": "SECRET=1\n",
+  };
+
+  await test("движок деплоя: стадии идут по порядку, образ получает тег с номером деплоя", async () => {
+    const d = mkproj("e-ok", projFiles);
+    const { engine, calls } = makeEngine({});
+    const r = await engine.deploy(d, {
+      cloud: { oauth: "o", folderId: "b1g", folderName: "default" },
+      name: "My Shop",
+      env: { DATABASE_URL: "postgres://user:pw@host/db" },
+      runTests: false,
+      healthTries: 2,
+      healthDelayMs: 1,
+    });
+    assert.strictEqual(r.ok, true);
+    assert.deepStrictEqual(
+      r.stages.map((s) => s.id),
+      ["check", "detect", "verify", "package", "registry", "login", "build", "push", "container", "revision", "health", "record"],
+      "порядок стадий фиксированный — модель его не придумывает"
+    );
+    assert.ok(r.stages.every((s) => s.status === "ok"));
+    assert.strictEqual(r.image, "cr.yandex/crp1/my-shop:d1", "тег с номером деплоя: иначе откат указывает на тот же образ");
+    // Секрет уходит в контейнер, но в состоянии проекта его нет.
+    const stateText = fs.readFileSync(path.join(d, ".cloud", "deployments.json"), "utf8") + fs.readFileSync(path.join(d, ".cloud", "infrastructure.json"), "utf8");
+    assert.ok(!stateText.includes("postgres://user:pw@host/db"), "значения секретов не пишем в состояние");
+    assert.ok(stateText.includes("DATABASE_URL"), "но ключи храним — иначе не восстановить конфигурацию");
+    // IAM-токен не должен светиться в аргументах команды.
+    const login = calls.run.find((c) => c.command.includes("docker login"));
+    assert.ok(login.command.includes("--password-stdin") && login.input === "t1.IAMTOKEN");
+    assert.ok(!calls.run.some((c) => c.command.includes("t1.IAMTOKEN")), "токен в argv виден в списке процессов — нельзя");
+  });
+
+  await test("движок деплоя: провалившийся выкат сам откатывается на прошлую рабочую версию", async () => {
+    const d = mkproj("e-rollback", projFiles);
+    const first = makeEngine({});
+    const r1 = await first.engine.deploy(d, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 2, healthDelayMs: 1 });
+    assert.strictEqual(r1.ok, true);
+
+    // Новая ревизия отдаёт 500, а прошлая после отката отвечает 200.
+    // 4 ответа на проверку до выката, 4 — после отката: последние живые.
+    const second = makeEngine({ health: [500, 500, 500, 500, 200, 200, 200, 200] });
+    const r2 = await second.engine.deploy(d, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 2, healthDelayMs: 1 });
+    assert.strictEqual(r2.ok, false);
+    assert.strictEqual(r2.status, "rolled-back", "если откат удался, это не просто «провал»");
+    assert.strictEqual(r2.rolledBackTo, 1);
+    assert.ok(second.calls.yandex.some((c) => c.startsWith("rollback:cont1:rev-")), "движок обязан вернуть прошлую ревизию");
+    const hist = cloudState.deploymentHistory(d);
+    assert.strictEqual(hist[0].status, "rolled-back");
+    assert.strictEqual(hist[0].rolledBackTo, 1);
+    assert.ok(hist[0].stages.some((s) => s.id === "rollback" && s.status === "ok"));
+  });
+
+  await test("движок деплоя: если и прошлая версия мертва — честный провал без вранья про успех", async () => {
+    const d = mkproj("e-dead", projFiles);
+    const first = makeEngine({});
+    await first.engine.deploy(d, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 2, healthDelayMs: 1 });
+    const second = makeEngine({ health: [500, 500, 500, 500, 500, 500, 500, 500] });
+    const r = await second.engine.deploy(d, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 2, healthDelayMs: 1 });
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.status, "failed");
+    assert.strictEqual(r.rolledBack, false);
+    assert.ok(/не отвечает/i.test(r.error), "в ошибке должно быть сказано, что приложение не отвечает");
+  });
+
+  await test("движок деплоя: упавшая сборка останавливает конвейер и не выдаёт успех", async () => {
+    const d = mkproj("e-build-fail", projFiles);
+    const { engine, calls } = makeEngine({ buildCode: 1 });
+    const r = await engine.deploy(d, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 2, healthDelayMs: 1 });
+    assert.strictEqual(r.ok, false);
+    const ids = r.stages.map((s) => s.id);
+    assert.strictEqual(ids[ids.length - 1], "build", "после упавшей сборки дальше идти некуда");
+    assert.ok(ids.includes("build") && !ids.includes("push"), "в реестр ничего не отправляем");
+    assert.ok(!calls.yandex.some((c) => c.startsWith("revision:")), "ревизию не создаём");
+    assert.ok(/docker build упал/.test(r.error));
+  });
+
+  await test("движок деплоя: локальная сборка идёт до упаковки, а приватный контейнер объясняется", async () => {
+    const d = mkproj("e-verify", projFiles);
+    const { engine, calls } = makeEngine({});
+    const r = await engine.deploy(d, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 1, healthDelayMs: 1 });
+    const order = calls.run.map((c) => c.command);
+    const iBuild = order.indexOf("npm run build");
+    const iDocker = order.findIndex((c) => c.includes("docker build"));
+    assert.ok(iBuild >= 0 && iDocker > iBuild, "сначала локальная сборка проекта, потом образ: иначе в образ уедет сломанное состояние");
+
+    // 403 значит «контейнер не публичный» — это надо назвать причиной, а не «ошибкой».
+    const priv = makeEngine({ health: [403, 403, 403, 403] });
+    const r2 = await priv.engine.deploy(d, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 1, healthDelayMs: 1, autoRollback: false });
+    assert.strictEqual(r2.ok, false);
+    assert.ok(/публичн/i.test(r2.error), "403 нужно объяснять словами про публичный доступ");
+  });
+
+  await test("движок деплоя: ручной откат проверяет результат, а не только команду", async () => {
+    const d = mkproj("e-manual", projFiles);
+    const first = makeEngine({});
+    await first.engine.deploy(d, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 1, healthDelayMs: 1 });
+    const good = makeEngine({ health: [200] });
+    const ok = await good.engine.rollback(d, { cloud: { oauth: "o" }, healthTries: 1, healthDelayMs: 1 });
+    assert.strictEqual(ok.ok, true);
+    assert.ok(ok.revisionId);
+
+    const bad = makeEngine({ health: [500, 500] });
+    const fail = await bad.engine.rollback(d, { cloud: { oauth: "o" }, healthTries: 1, healthDelayMs: 1 });
+    assert.strictEqual(fail.ok, false, "откат без проверки — это вера, а не факт");
+    assert.ok(/не отвечает/i.test(fail.error));
+  });
+
+  await test("проверка страницы: белый экран отличается от здоровой страницы", () => {
+    const deployCheck = require(path.join(ROOT, "src", "deploy-check.js"));
+    const good = {
+      ok: true,
+      status: 200,
+      info: { title: "Магазин", textLen: 400, rootChildren: 5, h1: ["Магазин"] },
+      consoleErrors: [],
+      pageErrors: [],
+      failedRequests: [],
+    };
+    assert.strictEqual(deployCheck.evaluate(good).level, "ok");
+
+    const blank = deployCheck.evaluate(Object.assign({}, good, { info: { title: "", textLen: 0, rootChildren: 0, h1: [] } }));
+    assert.strictEqual(blank.ok, false, "пустая страница — это провал, а не успех с оговоркой");
+    assert.ok(/белый экран/.test(blank.reason), blank.reason);
+
+    // Ошибки в консоли — замечание: страница работает, но о проблемах надо сказать.
+    const noisy = deployCheck.evaluate(Object.assign({}, good, { consoleErrors: ["Uncaught TypeError: x is not a function"] }));
+    assert.strictEqual(noisy.ok, true);
+    assert.strictEqual(noisy.level, "warn");
+    assert.ok(/консоли/.test(noisy.warnings.join(" ")), noisy.warnings.join(" "));
+
+    for (const pair of [[500, /падает/], [404, /404/], [401, /публичн|авторизац/]]) {
+      const r = deployCheck.evaluate(Object.assign({}, good, { status: pair[0] }));
+      assert.strictEqual(r.ok, false, "код " + pair[0] + " — провал выката");
+      assert.ok(pair[1].test(r.reason), r.reason);
+    }
+
+    // Текст есть, но контейнер приложения пуст — скрипты, скорее всего, не загрузились.
+    const emptyRoot = deployCheck.evaluate(Object.assign({}, good, { info: { title: "t", textLen: 300, rootChildren: 0, h1: [] } }));
+    assert.strictEqual(emptyRoot.level, "warn");
+    assert.ok(/контейнер приложения пуст/.test(emptyRoot.warnings.join(" ")), emptyRoot.warnings.join(" "));
+
+    // Браузера нет вовсе — проверка честно не проходит, но и не врёт «всё хорошо».
+    assert.strictEqual(deployCheck.evaluate({ ok: false, error: "браузер не запустился" }).ok, false);
+    assert.ok(/не запустился/.test(deployCheck.summarize(deployCheck.evaluate({ ok: false, error: "браузер не запустился" }))));
+  });
+
+  await test("движок деплоя: страница в браузере проверяется, сломанная — откат и скриншот", async () => {
+    const page = (extra) =>
+      Object.assign(
+        {
+          ok: true,
+          status: 200,
+          info: { title: "Магазин", textLen: 500, rootChildren: 4, h1: ["Магазин"] },
+          consoleErrors: [],
+          pageErrors: [],
+          failedRequests: [],
+          screenshot: Buffer.from("fake-png"),
+        },
+        extra || {}
+      );
+
+    const d = mkproj("e-browse", projFiles);
+    const good = makeEngine({ browserAudit: page() });
+    const r1 = await good.engine.deploy(d, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 1, healthDelayMs: 1 });
+    assert.strictEqual(r1.ok, true);
+    assert.deepStrictEqual(r1.stages.map((s) => s.id).slice(-3), ["health", "browse", "record"], "браузер проверяется после адреса");
+    assert.strictEqual(r1.browserCheck.metrics.title, "Магазин");
+    assert.ok(r1.browserShot && fs.existsSync(r1.browserShot), "скриншот выкаченной страницы сохраняется рядом с состоянием");
+    assert.ok(/Проверка в браузере/.test(r1.stages[r1.stages.length - 2].label));
+
+    // Шумная консоль деплой не отменяет, но замечание попадает и в историю, и в предупреждения.
+    const noisyEngine = makeEngine({ browserAudit: page({ consoleErrors: ["Uncaught TypeError: boom"] }) });
+    const r2 = await noisyEngine.engine.deploy(d, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 1, healthDelayMs: 1 });
+    assert.strictEqual(r2.ok, true);
+    assert.ok(r2.warnings.some((w) => /браузер:/.test(w)), r2.warnings.join(" | "));
+    const rec2 = cloudState.deploymentHistory(d)[0];
+    assert.strictEqual(rec2.browserCheck.level, "warn");
+
+    // Белый экран — провал: движок откатывается и проверяет страницу после отката.
+    const blankEngine = makeEngine({ browserAudit: page({ info: { title: "", textLen: 0, rootChildren: 0, h1: [] }, screenshot: null }) });
+    const r3 = await blankEngine.engine.deploy(d, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 1, healthDelayMs: 1 });
+    assert.strictEqual(r3.ok, false);
+    assert.strictEqual(r3.status, "rolled-back");
+    assert.ok(/белый экран/.test(r3.error), r3.error);
+    assert.ok(blankEngine.calls.yandex.some((c) => c.startsWith("rollback:")), "белый экран обязан приводить к откату");
+    assert.strictEqual(r3.browserCheck.ok, false, "проверка страницы после отката тоже видит пустую страницу");
+    assert.ok(blankEngine.calls.audit >= 2, "после отката страницу смотрим ещё раз: " + blankEngine.calls.audit);
+  });
+
+  await test("движок деплоя: без браузера стадия проверки страницы честно пропускается", async () => {
+    const d = mkproj("e-nobrowser", projFiles);
+    const { engine, calls } = makeEngine({});
+    const r = await engine.deploy(d, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 1, healthDelayMs: 1 });
+    assert.strictEqual(r.ok, true);
+    assert.ok(!r.stages.some((s) => s.id === "browse"), "стадии нет — значит и врать нечему");
+    assert.strictEqual(calls.audit, 0);
+    assert.ok(r.warnings.some((w) => /браузер недоступен|браузером пропущена/i.test(w)), r.warnings.join(" | "));
+  });
+
+  // ── связка с приложением ──
+  await test("деплой: приложение и агент идут одним конвейером, дублирующей логики нет", () => {
+    const mainSrc = backendSrc();
+    assert.ok(mainSrc.includes('require("./deploy-engine.js")'));
+    assert.ok(mainSrc.includes("async function runCloudDeploy("));
+    assert.ok(mainSrc.includes('ipcMain.handle("yc:deploy"'), "кнопка деплоя на месте");
+    assert.ok(mainSrc.includes('ipcMain.handle("deploy:state"') && mainSrc.includes('ipcMain.handle("deploy:rollback"'));
+    assert.ok(!mainSrc.includes("function ycGenerateDockerfile"), "своя копия генератора Dockerfile должна была исчезнуть");
+    // Агентский инструмент больше не собирает деплой сам.
+    const body = toolBody(mainSrc, "ycDeploy", "ycContainer");
+    assert.ok(body.length > 0, "тело инструмента ycDeploy не найдено");
+    assert.ok(body.includes("runCloudDeploy("), "инструмент агента вызывает движок");
+    assert.ok(!body.includes("docker build"), "инструмент агента не собирает образ сам");
+    // Состояние проекта подмешивается в ответ про облако.
+    assert.ok(mainSrc.includes("function cloudDeployBrief("));
+    assert.ok(mainSrc.includes("async function deployBrowserAudit("), "движок проверяет выкаченную страницу браузером");
+    assert.ok(mainSrc.includes("browserAudit: deployBrowserAudit"), "проверка передаётся движку");
+
+    const preloadSrc = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
+    for (const m of ["deployState", "deployRun", "deployRollback", "deployHealth"]) {
+      assert.ok(preloadSrc.includes(m + ":"), "preload должен отдавать " + m);
+    }
+
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    assert.ok(html.includes('id="sp-deploy"') && html.includes('data-sp="deploy"'), "вкладка панели деплоя");
+    assert.ok(html.includes('src="deploy-panel.js"') && html.includes('href="deploy-panel.css"'));
+    assert.ok(html.includes('id="rail-deploy"') && html.includes('id="btn-toggle-deploy"'));
+
+    const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    assert.ok(appSrc.includes("DeployPanel.open("), "панель подключается при открытии вкладки");
+    assert.ok(appSrc.includes('case "deploy_stage"') && appSrc.includes('case "deploy_done"'), "стадии деплоя доходят до панели");
+  });
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+}
+
+async function testYcCosts() {
+  const costs = require(path.join(ROOT, "src", "yc-costs.js"));
+  const yc = require(path.join(ROOT, "src", "yandex-cloud.js"));
+  const engine = require(path.join(ROOT, "src", "deploy-engine.js"));
+  const core = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
+  const mainSrc = backendSrc();
+
+  await test("стоимость: формула контейнера совпадает с примерами из документации", () => {
+    const doc = costs.containerCost({ memoryMb: 2048, cores: 0.2, calls: 3000000, msPerCall: 150 });
+    assert.strictEqual(doc.total, 1061.34, "первый пример расчёта из документации");
+    const doc2 = costs.containerCost({ memoryMb: 2048, cores: 1, calls: 3000000, msPerCall: 150 });
+    assert.strictEqual(doc2.total, 1630.34, "второй пример расчёта из документации");
+  });
+
+  await test("стоимость: бесплатный пакет учитывается, дорогое видно заранее", () => {
+    const est = costs.estimateContainerConfig({});
+    const quiet = est.scenarios.find((x) => /тихий/.test(x.title));
+    const busy = est.scenarios.find((x) => /живой/.test(x.title));
+    const idle = est.scenarios.find((x) => /круглосуточно/.test(x.title));
+    assert.strictEqual(quiet.cost.total, 0, "100 тыс. вызовов в месяц — в пределах бесплатного пакета");
+    assert.ok(busy.cost.total > 100, "живой сайт должен показывать реальную цифру: " + busy.cost.total);
+    assert.ok(idle.cost.total > busy.cost.total, "круглосуточная работа дороже вызовов по запросу");
+    assert.strictEqual(est.needsConfirm, true, "платную ревизию нельзя создавать без согласия");
+    assert.strictEqual(est.pricedAt, costs.PRICED_AT, "у оценки должна быть дата тарифов");
+  });
+
+  await test("стоимость: ресурсы считаются по тарифам, а не на глаз", () => {
+    assert.strictEqual(costs.estimate("storage", { gb: 0.5 }).approxMonth, 0, "первый гигабайт бесплатен");
+    assert.strictEqual(costs.estimate("storage", { gb: 23 }).approxMonth, 52.27, "23 ГБ — как в примере документации");
+    assert.strictEqual(costs.estimate("lockbox", {}).approxMonth, 19.73, "версия секрета: 720 × 0,0274 ₽");
+    assert.strictEqual(costs.estimate("dns", {}).approxMonth, 42.62, "зона DNS: 0,0592 ₽ × 720 ч");
+    assert.ok(costs.estimate("containerRegistry", { gb: 5 }).approxMonth < 20, "реестр на 5 ГБ — копейки");
+  });
+
+  await test("стоимость: где тариф не подтверждён — цифры нет, есть ссылка", () => {
+    const ydb = costs.estimate("ydb", {});
+    assert.strictEqual(ydb.approxMonth, null, "цену за RU не подтверждали — не выдумываем число");
+    assert.ok(/pricing/.test(ydb.source), "должна быть ссылка на тарифы сервиса");
+    assert.strictEqual(ydb.calculator, costs.CALCULATOR, "и ссылка на калькулятор");
+    const vpc = costs.estimate("vpc", {});
+    assert.strictEqual(vpc.level, "free", "сеть и подсети не тарифицируются");
+    assert.strictEqual(vpc.needsConfirm, false, "бесплатное не должно требовать согласия");
+  });
+
+  await test("стоимость: у каждого создаваемого ресурса есть оценка и текст", () => {
+    const keys = yc.creatableKeys();
+    const missing = keys.filter((k) => !costs.has(k));
+    assert.deepStrictEqual(missing, [], "нет оценки стоимости для: " + missing.join(", "));
+    const paid = keys.filter((k) => costs.needsConfirm(k));
+    assert.strictEqual(paid.length, keys.length - 1, "всё платное требует согласия, бесплатна только сеть");
+    for (const k of keys) {
+      const text = costs.formatLines(costs.estimate(k, {})).join("\n");
+      assert.ok(text.indexOf("undefined") === -1, k + ": в тексте оценки не должно быть undefined");
+      assert.ok(text.indexOf(costs.CALCULATOR) !== -1, k + ": должна быть ссылка на калькулятор");
+    }
+  });
+
+  await test("стоимость: параметры ревизии берутся из движка, а не из копии", () => {
+    assert.ok(engine.REVISION_DEFAULTS && engine.REVISION_DEFAULTS.memoryMb > 0, "движок отдаёт параметры ревизии");
+    const src = fs.readFileSync(path.join(ROOT, "src", "yc-costs.js"), "utf8");
+    assert.ok(src.indexOf("REVISION_DEFAULTS") !== -1, "цены читают параметры из движка");
+    const est = costs.estimateContainerConfig({});
+    assert.strictEqual(est.memoryMb, engine.REVISION_DEFAULTS.memoryMb, "оценка считается по тем же 256 МБ");
+    assert.strictEqual(est.cores, engine.REVISION_DEFAULTS.cores, "и по тому же 1 vCPU");
+    const big = costs.estimateContainerConfig({ memoryMb: 1024, cores: 1 });
+    assert.ok(big.scenarios[1].cost.total > est.scenarios[1].cost.total, "больше памяти — больше счёт");
+  });
+
+  await test("стоимость: агент видит инструмент, а платное создание идёт через согласие", () => {
+    const names = (core.TOOL_DEFINITIONS || []).map((d) => (d && d.function && d.function.name) || "");
+    assert.ok(names.includes("ycCosts"), "в схемах агента должен быть ycCosts");
+    const ycCreate = (core.TOOL_DEFINITIONS || []).find((d) => d.function && d.function.name === "ycCreate");
+    assert.ok(ycCreate && ycCreate.function.parameters.properties.confirm, "у ycCreate должно быть согласие confirm");
+    assert.ok(mainSrc.includes('ipcMain.handle("yc:costs"'), "в приложении должен быть канал оценки стоимости");
+    assert.ok(mainSrc.includes("⛔ Не создаю без согласия"), "агент не создаёт платное без согласия");
+    assert.ok(mainSrc.includes("cost = ycCosts.estimateContainerConfig({})"), "панель получает стоимость до запуска");
+  });
+
+  await test("стоимость: про дорогое, что мы не создаём, сказано прямо", () => {
+    const titles = costs.EXPENSIVE.map((e) => e.title).join(" ");
+    assert.ok(/PostgreSQL|Kubernetes/.test(titles), "про managed-базы надо предупредить");
+    assert.ok(/Виртуальная машина/.test(titles), "про ВМ 24/7 тоже");
+    assert.strictEqual(costs.PRICED_AT.length > 0, true, "у тарифов должна быть дата");
+  });
+}
+
+// ── Вынесенный Yandex Cloud: служебный слой и IPC-мост ──────────────────────
+// Код переехал из main.js в yc-service.js и yc-ipc.js (1.5.74). Проверяем три
+// вещи: в main.js его больше нет, модули работают сами (без Electron) и каналы
+// IPC отвечают на своих моках — включая запрет создавать платное без согласия.
+async function testYcSplit() {
+  const main = mainOnlySrc(); // проверяем: в main.js этого больше нет
+  const svcSrc = fs.readFileSync(path.join(ROOT, "src", "yc-service.js"), "utf8");
+  const ipcSrc = fs.readFileSync(path.join(ROOT, "src", "yc-ipc.js"), "utf8");
+  const { createYcService } = require(path.join(ROOT, "src", "yc-service.js"));
+  const { registerYcIpc } = require(path.join(ROOT, "src", "yc-ipc.js"));
+  const costs = require(path.join(ROOT, "src", "yc-costs.js"));
+
+  await test("Yandex Cloud: служебный слой и каналы вынесены из main.js", () => {
+    const channels = [
+      "yc:status", "yc:setToken", "yc:folders", "yc:setFolder", "yc:setPermissions",
+      "yc:logout", "yc:console:overview", "yc:console:list", "yc:console:rollback",
+      "yc:resources", "yc:costs", "yc:create", "yc:delete", "yc:logs",
+      "yc:cliStatus", "yc:installCli",
+    ];
+    for (const ch of channels) {
+      assert.ok(!main.includes('ipcMain.handle("' + ch + '"'), "канал остался в main.js: " + ch);
+      assert.ok(ipcSrc.includes('ipcMain.handle("' + ch + '"'), "канал не найден в yc-ipc.js: " + ch);
+    }
+    const deploySrc = fs.readFileSync(path.join(ROOT, "src", "deploy-ipc.js"), "utf8");
+    assert.ok(!main.includes('ipcMain.handle("yc:'), "каналов yc:* в main.js быть не должно");
+    assert.ok(deploySrc.includes('ipcMain.handle("yc:deploy"'), "мост деплоя переехал в deploy-ipc.js");
+    assert.ok(/const \{ runCloudDeploy, cloudDeployBrief \} = registerDeployIpc/.test(main), "main.js берёт запуск и сводку из моста");
+    assert.ok(!/^function ycConfig\(/m.test(main), "ycConfig остался в main.js");
+    assert.ok(/^function ycConfig\(/m.test(svcSrc), "ycConfig не найден в yc-service.js");
+    assert.ok(!/^async function readYcLogsText\(/m.test(main), "чтение логов осталось в main.js");
+    assert.ok(main.includes('require("./yc-service.js")') && main.includes('require("./yc-ipc.js")'), "main.js не подключает вынесенные модули");
+    assert.ok(/registerYcIpc\(\{ ipcMain/.test(main), "IPC-мост не регистрируется");
+    const found = [...ipcSrc.matchAll(/ipcMain\.handle\("(yc:[^"]+)"/g)].map((m) => m[1]);
+    assert.strictEqual(found.length, 16, "каналов в мосте должно быть 16 (yc:deploy остаётся мостом деплоя): " + found.length);
+  });
+
+  await test("Yandex Cloud: служебный слой работает сам, без main.js", () => {
+    const settings = {
+      yandexOauthToken: "  tok  ",
+      ycCloudId: " c1 ",
+      ycFolderId: " f1 ",
+      ycFolderName: " каталог ",
+      ycAllowAgentUpdate: true,
+    };
+    const svc = createYcService({
+      app: { getPath: () => "/tmp" },
+      path,
+      net: {},
+      secrets: {},
+      yandexCloud: {},
+      ycCli: { installed: () => "/tmp/bin/yc", binDir: () => "/tmp/bin" },
+      ycLogs: {},
+      ycEnsurePath: () => {},
+      loadSettings: () => settings,
+    });
+    const cfg = svc.ycConfig();
+    assert.strictEqual(cfg.oauth, "tok", "OAuth-токен берётся из настроек без пробелов");
+    assert.strictEqual(cfg.folderId, "f1", "каталог берётся из настроек");
+    assert.strictEqual(cfg.allowUpdate, true, "право менять контейнеры читается из настроек");
+    let err = null;
+    try {
+      svc.ycRequireAuth({});
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err && err.status === 401, "без токена — понятная ошибка 401");
+    assert.strictEqual(svc.ycJsonArg('{"A":"1"}').A, "1", "аргументы строкой разбираются");
+    assert.strictEqual(svc.ycJsonArg({ B: 2 }).B, 2, "объект проходит как есть");
+    assert.strictEqual(svc.ycJsonArg("мусор"), undefined, "мусор не роняет разбор");
+    const line = svc.ycRevisionLine({ id: "rev1", status: "ACTIVE", memoryMb: 256, cores: 1 }, true);
+    assert.ok(line.includes("rev1") && line.includes("★"), "строка ревизии: " + line);
+    const details = svc.ycRevisionDetails({ id: "rev1", status: "ACTIVE", command: [], args: [], secrets: [], storageMounts: [], mounts: [], env: { A: "1" } });
+    assert.ok(details.includes("Переменные окружения (1): A"), "в подробностях видны только КЛЮЧИ переменных, без значений");
+    assert.strictEqual(svc.ycCliStatus().installed, true, "статус встроенного yc CLI читается из папки приложения");
+  });
+
+  await test("Yandex Cloud: каналы отвечают на моках — согласие и сохранение настроек", async () => {
+    const handlers = new Map();
+    const ipcMain = { handle: (ch, fn) => handlers.set(ch, fn) };
+    const saved = [];
+    const settings = { yandexOauthToken: "" };
+    const svc = createYcService({
+      app: { getPath: () => "/tmp" },
+      path,
+      net: {},
+      secrets: {},
+      yandexCloud: { resetIamCache() {} },
+      ycCli: {},
+      ycLogs: {},
+      ycEnsurePath: () => {},
+      loadSettings: () => settings,
+    });
+    registerYcIpc({
+      ipcMain,
+      yandexCloud: {
+        resetIamCache() {},
+        listClouds: async () => [{ id: "c1", name: "облако" }],
+        listFolders: async () => [{ id: "f1", name: "каталог" }],
+        createResource: async () => ({ message: "создано", resourceId: "r1", name: "n" }),
+      },
+      ycConsole: {},
+      ycCosts: costs,
+      loadSettings: () => settings,
+      saveSettings: (s) => saved.push(s),
+      svc,
+    });
+    assert.ok(handlers.has("yc:status") && handlers.has("yc:create"), "обработчики зарегистрированы");
+    const status = await handlers.get("yc:status")();
+    assert.strictEqual(status.loggedIn, false, "без токена статус — «не авторизован»");
+    // Дальше — путь создания: он начинается с проверки авторизации.
+    settings.yandexOauthToken = "oauth-token";
+    settings.ycFolderId = "f1";
+    const denied = await handlers.get("yc:create")(null, "dns", "зона", {});
+    assert.strictEqual(denied.ok, false, "платное без согласия не создаётся");
+    assert.strictEqual(denied.needsConfirm, true, "должно вернуться требование согласия");
+    const allowed = await handlers.get("yc:create")(null, "dns", "зона", { confirmed: true });
+    assert.strictEqual(allowed.ok, true, "с согласием ресурс создаётся");
+    const tok = await handlers.get("yc:setToken")(null, "oauth-token");
+    assert.strictEqual(tok.ok, true, "токен принимается");
+    assert.strictEqual(saved.length, 1, "настройки сохранены один раз");
+    assert.strictEqual(saved[0].yandexOauthToken, "oauth-token", "токен записан в настройки");
+    assert.strictEqual(saved[0].ycFolderId, "f1", "каталог выбран автоматически");
+  });
+}
+
+// ── Вынесенный мост деплоя ──────────────────────────────────────────────────
+// Мост переехал из main.js в deploy-ipc.js (1.5.75). Проверяем главное, ради чего
+// он вообще существует: код выхода берётся у ПРОЦЕССА, а не угадывается по словам
+// в выводе, ввод уходит через stdin (токен не виден в списке процессов), а окно и
+// отправитель событий читаются живыми, а не копией.
+async function testDeployIpc() {
+  const { registerDeployIpc } = require(path.join(ROOT, "src", "deploy-ipc.js"));
+  const { execFile } = require("child_process");
+  const mainSrc = mainOnlySrc(); // проверяем: в main.js каналов больше нет
+  const ipcSrc = fs.readFileSync(path.join(ROOT, "src", "deploy-ipc.js"), "utf8");
+
+  const build = (extra) => {
+    const handlers = new Map();
+    const api = registerDeployIpc(Object.assign({
+      ipcMain: { handle: (ch, fn) => handlers.set(ch, fn) },
+      path,
+      fs,
+      execFile,
+      browserTools: { auditPage: async () => ({ ok: true, status: 200 }) },
+      cloudState: { readState: () => ({ deployments: [], current: {}, infrastructure: {}, project: {} }) },
+      deployRecipes: { detectProject: () => ({ kind: "vite", label: "Vite", port: 3000, healthPaths: ["/"], warnings: [], hasDockerfile: false }) },
+      createDeployEngine: () => ({ deploy: async () => ({ ok: true, stages: [] }), rollback: async () => ({ ok: true }), healthCheck: async () => ({ ok: true }) }),
+      yandexCloud: { slugify: (s) => s },
+      ycCosts: require(path.join(ROOT, "src", "yc-costs.js")),
+      audit: { record() {} },
+      // Оболочка-заглушка: команда исполняется настоящим Node — важен ЕЁ код выхода.
+      commandEnv: () => process.env,
+      loadSettings: () => ({ workDir: ROOT }),
+      agentWorkDir: () => ROOT,
+      stripAnsi: (s) => s,
+      resolveShell: (cmd) => ({ shell: process.execPath, args: ["-e", cmd] }),
+      findProgram: () => process.execPath,
+      ycConfig: () => ({ oauth: "t", folderId: "f" }),
+      ycRequireAuth: () => {},
+      getEmit: () => null,
+      getWindow: () => null,
+    }, extra || {}));
+    return { api, handlers };
+  };
+
+  await test("деплой-мост: в main.js каналов больше нет, модуль отдаёт запуск и сводку", () => {
+    for (const ch of ["deploy:state", "deploy:run", "deploy:rollback", "deploy:health", "yc:deploy"]) {
+      assert.ok(!mainSrc.includes('ipcMain.handle("' + ch + '"'), "канал остался в main.js: " + ch);
+      assert.ok(ipcSrc.includes('ipcMain.handle("' + ch + '"'), "канал не найден в deploy-ipc.js: " + ch);
+    }
+    assert.ok(/\(\{ runCloudDeploy, cloudDeployBrief \}\) = registerDeployIpc/, "main.js не берёт функции из моста");
+    assert.ok(!/^async function runCloudDeploy\(/m.test(mainSrc), "runCloudDeploy остался в main.js");
+    assert.ok(mainSrc.includes('require("./deploy-ipc.js")'), "main.js не подключает модуль");
+    const { api } = build();
+    assert.strictEqual(typeof api.runCloudDeploy, "function", "мост отдаёт запуск деплоя");
+    assert.strictEqual(typeof api.cloudDeployBrief, "function", "мост отдаёт сводку состояния");
+    assert.strictEqual(typeof api.runCapture, "function", "мост отдаёт запуск команды");
+  });
+
+  await test("деплой-мост: код выхода берётся у процесса, а не из текста вывода", async () => {
+    const { api } = build();
+    const ok = await api.runCapture("process.stdout.write('Successfully built'); process.exit(0)", ROOT, 8000);
+    assert.strictEqual(ok.code, 0, "успешная команда: код 0");
+    assert.ok(ok.out.includes("Successfully built"), "вывод сохранён");
+    // Главное: «error» в выводе при коде 0 — это НЕ провал.
+    const lyingOk = await api.runCapture("process.stdout.write('error: не ошибка'); process.exit(0)", ROOT, 8000);
+    assert.strictEqual(lyingOk.code, 0, "слово error в выводе не делает команду упавшей");
+    const bad = await api.runCapture("process.exit(3)", ROOT, 8000);
+    assert.strictEqual(bad.code, 3, "настоящий код выхода пробрасывается");
+    const killed = await api.runCapture("setTimeout(() => {}, 5000)", ROOT, 400);
+    assert.strictEqual(killed.code, 124, "таймаут — код 124, как у timeout(1)");
+  });
+
+  await test("деплой-мост: секрет уходит через stdin, а не в аргументах", async () => {
+    const { api } = build();
+    const r = await api.runCapture(
+      'process.stdin.resume(); process.stdin.on("data", (d) => { process.stdout.write("получено:" + d.toString().trim()); process.exit(0); });',
+      ROOT,
+      8000,
+      { input: "iam-token-value" }
+    );
+    assert.strictEqual(r.code, 0, "команда с вводом завершилась");
+    assert.ok(r.out.includes("получено:iam-token-value"), "ввод дошёл до процесса: " + r.out);
+  });
+
+  await test("деплой-мост: события и окно читаются живыми, сводка не выдумывает", async () => {
+    const events = [];
+    const { api, handlers } = build({ getEmit: () => (ev) => events.push(ev) });
+    const emit = api.deployEmitter();
+    emit({ type: "stage", id: "build", label: "Сборка", status: "ok", detail: "", ms: 5 });
+    emit({ type: "done", ok: true, url: "https://x", number: 3, rolledBack: true, rolledBackTo: 2 });
+    assert.ok(events.some((e) => e.type === "deploy_stage" && e.stage.label === "Сборка"), "стадия ушла в панель");
+    const done = events.find((e) => e.type === "deploy_done");
+    assert.ok(done && done.rolledBack === true && done.rolledBackTo === 2, "итог сообщает об откате");
+    assert.ok(events.some((e) => e.type === "yc_step"), "текстовая строка стадии тоже уходит");
+    // Проверка страницы не роняет деплой, если браузер не запустился.
+    const { api: api2 } = build({ browserTools: { auditPage: async () => { throw new Error("нет браузера"); } } });
+    const audit = await api2.deployBrowserAudit("https://x");
+    assert.strictEqual(audit.ok, false, "ошибка браузера — не провал деплоя, а причина");
+    assert.ok(/нет браузера/.test(audit.error), "причина названа: " + audit.error);
+    // Пустое состояние — пустая сводка, без выдуманных строк.
+    assert.strictEqual(api.cloudDeployBrief(ROOT), "", "нет деплоев — нет сводки");
+    const { api: api3 } = build({
+      cloudState: { readState: () => ({ deployments: [{ id: "d1" }], current: { number: 2, status: "ok", url: "https://x" }, lastHealthy: { id: "d0", number: 1 }, infrastructure: { container: { id: "c1" } } }) },
+    });
+    const brief = api3.cloudDeployBrief(ROOT);
+    assert.ok(brief.includes("#2") && brief.includes("https://x"), "сводка называет текущий выкат: " + brief.split("\n").join(" | "));
+    assert.ok(brief.includes("#1"), "сводка называет прошлую рабочую версию");
+  });
+}
+
+// ── Вынесенный почтовый мост ────────────────────────────────────────────────
+// Конфигурация подключения и каналы почты переехали из main.js в mail-ipc.js
+// (1.5.75). Проверяем ровно то, что раньше жило вперемешку с остальным: пустые
+// поля берутся из пресета провайдера, заполненные не перетираются, а без настроек
+// в сеть не уходит НИ ОДИН запрос.
+async function testMailIpc() {
+  const { registerMailIpc } = require(path.join(ROOT, "src", "mail-ipc.js"));
+  const mailMod = require(path.join(ROOT, "src", "mail.js"));
+  const mainSrc = mainOnlySrc(); // проверяем: в main.js почты больше нет
+  const ipcSrc = fs.readFileSync(path.join(ROOT, "src", "mail-ipc.js"), "utf8");
+
+  const build = (extra) => {
+    const handlers = new Map();
+    const api = registerMailIpc(Object.assign({
+      ipcMain: { handle: (ch, fn) => handlers.set(ch, fn) },
+      mail: mailMod,
+      loadSettings: () => ({}),
+    }, extra || {}));
+    return { api, handlers };
+  };
+
+  await test("почта: каналы уехали из main.js, конфигурация осталась доступной", () => {
+    for (const ch of ["mail:test", "mail:recent", "mail:testSend"]) {
+      assert.ok(!mainSrc.includes('ipcMain.handle("' + ch + '"'), "канал остался в main.js: " + ch);
+      assert.ok(ipcSrc.includes('ipcMain.handle("' + ch + '"'), "канал не найден в mail-ipc.js: " + ch);
+    }
+    assert.ok(!/^function mailConfig\(/m.test(mainSrc), "mailConfig остался в main.js");
+    assert.ok(mainSrc.includes('require("./mail-ipc.js")'), "main.js не подключает почтовый мост");
+    assert.ok(/const \{ mailConfig \} = registerMailIpc/.test(mainSrc), "main.js не берёт конфигурацию из моста");
+    assert.strictEqual(typeof build().api.mailConfig, "function", "мост отдаёт mailConfig");
+  });
+
+  await test("почта: пустое берётся из пресета, заполненное не перетирается", () => {
+    const preset = build({ loadSettings: () => ({ mailAddress: "user@gmail.com" }) }).api.mailConfig();
+    assert.strictEqual(preset.address, "user@gmail.com", "адрес на месте");
+    assert.strictEqual(preset.user, "user@gmail.com", "логин по умолчанию — сам адрес");
+    assert.ok(/gmail/.test(preset.imapHost) && /gmail/.test(preset.smtpHost), "серверы из пресета Gmail: " + preset.imapHost + " / " + preset.smtpHost);
+    assert.strictEqual(preset.imapPort, 993, "IMAP по умолчанию — 993");
+    assert.strictEqual(preset.smtpPort, 465, "SMTP по умолчанию — 465");
+    assert.strictEqual(preset.allowSend, false, "отправка агентом выключена по умолчанию");
+
+    const custom = build({
+      loadSettings: () => ({
+        mailAddress: "a@b.ru",
+        mailUser: "логин",
+        mailImapHost: "imap.example.ru",
+        mailImapPort: "1143",
+        mailSmtpPort: "2525",
+        mailStarttls: true,
+        mailAllowAgentSend: true,
+      }),
+    }).api.mailConfig();
+    assert.strictEqual(custom.imapHost, "imap.example.ru", "заполненный хост не перетирается пресетом");
+    assert.strictEqual(custom.imapPort, 1143, "порт приводится к числу");
+    assert.strictEqual(custom.smtpPort, 2525, "порт SMTP приводится к числу");
+    assert.strictEqual(custom.starttls, true, "STARTTLS читается из настроек");
+    assert.strictEqual(custom.user, "логин", "свой логин важнее адреса");
+    assert.strictEqual(custom.allowSend, true, "разрешение отправки доходит до конфигурации");
+  });
+
+  await test("почта: без настроек в сеть не уходит ни один запрос", async () => {
+    let called = 0;
+    const stub = {
+      listRecent: async () => { called++; return { ok: true, total: 0, messages: [] }; },
+      sendMail: async () => { called++; return { ok: true }; },
+      extractCode: () => "",
+      guessServers: () => ({}),
+    };
+    const { handlers } = build({ mail: stub, loadSettings: () => ({}) });
+    const test = await handlers.get("mail:test")();
+    assert.strictEqual(test.ok, false, "без адреса проверка связи не проходит");
+    assert.ok(/адрес почты/i.test(test.error), "сказано, чего не хватает: " + test.error);
+    assert.ok(test.servers && "imapHost" in test.servers, "серверы отдаются интерфейсу для подсказки");
+    const recent = await handlers.get("mail:recent")(null, 5);
+    assert.strictEqual(recent.ok, false, "без настроек письма не читаются");
+    const send = await handlers.get("mail:testSend")();
+    assert.strictEqual(send.ok, false, "без настроек письмо не отправляется");
+    assert.strictEqual(called, 0, "в сеть не ушло ни одного запроса");
+  });
+}
+
+// ── Вынесенные модули: стражи, файловая панель и git ────────────────────────
+// Первый тест — страховка от самой дорогой ошибки при разрезании файла: модуль
+// ссылается на имя, которое осталось в main.js, но не передано через deps.
+// Такая ошибка не видна ни синтаксической проверке, ни тестам, которые не ходят
+// в эту ветку кода, — она падает уже у пользователя. Именно так нашлись
+// stageAllSafe, fs и path в git-мосте.
+async function testFsGitIpc() {
+  const { registerFsIpc } = require(path.join(ROOT, "src", "fs-ipc.js"));
+  const { registerGitIpc } = require(path.join(ROOT, "src", "git-ipc.js"));
+
+  await test("вынесенные модули: ни одного имени из main.js без внедрения", () => {
+    // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
+    // находить пропуски при следующем разрезании файла.
+    const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js"];
+    const r = scanWiring(ROOT, modules, fs, path);
+    assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
+  });
+
+  await test("вынесенные модули: изменяемое значение меняется через сеттер, а не копией", () => {
+    // Обратная ошибка разреза: инструмент присваивает имени, которое ему передали
+    // значением. Копия «застынет» на null, и особенность работы приложения (журнал
+    // правок, сводка плана) молча перестанет обновляться.
+    const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js"];
+    const r = scanWiring(ROOT, modules, fs, path);
+    assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
+    assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
+  });
+
+  await test("страж связи: ловит голое живое имя, но не строку и не сам мост", () => {
+    // Сам страж тоже надо проверять: если он перестанет ловить, следующая правка
+    // молча вернёт «activeRunUndo is not defined» в инструменте отката.
+    const { bareLiveNames, bareCode } = require(path.join(__dirname, "backend-wiring.js"));
+    const scan = (text) => bareLiveNames(bareCode(text));
+    const broken = [
+      "const live = { get count() { return d.count(); }, set count(v) { d.count(v); } };",
+      "function f() { count = count.filter((x) => x.ok); }",
+    ].join("\n");
+    assert.deepStrictEqual(scan(broken), ["count"], "голое имя вне моста найдено");
+    const fine = [
+      "const live = { get count() { return d.count(); }, set count(v) { d.count(v); } };",
+      "function f() { live.count = live.count.filter((x) => x.ok); return \"count меняется через мост\"; }",
+    ].join("\n");
+    assert.deepStrictEqual(scan(fine), [], "мост и текст в строке за ошибку не считаются");
+    const propertyOnly = [
+      "const live = { get count() { return d.count(); } };",
+      "function f(s) { s.count = 1; return obj.count; }",
+    ].join("\n");
+    assert.deepStrictEqual(scan(propertyOnly), [], "свойство чужого объекта — не наше имя");
+  });
+
+  await test("файловая панель: бинарные файлы, имена и границы рабочей папки", () => {
+    const os2 = require("os");
+    const root = fs.mkdtempSync(path.join(os2.tmpdir(), "fs-ipc-"));
+    fs.writeFileSync(path.join(root, "note.txt"), "привет");
+    fs.writeFileSync(path.join(root, "logo.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const outside = fs.mkdtempSync(path.join(os2.tmpdir(), "fs-out-"));
+    fs.writeFileSync(path.join(outside, "secret.txt"), "чужое");
+    const opened = [];
+    const handlers = new Map();
+    // Тот же контракт, что у sanitizeDir/sanitizePath в main.js: наружу нельзя.
+    const inside = (p) => {
+      const abs = path.resolve(String(p || ""));
+      return abs === root || abs.startsWith(root + path.sep) ? abs : "";
+    };
+    const api = registerFsIpc({
+      ipcMain: { handle: (c, f) => handlers.set(c, f) },
+      shell: { showItemInFolder: (p) => opened.push(p), openExternal: (u) => opened.push(u) },
+      path,
+      fs,
+      sanitizeDir: inside,
+      sanitizePath: inside,
+    });
+    const call = (ch, ...args) => handlers.get(ch)(null, ...args);
+    assert.strictEqual(api.BINARY_EXT.has("png"), true, "список бинарных расширений отдаётся наружу");
+    assert.strictEqual(api.BINARY_EXT.has("txt"), false, "текстовые файлы читаются");
+    const read = call("fs:readFile", path.join(root, "note.txt"));
+    assert.ok(read.ok && read.content === "привет", "текстовый файл читается");
+    const png = call("fs:readFile", path.join(root, "logo.png"));
+    assert.strictEqual(png.binary, true, "картинка помечена бинарной, а не отдана как мусор");
+    const out = call("fs:readFile", path.join(outside, "secret.txt"));
+    assert.strictEqual(out.ok, false, "файл вне рабочей папки не читается");
+    assert.strictEqual(call("fs:createFile", root, "..", "x").ok, false, "имя «..» отклонено");
+    assert.strictEqual(call("fs:createFile", root, "a/b.txt", "x").ok, false, "имя со слэшем отклонено");
+    assert.strictEqual(call("fs:createFile", root, "new.txt", "тело").ok, true, "нормальное имя принимается");
+    assert.ok(fs.existsSync(path.join(root, "new.txt")), "файл создан");
+    assert.strictEqual(call("fs:createFolder", root, "sub").ok, true, "папка создана");
+    assert.strictEqual(call("fs:writeFile", path.join(root, "new.txt"), "обновлено").ok, true, "файл записан");
+    assert.strictEqual(fs.readFileSync(path.join(root, "new.txt"), "utf8"), "обновлено", "содержимое обновилось");
+    assert.strictEqual(call("fs:delete", path.join(root, "new.txt")).ok, true, "файл удалён");
+    assert.strictEqual(fs.existsSync(path.join(root, "new.txt")), false, "файла больше нет");
+    call("fs:openInExplorer", path.join(outside, "secret.txt"));
+    assert.strictEqual(opened.length, 0, "проводник не открывается на путь вне рабочей папки");
+    call("fs:openInExplorer", path.join(root, "note.txt"));
+    assert.strictEqual(opened.length, 1, "внутри рабочей папки проводник открывается");
+    call("shell:openExternal", "file:///etc/passwd");
+    assert.strictEqual(opened.length, 1, "открытие локальных файлов через shell заблокировано");
+    call("shell:openExternal", "https://example.com");
+    assert.strictEqual(opened.length, 2, "обычные ссылки открываются");
+  });
+
+  await test("git-панель: путь проверяется, состояние агента пишется сеттерами", async () => {
+    const os2 = require("os");
+    const root = fs.mkdtempSync(path.join(os2.tmpdir(), "git-ipc-"));
+    const outside = fs.mkdtempSync(path.join(os2.tmpdir(), "git-out-"));
+    fs.writeFileSync(path.join(root, "a.txt"), "x");
+    fs.writeFileSync(path.join(outside, "b.txt"), "y");
+    const calls = [];
+    const state = { dir: null, pending: false };
+    let stageCalled = 0;
+    const handlers = new Map();
+    const inside = (p) => {
+      const abs = path.resolve(String(p || ""));
+      return abs === root || abs.startsWith(root + path.sep) ? abs : "";
+    };
+    registerGitIpc({
+      ipcMain: { handle: (c, f) => handlers.set(c, f) },
+      path,
+      fs,
+      loadSettings: () => ({}),
+      runGit: async (dir, args) => { calls.push(args.join(" ")); return { ok: true, out: "ok" }; },
+      sanitizeDir: inside,
+      cloneRepoTo: async (u, d) => ({ ok: true, dir: path.join(d, "repo"), message: "Клонировано" }),
+      pickCloneBase: () => ({ ok: true, dir: root }),
+      stageAllSafe: async () => { stageCalled++; return { ok: true }; },
+      setLastAgentRepoDir: (v) => { state.dir = v; },
+      setClonedRepoPending: (v) => { state.pending = v; },
+    });
+    const call = (ch, ...args) => handlers.get(ch)(null, ...args);
+    const push = await call("git:push", root);
+    assert.ok(push.ok && calls.includes("push"), "push уходит в git");
+    calls.length = 0;
+    const foreign = await call("git:push", outside);
+    assert.strictEqual(foreign.ok, false, "папка вне рабочей не пускается");
+    assert.strictEqual(calls.length, 0, "и в git ничего не уходит");
+    const emptyMsg = await call("git:commit", root, "   ");
+    assert.strictEqual(emptyMsg.ok, false, "пустое сообщение коммита отклонено");
+    assert.strictEqual(stageCalled, 0, "и индекс не трогается");
+    const commit = await call("git:commit", root, "правка");
+    assert.strictEqual(commit.ok, true, "коммит проходит");
+    assert.strictEqual(stageCalled, 1, "перед коммитом файлы добавляются в индекс");
+    assert.ok(calls.some((c) => c.includes("commit")), "git получил команду коммита");
+    calls.length = 0;
+    const diffForeign = await call("git:diff", root, path.join(outside, "b.txt"));
+    assert.strictEqual(diffForeign.ok, false, "diff по файлу вне папки запрещён");
+    assert.strictEqual(calls.length, 0, "и в git такой diff не уходит");
+    const cloneBad = await call("git:clone", root, "ftp://пример/репо");
+    assert.strictEqual(cloneBad.ok, false, "неподдерживаемый протокол клона отклонён");
+    const clone = await call("git:clone", root, "https://github.com/user/repo");
+    assert.strictEqual(clone.ok, true, "клон проходит");
+    assert.ok(state.dir && state.dir.endsWith("repo"), "папка агента обновлена через сеттер: " + state.dir);
+    assert.strictEqual(state.pending, true, "флаг «после клона» выставлен — следующий ответ начнётся с анализа проекта");
+  });
+}
+
+// ── Реестр инструментов: обработчики получают окружение main.js ──────────────
+// Модуль инструментов собран аргументами: имя, оставшееся в main.js и не переданное
+// через deps, даёт у пользователя «X is not defined» ровно в этом инструменте.
+// Текстовая проверка связи есть в backend-wiring.js, но она смотрит разбор — поэтому
+// здесь проверяем ПО ФАКТУ: заглушки запоминают, кто их позвал, а живые значения —
+// что запись идёт через сеттер. Так нашлись stripAnsi, spawnCollect и auxConfig.
+async function testAgentTools() {
+  const { createAgentTools } = require(path.join(ROOT, "src", "agent-tools.js"));
+  const called = [];
+  const spy = (name) => (...args) => {
+    called.push(name);
+    return undefined;
+  };
+  // Любая незаданная зависимость — заглушка со своим именем: обращение видно в called.
+  const base = new Proxy({}, { get: (_t, key) => spy(String(key)) });
+  const state = {
+    agentEnv: { MY_VAR: "1" },
+    userAgentEnv: { MY_VAR: "1" },
+    lastAgentRepoDir: "",
+    clonedRepoPending: false,
+    activeEmit: null,
+    activeToolRouter: null,
+    mainWindow: null,
+    activeRunUndo: [],
+    lastUndoLog: [],
+    activePlanSummary: null,
+  };
+  const live = new Proxy({}, {
+    get: (_t, key) => {
+      const name = String(key);
+      if (name.startsWith("set")) {
+        const field = name.slice(3, 4).toLowerCase() + name.slice(4);
+        return (v) => {
+          called.push("live." + name);
+          state[field] = v;
+        };
+      }
+      return () => {
+        called.push("live." + name);
+        return state[name];
+      };
+    },
+  });
+  const tmp = fs.mkdtempSync(path.join(require("os").tmpdir(), "agent-tools-"));
+  const deps = Object.assign(Object.create(base), {
+    path,
+    fs,
+    os: require("os"),
+    live,
+    resolvePath: (p) => path.resolve(String(p == null ? "" : p)),
+    agentWorkDir: () => {
+      called.push("agentWorkDir");
+      return tmp;
+    },
+    truncateText: (t, n) => String(t == null ? "" : t).slice(0, n || 4000),
+    // Контракт приложения: настройки — объект, авто-переменные облака — словарь.
+    loadSettings: () => ({}),
+    ycAutoEnv: () => ({}),
+    app: {
+      getPath: () => {
+        called.push("app.getPath");
+        return tmp;
+      },
+    },
+    clipboard: {
+      writeText: (t) => called.push("clipboard.writeText:" + t),
+      readText: () => "из буфера",
+    },
+    agentStore: {
+      noteSave: () => ({ ok: true, message: "заметка сохранена" }),
+      tasksAdd: () => {
+        called.push("agentStore.tasksAdd");
+        return { ok: true, message: "дело добавлено" };
+      },
+      tasksList: () => ({ summary: { summary: { active: 1, overdue: 0, today: 0, tomorrow: 0, week: 0, noDue: 1, done: 0 } }, tasks: [] }),
+    },
+  });
+  const tools = createAgentTools(deps);
+
+  await test("реестр инструментов: собран целиком и отдаёт обработчики", () => {
+    assert.ok(Object.keys(tools).length >= 150, "обработчиков собралось: " + Object.keys(tools).length);
+    for (const name of ["clipboardWrite", "clipboardRead", "taskAdd", "taskList", "noteSave", "envList", "undoEdit"]) {
+      assert.strictEqual(typeof tools[name], "function", "обработчик «" + name + "» есть в реестре");
+    }
+  });
+
+  await test("реестр инструментов: буфер обмена и дела берут окружение из main.js", async () => {
+    called.length = 0;
+    const w = await tools.clipboardWrite({ text: "привет" }, {});
+    assert.match(w, /буфер обмена/, "инструмент ответил, а не упал: " + w);
+    assert.ok(called.includes("clipboard.writeText:привет"), "текст дошёл до буфера: " + called.join(", "));
+    const r = await tools.clipboardRead({}, {});
+    assert.match(r, /из буфера/, "чтение буфера отдало содержимое (для этого нужен truncateText): " + r);
+
+    called.length = 0;
+    const add = await tools.taskAdd({ title: "проверка" }, {});
+    assert.match(add, /дело добавлено/, "дело занесено: " + add);
+    for (const need of ["userDataDir", "agentStore.tasksAdd", "emitTasksChanged"]) {
+      assert.ok(called.includes(need), "дело проходит через " + need + " (званы: " + called.join(", ") + ")");
+    }
+    const list = await tools.taskList({}, {});
+    assert.match(list, /Дела: активных 1/, "список дел собран: " + list);
+
+    called.length = 0;
+    const note = await tools.noteSave({ key: "к", content: "тело" }, {});
+    assert.match(note, /заметка сохранена/, "заметка сохранена: " + note);
+    assert.ok(called.includes("app.getPath"), "заметки пишутся в папку приложения");
+    assert.ok(called.includes("agentWorkDir"), "заметки привязаны к папке проекта");
+
+    called.length = 0;
+    const env = await tools.envList({}, {});
+    assert.match(env, /MY_VAR — установлена \(1 симв\.\)/, "переменные агента читаются живыми: " + env);
+    assert.ok(called.includes("live.agentEnv"), "значение берётся в момент вызова, а не копией");
+  });
+
+  await test("реестр инструментов: откат меняет журнал через сеттер, а не копию", async () => {
+    const file = path.join(tmp, "note.txt");
+    fs.writeFileSync(file, "новое", "utf8");
+    state.activeRunUndo = [{ path: file, content: "старое" }];
+    state.lastUndoLog = [];
+    called.length = 0;
+    const res = await tools.undoEdit({ path: file }, {});
+    assert.match(res, /OK — файл откачен/, "откат выполнен: " + res);
+    assert.strictEqual(fs.readFileSync(file, "utf8"), "старое", "файл вернулся к прежнему содержимому");
+    assert.ok(called.includes("loadPersistedUndo"), "журнал прошлых запусков читается");
+    assert.ok(called.includes("persistUndo"), "журнал сохраняется после отката");
+    assert.ok(called.includes("live.setActiveRunUndo"), "журнал текущего запуска записан сеттером: " + called.join(", "));
+    assert.strictEqual(state.activeRunUndo.length, 0, "снимок снят из живого журнала");
+
+    state.activeRunUndo = [];
+    const empty = await tools.undoEdit({}, {});
+    assert.match(empty, /Нет изменений для отката/, "пустой журнал честно об этом говорит: " + empty);
+  });
+}
+// ── Разрез транспорта, часть 1: подключение к провайдеру ────────────────────
+// Модуль обязан собирать адрес, ключ и заголовки БЕЗ агента и без настроек
+// приложения: всё приходит аргументом. Если он дёрнет ядро, «самостоятельность»
+// окажется мнимой, и правка модуля уронит приложение.
+async function testProviderConfig() {
+  const pc = require(path.join(ROOT, "src", "renderer", "provider-config.js"));
+
+  await test("подключение к провайдеру: адрес и ключ собираются без агента", () => {
+    // Адреса: свой URL побеждает, хвостовой слэш убирается, /v1 у Anthropic не дублируется.
+    assert.strictEqual(pc.baseFor("ollama", {}), pc.DEFAULT_BASES.ollama, "адрес Ollama по умолчанию потерян");
+    assert.strictEqual(pc.baseFor("openai", {}), pc.DEFAULT_BASES.openai, "адрес OpenAI-совместимых по умолчанию потерян");
+    assert.strictEqual(pc.baseFor("openai", { openaiUrl: "https://свой.прокси/v1/" }), "https://свой.прокси/v1", "свой адрес с хвостовым слэшем не приведён");
+    assert.strictEqual(pc.baseFor("openai", { externalUrl: "https://старое/v1" }), "https://старое/v1", "старое поле externalUrl больше не читается");
+    assert.strictEqual(pc.baseFor("anthropic", { anthropicUrl: "https://api.anthropic.com/v1" }), "https://api.anthropic.com", "/v1 у Anthropic удвоится");
+    assert.strictEqual(pc.baseFor("anthropic", { anthropicUrl: "https://api.anthropic.com" }), "https://api.anthropic.com", "адрес Anthropic изменён без нужды");
+
+    // Ключи: у каждого семейства свой, с откатом на общий.
+    assert.strictEqual(pc.apiKeyFor("anthropic", { anthropicApiKey: "a" }), "a", "ключ Anthropic потерян");
+    assert.strictEqual(pc.apiKeyFor("openai", { openaiApiKey: "o", apiKey: "общий" }), "o", "ключ OpenAI потерян");
+    assert.strictEqual(pc.apiKeyFor("openai", { apiKey: "общий" }), "общий", "общий ключ больше не подхватывается");
+    assert.strictEqual(pc.apiKeyFor("ollama", { apiKey: "общий" }), "", "Ollama получила чужой ключ");
+
+    // Заголовки: у каждого семейства свой набор.
+    const ollama = pc.apiHeaders("ollama", "", false, null);
+    assert.strictEqual(ollama.Authorization, undefined, "запрос к Ollama уходит с Authorization");
+    assert.strictEqual(ollama["Content-Type"], "application/json", "нет Content-Type");
+    const anth = pc.apiHeaders("anthropic", "k", false, null);
+    assert.strictEqual(anth["x-api-key"], "k", "нет ключа Anthropic");
+    assert.strictEqual(anth["anthropic-version"], "2023-06-01", "нет версии Anthropic API");
+    assert.strictEqual(anth["anthropic-dangerous-direct-browser-access"], undefined, "браузерный заголовок ушёл из десктопа");
+    assert.strictEqual(pc.apiHeaders("anthropic", "k", true, null)["anthropic-dangerous-direct-browser-access"], "true", "из браузера запрос к Anthropic не пройдёт");
+    assert.strictEqual(pc.apiHeaders("openai", "k", false, null).Authorization, "Bearer k", "нет Bearer-заголовка");
+    assert.strictEqual(pc.apiHeaders("openai", "k", false, { "OpenAI-Project": "b1g" })["OpenAI-Project"], "b1g", "каталог Yandex не доходит до запроса");
+    assert.strictEqual(pc.apiHeaders("openai", "", false, null).Authorization, undefined, "пустой ключ превратился в «Bearer »");
+
+    // Каталог (папка) Yandex и разбор аргументов вызова инструмента.
+    assert.strictEqual(pc.projectHeader({}), null, "пустой каталог превратился в заголовок");
+    assert.deepStrictEqual(pc.projectHeader({ openaiProject: " b1g " }), { "OpenAI-Project": "b1g" }, "каталог не обрезан");
+    assert.deepStrictEqual(pc.jsonArgs({ a: 1 }), { a: 1 }, "объект аргументов испорчен");
+    assert.deepStrictEqual(pc.jsonArgs('{"a":1}'), { a: 1 }, "строка аргументов не разобрана");
+    assert.deepStrictEqual(pc.jsonArgs("не json"), { raw: "не json" }, "битая строка аргументов потеряна");
+    assert.deepStrictEqual(pc.jsonArgs(null), {}, "пустые аргументы дали не объект");
+
+    // Идентификатор вызова уникален: по нему провайдер сопоставляет ответ и запрос.
+    const ids = new Set();
+    for (let i = 0; i < 200; i++) ids.add(pc.genCallId());
+    assert.strictEqual(ids.size, 200, "идентификаторы вызовов повторяются");
+    assert.ok([...ids][0].startsWith("call_"), "идентификатор вызова без префикса");
+
+    // Маршрут «Провайдер:модель» разбирается только для известных провайдеров G4F.
+    assert.deepStrictEqual(pc.splitG4fRoute("DeepInfra:deepseek-ai/DeepSeek-V3.1"), { provider: "DeepInfra", model: "deepseek-ai/DeepSeek-V3.1" }, "маршрут G4F не разобран");
+    assert.strictEqual(pc.splitG4fRoute("openai/gpt-4o:free"), null, "чужое двоеточие принято за маршрут G4F");
+    assert.strictEqual(pc.splitG4fRoute("DeepInfra:"), null, "пустая модель принята за маршрут");
+    assert.ok(pc.G4F_PROVIDERS.length > 10, "реестр провайдеров G4F опустел");
+  });
+
+  await test("подключение к провайдеру: ошибка читается и объясняется", async () => {
+    // Тело ответа: из JSON берём причину, а не сырой объект.
+    const json = await pc.readApiError({ text: async () => JSON.stringify({ error: { message: "API key not valid" } }) });
+    assert.ok(/API key not valid/.test(json), "причина из JSON не извлечена: " + json);
+    // Обёртку {"error": {...}} разворачиваем: человеку нужна причина, а не конверт.
+    assert.ok(!/"error"/.test(json), "в текст ошибки попала обёртка error: " + json);
+    assert.ok(!/\[object/.test(json), "в текст ошибки попал объект вместо текста: " + json);
+    const plain = await pc.readApiError({ text: async () => "ошибка шлюза" });
+    assert.strictEqual(plain, "ошибка шлюза", "обычный текст потерян");
+    const long = await pc.readApiError({ text: async () => "x".repeat(5000) });
+    assert.strictEqual(long.length, 600, "длинное тело не обрезано: " + long.length);
+    const broken = await pc.readApiError({ text: async () => { throw new Error("тело уже прочитано"); } });
+    assert.strictEqual(broken, "", "нечитаемое тело уронило разбор ошибки");
+
+    // Лимит Groq объясняется понятными словами — и только когда это правда.
+    const groq = pc.friendlyRateLimitError(413, "reduce your message size", { openaiUrl: "https://api.groq.com/openai/v1" });
+    assert.ok(groq && /Groq/.test(groq) && /Dev Tier/.test(groq), "лимит Groq не объяснён: " + groq);
+    assert.strictEqual(pc.friendlyRateLimitError(413, "reduce your message size", { openaiUrl: "https://api.openai.com/v1" }), null, "чужому провайдеру приписаны лимиты Groq");
+    assert.strictEqual(pc.friendlyRateLimitError(429, "слишком много запросов", { openaiUrl: "https://api.groq.com/openai/v1" }), null, "обычный 429 объяснён как токенный лимит Groq");
+
+    // Классификация: меняет ли ошибка ключ.
+    assert.deepStrictEqual(pc.classifyKeyError("API error 401 invalid api key"), { key: true, reason: "auth", cooldownMs: 600000 }, "401 не распознан");
+    assert.deepStrictEqual(pc.classifyKeyError("API error 402 insufficient balance"), { key: true, reason: "quota", cooldownMs: 300000 }, "402 не распознан");
+    assert.deepStrictEqual(pc.classifyKeyError("API error 429 rate limit exceeded"), { key: true, reason: "rate", cooldownMs: 60000 }, "429 не распознан");
+    assert.strictEqual(pc.classifyKeyError("API error 400 invalid request").key, false, "ошибка запроса принята за ошибку ключа — агент зря сменит ключ");
+    assert.strictEqual(pc.classifyKeyError("").key, false, "пустая ошибка признана ключевой");
+
+    // Сколько ждать: заголовок, текст провайдера, частота запросов.
+    assert.strictEqual(pc.rateLimitInfo(429, { get: (k) => (k === "retry-after" ? "12" : null) }, "").retryMs, 12000, "Retry-After не прочитан");
+    assert.strictEqual(pc.rateLimitInfo(429, { get: () => null }, "Please retry in 12.3s").retryMs, 12300, "пауза из текста не прочитана");
+    const rpm = pc.rateLimitInfo(429, { get: () => null }, "Maximum 8 requests within 1 minutes");
+    assert.strictEqual(rpm.rpm, 8, "частота из «within 1 minutes» не разобрана: " + JSON.stringify(rpm));
+    assert.strictEqual(rpm.retryMs, 60000, "пауза взята не по окну лимита: " + rpm.retryMs);
+    assert.strictEqual(pc.rateLimitInfo(429, { get: (k) => (k === "retry-after" ? "9999" : null) }, "").retryMs, 120000, "пауза не ограничена сверху");
+
+    // Держатель темпа: расставляет запросы сам, чтобы 429 вообще не случался.
+    const lim = pc.createRateLimiter();
+    assert.strictEqual(lim.pendingMs(), 0, "новый держатель темпа что-то ждёт");
+    assert.strictEqual(await lim.take(), 0, "первый запрос ждал напрасно");
+    lim.note({ rpm: 600 }); // 600 запросов в минуту → 100 мс между запросами
+    await lim.take(); // этот ещё не ждёт: темп ставится на следующий запрос
+    assert.ok(lim.pendingMs() > 0, "частота запомнена, но следующий запрос уйдёт сразу");
+    const waited = await lim.take();
+    assert.ok(waited > 0, "третий запрос ушёл без паузы: " + waited);
+    // После 429 держатель темпа ждёт время, названное провайдером.
+    const after429 = pc.createRateLimiter();
+    after429.note({ retryMs: 5000 });
+    assert.ok(after429.pendingMs() > 0, "пауза после 429 не выставлена");
+    assert.strictEqual(pc.createRateLimiter().pendingMs(), 0, "держатели темпа делят состояние между собой");
+    // Пауза ограничена сверху: провайдер может прислать абсурдное «жди час».
+    const huge = pc.createRateLimiter();
+    huge.note({ retryMs: 99999999 });
+    assert.ok(huge.pendingMs() <= 120000, "пауза после 429 не ограничена: " + huge.pendingMs());
+
+    // Текст исключения для интерфейса: причина, а не «[object Promise]».
+    assert.strictEqual(pc.fmtError(new Error("сбой")), "сбой", "Error разобран неверно");
+    assert.ok(/Promise/.test(pc.fmtError(Promise.resolve(1))), "забытый await не распознан: " + pc.fmtError(Promise.resolve(1)));
+    assert.strictEqual(pc.fmtError("строка"), "строка", "строка испорчена");
+    assert.strictEqual(pc.fmtError(null), "null", "пустая ошибка испорчена");
+  });
+}
+
+// ── Разрез транспорта, часть 2: сообщения, запрос, стрим, окно модели ─────────
+// Модуль получает ровно две вещи: подключение (адреса, ключи, заголовки) и таблицу
+// инструментов агента. Если он дёрнет что-то ещё — «самостоятельность» мнимая, и
+// правка транспорта уронит приложение.
+async function testProviderTransport() {
+  const makeTransport = require(path.join(ROOT, "src", "renderer", "provider-transport.js"));
+  const config = require(path.join(ROOT, "src", "renderer", "provider-config.js"));
+  const TOOLS = [
+    {
+      type: "function",
+      function: {
+        name: "runCommand",
+        description: "Выполнить команду",
+        parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+      },
+    },
+    { type: "function", function: { name: "readFile", description: "Прочитать файл", parameters: { type: "object", properties: { path: { type: "string" } } } } },
+  ];
+  const tr = makeTransport({ config, toolDefinitions: TOOLS });
+
+  await test("транспорт: собирается без ядра — на подключении и таблице инструментов", () => {
+    for (const n of ["buildChatRequest", "consumeProviderStream", "listModels", "modelWindow", "ollamaNumCtx", "messagesForProvider", "contentForProvider", "toolsForProvider"]) {
+      assert.strictEqual(typeof tr[n], "function", "модуль не собрал " + n);
+    }
+    const msgs = [{ role: "system", content: "СИСТЕМА" }, { role: "user", content: "привет" }];
+
+    // OpenAI-совместимые: путь, ключ, модель и схемы инструментов как есть.
+    const oai = tr.buildChatRequest(
+      { provider: "openai", openaiUrl: "https://api.openai.com/v1", openaiApiKey: "k" },
+      { model: "gpt-4o", messages: msgs, tools: TOOLS }
+    );
+    assert.strictEqual(oai.url, "https://api.openai.com/v1/chat/completions", "адрес OpenAI-запроса неверен: " + oai.url);
+    assert.strictEqual(oai.headers.Authorization, "Bearer k", "ключ не попал в заголовки");
+    const oaiBody = JSON.parse(oai.body);
+    assert.strictEqual(oaiBody.model, "gpt-4o", "модель не попала в запрос");
+    assert.deepStrictEqual(oaiBody.tools.map((t) => t.function.name), ["runCommand", "readFile"], "таблица инструментов не разошлась по запросу");
+    assert.strictEqual(oaiBody.messages[0].role, "system", "OpenAI-диалект: системный промпт потерян");
+
+    // Anthropic: свой путь, свой заголовок ключа и свой диалект схем.
+    const ant = tr.buildChatRequest(
+      { provider: "anthropic", anthropicUrl: "https://api.anthropic.com", anthropicApiKey: "k" },
+      { model: "claude-sonnet-4", messages: msgs, tools: TOOLS }
+    );
+    assert.strictEqual(ant.url, "https://api.anthropic.com/v1/messages", "адрес Anthropic неверен: " + ant.url);
+    assert.strictEqual(ant.headers["x-api-key"], "k", "ключ Anthropic не попал в заголовки");
+    const antBody = JSON.parse(ant.body);
+    assert.strictEqual(antBody.tools[0].input_schema.properties.command.type, "string", "Anthropic: схема инструмента не переведена");
+    assert.strictEqual(antBody.tools[0].function, undefined, "Anthropic: ушёл OpenAI-формат инструмента (будет 400)");
+    assert.ok(JSON.stringify(antBody.system).includes("СИСТЕМА"), "Anthropic: системный промпт не вынесен отдельно");
+
+    // Ollama: нативный путь, стрим и удержание модели с нужным окном.
+    const ol = tr.buildChatRequest(
+      { provider: "ollama", ollamaUrl: "http://localhost:11434" },
+      { model: "qwen3:4b", messages: msgs, tools: TOOLS, numCtxBudget: 14000, modelWindow: 32768 }
+    );
+    assert.strictEqual(ol.url, "http://localhost:11434/api/chat", "адрес Ollama неверен: " + ol.url);
+    const olBody = JSON.parse(ol.body);
+    assert.strictEqual(olBody.stream, true, "Ollama-запрос ушёл без стрима");
+    assert.ok(olBody.keep_alive, "keep_alive не выставлен — модель выгружается между раундами");
+    assert.ok(olBody.options && olBody.options.num_ctx > 14000, "num_ctx не покрывает бюджет: " + JSON.stringify(olBody.options));
+    assert.deepStrictEqual(olBody.messages, msgs, "Ollama-диалект исказил сообщения");
+
+    // Пустая таблица в opts — явный отказ от инструментов; без opts.tools берётся таблица модуля.
+    const bare = JSON.parse(tr.buildChatRequest({ provider: "openai", openaiUrl: "https://api.openai.com/v1", openaiApiKey: "k" }, { model: "gpt-4o", messages: msgs, tools: [] }).body);
+    assert.deepStrictEqual(bare.tools, [], "явно пустая таблица инструментов не соблюдена");
+    const stored = JSON.parse(tr.buildChatRequest({ provider: "openai", openaiUrl: "https://api.openai.com/v1", openaiApiKey: "k" }, { model: "gpt-4o", messages: msgs }).body);
+    assert.strictEqual(stored.tools.length, 2, "без opts.tools не взялась таблица модуля: " + JSON.stringify(stored.tools).slice(0, 80));
+  });
+
+  await test("транспорт: поток каждого семейства читается без ядра", async () => {
+    const streamOf = (text) =>
+      new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode(text));
+          c.close();
+        },
+      });
+
+    // OpenAI-совместимые: текст и вызов инструмента, аргументы приходят кусками.
+    const oaiText = [];
+    const oaiTools = [];
+    await tr.consumeProviderStream({
+      response: {
+        body: streamOf(
+          "data: " + JSON.stringify({ choices: [{ delta: { content: "Ответ" } }] }) + "\n" +
+            "data: " + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "c1", function: { name: "runCommand", arguments: '{"command":' } }] } }] }) + "\n" +
+            "data: " + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"ls"}' } }] } }] }) + "\n" +
+            "data: [DONE]\n"
+        ),
+      },
+      provider: "openai",
+      onText: (t) => oaiText.push(t),
+      onToolCall: (tc) => oaiTools.push(tc),
+    });
+    assert.strictEqual(oaiText.join(""), "Ответ", "текст потока потерян: " + JSON.stringify(oaiText));
+    assert.strictEqual(oaiTools.length, 1, "вызов инструмента не собран: " + oaiTools.length);
+    assert.strictEqual(oaiTools[0].name, "runCommand", "имя вызова потеряно");
+    assert.deepStrictEqual(oaiTools[0].args, { command: "ls" }, "аргументы не собраны из кусков: " + JSON.stringify(oaiTools[0].args));
+
+    // Ollama: рассуждения отдельным полем, текст — отдельно.
+    const think = [];
+    const olText = [];
+    await tr.consumeProviderStream({
+      response: {
+        body: streamOf(
+          JSON.stringify({ message: { role: "assistant", thinking: "думаю", content: "" }, done: false }) + "\n" +
+            JSON.stringify({ message: { role: "assistant", content: "готово" }, done: false }) + "\n" +
+            JSON.stringify({ message: { role: "assistant", content: "" }, done: true, prompt_eval_count: 7, eval_count: 3 }) + "\n"
+        ),
+      },
+      provider: "ollama",
+      onText: (t) => olText.push(t),
+      onThinking: (t) => think.push(t),
+    });
+    assert.strictEqual(think.join(""), "думаю", "рассуждения Ollama потеряны");
+    assert.strictEqual(olText.join(""), "готово", "текст Ollama потерян");
+
+    // Anthropic: вызов инструмента приходит кусками JSON (input_json_delta).
+    const antTools = [];
+    await tr.consumeProviderStream({
+      response: {
+        body: streamOf(
+          "data: " + JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_1", name: "readFile" } }) + "\n" +
+            "data: " + JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"path":' } }) + "\n" +
+            "data: " + JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '"README.md"}' } }) + "\n" +
+            "data: " + JSON.stringify({ type: "content_block_stop", index: 0 }) + "\n" +
+            "data: " + JSON.stringify({ type: "message_stop" }) + "\n"
+        ),
+      },
+      provider: "anthropic",
+      onToolCall: (tc) => antTools.push(tc),
+    });
+    assert.strictEqual(antTools.length, 1, "Anthropic: вызов инструмента не собран: " + antTools.length);
+    assert.strictEqual(antTools[0].name, "readFile", "Anthropic: имя вызова потеряно");
+    assert.deepStrictEqual(antTools[0].args, { path: "README.md" }, "Anthropic: аргументы собраны неверно: " + JSON.stringify(antTools[0].args));
+  });
+
+  await test("транспорт: окно модели спрашивается у сервера и кэшируется", async () => {
+    const real = global.fetch;
+    const seen = [];
+    try {
+      global.fetch = async (url) => {
+        seen.push(String(url));
+        return {
+          ok: true,
+          json: async () => ({ model_info: { "general.architecture": "qwen3", "qwen3.context_length": 32768 }, capabilities: ["completion", "tools"] }),
+        };
+      };
+      const settings = { provider: "ollama", ollamaUrl: "http://localhost:11434", model: "qwen3:4b" };
+      assert.strictEqual(await tr.modelWindow(settings, "qwen3:4b"), 32768, "окно модели не прочитано");
+      assert.strictEqual(await tr.modelWindow(settings, "qwen3:4b"), 32768, "повторный вызов сломался");
+      assert.strictEqual(seen.filter((u) => /\/api\/show$/.test(u)).length, 1, "окно спрашивается заново: " + seen.length);
+      const info = await tr.ollamaModelInfo(settings, "qwen3:4b");
+      assert.strictEqual(info.tools, true, "возможность tools не прочитана");
+      assert.ok(tr.ollamaNumCtx(14000, 32768) > 14000, "num_ctx не покрывает бюджет с запасом");
+      assert.ok(tr.ollamaNumCtx(14000, 0) > 14000, "num_ctx без окна не посчитан");
+    } finally {
+      global.fetch = real;
+    }
+  });
+}
+
+// ── Разрез ядра: контекст и компакция ───────────────────────────────────────
+// Модуль получает подключение к провайдеру (кому отправить запрос за памяткой) и
+// транспорт (разбор частей сообщения). Настройки видит только те, что передали.
+async function testContextWindow() {
+  const makeContext = require(path.join(ROOT, "src", "renderer", "context-window.js"));
+  const config = require(path.join(ROOT, "src", "renderer", "provider-config.js"));
+  const partsText = (parts) => (parts || []).filter((p) => p && p.type === "text").map((p) => p.text || "").join("\n");
+  const ctx = makeContext({ config, transport: { partsText } });
+
+  await test("контекст: бюджет, обрезка и пары инструментов — без ядра", () => {
+    for (const n of ["estimateTokens", "estimateMessageTokens", "contextBudget", "sanitizeToolPairs", "trimConversation", "truncateText", "compactRemote", "createContextManager"]) {
+      assert.strictEqual(typeof ctx[n], "function", "модуль не собрал " + n);
+    }
+    // Токены: текст считается по длине, картинка — как фиксированный вес.
+    assert.strictEqual(ctx.estimateTokens("привет мир"), 3, "оценка текста сломана");
+    const withImage = ctx.estimateTokens([{ type: "text", text: "привет" }, { type: "image_url", image_url: { url: "data:image/png;base64,AA==" } }]);
+    assert.ok(withImage >= 800, "изображение не учтено в токенах: " + withImage);
+    assert.ok(ctx.estimateMessageTokens({ role: "user", content: "привет мир" }) >= 3, "токены сообщения не считаются");
+
+    // Бюджет: у локальных моделей свой потолок, иначе — по типу модели.
+    assert.strictEqual(ctx.contextBudget("ollama", "qwen3:4b"), 14000, "потолок Ollama изменился");
+    assert.strictEqual(ctx.contextBudget("openai", "deepseek-chat"), 26000, "потолок для больших моделей изменился");
+    assert.ok(ctx.contextBudget("openai", "gpt-4o") > 0, "бюджет обычной модели не посчитан");
+
+    // Обрезка текста: короткий не трогаем, у длинного видно, сколько было.
+    assert.strictEqual(ctx.truncateText("коротко", 100), "коротко", "короткий текст обрезан");
+    const long = ctx.truncateText("x".repeat(500), 100);
+    assert.ok(long.startsWith("x".repeat(100)) && long.includes("обрезано: 500"), "обрезанный текст не объясняет размер: " + long.slice(90, 140));
+
+    // Пары tool: осиротевший результат инструмента роняет запрос (400 wrong_api_format).
+    const orphan = ctx.sanitizeToolPairs([{ role: "user", content: "привет" }, { role: "tool", tool_call_id: "a", content: "результат" }]);
+    assert.deepStrictEqual(orphan.map((m) => m.role), ["user"], "осиротевший tool не убран");
+    const paired = ctx.sanitizeToolPairs([
+      { role: "user", content: "привет" },
+      { role: "assistant", content: "", tool_calls: [{ id: "a", function: { name: "readFile", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "a", content: "результат" },
+    ]);
+    assert.deepStrictEqual(paired.map((m) => m.role), ["user", "assistant", "tool"], "правильная пара выброшена");
+
+    // Обрезка истории: цель задачи (последний вопрос) остаётся.
+    const msgs = [{ role: "system", content: "СИСТЕМА" }];
+    for (let i = 0; i < 12; i++) msgs.push({ role: i % 2 ? "assistant" : "user", content: "шум ".repeat(400) });
+    msgs.push({ role: "user", content: "ЦЕЛЬ ЗАДАЧИ" });
+    const kept = ctx.trimConversation(msgs, 900);
+    assert.ok(kept.some((m) => m.content === "ЦЕЛЬ ЗАДАЧИ"), "последний вопрос потерян при обрезке");
+    assert.ok(kept.every((m) => m.role !== "tool" || kept.some((x) => x.role === "assistant")), "в истории остался осиротевший tool");
+  });
+
+  await test("контекст: памятка запрашивается через подключение, а не напрямую", async () => {
+    const real = global.fetch;
+    const calls = [];
+    try {
+      global.fetch = async (url, opts) => {
+        calls.push({ url: String(url), headers: opts && opts.headers, body: opts && opts.body });
+        return { ok: true, json: async () => ({ choices: [{ message: { content: "ПАМЯТКА: сделано то-то" } }] }) };
+      };
+      const big = (role, text) => ({ role, content: text.repeat(1200) });
+      const messages = [
+        { role: "system", content: "СИСТЕМА" },
+        big("user", "пользователь просил "),
+        big("assistant", "агент сделал "),
+        big("user", "потом попросил "),
+        big("assistant", "агент сделал "),
+        { role: "user", content: "текущая задача" },
+      ];
+      const settings = { provider: "openai", openaiUrl: "https://api.openai.com/v1", openaiApiKey: "k", model: "gpt-4o-mini" };
+
+      // Голова маленькая — вызов модели не нужен, дешевле обычная обрезка.
+      const small = await ctx.compactRemote(settings, [{ role: "user", content: "привет" }, { role: "user", content: "ещё" }]);
+      assert.strictEqual(small, null, "памятка запрошена для крошечной истории");
+      assert.strictEqual(calls.length, 0, "лишний запрос к провайдеру: " + calls.length);
+      // Без модели сжимать нечем.
+      assert.strictEqual(await ctx.compactRemote({ provider: "openai" }, messages), null, "без модели запрос всё равно ушёл");
+
+      const memo = await ctx.compactRemote(settings, messages);
+      assert.strictEqual(memo, "ПАМЯТКА: сделано то-то", "текст памятки не вернулся: " + memo);
+      assert.strictEqual(calls.length, 1, "памятка запрошена не одним вызовом: " + calls.length);
+      assert.strictEqual(calls[0].url, "https://api.openai.com/v1/chat/completions", "адрес запроса взят не из подключения: " + calls[0].url);
+      assert.strictEqual(calls[0].headers.Authorization, "Bearer k", "ключ не доехал до запроса памятки");
+      const sent = JSON.parse(calls[0].body);
+      assert.strictEqual(sent.stream, false, "запрос памятки ушёл потоком");
+      assert.ok(/Пользователь:|Агент:/.test(sent.messages[1].content), "в памятку не попала переписка с ролями");
+      assert.ok(!sent.messages[1].content.includes("текущая задача"), "в памятку попал текущий вопрос — он должен остаться в истории");
+
+      // Anthropic: ответ приходит блоками, а путь свой.
+      calls.length = 0;
+      global.fetch = async (url, opts) => {
+        calls.push({ url: String(url), headers: opts && opts.headers, body: opts && opts.body });
+        return { ok: true, json: async () => ({ content: [{ type: "text", text: "ПАМЯТКА ANTHROPIC" }] }) };
+      };
+      const ant = await ctx.compactRemote({ provider: "anthropic", anthropicUrl: "https://api.anthropic.com", anthropicApiKey: "k", model: "claude" }, messages);
+      assert.strictEqual(ant, "ПАМЯТКА ANTHROPIC", "блоки ответа Anthropic не собраны: " + ant);
+      assert.strictEqual(calls[0].url, "https://api.anthropic.com/v1/messages", "путь Anthropic неверен: " + calls[0].url);
+      assert.strictEqual(calls[0].headers["x-api-key"], "k", "ключ Anthropic не доехал");
+
+      // Отказ провайдера — не исключение: агент просто продолжит с обрезкой.
+      global.fetch = async () => ({ ok: false, status: 500, json: async () => ({}) });
+      assert.strictEqual(await ctx.compactRemote(settings, messages), null, "ошибка провайдера не обработана как «памятки нет»");
+    } finally {
+      global.fetch = real;
+    }
+  });
+
+  await test("контекст: менеджер сжимает переполнение и не теряет цель задачи", async () => {
+    const real = global.fetch;
+    const fetches = [];
+    const events = [];
+    const memos = [];
+    try {
+      global.fetch = async () => {
+        fetches.push(1);
+        return { ok: true, json: async () => ({ choices: [{ message: { content: "ПАМЯТКА " + fetches.length } }] }) };
+      };
+      const settings = { provider: "openai", openaiUrl: "https://api.openai.com/v1", openaiApiKey: "k", model: "gpt-4o-mini" };
+      const mgr = ctx.createContextManager({ settings, emit: (e) => events.push(e), onMemo: (m) => memos.push(m) });
+      const big = (role, text) => ({ role, content: text.repeat(1200) });
+      const messages = [
+        { role: "system", content: "СИСТЕМА" },
+        big("user", "просил "),
+        big("assistant", "сделал "),
+        big("user", "потом "),
+        big("assistant", "сделал "),
+        { role: "user", content: "ЦЕЛЬ ЗАДАЧИ" },
+      ];
+
+      // Контекст влезает: только страховка от осиротевших tool, вызова модели нет.
+      const fits = await mgr.manage([{ role: "user", content: "привет" }], 100000);
+      assert.deepStrictEqual(fits, [{ role: "user", content: "привет" }], "короткая история испорчена");
+      assert.strictEqual(fetches.length, 0, "сжатие запустилось без переполнения");
+
+      const squeezed = await mgr.manage(messages, 200);
+      assert.strictEqual(squeezed[0].role, "system", "первым сообщением идёт не памятка");
+      assert.ok(squeezed[0].content.includes("ПАМЯТКА ПРЕДЫДУЩЕГО КОНТЕКСТА"), "памятка не поставлена в начало: " + squeezed[0].content.slice(0, 60));
+      assert.ok(squeezed.some((m) => m.content === "ЦЕЛЬ ЗАДАЧИ"), "цель задачи потеряна при сжатии");
+      assert.ok(events.some((e) => e.type === "compact"), "пользователю не сказали, что контекст сжат");
+      assert.strictEqual(memos.length, 1, "дневник памяток не получил запись: " + memos.length);
+      assert.strictEqual(memos[0].text, "ПАМЯТКА 1", "в дневник ушёл не тот текст");
+      assert.strictEqual(memos[0].model, "gpt-4o-mini", "в дневнике нет модели");
+      assert.strictEqual(mgr.memo().content.includes("ПАМЯТКА 1"), true, "менеджер не помнит памятку");
+
+      // Сжатий за прогон не больше трёх: иначе модель тратится на бесконечные пересказы.
+      for (let i = 0; i < 6; i++) await mgr.manage(messages, 200);
+      assert.ok(fetches.length <= 3, "сжатий больше предела: " + fetches.length);
+      // В режиме плана сжатие выключено: план не должен теряться.
+      const planMgr = ctx.createContextManager({ settings, planMode: true });
+      const before = fetches.length;
+      await planMgr.manage(messages, 200);
+      assert.strictEqual(fetches.length, before, "в режиме плана контекст всё равно сжимался");
+    } finally {
+      global.fetch = real;
+    }
+  });
+}
+
+// ── Разрез ядра: веб-модуль ─────────────────────────────────────────────────
+// Вынесенный модуль обязан работать БЕЗ агента: если он хоть раз дёрнет что-то из
+// ядра, «самостоятельность» окажется мнимой, и правка модуля уронит приложение.
+async function testWebTools() {
+  const web = require(path.join(ROOT, "src", "renderer", "web-tools.js"));
+
+  await test("веб-модуль: ссылки, сниппеты и текст разбираются без агента", () => {
+    assert.strictEqual(
+      web.ddgUrlToHttps("//duckduckgo.com/l/?uddg=https%3A%2F%2Fone.ru%2Fb%3Fx%3D1"),
+      "https://one.ru/b?x=1",
+      "распакованная ссылка DuckDuckGo потерялась"
+    );
+    assert.strictEqual(web.ddgUrlToHttps("https://прямой.ру/x"), "https://прямой.ру/x", "прямая ссылка изменена");
+    assert.strictEqual(web.stripHtml("<b>a</b>&nbsp;b&amp;c"), "a b&c", "раскрытие сущностей сломано");
+
+    const html =
+      '<a class="result__a" href="//d/l/?uddg=https%3A%2F%2Fone.ru">Первый &amp; второй</a>' +
+      '<a class="result__snippet">сниппет один</a>' +
+      '<a class="result__a" href="mailto:x@y.ru">почта</a>';
+    const r = web.parseDdgHtml(html);
+    assert.deepStrictEqual(
+      r,
+      [{ title: "Первый & второй", url: "https://one.ru", snippet: "сниппет один" }],
+      "разбор html-выдачи DuckDuckGo: " + JSON.stringify(r)
+    );
+    // Нессылочные адреса (mailto) в результаты не попадают — иначе агент ходит в никуда.
+    assert.strictEqual(r.length, 1, "в результаты попал не-http адрес");
+
+    const lite = web.parseDdgLite(
+      '<a class="result-link" href="https://two.ru">Второй</a><td class="result-snippet">сниппет два</td>'
+    );
+    assert.deepStrictEqual(lite, [{ title: "Второй", url: "https://two.ru", snippet: "сниппет два" }], "lite-выдача не разобрана");
+
+    const text = web.htmlToText("<script>var secret=1</script><style>p{color:red}</style><p>Привет &mdash; мир</p>");
+    assert.ok(text.includes("Привет — мир"), "текст страницы не извлёкся: " + JSON.stringify(text));
+    assert.ok(!text.includes("var secret") && !text.includes("color:red"), "в текст попали скрипт или стиль");
+  });
+
+  await test("веб-модуль: таймаут, HTTP-ошибка и лимит размера", async () => {
+    const real = global.fetch;
+    try {
+      global.fetch = async () => ({ ok: false, status: 404 });
+      const notFound = await web.downloadHtml("https://x.example/нет");
+      assert.strictEqual(notFound.ok, false, "404 отдан как успех");
+      assert.strictEqual(notFound.error, "HTTP 404", "код ответа не назван: " + notFound.error);
+
+      global.fetch = async () => {
+        const e = new Error("aborted");
+        e.name = "AbortError";
+        throw e;
+      };
+      const aborted = await web.downloadHtml("https://x.example/долго");
+      assert.strictEqual(aborted.error, "таймаут", "обрыв по времени назван непонятно: " + aborted.error);
+
+      // Огромная страница не должна уходить в контекст целиком.
+      global.fetch = async () => ({ ok: true, text: async () => "x".repeat(3 * 1024 * 1024) });
+      const big = await web.downloadHtml("https://x.example/большая");
+      assert.strictEqual(big.ok, true, "большая страница отброшена целиком");
+      assert.strictEqual(big.text.length, 2 * 1024 * 1024, "страница не обрезана до 2 МБ: " + big.text.length);
+    } finally {
+      global.fetch = real;
+    }
+  });
+
+  await test("веб-модуль: поиск переходит с html на lite, а не молчит", async () => {
+    const real = global.fetch;
+    const seen = [];
+    try {
+      // Первый адрес отвечает 200, но без результатов (капча/новая разметка) — тогда
+      // модуль обязан попробовать lite-версию, иначе человек видит «ничего не нашлось».
+      global.fetch = async (url) => {
+        seen.push(String(url));
+        if (String(url).includes("lite.duckduckgo.com")) {
+          return { ok: true, text: async () => '<a class="result-link" href="https://lite.ru">Из lite</a>' };
+        }
+        return { ok: true, text: async () => "<html><body>ничего</body></html>" };
+      };
+      const res = await web.webSearchDDG("проверка");
+      assert.strictEqual(seen.length, 2, "вторая (lite) попытка не сделана: " + seen.join(" → "));
+      assert.ok(res.includes("https://lite.ru"), "результат lite не попал в ответ: " + res.slice(0, 120));
+
+      // Serper: ключ отклонён — говорим про ключ, а не «ошибка поиска».
+      global.fetch = async () => ({ ok: false, status: 403, statusText: "Forbidden" });
+      const bad = await web.webSearchSerper("проверка", "плохой-ключ");
+      assert.ok(/отклонил ключ/.test(bad), "отказ ключа Serper не объяснён: " + bad);
+      assert.ok(/HTTP 403/.test(bad), "код ответа Serper потерян: " + bad);
+
+      // webSearch без ключа идёт в DuckDuckGo, с ключом — в Serper.
+      global.fetch = async (url) => {
+        seen.push(String(url));
+        return { ok: true, text: async () => "<html></html>" };
+      };
+      seen.length = 0;
+      await web.webSearch("запрос", "");
+      assert.ok(seen.some((u) => u.includes("duckduckgo.com")), "без ключа поиск ушёл не в DuckDuckGo: " + seen.join(" → "));
+      seen.length = 0;
+      global.fetch = async (url, opts) => {
+        seen.push(String(url));
+        assert.ok(opts && opts.headers && opts.headers["X-API-KEY"] === "ключ", "запрос Serper ушёл без ключа");
+        return { ok: true, json: async () => ({ organic: [{ title: "T", link: "https://s.ru", snippet: "S" }] }) };
+      };
+      const serp = await web.webSearch("запрос", "ключ");
+      assert.ok(seen[0].includes("serper.dev"), "с ключом поиск ушёл не в Serper: " + seen[0]);
+      assert.ok(serp.includes("https://s.ru"), "результат Serper не попал в ответ");
+    } finally {
+      global.fetch = real;
+    }
+  });
+}
+
+// ── Разрез ядра: вспомогательная модель (зрение + генерация изображений) ─────
+async function testImageTools() {
+  const makeImageTools = require(path.join(ROOT, "src", "renderer", "image-tools.js"));
+
+  await test("модуль изображений: собирается на трёх помощниках ядра", () => {
+    const used = [];
+    const tools = makeImageTools({
+      apiHeaders: (provider, key, stream, extra) => {
+        used.push("apiHeaders:" + provider + ":" + (key || "—") + ":" + (extra ? "extra" : "нет"));
+        return { "X-Проверка": "1" };
+      },
+      proxiedBase: (u) => {
+        used.push("proxiedBase");
+        return String(u || "");
+      },
+      readApiError: async () => {
+        used.push("readApiError");
+        return "тело ошибки от провайдера";
+      },
+    });
+    for (const n of ["auxConfig", "normalizeAuxBase", "imageAttempts", "imageProviderLabel", "describeImageRemote", "generateImageRemote", "proxiedUrl"]) {
+      assert.strictEqual(typeof tools[n], "function", "модуль не собрал " + n);
+    }
+    assert.strictEqual(tools.imageProviderLabel("https://openrouter.ai/api/v1"), "OpenRouter", "провайдер не распознан");
+    assert.strictEqual(tools.normalizeAuxBase("https://api.openai.com"), "https://api.openai.com/v1", "база не достроена");
+    assert.ok(tools.proxiedUrl, "нет сборщика прокси-адреса");
+  });
+
+  await test("модуль изображений: подставленные помощники действительно работают", async () => {
+    const calls = [];
+    const tools = makeImageTools({
+      apiHeaders: (provider, key, stream) => {
+        calls.push("headers:" + provider);
+        return { Authorization: "Bearer " + String(key || "") };
+      },
+      proxiedBase: (u) => {
+        calls.push("proxy");
+        return String(u || "");
+      },
+      readApiError: async () => {
+        calls.push("readApiError");
+        return "QUOTA_EXCEEDED: кончилась квота";
+      },
+    });
+    const real = global.fetch;
+    try {
+      // Зрение: запрос идёт на /chat/completions, заголовки — от ядра, текст ошибки — тоже.
+      global.fetch = async (url, opts) => {
+        calls.push("fetch:" + String(url));
+        assert.strictEqual(opts.headers.Authorization, "Bearer k", "заголовки ядра не дошли до запроса");
+        return { ok: false, status: 429, text: async () => "{}" };
+      };
+      const cfg = tools.auxConfig({ visionEnabled: true, visionUrl: "https://api.openai.com/v1", visionKey: "k", visionModel: "m" });
+      await assert.rejects(
+        () => tools.describeImageRemote(cfg, "data:image/png;base64,AA==", "что тут?", "m"),
+        /QUOTA_EXCEEDED/,
+        "ошибка провайдера не показана человеку"
+      );
+      assert.ok(calls.includes("proxy"), "адрес не прошёл через прокси браузерного режима");
+      assert.ok(calls.includes("headers:openai"), "заголовки собраны не для openai-диалекта");
+      assert.ok(calls.includes("fetch:" + cfg.url + "/chat/completions"), "запрос ушёл не на /chat/completions: " + calls.join(" | "));
+      // Текст ошибки берётся у ядра: без этого человек снова увидел бы пустое сообщение.
+      assert.ok(calls.includes("readApiError"), "тело ответа не прочитано: " + calls.join(" | "));
+
+      // Адрес берётся из переданной конфигурации, а не из настроек приложения:
+      // это и делает модуль самостоятельным.
+      calls.length = 0;
+      const other = tools.auxConfig({ visionEnabled: true, visionUrl: "https://свой.прокси/v1", visionKey: "k2", visionModel: "m" });
+      global.fetch = async (url) => {
+        calls.push("fetch:" + String(url));
+        return { ok: false, status: 500, text: async () => "{}" };
+      };
+      await assert.rejects(() => tools.describeImageRemote(other, "data:image/png;base64,AA==", "что тут?", "m"));
+      assert.ok(calls.includes("fetch:https://свой.прокси/v1/chat/completions"), "чужой базовый адрес изменён: " + calls.join(" | "));
+
+      // Явная ошибка вместо пустого ответа: без адреса модуль обязан отказать громко.
+      let loud = false;
+      global.fetch = async (url) => {
+        if (!/^https?:/i.test(String(url))) throw new TypeError("Failed to parse URL from " + url);
+        return { ok: true, json: async () => ({}) };
+      };
+      try {
+        await tools.describeImageRemote(tools.auxConfig({ visionEnabled: true, visionKey: "k" }), "data:image/png;base64,AA==", "что тут?", "m");
+      } catch (e) {
+        loud = e instanceof Error;
+      }
+      assert.ok(loud, "без адреса разбор картинки прошёл молча");
+    } finally {
+      global.fetch = real;
+    }
+  });
+}
+
+// ── Разрез ядра: связность ──────────────────────────────────────────────────
+// Модуль, который никто не подключил, в Electron main работает (require), а в окне
+// молча падает: window.WebTools нет, и приложение остаётся пустым. Поэтому проверяем
+// все пути загрузки сразу — тег в index.html, список preview-сервера и require в ядре.
+async function testCoreSplit() {
+  const core = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
+  const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+  const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+  const bridge = fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8");
+
+  await test("разрез ядра: модули подключены в окне, мосту и ядре", () => {
+    const posWeb = html.indexOf('src="web-tools.js"');
+    const posImg = html.indexOf('src="image-tools.js"');
+    const posCore = html.indexOf('src="agent-core.js"');
+    assert.ok(posWeb > 0 && posImg > 0 && posCore > 0, "в index.html нет тегов модулей");
+    assert.ok(posWeb < posCore && posImg < posCore, "модули подключены ПОСЛЕ ядра — window.WebTools будет пустым");
+    assert.ok(/require\("\.\/web-tools\.js"\)/.test(coreSrc), "ядро не требует web-tools в CommonJS");
+    assert.ok(/require\("\.\/image-tools\.js"\)/.test(coreSrc), "ядро не требует image-tools в CommonJS");
+    assert.ok(
+      /factory\(root\.ProviderConfig, root\.ProviderTransport, root\.ContextWindow, root\.WebTools, root\.ImageTools\)/.test(coreSrc),
+      "браузерная ветка ядра не получает модули"
+    );
+    assert.ok(/require\("\.\/provider-config\.js"\)/.test(coreSrc), "ядро не требует provider-config в CommonJS");
+    const posCfg = html.indexOf('src="provider-config.js"');
+    assert.ok(posCfg > 0 && posCfg < posCore, "подключение к провайдеру подключено ПОСЛЕ ядра — window.ProviderConfig будет пустым");
+    assert.ok(/"provider-config\.js"/.test(bridge), "preview-мост не отдаёт модуль подключения телефону");
+    assert.ok(/require\("\.\/provider-transport\.js"\)/.test(coreSrc), "ядро не требует provider-transport в CommonJS");
+    const posTr = html.indexOf('src="provider-transport.js"');
+    assert.ok(posTr > 0 && posTr < posCore, "транспорт подключён ПОСЛЕ ядра — window.ProviderTransport будет пустым");
+    assert.ok(posCfg < posTr, "транспорт подключён раньше подключения к провайдеру");
+    assert.ok(/"provider-transport\.js"/.test(bridge), "preview-мост не отдаёт транспорт телефону");
+    assert.ok(/require\("\.\/context-window\.js"\)/.test(coreSrc), "ядро не требует context-window в CommonJS");
+    const posCtx = html.indexOf('src="context-window.js"');
+    assert.ok(posCtx > 0 && posCtx < posCore, "контекст подключён ПОСЛЕ ядра — window.ContextWindow будет пустым");
+    assert.ok(posTr < posCtx, "контекст подключён раньше транспорта, а он им пользуется");
+    assert.ok(/"context-window\.js"/.test(bridge), "preview-мост не отдаёт контекст телефону");
+    assert.ok(!/function trimConversation\(/.test(coreSrc), "trimConversation остался в ядре");
+    assert.ok(!/function compactRemote\(/.test(coreSrc), "compactRemote остался в ядре");
+    // Само ядро больше не содержит перенесённого транспорта.
+    assert.ok(!/function buildChatRequest\(/.test(coreSrc), "buildChatRequest остался в ядре");
+    assert.ok(!/function consumeProviderStream\(/.test(coreSrc), "consumeProviderStream остался в ядре");
+    assert.ok(!/function messagesForProvider\(/.test(coreSrc), "messagesForProvider остался в ядре");
+    assert.ok(/"web-tools\.js"/.test(bridge) && /"image-tools\.js"/.test(bridge), "preview-мост не отдаёт модули телефону");
+    // Само ядро больше не содержит перенесённого кода: иначе правки шли бы в две копии.
+    assert.ok(!/function stripHtml\(/.test(coreSrc), "stripHtml остался в ядре");
+    assert.ok(!/function generateImageRemote\(/.test(coreSrc), "generateImageRemote остался в ядре");
+    assert.ok(!/function parseDdgHtml\(/.test(coreSrc), "parseDdgHtml остался в ядре");
+    // А через общий объект имена доступны по-прежнему — main.js и инструменты не менялись.
+    for (const n of ["webSearch", "webFetchPage", "htmlToText", "downloadHtml", "webSearchDDG", "classifyKeyError", "auxConfig", "imageAttempts", "describeImageRemote", "generateImageRemote", "proxiedUrl"]) {
+      assert.strictEqual(typeof core[n], "function", "ядро перестало отдавать " + n);
+    }
+    // Ядро отдаёт наружу именно модульные функции (фабрика каждый раз создаёт новые
+    // обёртки, поэтому сверяем поведение и имя, а не ссылки): правка модуля меняет
+    // поведение агента, а не оседает во второй копии.
+    const web = require(path.join(ROOT, "src", "renderer", "web-tools.js"));
+    const img = require(path.join(ROOT, "src", "renderer", "image-tools.js"))({ apiHeaders: () => ({}), proxiedBase: (u) => u, readApiError: async () => "" });
+    assert.strictEqual(core.webSearch.name, web.webSearch.name, "ядро отдаёт не модульный веб-поиск");
+    assert.strictEqual(core.htmlToText("<p>a &amp; b</p>"), web.htmlToText("<p>a &amp; b</p>"), "поведение веб-модуля и ядра разошлось");
+    assert.strictEqual(core.imageProviderLabel("https://openrouter.ai/api/v1"), img.imageProviderLabel("https://openrouter.ai/api/v1"), "поведение модуля изображений и ядра разошлось");
+    assert.strictEqual(core.generateImageRemote.name, img.generateImageRemote.name, "ядро отдаёт не модульную генерацию изображений");
+  });
+
+  await test("разрез ядра: вынесенные модули не тянут за собой ядро", () => {
+    // Обратная ошибка: модуль «самостоятелен» только на бумаге и на деле берёт
+    // помощники из ядра. Тогда его нельзя ни проверить, ни переиспользовать.
+    const stubDeps = { apiHeaders: () => ({}), proxiedBase: (u) => u, readApiError: async () => "" };
+    const allowed = {
+      "provider-config.js": { src: require(path.join(ROOT, "src", "renderer", "provider-config.js")), deps: [] },
+      "provider-transport.js": {
+        src: require(path.join(ROOT, "src", "renderer", "provider-transport.js"))({ config: {}, toolDefinitions: [] }),
+        deps: [],
+      },
+      "context-window.js": {
+        src: require(path.join(ROOT, "src", "renderer", "context-window.js"))({ config: {}, transport: {} }),
+        deps: [],
+      },
+      "web-tools.js": { src: require(path.join(ROOT, "src", "renderer", "web-tools.js")), deps: [] },
+      "image-tools.js": { src: require(path.join(ROOT, "src", "renderer", "image-tools.js"))(stubDeps), deps: ["apiHeaders", "proxiedBase", "readApiError"] },
+    };
+    for (const [file, info] of Object.entries(allowed)) {
+      const src = fs
+        .readFileSync(path.join(ROOT, "src", "renderer", file), "utf8")
+        .replace(/\/\*[\s\S]*?\*\//g, " ")
+        .replace(/\/\/[^\n]*/g, " ");
+      // Свои имена модуля (в том числе экспортируемые) — не утечка: ядро раздаёт их же.
+      const own = new Set(Object.keys(info.src));
+      // Имена, ОБЪЯВЛЕННЫЕ внутри модуля (в том числе полученные из deps), — это и есть
+      // внедрение. Утечка — имя, которого модуль ниоткуда не получил: тогда у человека
+      // упадёт «X is not defined» ровно в этом месте.
+      const declared = new Set();
+      for (const m of src.matchAll(/(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)/g)) declared.add(m[1]);
+      for (const m of src.matchAll(/(?:const|let|var)\s*\{([^}]*)\}/g)) {
+        for (const m2 of m[1].matchAll(/([A-Za-z_$][\w$]*)/g)) declared.add(m2[1]);
+      }
+      for (const m of src.matchAll(/function\s*[A-Za-z_$]*\s*\(([^)]*)\)/g)) {
+        for (const m2 of m[1].matchAll(/([A-Za-z_$][\w$]*)/g)) declared.add(m2[1]);
+      }
+      for (const m of src.matchAll(/\(([^)]*)\)\s*=>/g)) {
+        for (const m2 of m[1].matchAll(/([A-Za-z_$][\w$]*)/g)) declared.add(m2[1]);
+      }
+      for (const m of src.matchAll(/([A-Za-z_$][\w$]*)\s*=>/g)) declared.add(m[1]);
+      const leaked = [];
+      for (const name of Object.keys(core)) {
+        if (info.deps.includes(name) || own.has(name) || declared.has(name)) continue;
+        if (new RegExp("(^|[^\\w$.'\"])\\b" + name + "\\b").test(src)) leaked.push(name);
+      }
+      assert.deepStrictEqual(leaked, [], file + " ссылается на ядро без внедрения: " + leaked.join(", "));
+    }
+  });
+}
+
 (async () => {
   console.log("Smoke-тесты: " + path.basename(__filename));
   await testAgentCore();
@@ -7358,6 +10076,22 @@ async function testSandboxObstacles() {
   await testLeftRail();
   await testSandboxObstacles();
   await testLongChatRecovery();
+  await testTasks();
+  await testYcConsole();
+  await testDeploy();
+  await testToolPolicy();
+  await testYcCosts();
+  await testYcSplit();
+  await testDeployIpc();
+  await testMailIpc();
+  await testFsGitIpc();
+  await testAgentTools();
+  await testWebTools();
+  await testImageTools();
+  await testCoreSplit();
+  await testProviderConfig();
+  await testProviderTransport();
+  await testContextWindow();
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");
   process.exit(failed ? 1 : 0);
 })();

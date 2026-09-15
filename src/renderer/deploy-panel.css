@@ -1,0 +1,134 @@
+/* ── Панель «Деплой» в правой панели ─────────────────────────────────────────
+   Отдельный файл по той же причине, что и yc-console.css: экран самостоятельный,
+   а styles.css и без него большой. Токены темы — общие, ничего не переопределяем. */
+
+#sp-deploy { display: flex; flex-direction: column; gap: 10px; padding: 12px 14px 20px; overflow-y: auto; }
+#sp-deploy.hidden { display: none !important; }
+
+/* ── шапка ── */
+.dp-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dp-title { font-size: 13px; font-weight: 600; }
+.dp-status { font-size: 11.5px; color: var(--text-dim); margin-left: auto; }
+.dp-btns { display: flex; align-items: center; gap: 6px; }
+
+/* Имя приложения перед деплоем */
+.dp-name-row { display: flex; align-items: center; gap: 6px; }
+.dp-name-row label { font-size: 11.5px; color: var(--text-dim); white-space: nowrap; }
+.dp-name-row input { flex: 1; min-width: 0; background: var(--bg-input); border: 1px solid var(--border-soft);
+  border-radius: 8px; color: var(--text); font-family: inherit; font-size: 12.5px; padding: 5px 8px; }
+
+/* ── рецепт проекта ── */
+.dp-recipe { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 11px; padding: 8px 10px; }
+.dp-recipe-kind { font-size: 12.5px; font-weight: 600; }
+.dp-recipe-meta { font-size: 11.5px; color: var(--text-faint); }
+.dp-warn { font-size: 11.5px; line-height: 1.5; color: var(--warn); padding-left: 2px; }
+
+/* ── стоимость выката ── */
+.dp-cost { background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 11px; padding: 9px 10px; margin-top: 8px; }
+.dp-cost-top { font-size: 12px; color: var(--text); }
+.dp-cost-row { font-size: 11.5px; color: var(--text-faint); line-height: 1.6; }
+.dp-cost-warn { color: var(--warn); }
+.dp-cost-links { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.dp-cost-link { font-size: 11.5px; color: var(--accent); text-decoration: none; }
+.dp-cost-note { font-size: 11px; color: var(--text-faint); }
+
+/* ── текущий выкат ── */
+.dp-current { background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 11px; padding: 10px; }
+.dp-current-top { display: flex; align-items: center; gap: 8px; font-size: 13.5px; }
+.dp-url { display: block; margin-top: 5px; font-size: 12px; color: var(--text); text-decoration: none;
+  word-break: break-all; border-bottom: 1px dashed var(--border-soft); }
+.dp-url:hover { color: var(--warn); border-bottom-color: var(--warn); }
+.dp-current-meta { margin-top: 6px; font-size: 11.5px; color: var(--text-dim); line-height: 1.5; word-break: break-word; }
+.dp-note { margin-top: 6px; font-size: 11.5px; color: var(--warn); line-height: 1.5; }
+.dp-error { margin-top: 6px; font-size: 11.5px; color: var(--danger); line-height: 1.5; }
+
+/* Чип состояния */
+.dp-chip { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; padding: 2px 8px;
+  border-radius: 999px; border: 1px solid var(--border-soft); color: var(--text-dim); }
+.dp-chip i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); flex-shrink: 0; }
+.dp-chip.ok { color: #6ee7a8; border-color: rgba(110, 231, 168, 0.35); }
+.dp-chip.ok i { background: #6ee7a8; }
+.dp-chip.bad { color: var(--danger); border-color: rgba(255, 107, 107, 0.4); }
+.dp-chip.bad i { background: var(--danger); }
+.dp-chip.run { color: var(--warn); border-color: rgba(255, 193, 7, 0.35); }
+.dp-chip.run i { background: var(--warn); animation: dp-pulse 1.2s ease-in-out infinite; }
+.dp-chip.warn { color: var(--warn); border-color: rgba(255, 193, 7, 0.3); }
+.dp-chip.warn i { background: var(--warn); }
+@keyframes dp-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+/* ── блоки ── */
+.dp-block { display: flex; flex-direction: column; gap: 6px; }
+.dp-block-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-faint); }
+
+/* ── стадии ── */
+.dp-stages { display: flex; flex-direction: column; gap: 1px; background: var(--bg-card);
+  border: 1px solid var(--border-soft); border-radius: 11px; overflow: hidden; }
+.dp-stage { display: flex; align-items: baseline; gap: 8px; padding: 6px 10px; font-size: 12.5px; }
+.dp-stage + .dp-stage { border-top: 1px solid var(--border-soft); }
+.dp-stage-mark { width: 12px; flex-shrink: 0; color: var(--text-faint); }
+.dp-stage.ok .dp-stage-mark { color: #6ee7a8; }
+.dp-stage.fail .dp-stage-mark { color: var(--danger); }
+.dp-stage.run .dp-stage-mark { color: var(--warn); }
+.dp-stage-name { flex: 0 0 auto; }
+.dp-stage.fail .dp-stage-name { color: var(--danger); }
+.dp-stage-detail { flex: 1; min-width: 0; color: var(--text-dim); font-size: 11.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dp-stage-ms { flex-shrink: 0; color: var(--text-faint); font-size: 11px; }
+
+/* ── история ── */
+.dp-history { display: flex; flex-direction: column; gap: 1px; background: var(--bg-card);
+  border: 1px solid var(--border-soft); border-radius: 11px; overflow: hidden; }
+.dp-hist { display: flex; align-items: center; gap: 8px; padding: 6px 10px; font-size: 12.5px; }
+.dp-hist + .dp-hist { border-top: 1px solid var(--border-soft); }
+.dp-hist:hover { background: var(--bg-hover); }
+.dp-hist-mark { width: 12px; flex-shrink: 0; color: #6ee7a8; }
+.dp-hist.bad .dp-hist-mark { color: var(--danger); }
+.dp-hist.warn .dp-hist-mark { color: var(--warn); }
+.dp-hist-num { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); flex-shrink: 0; }
+.dp-hist-time { flex: 1; min-width: 0; color: var(--text-faint); font-size: 11.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dp-hist-acts { display: flex; gap: 4px; flex-shrink: 0; }
+.dp-mini { padding: 1px 6px !important; font-size: 11.5px !important; line-height: 1.4 !important; }
+.dp-mini.bad { color: var(--danger); }
+
+/* ── проверка страницы браузером ── */
+.dp-browser { font-size: 12px; line-height: 1.5; padding: 7px 9px; border-radius: 9px;
+  background: var(--bg-card); border: 1px solid var(--border-soft); border-left: 3px solid var(--text-faint);
+  word-break: break-word; }
+.dp-browser.ok { border-left-color: #6ee7a8; }
+.dp-browser.warn { border-left-color: var(--warn); }
+.dp-browser.bad { border-left-color: var(--danger); color: var(--danger); }
+.dp-shot { display: block; width: 100%; margin-top: 6px; border-radius: 9px;
+  border: 1px solid var(--border-soft); background: var(--bg-input); }
+
+/* ── логи ── */
+.dp-logs { max-height: 220px; overflow: auto; margin: 0; padding: 8px 10px; background: var(--bg-input);
+  border: 1px solid var(--border-soft); border-radius: 10px; font-family: var(--mono); font-size: 11px;
+  line-height: 1.5; color: var(--text-dim); white-space: pre-wrap; word-break: break-word; }
+
+/* ── сообщения и пустые состояния ── */
+.dp-msg { font-size: 11.5px; line-height: 1.55; color: var(--text-dim); background: var(--bg-card);
+  border: 1px solid var(--border-soft); border-left: 3px solid var(--text-faint);
+  border-radius: 9px; padding: 7px 9px; white-space: pre-wrap; }
+.dp-msg.ok { border-left-color: #6ee7a8; }
+.dp-msg.bad { border-left-color: var(--danger); }
+.dp-msg.warn { border-left-color: var(--warn); }
+
+.dp-empty { font-size: 12.5px; color: var(--text-dim); line-height: 1.55; padding: 8px 2px; }
+
+.dp-onboard { display: flex; flex-direction: column; align-items: center; gap: 6px; text-align: center;
+  padding: 18px 10px; }
+.dp-onboard-ic { font-size: 26px; }
+.dp-onboard-title { font-size: 13.5px; font-weight: 600; }
+.dp-onboard-text { font-size: 12px; color: var(--text-dim); line-height: 1.6; }
+
+.dp-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+
+/* Узкая панель: кнопки в строку не влезают — переносим, ничего не обрезаем. */
+@media (max-width: 520px) {
+  .dp-top { align-items: flex-start; }
+  .dp-status { margin-left: 0; }
+  .dp-btns { flex-wrap: wrap; }
+  .dp-stage-detail { display: none; }
+}

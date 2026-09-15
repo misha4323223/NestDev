@@ -1,0 +1,71 @@
+/* ── Консоль Yandex Cloud: карточка ресурса в правой панели ──────────────────
+   Отдельный файл: панель облака — самостоятельный экран, и держать его стили
+   вместе с остальными значит растить styles.css без нужды. */
+
+.yc-console {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  padding: 12px 14px 20px;
+}
+.yc-console.hidden { display: none !important; }
+
+/* Шапка: назад, сервис, имя ресурса, обновление */
+.ykc-head { display: flex; align-items: flex-start; gap: 8px; }
+.ykc-back { flex-shrink: 0; }
+.ykc-titles { flex: 1; min-width: 0; }
+.ykc-sub { font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.05em; }
+.ykc-title { font-size: 15px; font-weight: 600; margin-top: 2px; word-break: break-word; }
+.ykc-open { align-self: flex-start; }
+
+/* Обзор: подписи и значения */
+.ykc-section { display: flex; align-items: center; gap: 8px; margin: 6px 0 -2px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); }
+.ykc-section::after { content: ""; flex: 1; height: 1px; background: var(--border-soft); }
+.ykc-fields { display: flex; flex-direction: column; gap: 1px; background: var(--bg-card);
+  border: 1px solid var(--border-soft); border-radius: 11px; overflow: hidden; }
+.ykc-field { display: flex; gap: 10px; align-items: baseline; padding: 6px 10px; }
+.ykc-field + .ykc-field { border-top: 1px solid var(--border-soft); }
+.ykc-flabel { flex: 0 0 38%; min-width: 0; font-size: 11.5px; color: var(--text-dim); }
+.ykc-fvalue { flex: 1; min-width: 0; font-size: 12.5px; word-break: break-word; }
+.ykc-fvalue.mono { font-family: var(--mono); font-size: 11.5px; }
+
+/* Сложные значения — под раскрывающимся блоком, а не строкой «[object]» */
+.ykc-extra { background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: 10px; padding: 6px 10px; }
+.ykc-extra summary { cursor: pointer; font-size: 12px; color: var(--text-dim); }
+.ykc-json { margin-top: 6px; max-height: 260px; overflow: auto; font-family: var(--mono);
+  font-size: 11px; line-height: 1.5; color: var(--text-dim); white-space: pre; }
+
+/* Имя ресурса в списке сервиса — вход в карточку */
+.yc-item-name.ykc-openable { cursor: pointer; }
+.yc-item-name.ykc-openable:hover { color: var(--text); text-decoration: underline; }
+
+/* Связанные объекты: плитки со счётчиками + таблица */
+.ykc-rels { display: flex; flex-wrap: wrap; gap: 6px; }
+.ykc-rel.bad { border-color: rgba(255, 107, 107, 0.36); }
+.ykc-rel.bad .tk-n { color: var(--danger); }
+.ykc-tablebox { display: flex; flex-direction: column; gap: 6px; }
+.ykc-table-wrap { overflow-x: auto; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--bg-card); }
+.ykc-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.ykc-table th { text-align: left; font-weight: 600; font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--text-faint); padding: 7px 10px; background: var(--bg-input); white-space: nowrap; }
+.ykc-table td { padding: 6px 10px; border-top: 1px solid var(--border-soft); vertical-align: top;
+  max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ykc-table tr:hover td { background: var(--bg-hover); }
+.ykc-actions { white-space: nowrap; }
+
+/* Состояния */
+.ykc-loading, .ykc-hint, .ykc-path { font-size: 11.5px; color: var(--text-faint); }
+.ykc-path { font-family: var(--mono); font-size: 10.5px; word-break: break-all; }
+.ykc-empty { font-size: 12.5px; color: var(--text-dim); padding: 8px 2px; }
+.ykc-err { font-size: 12px; color: var(--danger); background: rgba(255, 107, 107, 0.08);
+  border: 1px solid rgba(255, 107, 107, 0.28); border-radius: 10px; padding: 8px 10px;
+  white-space: pre-wrap; line-height: 1.5; }
+.ykc-warn { font-size: 11.5px; color: var(--warn); background: rgba(217, 180, 91, 0.08);
+  border: 1px solid rgba(217, 180, 91, 0.26); border-radius: 10px; padding: 7px 10px; }
+
+@media (max-width: 900px) {
+  .ykc-field { flex-direction: column; gap: 2px; }
+  .ykc-flabel { flex: none; }
+}

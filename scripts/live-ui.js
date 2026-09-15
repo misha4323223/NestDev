@@ -25,6 +25,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // запуске; теперь по этому пути лежит пустая заглушка src/renderer/bootstrap.js).
 const INTENTIONAL_404 = [];
 
+// Сценарии генерации картинок намеренно воспроизводят отказ провайдера (404 пустым телом,
+// несуществующий путь), чтобы проверить наш разбор ошибок. Такие ответы — часть проверки,
+// а не сбой страницы, поэтому считаем их ожидаемыми (гасим и HTTP, и сообщение консоли).
+function isFakeProviderFailure(u) {
+  if (!u.pathname.startsWith("/api/llm/")) return false;
+  const rest = u.pathname.slice("/api/llm/".length);
+  const slash = rest.indexOf("/");
+  if (slash <= 0) return false;
+  try {
+    const base = decodeURIComponent(rest.slice(0, slash));
+    return /(^|\.)live\.test$/.test(new URL(base).host);
+  } catch (e) {
+    return false;
+  }
+}
+
 let pass = 0;
 let fail = 0;
 function check(name, ok, extra) {
@@ -99,7 +115,7 @@ async function startServer(port) {
       r0.status === 200 && html.includes('id="rail"') && html.includes('id="plan-panel"'),
       r0.status + ", " + html.length + " байт"
     );
-    for (const f of ["app.js", "agent-core.js", "styles.css", "monochrome.css"]) {
+    for (const f of ["app.js", "provider-config.js", "provider-transport.js", "context-window.js", "web-tools.js", "image-tools.js", "agent-core.js", "styles.css", "monochrome.css"]) {
       const rr = await fetch(BASE + "/" + f);
       check("GET /" + f + " → 200", rr.status === 200);
     }
@@ -154,14 +170,48 @@ async function startServer(port) {
   page.on("response", (r) => {
     if (r.status() < 400) return;
     const u = new URL(r.url());
-    if (INTENTIONAL_404.includes(u.pathname)) expected404++;
+    if (INTENTIONAL_404.includes(u.pathname) || isFakeProviderFailure(u)) expected404++;
     else badHttp.push(r.status() + " " + u.pathname);
   });
 
-  // Подмена провайдера: сценарий выбирается тестом, ответ — настоящий SSE-поток.
+  // Подмена провайдера: чат — SSE-потоком, генерация картинок — JSON-ответами.
+  // Так весь путь (провайдер определяется по адресу → путь запроса → разбор ответа)
+  // проверяется на настоящем коде в настоящем браузере.
   let scenario = "text";
   let calls = 0;
+  const imgCalls = []; // { path, body } — что и куда просила генерация картинок
+  const TINY_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/gG8uwAAAABJRU5ErkJggg==";
   await page.route("**/api/llm/**", async (route) => {
+    const req = route.request();
+    const u = new URL(req.url());
+    const rest = u.pathname.slice("/api/llm/".length);
+    const slash = rest.indexOf("/");
+    let base = "";
+    try {
+      base = decodeURIComponent(rest.slice(0, slash));
+    } catch (e) {}
+    const pathOnly = rest.slice(slash);
+    if (/images|sdapi/.test(pathOnly)) {
+      imgCalls.push({ path: base + pathOnly, body: req.postData() || "" });
+      let host = "";
+      try {
+        host = new URL(base).host;
+      } catch (e) {}
+      const json = (status, payload) =>
+        route.fulfill({ status: status, headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+      const isGen = /\/images\/generations$/.test(pathOnly);
+      if (host === "broken.live.test") {
+        // Полный отказ: пустое тело и 404 — раньше это давало пустую ошибку.
+        await route.fulfill({ status: 404, headers: { "content-type": "application/json" }, body: "" });
+        return;
+      }
+      if (host === "gw.live.test" && !isGen) await json(200, { data: [{ b64_json: TINY_PNG }] });
+      else if (host === "gw.live.test") await json(404, { error: { message: "Not Found" } });
+      else if (host === "openrouter.ai" && !isGen) await json(200, { data: [{ b64_json: TINY_PNG }] });
+      else if (host === "generativelanguage.googleapis.com" && isGen) await json(200, { data: [{ b64_json: TINY_PNG, media_type: "image/png" }] });
+      else await json(404, { error: { message: "No such endpoint: " + pathOnly } });
+      return;
+    }
     calls++;
     let body;
     if (scenario === "tool" && calls === 1) {
@@ -191,7 +241,9 @@ async function startServer(port) {
     await page.goto(BASE, { waitUntil: "load" });
     await page.waitForSelector("#rail", { state: "visible", timeout: 10000 });
     await sleep(600);
-    check("рельса: 7 иконок", (await page.locator("#rail .rail-btn").count()) === 7);
+    check("рельса: 9 иконок (добавился «Деплой»)", (await page.locator("#rail .rail-btn").count()) === 9);
+    check("на рельсе есть кнопка «Дела»", await page.locator("#rail-tasks").isVisible());
+    check("на рельсе есть кнопка «Деплой»", await page.locator("#rail-deploy").isVisible());
     check("список чатов виден", await page.locator("#sidebar").isVisible());
     check("на рельсе подсвечены «Чаты»", ((await page.locator("#rail-chats").getAttribute("class")) || "").includes("active"));
 
@@ -247,7 +299,41 @@ async function startServer(port) {
     check("видны пункты от инструмента", /Прочитать|кнопку|Нажать/i.test(toolPanel), JSON.stringify(toolPanel.slice(0, 90)));
     check("было ≥2 раунда (инструмент + ответ)", calls >= 2, "запросов к модели: " + calls);
 
-    console.log("\n[5] Живой AgentCore в браузере");
+    console.log("\n[5] Генерация картинок: провайдер по адресу (живьём в браузере)");
+    const gen = await page.evaluate(async () => {
+      const A = window.AgentCore;
+      const run = async (cfg, model, ratio) => {
+        try {
+          const r = await A.generateImageRemote(cfg, "кот в шляпе", model, ratio ? { aspectRatio: ratio } : {});
+          return { ok: true, kind: r.kind, label: r.label, mediaType: r.mediaType, ext: r.ext, len: (r.b64 || "").length };
+        } catch (e) {
+          return { ok: false, message: String((e && e.message) || e) };
+        }
+      };
+      return {
+        gemini: await run({ url: "https://generativelanguage.googleapis.com/v1beta/openai", key: "g" }, "gemini-2.5-flash-image", "16:9"),
+        openrouter: await run({ url: "https://openrouter.ai/api/v1", key: "o" }, "openai/dall-e-3", "1:1"),
+        gateway: await run({ url: "https://gw.live.test/v1", key: "k" }, "model-x", ""),
+        gatewayAgain: await run({ url: "https://gw.live.test/v1", key: "k" }, "model-x", ""),
+        broken: await run({ url: "https://broken.live.test/v1", key: "k" }, "model-x", ""),
+        labelUnknown: A.imageProviderLabel("https://gw.live.test/v1"),
+      };
+    });
+    check("Gemini: OpenAI-совместимый путь /images/generations", gen.gemini.ok && gen.gemini.kind === "openai_images", JSON.stringify(gen.gemini).slice(0, 120));
+    check("Gemini: провайдер назван правильно", /Gemini/.test(gen.gemini.label || ""), gen.gemini.label);
+    check("OpenRouter: свой путь /images", gen.openrouter.ok && gen.openrouter.kind === "openrouter", JSON.stringify(gen.openrouter).slice(0, 120));
+    check("незнакомый шлюз: путь найден перебором", gen.gateway.ok && gen.gateway.kind === "openrouter", JSON.stringify(gen.gateway).slice(0, 120));
+    check("незнакомый адрес честно назван незнакомым", /незнаком/.test(gen.labelUnknown || ""), gen.labelUnknown);
+    const geminiCall = imgCalls.find((c) => /generativelanguage/.test(c.path)) || { path: "нет" };
+    check("запрос Gemini ушёл на /v1beta/openai/images/generations", /\/v1beta\/openai\/images\/generations$/.test(geminiCall.path), geminiCall.path.replace(/^https:\/\//, ""));
+    const orCall = imgCalls.find((c) => /openrouter\.ai\/api\/v1\/images$/.test(c.path)) || { path: "нет", body: "" };
+    check("в OpenRouter ушёл aspect_ratio", /"aspect_ratio":"1:1"/.test(orCall.body), orCall.body.slice(0, 90));
+    const gw = imgCalls.filter((c) => /gw\.live\.test/.test(c.path)).map((c) => c.path.replace(/^https:\/\/gw\.live\.test/, ""));
+    check("шлюз: сначала /images/generations, потом /images", /\/v1\/images\/generations$/.test(gw[0] || "") && /\/v1\/images$/.test(gw[1] || ""), gw.join(" → "));
+    check("второй вызов помнит удачный путь (без лишнего 404)", gw.length === 3 && /\/v1\/images$/.test(gw[2]), "запросов к шлюзу: " + gw.length + " (" + gw.join(" → ") + ")");
+    check("полный отказ: подробная ошибка, а не пустая", !gen.broken.ok && /Не удалось сгенерировать/.test(gen.broken.message) && /HTTP 404/.test(gen.broken.message) && /broken\.live\.test/.test(gen.broken.message) && /images/.test(gen.broken.message), (gen.broken.message || "").split("\n")[0] + " | " + ((gen.broken.message || "").match(/HTTP 404/g) || []).length + " попыток 404");
+
+    console.log("\n[6] Живой AgentCore в браузере");
     const live = await page.evaluate((badJson) => {
       const A = window.AgentCore;
       const hist = [
@@ -294,13 +380,13 @@ async function startServer(port) {
     check("429 и обычный 500 в эту ветку не попадают", live.rate === null && live.plain === null);
     console.log("     текст пользователю: " + live.coldText.slice(0, 105));
 
-    console.log("\n[6] Мобильная ширина 390×844");
+    console.log("\n[7] Мобильная ширина 390×844");
     await page.setViewportSize({ width: 390, height: 844 });
     await sleep(500);
     check("рельса скрыта на телефоне", (await page.locator("#rail").evaluate((e) => getComputedStyle(e).display)) === "none");
     check("поле ввода доступно", await page.locator("#input").isVisible());
 
-    console.log("\n[7] Ошибки страницы");
+    console.log("\n[8] Ошибки страницы");
     check("нет ошибочных ответов сервера", badHttp.length === 0, badHttp.slice(0, 4).join(", ") || "чисто");
     check("нет ошибок JS и консоли", errs.length === 0, errs.slice(0, 4).join(" | ") || "чисто" + (explained.length ? " (объяснено ожидаемых: " + explained.length + ")" : ""));
   } catch (e) {

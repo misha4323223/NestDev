@@ -1750,11 +1750,11 @@
     session = { chatId: chat.id, assistantId: assistantMsg.id, segmentIds: [assistantMsg.id] };
     try {
       if (isElectron) {
-        await api.sendMessage(history, { plan: usePlan });
+        await api.sendMessage(history, { plan: usePlan, role: chat.role || "dev" });
       } else {
         webAbort = new AbortController();
         try {
-          await webSend(history, onAiEvent, webAbort.signal, { plan: usePlan });
+          await webSend(history, onAiEvent, webAbort.signal, { plan: usePlan, role: chat.role || "dev" });
         } catch (e) {
           if (e.name !== "AbortError") onAiEvent({ type: "error", message: e.message || String(e) });
         }
@@ -1812,6 +1812,25 @@
   }
 
   function onAiEvent(ev) {
+    // Служебная заметка прогона (например, ожидание лимита провайдера). Показываем тостом:
+    // в «Консоль» за этим никто не следит, а ждать приходится молча и помногу.
+    if (ev && ev.type === "notice") {
+      if (ev.text) toast(ev.text);
+      return;
+    }
+    // Напоминание о деле приходит вне прогона агента: тост + обновление панели.
+    if (ev && ev.type === "task-reminder") {
+      const list = Array.isArray(ev.tasks) ? ev.tasks : [];
+      if (list.length) {
+        const late = list.filter((t) => t.late).length;
+        const text = list.length === 1
+          ? (late ? "⚠ Просрочено: " : "⏰ Срок: ") + list[0].title
+          : late ? "⚠ Просроченных дел: " + late : "⏰ Подошёл срок: " + list.length + " дел";
+        toast(text);
+      }
+      renderTasks();
+      return;
+    }
     // Прогон запущен другим клиентом (обычно телефоном): у событий нет привязки к
     // переписке, поэтому в свой чат их не подмешиваем — иначе ответ с телефона
     // дописывался бы в открытую на ПК переписку. Результат придёт целиком через
@@ -2035,6 +2054,14 @@
         }
         break;
       }
+      case "deploy_stage": {
+        if (window.DeployPanel && ev.stage) window.DeployPanel.onStage(ev.stage);
+        break;
+      }
+      case "deploy_done": {
+        if (window.DeployPanel) window.DeployPanel.onDone(ev);
+        break;
+      }
       case "yc_step": {
         const box = $("yc-deploy-box");
         const stepsEl = $("yc-deploy-steps");
@@ -2172,6 +2199,14 @@
     $("sp-preview").classList.toggle("hidden", sideTab !== "preview");
     const spCloudEl = $("sp-cloud");
     if (spCloudEl) spCloudEl.classList.toggle("hidden", sideTab !== "cloud");
+    const spTasksEl = $("sp-tasks");
+    if (spTasksEl) spTasksEl.classList.toggle("hidden", sideTab !== "tasks");
+    const spDeployEl = $("sp-deploy");
+    if (spDeployEl) spDeployEl.classList.toggle("hidden", sideTab !== "deploy");
+    if ($("rail-deploy")) $("rail-deploy").classList.toggle("active", sideTab === "deploy");
+    if (sideTab === "deploy" && window.DeployPanel) window.DeployPanel.open(settings.workingDir || "");
+    if ($("rail-tasks")) $("rail-tasks").classList.toggle("active", sideTab === "tasks");
+    if (sideTab === "tasks") renderTasks();
     $("btn-toggle-console").classList.add("active");
     $("btn-toggle-preview").classList.add("active");
     if ($("btn-toggle-cloud")) $("btn-toggle-cloud").classList.add("active");
@@ -2194,11 +2229,393 @@
     $("btn-toggle-console").classList.remove("active");
     $("btn-toggle-preview").classList.remove("active");
     if ($("btn-toggle-cloud")) $("btn-toggle-cloud").classList.remove("active");
+    if ($("rail-tasks")) $("rail-tasks").classList.remove("active");
+    if ($("rail-deploy")) $("rail-deploy").classList.remove("active");
+    if ($("btn-toggle-deploy")) $("btn-toggle-deploy").classList.remove("active");
     syncRail();
   }
 
   function switchSideTab(tab) {
     openSidePanel(tab);
+  }
+
+  // ── Роли чата ────────────────────────────────────────────────────────────
+  // Роль — режим всего чата: текст роли уходит в системный промпт каждый раунд, а её
+  // инструменты включены с первого раунда (см. AGENT_ROLES в ядре). Выбор хранится в
+  // самом чате, поэтому переписка с менеджером остаётся менеджерской и после перезапуска.
+  function roleEsc(s) {
+    return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  function chatRole() {
+    const c = getActiveChat();
+    return AgentCore.roleById((c && c.role) || settings.defaultRole || "dev");
+  }
+  function renderRoleButton() {
+    const btn = $("btn-role");
+    if (!btn) return;
+    const role = chatRole();
+    btn.textContent = role.icon + " " + role.title;
+    btn.classList.toggle("active", role.id !== "dev");
+    btn.title = role.hint + " · клик — сменить роль";
+  }
+  function renderRolePopover() {
+    const box = $("role-popover");
+    if (!box) return;
+    const cur = chatRole();
+    box.innerHTML = '<div class="role-popover-head">Роль держится весь чат: агент иначе себя ведёт и сразу включает нужные инструменты. Выбор запоминается в чате.</div>';
+    for (const r of AgentCore.rolesList()) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "role-card" + (r.id === cur.id ? " active" : "");
+      b.innerHTML = '<span class="role-card-ic">' + roleEsc(r.icon) + '</span><span><span class="role-card-title">' + roleEsc(r.title) + '</span><div class="role-card-hint">' + roleEsc(r.hint) + "</div></span>";
+      b.onclick = () => { setChatRole(r.id); toggleRolePopover(false); };
+      box.appendChild(b);
+    }
+  }
+  function toggleRolePopover(show) {
+    const box = $("role-popover");
+    if (!box) return;
+    const next = show === undefined ? box.classList.contains("hidden") : !!show;
+    if (next) renderRolePopover();
+    box.classList.toggle("hidden", !next);
+  }
+  function setChatRole(id) {
+    const role = AgentCore.roleById(id);
+    const chat = getActiveChat();
+    if (chat) {
+      chat.role = role.id;
+      persistChatsNow();
+      renderSidebar();
+    }
+    // Новые чаты наследуют последнюю выбранную роль.
+    settings.defaultRole = role.id;
+    if (api && api.setSettings) api.setSettings({ defaultRole: role.id }).catch(() => {});
+    renderRoleButton();
+    renderRoleChips();
+    toast(role.icon + " Роль: " + role.title);
+    if (role.id === "manager") {
+      openSidePanel("tasks");
+      renderTasks();
+    }
+  }
+  function renderRoleChips() {
+    const box = $("role-chips");
+    if (!box) return;
+    const chips = chatRole().chips || [];
+    box.innerHTML = "";
+    box.classList.toggle("hidden", !chips.length);
+    for (const c of chips) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "chip action role-chip";
+      b.textContent = c.t;
+      b.onclick = () => {
+        const input = $("input");
+        input.value = c.t;
+        autoResize();
+        if (c.send) sendMessage();
+        else input.focus();
+      };
+      box.appendChild(b);
+    }
+  }
+
+  // ── Дела (задачи и сроки) ────────────────────────────────────────────────
+  let tasksShowDone = false;
+  function tasksSupported() {
+    return !!(isElectron && api.tasksBoard);
+  }
+  function dayStart(ts) {
+    const d = new Date(ts);
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+  // Срок по-человечески: «сегодня 14:00», «завтра», «⚠ просрочено 2 ч назад».
+  function tasksDueText(t) {
+    if (!t.due) return "без срока";
+    const at = new Date(t.due);
+    if (isNaN(at.getTime())) return String(t.due);
+    const now = Date.now();
+    const time = t.allDay ? "" : " " + String(at.getHours()).padStart(2, "0") + ":" + String(at.getMinutes()).padStart(2, "0");
+    if (at.getTime() < now) {
+      const mins = Math.max(1, Math.round((now - at.getTime()) / 60000));
+      const ago = mins < 60 ? mins + " мин" : Math.round(mins / 60) + " ч";
+      return "⚠ просрочено" + time + " · " + ago + " назад";
+    }
+    const diff = Math.round((dayStart(at.getTime()) - dayStart(now)) / 86400000);
+    if (diff === 0) return "сегодня" + time + (t.allDay ? " (весь день)" : "");
+    if (diff === 1) return "завтра" + time + (t.allDay ? " (весь день)" : "");
+    if (diff > 1 && diff < 7) return "через " + diff + " дн" + time;
+    return at.toLocaleDateString("ru-RU", { day: "numeric", month: "long" }) + time;
+  }
+  function updateTasksBadge(s) {
+    const b = $("rail-tasks-badge");
+    if (!b) return;
+    const n = (s && (s.overdue || 0) + (s.today || 0)) || 0;
+    b.textContent = n > 99 ? "99+" : String(n);
+    b.classList.toggle("hidden", n === 0);
+  }
+  function taskRow(t, done) {
+    const high = t.priority === "high";
+    const row = document.createElement("div");
+    row.className = "task-row" + (done ? " done" : "") + (high ? " high" : "");
+    const at = t.due ? new Date(t.due) : null;
+    const late = !!(at && !isNaN(at.getTime()) && !done && at.getTime() < Date.now());
+    if (late) row.classList.add("late");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.className = "task-check";
+    cb.checked = !!done;
+    cb.title = done ? "Снять отметку «выполнено»" : "Отметить выполненным";
+    cb.onchange = async () => { await api.tasksDone(t.id, !done); renderTasks(); };
+    // Название и срок живут в одном блоке: длинные дела переносятся, а метки
+    // не разъезжаются по всей ширине панели.
+    const body = document.createElement("div");
+    body.className = "task-body";
+    const title = document.createElement("div");
+    title.className = "task-title";
+    title.textContent = t.title;
+    if (t.note) title.title = t.note;
+    title.onclick = () => startTaskEdit(row, title, t, "title");
+    const meta = document.createElement("div");
+    meta.className = "task-meta";
+    const due = document.createElement("span");
+    due.className = "task-due" + (late ? " late" : t.due ? "" : " none");
+    due.textContent = (late ? "⚠ " : t.due ? "🕒 " : "— ") + tasksDueText(t);
+    due.title = "Клик — изменить срок (например: завтра 14:00)";
+    due.onclick = () => startTaskEdit(row, due, t, "due");
+    meta.appendChild(due);
+    if (t.project) {
+      const tag = document.createElement("span");
+      tag.className = "task-tag";
+      tag.textContent = t.project;
+      tag.title = "Проект: " + t.project;
+      meta.appendChild(tag);
+    }
+    if (high || t.priority === "low") {
+      const tag = document.createElement("span");
+      tag.className = "task-tag" + (high ? " high" : "");
+      tag.textContent = high ? "важное" : "мелкое";
+      meta.appendChild(tag);
+    }
+    body.append(title, meta);
+    const actions = document.createElement("div");
+    actions.className = "task-actions";
+    const del = document.createElement("button");
+    del.className = "task-edit";
+    del.textContent = "🗑";
+    del.title = "Удалить дело";
+    del.onclick = async () => {
+      if (!window.confirm("Удалить дело «" + t.title + "»?")) return;
+      await api.tasksDelete(t.id);
+      renderTasks();
+    };
+    actions.appendChild(del);
+    row.append(cb, body, actions);
+    return row;
+  }
+  // Правка прямо в строке: клик по названию или сроку. В Electron window.prompt нет,
+  // поэтому редактируем на месте и сохраняем по Enter или потере фокуса.
+  function startTaskEdit(row, el, t, field) {
+    if (row.querySelector(".task-edit-input")) return;
+    const input = document.createElement("input");
+    input.className = "task-edit-input";
+    input.value = field === "due" ? t.due || "" : t.title;
+    if (field === "due") input.placeholder = "завтра 14:00 / в пятницу / пусто — без срока";
+    el.replaceWith(input);
+    input.focus();
+    if (field === "title") input.select();
+    const save = async () => {
+      const value = input.value.trim();
+      input.onblur = null;
+      if (!value && field === "title") { renderTasks(); return; }
+      const patch = {};
+      patch[field] = value;
+      const r = await api.tasksUpdate(t.id, patch);
+      if (r && r.ok === false) toast("Дела: " + r.error);
+      renderTasks();
+    };
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") { e.preventDefault(); save(); }
+      if (e.key === "Escape") { input.onblur = null; renderTasks(); }
+    };
+    input.onblur = save;
+  }
+  // Фильтр панели: «Все» либо конкретная группа сроков (клик по плитке).
+  let tasksFilter = "all";
+  const TASK_FILTERS = [
+    { id: "all", title: "Все" },
+    { id: "overdue", title: "Просрочено" },
+    { id: "today", title: "Сегодня" },
+    { id: "tomorrow", title: "Завтра" },
+    { id: "week", title: "На неделе" },
+    { id: "none", title: "Без срока" },
+  ];
+  function paintTaskFilters(board) {
+    const box = $("tasks-filters");
+    if (!box) return;
+    const groups = board.groups || [];
+    const total = groups.reduce((n, g) => n + g.tasks.length, 0);
+    // Фильтр, в котором ничего не осталось, сам возвращается к «Все» —
+    // иначе панель выглядела бы пустой без причины.
+    if (tasksFilter !== "all" && !groups.some((g) => g.id === tasksFilter && g.tasks.length)) tasksFilter = "all";
+    box.innerHTML = "";
+    for (const f of TASK_FILTERS) {
+      const n = f.id === "all" ? total : ((groups.find((g) => g.id === f.id) || { tasks: [] }).tasks.length);
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "tk-chip" + (tasksFilter === f.id ? " active" : "") + (n ? "" : " zero") + (f.id === "overdue" && n ? " late" : "");
+      b.dataset.filter = f.id;
+      b.title = "Показать: " + f.title.toLowerCase();
+      const label = document.createElement("span");
+      label.textContent = f.title;
+      const num = document.createElement("span");
+      num.className = "tk-n";
+      num.textContent = String(n);
+      b.append(label, num);
+      b.onclick = () => { tasksFilter = f.id; renderTasks(); };
+      box.appendChild(b);
+    }
+  }
+  async function renderTasks() {
+    if (!tasksSupported()) {
+      const c0 = $("tasks-counts");
+      if (c0) c0.textContent = "Дела работают в приложении на ПК (в веб-превью список недоступен).";
+      return;
+    }
+    const box = $("tasks-groups");
+    if (!box) return;
+    let board = null;
+    try { board = await api.tasksBoard(); } catch { board = null; }
+    if (!board || !board.groups) {
+      const c = $("tasks-counts");
+      if (c) c.textContent = "Не удалось прочитать список дел.";
+      return;
+    }
+    const s = board.summary || {};
+    const counts = $("tasks-counts");
+    if (counts) {
+      counts.innerHTML = "Активных: " + (s.active || 0) +
+        (s.overdue ? ' · <span class="tc-late">просрочено ' + s.overdue + "</span>" : "") +
+        " · сегодня " + (s.today || 0) + " · завтра " + (s.tomorrow || 0);
+    }
+    paintTaskFilters(board);
+    box.innerHTML = "";
+    for (const g of board.groups) {
+      if (!g.tasks.length) continue;
+      if (tasksFilter !== "all" && g.id !== tasksFilter) continue;
+      const head = document.createElement("div");
+      head.className = "tasks-group-head" + (g.id === "overdue" ? " overdue" : "");
+      head.textContent = g.title + " · " + g.tasks.length;
+      box.appendChild(head);
+      for (const t of g.tasks) box.appendChild(taskRow(t, false));
+    }
+    const empty = $("tasks-empty");
+    if (empty) {
+      const nothing = box.childElementCount === 0;
+      empty.classList.toggle("hidden", !nothing);
+      if (nothing) {
+        const filtered = tasksFilter !== "all";
+        empty.innerHTML =
+          '<span class="tk-empty-ic">' + (filtered ? "🔍" : "🗒") + "</span>" +
+          '<div class="tk-empty-t">' + (filtered ? "В этом фильтре дел нет" : "Дел пока нет") + "</div>" +
+          '<div class="tk-empty-s">' + (filtered
+            ? "Сбрось фильтр кнопкой «Все» выше — или добавь дело с таким сроком."
+            : "Добавь первое дело в поле выше — или попроси агента: «запиши дело позвонить в банк завтра в 10».") + "</div>";
+      }
+    }
+    const doneBox = $("tasks-done-list");
+    if (doneBox) {
+      doneBox.classList.toggle("hidden", !tasksShowDone);
+      doneBox.innerHTML = "";
+      const toggle = $("btn-tasks-done-toggle");
+      if (toggle) {
+        const n = (board.done || []).length;
+        toggle.classList.toggle("active", tasksShowDone);
+        toggle.title = tasksShowDone ? "Скрыть выполненные дела" : "Показать выполненные дела";
+        const label = toggle.querySelector(".tk-done-label");
+        if (label) label.textContent = "Выполненные" + (n ? " · " + n : "");
+      }
+      if (tasksShowDone) {
+        if (!board.done.length) doneBox.innerHTML = '<div class="tasks-empty">Выполненных дел пока нет.</div>';
+        else for (const t of board.done) doneBox.appendChild(taskRow(t, true));
+      }
+    }
+    updateTasksBadge(s);
+  }
+  async function addTaskFromPanel() {
+    if (!tasksSupported()) { toast("Дела: список доступен в приложении на ПК"); return; }
+    const titleEl = $("task-new-title");
+    const dueEl = $("task-new-due");
+    const title = (titleEl.value || "").trim();
+    if (!title) { titleEl.focus(); toast("Дела: напиши, что нужно сделать"); return; }
+    const r = await api.tasksAdd({ title: title, due: (dueEl.value || "").trim(), priority: $("task-new-priority").value });
+    if (r && r.ok === false) { toast("Дела: " + r.error); return; }
+    titleEl.value = "";
+    dueEl.value = "";
+    titleEl.focus();
+    renderTasks();
+  }
+  // Быстрые сроки у поля добавления: клик подставляет срок, а если название уже
+  // написано — сразу добавляет дело (не надо тянуться к кнопке).
+  const QUICK_DUE = ["через час", "сегодня вечером", "завтра 10:00", "в пятницу", "через неделю"];
+  function paintQuickDue() {
+    const box = $("tasks-quick-due");
+    if (!box) return;
+    box.innerHTML = "";
+    for (const q of QUICK_DUE) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = q;
+      b.title = "Срок: " + q;
+      b.onclick = () => {
+        const dueEl = $("task-new-due");
+        if (dueEl) dueEl.value = q;
+        const titleEl = $("task-new-title");
+        if (titleEl && titleEl.value.trim()) addTaskFromPanel();
+        else if (titleEl) titleEl.focus();
+      };
+      box.appendChild(b);
+    }
+  }
+  // Отдельные модули интерфейса (консоль Yandex Cloud) — в своём файле и не видят
+  // замыкание app.js. Тост отдаём наружу явно, а не дублируем его реализацию.
+  window.uiToast = toast;
+  function initRolesAndTasks() {
+    if ($("btn-role")) $("btn-role").onclick = () => toggleRolePopover();
+    paintQuickDue();
+    if ($("rail-tasks")) $("rail-tasks").onclick = () => {
+      if (sidePanelVisible() && sideTab === "tasks") closeSidePanel();
+      else openSidePanel("tasks");
+    };
+    if ($("btn-task-add")) $("btn-task-add").onclick = addTaskFromPanel;
+    if ($("task-new-title")) $("task-new-title").onkeydown = (e) => {
+      if (e.key === "Enter") { e.preventDefault(); addTaskFromPanel(); }
+    };
+    if ($("task-new-due")) $("task-new-due").onkeydown = (e) => {
+      if (e.key === "Enter") { e.preventDefault(); addTaskFromPanel(); }
+    };
+    if ($("btn-tasks-refresh")) $("btn-tasks-refresh").onclick = () => renderTasks();
+    if ($("btn-tasks-done-toggle")) $("btn-tasks-done-toggle").onclick = () => {
+      tasksShowDone = !tasksShowDone;
+      $("btn-tasks-done-toggle").classList.toggle("active", tasksShowDone);
+      renderTasks();
+    };
+    // Клик вне попапа ролей закрывает его (иначе он перекрывает поле ввода).
+    document.addEventListener("mousedown", (e) => {
+      const box = $("role-popover");
+      if (!box || box.classList.contains("hidden")) return;
+      if (box.contains(e.target) || ($("btn-role") && $("btn-role").contains(e.target))) return;
+      toggleRolePopover(false);
+    });
+    if (api && api.onTasksChanged) {
+      api.onTasksChanged(() => {
+        renderTasks();
+      });
+    }
+    renderRoleButton();
+    renderRoleChips();
+    if (tasksSupported()) api.tasksBoard().then((b) => updateTasksBadge(b && b.summary)).catch(() => {});
   }
 
   // ── Консоль ──
@@ -3197,6 +3614,10 @@
     ];
     const maxRounds = planMode ? 3 : 10;
     let finalText = "";
+    // Лимит провайдера (429) в веб-режиме: ждём сами до потолка, как в приложении.
+    // Раньше здесь 429 сразу завершал прогон ошибкой и требовал «напиши продолжай».
+    const RATE_WAIT_BUDGET_MS = 10 * 60 * 1000;
+    let rateWaitedMs = 0;
 
     for (let round = 0; round < maxRounds; round++) {
       let collected = "";
@@ -3236,6 +3657,26 @@
           if (tryWebAutoSwitch(friendly)) { round--; continue; }
           onEvent({ type: "error", message: friendly });
           return;
+        }
+        // 429: ждём окно лимита и повторяем ТОТ ЖЕ раунд — без участия пользователя.
+        if (res.status === 429) {
+          const info = AgentCore.rateLimitInfo(res.status, res.headers, detail);
+          const wantMs = Math.max(2000, Math.min(info.retryMs || 5000, 60000));
+          const leftMs = RATE_WAIT_BUDGET_MS - rateWaitedMs;
+          if (leftMs >= 1000) {
+            const waitMs = Math.min(wantMs, leftMs);
+            rateWaitedMs += waitMs;
+            onEvent({
+              type: "notice",
+              text:
+                "⏳ Лимит провайдера на запросы: жду " + Math.max(1, Math.round(waitMs / 1000)) + " с и повторю сам" +
+                (info.rpm ? ", лимит ≈" + Math.round(info.rpm) + " запросов/мин" : "") +
+                ". Писать ничего не нужно.",
+            });
+            await new Promise((r) => setTimeout(r, waitMs));
+            round--;
+            continue;
+          }
         }
         // Переполнение контекста: один раз повторяем с резко урезанной историей
         if (!contextRetried && /context|too long|maximum|num_ctx|token/i.test(detail) && budget > 3000) {
@@ -3610,8 +4051,12 @@
     $("s-serper-key").value = settings.serperApiKey || "";
     $("s-vision-model").value = settings.visionModel || "";
     $("s-image-model").value = settings.imageModel || "";
+    renderVisionDetect();
     $("vision-fields").classList.toggle("hidden", !$("s-vision-enabled").checked);
     $("vision-model-hints").classList.add("hidden");
+    if ($("s-default-role")) $("s-default-role").value = AgentCore.roleById(settings.defaultRole).id;
+    if ($("s-task-reminders")) $("s-task-reminders").checked = settings.taskReminders !== false;
+    if ($("s-audit-log")) $("s-audit-log").checked = settings.auditLog !== false;
     $("s-ota-enabled").checked = settings.otaEnabled !== false;
     $("s-ota-dir").value = settings.otaDir || "";
     renderOpenaiProfiles();
@@ -3671,6 +4116,9 @@
     settings.mailAllowAgentSend = !!$("s-mail-allow-send").checked;
     settings.visionModel = $("s-vision-model").value.trim();
     settings.imageModel = $("s-image-model").value.trim();
+    if ($("s-default-role")) settings.defaultRole = AgentCore.roleById($("s-default-role").value).id;
+    if ($("s-task-reminders")) settings.taskReminders = !!$("s-task-reminders").checked;
+    if ($("s-audit-log")) settings.auditLog = !!$("s-audit-log").checked;
     settings.otaEnabled = !!$("s-ota-enabled").checked;
     settings.otaDir = $("s-ota-dir").value.trim();
     settings.autoSwitchProfiles = !!$("s-auto-switch").checked;
@@ -3980,6 +4428,17 @@
     } catch (e) {
       setSettingsMsg("Не удалось сменить PIN: " + (e.message || ""), true);
     }
+  }
+
+  // Тип подключения вспомогательной модели выбирать не нужно — приложение определяет
+  // провайдера по адресу. Но человек должен видеть, что понято правильно: «Gemini
+  // (OpenAI-совместимо)», «OpenRouter», «ЯндексART» и т. д.
+  function renderVisionDetect() {
+    const el = $("vision-detect-hint");
+    if (!el) return;
+    const url = ($("s-vision-url").value || "").trim() || settings.visionUrl || "https://openrouter.ai/api/v1";
+    const label = AgentCore.imageProviderLabel(url);
+    el.textContent = "Генерация картинок: " + label + " — путь к API приложение подбирает само, выбирать вручную не нужно.";
   }
 
   // Загрузка списка моделей для вспомогательной модели (зрение/генерация)
@@ -4536,9 +4995,21 @@
             const row = document.createElement("div");
             row.className = "yc-item";
             const nm = document.createElement("span");
-            nm.className = "yc-item-name";
+            nm.className = "yc-item-name ykc-openable";
             nm.textContent = it.name || it.id || "—";
-            nm.title = it.id || "";
+            nm.title = "Открыть карточку ресурса (" + (it.id || "") + ")";
+            // Клик по имени — вход в карточку: поля ресурса и связанные объекты
+            // (подсети, образы, ключи, ревизии). Раньше список был тупиком.
+            nm.onclick = (e) => {
+              e.stopPropagation();
+              if (!window.YcConsole) return;
+              window.YcConsole.open({
+                serviceKey: s.key,
+                title: s.title,
+                item: it,
+                folderId: (ycStatusCache && ycStatusCache.folderId) || "",
+              });
+            };
             row.appendChild(nm);
             const actions = document.createElement("div");
             actions.className = "yc-item-actions";
@@ -4606,6 +5077,9 @@
         card.appendChild(list);
       }
       card.onclick = () => {
+        // Возврат к дашборду закрывает карточку ресурса — иначе она перекрывала бы
+        // список, который пользователь только что открыл.
+        if (window.YcConsole && window.YcConsole.isOpen()) window.YcConsole.close();
         ycDashKey = ycDashKey === s.key ? "" : s.key;
         ycRenderDash();
       };
@@ -4615,11 +5089,20 @@
   }
 
   function ycCreateFlow(serviceKey, title) {
-    inputDialog("＋ Создать: " + title, "Имя: латиница, цифры, дефис (2–63 символа). Создание может быть платным.", "Создать").then(async (name) => {
+    // Цена — до создания: иначе платный ресурс создаётся вслепую, а счёт
+    // пользователь увидит только в Yandex Cloud. Согласие — нажатие «Создать».
+    Promise.resolve(api.ycCosts ? api.ycCosts(serviceKey, {}) : null).then((c) => {
+      const est = c && c.ok ? c.estimate : null;
+      const head = est
+        ? (est.needsConfirm ? "Платный ресурс: " : "Ресурс: ") + (est.levelLabel || "") + (est.approxMonth != null ? " · ≈ " + String(est.approxMonth).replace(".", ",") + " ₽/мес" : "")
+        : "Цену ресурса проверить не удалось.";
+      const lines = c && c.ok && c.lines ? c.lines.slice(0, 6) : [];
+      const hint = [head, ...lines, "", "Имя: латиница, цифры, дефис (2–63 символа)."].join("\n");
+      inputDialog("＋ Создать: " + title, hint, "Создать").then(async (name) => {
       if (!name) return;
       let r;
       try {
-        r = await api.ycCreate(serviceKey, name);
+        r = await api.ycCreate(serviceKey, name, { confirmed: true });
       } catch (e) {
         r = { ok: false, error: (e && e.message) || String(e) };
       }
@@ -4630,6 +5113,7 @@
       } else {
         toast("❌ " + ((r && r.error) || "Ошибка создания"));
       }
+      });
     });
   }
 
@@ -4802,6 +5286,13 @@
     $("btn-toggle-cloud").onclick = () => {
       if (sidePanelVisible() && sideTab === "cloud") closeSidePanel();
       else openSidePanel("cloud");
+    };
+  }
+  // Кнопка «🚀» в шапке — панель деплоя
+  if ($("btn-toggle-deploy")) {
+    $("btn-toggle-deploy").onclick = () => {
+      if (sidePanelVisible() && sideTab === "deploy") closeSidePanel();
+      else openSidePanel("deploy");
     };
   }
   // Из настроек — сразу открыть дашборд
@@ -7005,6 +7496,7 @@
     proxy("rail-console", "btn-toggle-console");
     proxy("rail-preview", "btn-toggle-preview");
     proxy("rail-cloud", "btn-toggle-cloud");
+    proxy("rail-deploy", "btn-toggle-deploy");
     proxy("rail-files", "btn-toggle-panel");
     proxy("rail-new", "btn-new-chat");
     proxy("rail-settings", "btn-settings");
@@ -7735,6 +8227,9 @@
   if ($("btn-mail-recent")) $("btn-mail-recent").onclick = mailDoRecent;
   $("btn-refresh-vision-models").onclick = () => loadAuxModels("vision");
   $("btn-refresh-image-models").onclick = () => loadAuxModels("image");
+  if ($("s-vision-url")) $("s-vision-url").addEventListener("input", renderVisionDetect);
+  if ($("s-vision-enabled")) $("s-vision-enabled").addEventListener("change", renderVisionDetect);
+  initRolesAndTasks();
   $("btn-mobile-menu").onclick = () => $("sidebar").classList.toggle("open");
   $("chat-list").addEventListener("click", () => {
     if (window.innerWidth <= 900) $("sidebar").classList.remove("open");
