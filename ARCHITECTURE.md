@@ -58,6 +58,7 @@
 | src/renderer/chat-segments.js | сегменты ответа: лог «текст → действия → текст» | app.js: window.ChatSegments({ |
 | src/renderer/chat-render.js | отрисовка сообщения: текст, вложения, метка времени, кнопки | app.js: window.ChatRender({ |
 | src/renderer/chat-feed.js | лента: умная прокрутка и очередь кадра при стриме | app.js: window.ChatFeed({ |
+| src/renderer/chat-work.js | строки действий агента и группа работ текущего ответа | app.js: window.ChatWork({ |
 | src/renderer/field-guard.js | страховка полей ввода (фокус не теряется) | — сам навешивает защиту |
 | src/renderer/app.js | оболочка окна: чат, панели, настройки, события | — собирает всё в окне |
 <!-- UI-MAP:END -->

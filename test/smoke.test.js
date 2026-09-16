@@ -7620,8 +7620,8 @@ async function testBrowserReplayData() {
     assert.ok(/browserNetwork, browserReplay, waitForIdle/.test(coreSrc), "не попал в список инструментов промпта");
     assert.ok(/38\. Данные со страницы бери ЗАПРОСОМ/.test(coreSrc), "нет правила про сбор данных запросом");
     assert.ok(/"browserEval", "browserScroll", "browserHover", "browserReplay"/.test(policySrc), "нет capability в политике инструментов");
-    assert.ok(/browserReplay: "🔁"/.test(appSrc), "нет иконки в журнале действий");
-    assert.ok(/browserReplay: "Повтор запроса сайта"/.test(appSrc), "нет подписи инструмента");
+    assert.ok(/browserReplay: "🔁"/.test(uiAll()), "нет иконки в журнале действий");
+    assert.ok(/browserReplay: "Повтор запроса сайта"/.test(uiAll()), "нет подписи инструмента");
     // Гайды: замер ВК и порядок работы по сети.
     assert.ok(/api\.vk\.ru\/method\/messages\.getItems/.test(vkGuide), "в гайде ВК нет проверенного эндпоинта");
     assert.ok(/v=5\.285/.test(vkGuide), "в гайде ВК нет версии клиента");
@@ -7897,6 +7897,172 @@ async function testChatFeed() {
   });
 }
 
+// ── Строки действий агента и группа работ (этап 3.7, часть 5) ───────────────
+// Модуль вынесен из app.js. Проверяем ПОВЕДЕНИЕ: как из tool-сообщения собирается
+// компактная строка (значок, подпись, цель, состояние, подробности), когда путь
+// становится ссылкой на файл, и как строки складываются в группу «Выполняю
+// действия · N», которая закрывается по концу ответа и начинается заново.
+async function testChatWork() {
+  const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "chat-work.js"), "utf8");
+
+  await test("строки действий: строка, ссылка на файл и группа работ работают, как раньше", () => {
+    // 1. Модуль на месте, подключён до app.js, отдаётся телефону, собран в оболочке.
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const iTag = html.indexOf('src="chat-work.js"');
+    assert.ok(iTag > 0, "разметка не грузит chat-work.js");
+    assert.ok(iTag < html.indexOf('src="app.js"'), "chat-work.js подключён после app.js");
+    const bridge = fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8");
+    assert.ok(/"chat-work\.js"/.test(bridge), "мобильный мост не отдаёт chat-work.js телефону");
+    const appSrc = uiFile("app.js");
+    for (const gone of ["const TOOL_ICON", "const TOOL_LABEL", "function buildToolEl", "function toolTargetOf", "let turnPlan", "function ensureWorkGroup", "function updatePlanTitle"]) {
+      assert.ok(appSrc.indexOf(gone) === -1, "код строк действий остался в app.js: " + gone);
+    }
+    const wiring = appSrc.slice(appSrc.indexOf("window.ChatWork({"));
+    const wiringCall = wiring.slice(0, wiring.indexOf("});"));
+    for (const dep of ["$: $", "isElectron: isElectron", "openFile: openToolFile"]) {
+      assert.ok(wiringCall.includes(dep), "в проводку строк действий не передан " + dep);
+    }
+    // Границы модуля: чужое — только через deps (открытие файла зовут, а не ищут сами).
+    for (const name of ["chatsData", "session", "streaming", "msgEls", "projectDir", "viewFile", "window."]) {
+      assert.ok(!new RegExp("(^|[^\\w$.])" + name.replace(".", "\\.") + "\\b").test(src), "модуль ссылается на " + name + " без внедрения");
+    }
+
+    // 2. Среда: заглушка DOM, живые зависимости и счётчики вызовов.
+    const mkEl = (tag) => {
+      const cls = new Set();
+      const el = {
+        tagName: tag, textContent: "", title: "", value: "", disabled: false,
+        onclick: null, children: [], parentNode: null,
+        // Как в браузере: запись innerHTML заменяет содержимое. Раньше панель
+        // действий чистит себя именно так, и без этого старые блоки копились бы.
+        get innerHTML() { return ""; },
+        set innerHTML(v) { if (!String(v == null ? "" : v)) this.children.length = 0; },
+        get className() { return [...cls].join(" "); },
+        set className(v) { cls.clear(); String(v || "").split(/\s+/).filter(Boolean).forEach((x) => cls.add(x)); },
+        classList: {
+          add: (...c) => c.forEach((x) => cls.add(x)),
+          remove: (...c) => c.forEach((x) => cls.delete(x)),
+          contains: (c) => cls.has(c),
+          toggle: (c, on) => {
+            const want = on === undefined ? !cls.has(c) : !!on;
+            if (want) cls.add(c); else cls.delete(c);
+            return want;
+          },
+        },
+        appendChild(c) { el.children.push(c); c.parentNode = el; return c; },
+        querySelector: () => null,
+      };
+      return el;
+    };
+    // Плоский текст ветки: у строк действий всё содержание — строки и вложенные блоки.
+    let nodeSeq = 0;
+    const mark = (n) => {
+      if (!n) return [];
+      n.__id = ++nodeSeq;
+      return [n].concat((n.children || []).flatMap(mark));
+    };
+    const textOf = (n) => ((n && n.textContent) || "");
+    const hosts = {};
+    const opened = [];
+    const vm = require("vm");
+    const build = (deps) => {
+      const sandbox = {
+        module: { exports: {} }, self: {}, window: {},
+        console: { log() {}, warn() {}, error() {} },
+        document: { createElement: mkEl },
+      };
+      vm.runInNewContext(src, sandbox, { filename: "chat-work.js" });
+      assert.strictEqual(typeof sandbox.module.exports, "function", "модуль не отдал фабрику");
+      return sandbox.module.exports(deps);
+    };
+    const $ = (id) => (hosts[id] = hosts[id] || mkEl("div"));
+    const deps = { $: $, isElectron: true, openFile: (p) => opened.push(p) };
+    const W = build(deps);
+    assert.deepStrictEqual(
+      Object.keys(W).sort(),
+      ["TOOL_ICON", "TOOL_LABEL", "addRow", "buildToolEl", "ensureWorkGroup", "finishGroup", "planAdd", "planSet", "resetGroup", "toolArgsPreview", "toolIcon", "toolLabel", "toolTargetOf", "updatePlanTitle"],
+      "наружу торчит лишнее или чего-то не хватает"
+    );
+    assert.strictEqual(W.toolIcon("writeFile"), "✏️", "значок инструмента потерялся");
+    assert.strictEqual(W.toolIcon("такого-нет"), "⚙️", "нет запасного значка");
+    assert.strictEqual(W.toolLabel("writeFile"), "Изменение файла", "подпись инструмента потерялась");
+    assert.strictEqual(W.toolLabel("такого-нет"), "такого-нет", "нет запасной подписи");
+
+    // 3. Строка действия: значки, подпись, цель, состояние, подробности.
+    const flat = (el) => mark(el).map((n) => textOf(n)).filter(Boolean).join(" · ");
+    const busy = W.buildToolEl({ toolName: "writeFile", toolArgs: { path: "src/a.js" }, pending: true });
+    assert.ok(/msg tool/.test(busy.className), "строка действия потеряла класс сообщения: " + busy.className);
+    assert.ok(flat(busy).indexOf("●") >= 0 && flat(busy).indexOf("✏️") >= 0, "в строке нет состояния или значка: " + flat(busy));
+    assert.ok(flat(busy).indexOf("Изменение файла") >= 0, "в строке нет подписи действия: " + flat(busy));
+    assert.ok(flat(busy).indexOf("src/a.js") >= 0, "в строке нет цели действия: " + flat(busy));
+    assert.ok(flat(busy).indexOf("Выполняется") >= 0, "нет состояния «идёт»: " + flat(busy));
+    assert.ok(/path/.test(flat(busy)), "в подробностях нет аргументов вызова: " + flat(busy));
+
+    const done = W.buildToolEl({ toolName: "runCommand", toolArgs: { command: "ls -la" }, toolResult: "ok", pending: false });
+    assert.ok(flat(done).indexOf("✓") >= 0 && flat(done).indexOf("Готово") >= 0, "готовое действие не отмечено: " + flat(done));
+    assert.ok(flat(done).indexOf("ok") >= 0, "в подробностях нет результата: " + flat(done));
+    const failed = W.buildToolEl({ toolName: "runCommand", toolArgs: { command: "нет" }, toolResult: "Ошибка", pending: false, toolOk: false });
+    assert.ok(flat(failed).indexOf("✕") >= 0 && flat(failed).indexOf("Ошибка") >= 0, "провал действия не отмечен: " + flat(failed));
+
+    // 4. Клик по строке раскрывает подробности; путь файла открывается из настольного окна.
+    const link = mark(busy).find((n) => /tool-target-link/.test(n.className));
+    assert.ok(link, "файловая цель не стала ссылкой: " + flat(busy));
+    link.onclick({ stopPropagation() {} });
+    assert.deepStrictEqual(opened, ["src/a.js"], "клик по пути не открыл файл: " + JSON.stringify(opened));
+    const linkless = W.buildToolEl({ toolName: "runCommand", toolArgs: { command: "ls" }, pending: true });
+    assert.ok(!mark(linkless).some((n) => /tool-target-link/.test(n.className)), "ссылка появилась у не-файлового действия");
+    const browser = build({ $: $, isElectron: false, openFile: () => {} });
+    const inBrowser = browser.buildToolEl({ toolName: "readFile", toolArgs: { path: "src/a.js" }, pending: true });
+    assert.ok(!mark(inBrowser).some((n) => /tool-target-link/.test(n.className)), "в браузере путь открывает файл");
+    const body = mark(busy).find((n) => /tool-body/.test(n.className));
+    body.onclick({ target: { closest: () => null } });
+    assert.strictEqual(body.classList.contains("open"), true, "клик по строке не раскрыл подробности");
+
+    // 5. Цель и предпросмотр аргументов.
+    assert.strictEqual(W.toolTargetOf({ args: { url: "https://a.test" } }), "https://a.test", "цель-адрес потерялась");
+    assert.strictEqual(W.toolTargetOf({ args: { commit: "abc123" } }), "commit abc123", "цель-коммит потерялась");
+    assert.strictEqual(W.toolTargetOf({ args: {} }), "", "цель выдумана из пустых аргументов");
+    const long = "x".repeat(300);
+    assert.ok(/… \(300 симв\.\)/.test(W.toolArgsPreview({ q: long })), "длинный аргумент не ужат: " + W.toolArgsPreview({ q: long }).slice(0, 60));
+
+    // 6. Группа работ: строка встаёт в группу, счётчик и заголовок живут, группа закрывается.
+    assert.strictEqual(W.ensureWorkGroup(), W.ensureWorkGroup(), "группа создаётся заново на каждый вызов");
+    const panel = hosts["work-panel"];
+    assert.strictEqual(panel.children.length, 1, "группа не встала в панель действий");
+    const rowEl = mkEl("div");
+    const group = W.addRow(rowEl);
+    assert.ok(group.body.children.some((c) => c === rowEl), "строка не попала в тело группы");
+    W.planAdd({ name: "writeFile" });
+    W.planAdd({ name: "runCommand" });
+    assert.strictEqual(group.badge.textContent, "2", "счётчик действий не растёт: " + group.badge.textContent);
+    // В свёрнутой группе заголовок называет ТЕКУЩЕЕ действие — то, что началось последним.
+    assert.strictEqual(group.txt.textContent, "Выполняю: Команда в терминале", "заголовок группы не назвал текущее действие: " + group.txt.textContent);
+    group.head.onclick({ stopPropagation() {} });
+    assert.strictEqual(group.body.classList.contains("expanded"), true, "группа не развернулась по клику");
+    assert.strictEqual(group.txt.textContent, "Выполняю действия", "в развёрнутой группе заголовок не общий: " + group.txt.textContent);
+    W.finishGroup();
+    assert.strictEqual(group.body.classList.contains("finished"), true, "группа не закрылась по концу ответа");
+    assert.strictEqual(group.txt.textContent, "Действия выполнены", "после ответа группа не сказала, что сделано: " + group.txt.textContent);
+    W.resetGroup();
+    const next = W.ensureWorkGroup();
+    assert.notStrictEqual(next, group, "новая работа продолжила старую группу");
+    // В новой группе только заголовок: строки прошлой работы с ней не переехали.
+    assert.strictEqual(next.body.children.indexOf(rowEl), -1, "новая группа пришла с чужими строками");
+    assert.strictEqual(next.badge.textContent, "0", "новая группа начала со старым счётчиком: " + next.badge.textContent);
+    assert.strictEqual(panel.children.length, 1, "в панели остался старый блок работы");
+
+    // 7. Негативный контроль зависимостей: без DOM модуль падает понятной ошибкой.
+    const noDollar = build({ isElectron: false, openFile: () => {} });
+    assert.throws(() => noDollar.ensureWorkGroup(), /is not a function/, "без $ модуль не упал");
+    try {
+      noDollar.ensureWorkGroup();
+      assert.fail("без $ ошибка не назвала забытую зависимость");
+    } catch (e) {
+      assert.ok(/\$/.test(String(e && e.message)), "ошибка не называет забытую зависимость: " + (e && e.message));
+    }
+  });
+}
+
 // ── Стрим и печать: работа не чаще одного кадра ────────────────────────────
 async function testStreamThrottle() {
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
@@ -8168,8 +8334,10 @@ async function testBrowserSpeed() {
     await test("browserAct: подключён к интерфейсу, промпту и подписям инструментов", () => {
       assert.ok(hasTool(mainSrc, "browserAct"), "бэкенд не обрабатывает browserAct");
       assert.ok(/name: "browserAct"/.test(coreSrc), "нет определения инструмента browserAct");
-      assert.ok(/browserAct: "⚡"/.test(appSrc), "нет иконки browserAct в интерфейсе");
-      assert.ok(/browserAct: "Цепочка действий в браузере"/.test(appSrc), "нет подписи browserAct");
+      // Значки и подписи инструментов живут в src/renderer/chat-work.js
+      // (этап 3.7, часть 5) — проверяем окно целиком, а не один файл.
+      assert.ok(/browserAct: "⚡"/.test(uiAll()), "нет иконки browserAct в интерфейсе");
+      assert.ok(/browserAct: "Цепочка действий в браузере"/.test(uiAll()), "нет подписи browserAct");
       assert.ok(/быстрый путь/i.test(modelPrompt()), "в промпте нет блока про быстрый путь");
       assert.ok(/submit: true/.test(coreSrc), "промпт не знает про submit у browserFill");
       assert.ok(/фрейм/.test(coreSrc), "в описаниях нет поиска по фреймам");
@@ -8492,8 +8660,8 @@ async function testBrowserSenses() {
         assert.ok(core.indexOf(t) >= 0, t + " выпал из ядра инструментов");
       }
       // Интерфейс: иконки и понятные подписи.
-      assert.ok(/browserScroll: "↕️"/.test(appSrc) && /browserNetwork: "📡"/.test(appSrc) && /agentGuide: "📘"/.test(appSrc), "нет иконок новых инструментов");
-      assert.ok(/browserScroll: "Прокрутка страницы"/.test(appSrc) && /waitForIdle: "Ожидание покоя страницы"/.test(appSrc), "нет подписей новых инструментов");
+      assert.ok(/browserScroll: "↕️"/.test(uiAll()) && /browserNetwork: "📡"/.test(uiAll()) && /agentGuide: "📘"/.test(uiAll()), "нет иконок новых инструментов");
+      assert.ok(/browserScroll: "Прокрутка страницы"/.test(uiAll()) && /waitForIdle: "Ожидание покоя страницы"/.test(uiAll()), "нет подписей новых инструментов");
       // Веб-версия: справочники и браузер честно недоступны, ожидание покоя = пауза.
       assert.ok(/agentGuide\) доступны в desktop-приложении/.test(uiAll()), "веб-версия не отвечает про agentGuide");
     });
@@ -13786,6 +13954,7 @@ async function testMissions() {
   await testChatSegments();
   await testChatRender();
   await testChatFeed();
+  await testChatWork();
   await testTasksMission();
   await testProviderConfig();
   await testProviderTransport();
