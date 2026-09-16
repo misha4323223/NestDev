@@ -32,6 +32,25 @@
   var gateViewportBound = false;
   var gateHost = location.host || "";
 
+  // ─── PIN из адреса: подключение по QR-коду с экрана ПК ───
+  // На экране ПК (Настройки → «Мобильный доступ») есть QR-код с адресом вида
+  // http://192.168.1.42:9090/#pin=482913. Камера телефона открывает такую ссылку —
+  // и вводить PIN не надо: он уже в адресе. Из адресной строки PIN сразу убираем
+  // (history.replaceState), чтобы он не остался в истории браузера и не попал
+  // в скриншот экрана.
+  function pinFromLocation() {
+    var raw = String(location.hash || "") + "&" + String(location.search || "");
+    var m = /(?:^|[#?&])(?:pin|p)=(\d{4,6})(?:&|$)/i.exec(raw);
+    return m ? m[1] : "";
+  }
+  var urlPin = pinFromLocation();
+  if (urlPin) {
+    enteredPin = urlPin;
+    try {
+      history.replaceState(null, "", location.pathname + (location.search || ""));
+    } catch (e) {}
+  }
+
   // ─── Вызов канала (очередь до авторизации) ───
   function call(ch, args) {
     return new Promise(function (resolve, reject) {
@@ -129,6 +148,11 @@
     tasksUpdate: invoke("tasks:update"),
     tasksDone: invoke("tasks:done"),
     tasksDelete: invoke("tasks:delete"),
+    // Автозадачи запускает только окно на ПК (прогон не должен удваиваться с телефона),
+    // но методы интерфейса должны существовать и здесь: иначе вызов на телефоне молча
+    // ничего не делает, и причину не видно.
+    tasksAutoAck: invoke("tasks:auto-ack"),
+    tasksAutoRearm: invoke("tasks:auto-rearm"),
     onTasksChanged: on("tasks:changed"),
     projectsList: invoke("projects:list"),
     projectsCreate: invoke("projects:create"),
@@ -346,6 +370,9 @@
     gateStatusEl = gateEl.querySelector("#mobile-gate-status");
     var hostEl = gateEl.querySelector(".mg-host");
     if (hostEl) hostEl.textContent = "ПК: " + gateHost;
+    // PIN мог прийти из QR-кода: подставляем его в поле, чтобы человек видел, что
+    // именно отправили, и мог поправить, если на ПК PIN уже сменили.
+    if (pinInput && enteredPin && !pinInput.value) pinInput.value = enteredPin;
     var btn = gateEl.querySelector("#mobile-gate-btn");
     var retryBtn = gateEl.querySelector("#mobile-gate-retry");
 
@@ -498,6 +525,9 @@
       } else if (m.t === "auth_err") {
         authed = false;
         setGateBusy(false);
+        // Галочку в адресе мог принести QR-код, а PIN на ПК уже сменили: гейта могло
+        // ещё не быть — тогда ошибка оставалась невидимой (пустой экран без объяснений).
+        if (!gateEl) showGate();
         if (gateEl) {
           resetPinField();
           gateError(m.lock ? "Слишком много попыток. Вход заблокирован на 5 минут." : "Неверный PIN. Попробуй ещё раз.");
@@ -505,6 +535,7 @@
       } else if (m.t === "auth_lock") {
         authed = false;
         setGateBusy(false);
+        if (!gateEl) showGate();
         resetPinField();
         gateError("Слишком много неверных попыток. Переподключение…");
       } else if (m.t === "res") {

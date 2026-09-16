@@ -8504,7 +8504,19 @@ async function testTasks() {
     assert.strictEqual(store.tasksTakeAuto(ud, NOW + 1000).tasks.length, 0, "автозадача запустилась дважды");
     // Повтор уехал на завтра, разовое осталось активным (его закроет агент или человек).
     const list = store.tasksList(ud, { status: "active", nowMs: NOW }).tasks;
-    assert.ok(list.find((t) => t.title === "План дня").due.startsWith("2026-09-14"), "повтор не сдвинулся");
+    // Расписание увозит только ПОДТВЕРЖДЁННЫЙ прогон: пока клиент не ответил, срок на
+    // месте. Раньше повтор двигался прямо при запуске — и сорвавшийся прогон съедал
+    // срабатывание навсегда (этот тест такую поломку и закреплял).
+    const plan = () => store.tasksList(ud, { status: "active", nowMs: NOW }).tasks.find((t) => t.title === "План дня");
+    assert.ok(plan().due.startsWith("2026-09-13"), "срок повтора уехал до подтверждения прогона: " + plan().due);
+    assert.ok(store.tasksAutoAck(ud, plan().id, false, "провайдер не ответил").ok, "отказ клиента не принят");
+    assert.ok(plan().due.startsWith("2026-09-13"), "отказ прогона увёз расписание: " + plan().due);
+    assert.ok(plan().autoNextAt > NOW, "после отказа не назначена повторная попытка");
+    const beforeDue = plan().due;
+    assert.ok(store.tasksAutoAck(ud, plan().id, true).ok, "подтверждение прогона не принято");
+    const afterDue = plan().due;
+    assert.ok(afterDue > beforeDue, "подтверждённый прогон не сдвинул повтор: " + beforeDue + " → " + afterDue);
+    assert.strictEqual(afterDue.slice(-5), beforeDue.slice(-5), "сдвиг повтора изменил время суток");
     // Автозадачи — работа агента, а не тост: напоминание приходит только обычному делу.
     assert.deepStrictEqual(store.tasksTakeReminders(ud, NOW).tasks.map((t) => t.title), ["Позвонить"], "автозадача или её повтор дали лишнее напоминание");
     // Вырожденный повтор не принимается.
@@ -11016,6 +11028,7 @@ async function testMissions() {
   await testProviderTransport();
   await testContextWindow();
   await testSecretScopes();
+  await testOneNavigation();
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");
   process.exit(failed ? 1 : 0);
 })();
@@ -11223,5 +11236,132 @@ async function testSecretScopes() {
     assert.ok(mobile.includes('"policy:groups"'), "с телефона выдача недоступна");
     assert.ok(html.includes("выдача"), "в интерфейсе не объяснено, что такое выдача");
     assert.ok(coreSrc.includes("scopes: {"), "у envSet нет параметра выдачи");
+  });
+}
+// ── Одна навигация: рельса слева, шапка — действия чата (1.5.90) ─────────────
+// Было: одни и те же разделы переключались из трёх мест — иконки на рельсе,
+// иконки в шапке справа и вкладки внутри самой панели. Хуже того, подсветка
+// загоралась сразу у трёх иконок: openSidePanel включал консоль, превью и
+// облако одной пачкой, а не по активному разделу.
+// Стало: разделы переключает ТОЛЬКО рельса; в шапке остаются действия чата,
+// а шапка панели показывает название раздела. Иконки разделов и вкладки панели
+// возвращаются лишь на телефоне, где рельсы нет.
+async function testOneNavigation() {
+  const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+  const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+  const css = fs.readFileSync(path.join(ROOT, "src", "renderer", "styles.css"), "utf8");
+  const m900 = css.match(/@media \(max-width: 900px\) \{([\s\S]*?)\n\}/);
+  const TABS = ["console", "preview", "cloud", "deploy", "mission", "tasks"];
+
+  await test("одна навигация: дубли в шапке спрятаны, раздел подписан", () => {
+    // Кнопки-дубли остаются в разметке (рельса нажимает именно их через proxy),
+    // но помечены — иначе их нечем скрыть на широком экране.
+    for (const id of ["btn-toggle-console", "btn-toggle-preview", "btn-toggle-cloud", "btn-toggle-deploy", "btn-toggle-panel"]) {
+      assert.ok(new RegExp('id="' + id + '"[^>]*class="[^"]*hdr-dupe').test(html), "кнопка " + id + " не помечена дублем рельсы");
+    }
+    assert.ok(/\.header-btns \.hdr-dupe \{ display: none; \}/.test(css), "дубли шапки видны на широком экране");
+    assert.ok(m900 && /\.header-btns \.hdr-dupe \{ display: inline-flex; \}/.test(m900[1]), "на телефоне иконки разделов не вернулись в шапку");
+    // Вкладки внутри панели — тот же дубль: на широком экране их нет.
+    assert.ok(/\.sp-switch \{\n  display: none;/.test(css), "вкладки панели видны на широком экране");
+    assert.ok(m900 && /\.sp-switch \{ display: flex; \}/.test(m900[1]), "на телефоне вкладки панели не вернулись");
+    // Вместо вкладок панель показывает название раздела.
+    assert.ok(html.indexOf('id="sp-title"') !== -1, "в шапке панели нет названия раздела");
+    assert.ok(/SP_TITLES = \{[\s\S]{0,200}?tasks: "Дела"/.test(appSrc), "нет названий разделов");
+    assert.ok(/spTitle\.textContent = SP_TITLES\[sideTab\]/.test(appSrc), "название раздела не обновляется");
+    // Каскад: мобильное правило обязано идти ПОСЛЕ базового и лежать внутри блока 900px —
+    // иначе скрытие не переопределится и на телефоне не останется навигации вообще.
+    const baseDupe = css.indexOf(".header-btns .hdr-dupe { display: none; }");
+    const mobDupe = css.indexOf(".header-btns .hdr-dupe { display: inline-flex; }");
+    assert.ok(baseDupe > 0 && mobDupe > baseDupe, "мобильное правило дублей не после базового");
+    assert.ok(css.indexOf(".header-btns .hdr-dupe { display: none; }", baseDupe + 1) === -1, "базовое правило дублей продублировано");
+    const baseSwitch = css.indexOf(".sp-switch {\n  display: none;");
+    const mobSwitch = css.indexOf(".sp-switch { display: flex; }");
+    assert.ok(baseSwitch > 0 && mobSwitch > baseSwitch, "мобильное правило вкладок не после базового");
+    assert.ok(css.indexOf(".sp-switch {\n  display: none;", baseSwitch + 1) === -1, "базовое правило вкладок продублировано");
+    assert.ok(m900 && m900[1].indexOf(".sp-switch { display: flex; }") !== -1 && m900[1].indexOf(".header-btns .hdr-dupe { display: inline-flex; }") !== -1, "мобильные правила лежат вне блока 900px");
+    // Стили, которые грузятся последними, не должны возвращать этим элементам видимость.
+    for (const cssFile of ["monochrome.css", "yc-console.css", "deploy-panel.css"]) {
+      const t = fs.readFileSync(path.join(ROOT, "src", "renderer", cssFile), "utf8");
+      assert.ok(!/(sp-switch|hdr-dupe|sp-title)[^}]*display/.test(t), cssFile + " возвращает видимость вкладкам, дублям или названию раздела");
+    }
+  });
+
+  await test("одна навигация: ровно одна подсветка вместо трёх", () => {
+    const a1 = appSrc.indexOf("  // Рельса слева (как в Replit): иконки переиспользуют");
+    const a2 = appSrc.indexOf("  function sidePanelVisible() {", a1);
+    assert.ok(a1 > 0 && a2 > a1, "не нашёл блок навигации в app.js");
+    const openBody = appSrc.slice(appSrc.indexOf("  function openSidePanel(tab) {"), appSrc.indexOf("  function closeSidePanel() {"));
+    assert.ok(openBody.indexOf("markPanelButtons();") !== -1, "openSidePanel не пересчитывает подсветку");
+    assert.ok(openBody.indexOf('.classList.add("active")') === -1, "openSidePanel снова включает подсветку вручную");
+    assert.ok(/function markPanelButtons\(\)/.test(appSrc), "нет единой точки подсветки разделов");
+
+    // Живая логика: берём из app.js сам блок навигации и прогоняем на игрушечном
+    // DOM. sidePanelVisible и sideTab объявлены в файле рядом — подставляем их
+    // ровно так же, как в исходнике, чтобы slice остался хрупким не больше нужного.
+    const code =
+      "let sideTab = 'preview';\n" +
+      "function sidePanelVisible() { return !$('side-panel').classList.contains('hidden'); }\n" +
+      appSrc.slice(a1, a2) +
+      "\nreturn { markPanelButtons: markPanelButtons, setTab: function (t) { sideTab = t; } };";
+    const el = () => {
+      const e = { _c: new Set(), title: "", onclick: null };
+      Object.defineProperty(e, "classList", {
+        value: {
+          contains: (c) => e._c.has(c),
+          add: (...cs) => cs.forEach((c) => e._c.add(c)),
+          remove: (...cs) => cs.forEach((c) => e._c.delete(c)),
+          toggle: (c, on) => {
+            const want = on === undefined ? !e._c.has(c) : !!on;
+            if (want) e._c.add(c);
+            else e._c.delete(c);
+            return want;
+          },
+        },
+      });
+      return e;
+    };
+    const ids = [
+      "side-panel", "sidebar", "btn-side-collapse",
+      "rail-chats", "rail-console", "rail-preview", "rail-cloud", "rail-deploy", "rail-mission", "rail-tasks", "rail-files",
+      "btn-toggle-console", "btn-toggle-preview", "btn-toggle-cloud", "btn-toggle-deploy", "btn-toggle-panel",
+    ];
+    const nodes = {};
+    for (const id of ids) nodes[id] = el();
+    const store = {};
+    const localStorage = {
+      getItem: (k) => (k in store ? store[k] : null),
+      setItem: (k, v) => { store[k] = String(v); },
+    };
+    const fakeDoc = { getElementById: (id) => nodes[id] || null };
+    const run = new Function("document", "$", "localStorage", "window", code)(fakeDoc, fakeDoc.getElementById, localStorage, { innerWidth: 1280 });
+    const active = () => TABS.filter((t) => nodes["rail-" + t].classList.contains("active"));
+
+    nodes["side-panel"].classList.add("hidden");
+    run.setTab("console");
+    nodes["side-panel"].classList.remove("hidden");
+    run.markPanelButtons();
+    assert.deepStrictEqual(active(), ["console"], "подсвечено не одно: " + JSON.stringify(active()));
+    assert.ok(nodes["btn-toggle-console"].classList.contains("active"), "кнопка шапки не подсветилась");
+    assert.ok(!nodes["btn-toggle-preview"].classList.contains("active") && !nodes["btn-toggle-cloud"].classList.contains("active"), "подсветились чужие кнопки шапки");
+
+    run.setTab("deploy");
+    run.markPanelButtons();
+    assert.deepStrictEqual(active(), ["deploy"], "переключение раздела оставило прошлую подсветку");
+    assert.ok(nodes["btn-toggle-deploy"].classList.contains("active") && !nodes["btn-toggle-console"].classList.contains("active"), "деплой не подсветился или консоль осталась активной");
+
+    nodes["side-panel"].classList.add("hidden");
+    run.markPanelButtons();
+    assert.deepStrictEqual(active(), [], "закрытая панель оставила подсветку разделов");
+    assert.ok(!nodes["btn-toggle-deploy"].classList.contains("active"), "закрытая панель оставила кнопку шапки активной");
+  });
+
+  await test("композер: кнопки одной высоты, подписи компактные", () => {
+    assert.ok(/\.composer-btns \{ display: flex; align-items: center; gap: 6px; margin-left: auto; \}/.test(css), "кнопки композера не прижаты вправо");
+    assert.ok(/\.composer-btns > \.btn \{ height: 30px; padding: 0 10px; border-radius: 9px; font-size: 12px; gap: 5px; \}/.test(css), "кнопки композера не одной высоты");
+    assert.ok(/\.composer-btns > #btn-send,\n\.composer-btns > #btn-stop \{ width: 34px; height: 34px;/.test(css), "главное действие не выделено размером");
+    assert.ok(html.indexOf("Enter — отправить · Shift+Enter — новая строка</span>") !== -1, "подсказка в композере не укорочена");
+    assert.ok(html.indexOf("📋 План</button>") !== -1, "подпись режима плана не укорочена");
+    assert.ok(m900 && /\.input-hint \{ display: none; \}/.test(m900[1]), "на телефоне осталась подсказка про Enter");
+    assert.ok(m900 && /\.composer-btns \{ gap: 5px; \}/.test(m900[1]), "на телефоне кнопки композера не сжаты");
   });
 }

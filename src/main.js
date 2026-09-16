@@ -1943,15 +1943,25 @@ function armTaskWake() {
 function checkTaskReminders() {
   let due = [];
   let auto = [];
+  let failed = [];
   let remindOn = true;
   let autoOn = true;
+  // Доставить дело некому (окна нет — свёрнуто в трей, закрыто): дела НЕ «берём»,
+  // иначе автозадача сгорела бы впустую. Возьмём их, когда окно вернётся.
+  if (!mainWindow || mainWindow.isDestroyed()) return;
   try {
     const s = loadSettings();
     remindOn = s.taskReminders !== false;
     autoOn = s.taskAuto !== false;
-    if (remindOn) due = agentStore.tasksTakeReminders(userDataDir()).tasks;
+    // Автозадачи выключены галочкой — дело не должно молчать совсем: напоминаем
+    // тостом, как обычное (иначе «ставлю время, и не происходит ничего»).
+    if (remindOn) due = agentStore.tasksTakeReminders(userDataDir(), undefined, { includeAuto: !autoOn }).tasks;
     // Автозадачи — это работа агента, а не тост: галочка напоминаний их не глушит.
-    if (autoOn) auto = agentStore.tasksTakeAuto(userDataDir()).tasks;
+    if (autoOn) {
+      const take = agentStore.tasksTakeAuto(userDataDir());
+      auto = take.tasks;
+      failed = take.failed || [];
+    }
   } catch {
     return;
   }
@@ -1961,7 +1971,12 @@ function checkTaskReminders() {
     const late = at < now;
     notifyUser((late ? "⚠ Дело просрочено: " : "⏰ Дело: ") + t.title, agentStore.humanDue(t, now));
   }
-  if (due.length || auto.length) emitTasksChanged();
+  // Автозадача не подтвердилась после всех попыток: молчать нельзя — человек ждал,
+  // что агент сработает сам.
+  for (const t of failed) {
+    notifyUser("⚠ Автозадача не запустилась: " + t.title, t.error || "прогон не подтвердился");
+  }
+  if (due.length || auto.length || failed.length) emitTasksChanged();
   try {
     if (due.length) {
       mainWindow.webContents.send("ai:event", {
@@ -1973,6 +1988,10 @@ function checkTaskReminders() {
       // from: "desktop" — событие уходит и на телефон, но запускать автозадачу
       // должен только ПК-клиент: у чатов один хозяин, иначе прогон удвоится.
       mainWindow.webContents.send("ai:event", { type: "task-due", from: "desktop", tasks: auto });
+    }
+    // Автозадача не пошла: окно говорит об этом человеку тостом в ленте.
+    if (failed.length) {
+      mainWindow.webContents.send("ai:event", { type: "task-auto-failed", tasks: failed });
     }
   } catch {}
   armTaskWake();
@@ -3747,22 +3766,52 @@ ipcMain.handle("agentfiles:clear", () => {
 ipcMain.handle("tasks:list", (_e, opts) => agentStore.tasksList(userDataDir(), opts || {}));
 ipcMain.handle("tasks:add", (_e, input) => {
   const r = agentStore.tasksAdd(userDataDir(), input || {});
-  if (r.ok) emitTasksChanged();
+  if (r.ok) {
+    emitTasksChanged();
+    armTaskWake(); // срок мог стать ближе — будильник перезаряжаем сразу
+  }
   return r;
 });
 ipcMain.handle("tasks:update", (_e, key, patch) => {
   const r = agentStore.tasksUpdate(userDataDir(), key, patch || {});
-  if (r.ok) emitTasksChanged();
+  if (r.ok) {
+    emitTasksChanged();
+    armTaskWake(); // срок мог стать ближе — будильник перезаряжаем сразу
+  }
   return r;
 });
 ipcMain.handle("tasks:done", (_e, key, done) => {
   const r = agentStore.tasksDone(userDataDir(), key, done !== false);
-  if (r.ok) emitTasksChanged();
+  if (r.ok) {
+    emitTasksChanged();
+    armTaskWake(); // срок мог стать ближе — будильник перезаряжаем сразу
+  }
   return r;
 });
 ipcMain.handle("tasks:delete", (_e, key) => {
   const r = agentStore.tasksDelete(userDataDir(), key);
-  if (r.ok) emitTasksChanged();
+  if (r.ok) {
+    emitTasksChanged();
+    armTaskWake(); // срок мог стать ближе — будильник перезаряжаем сразу
+  }
+  return r;
+});
+// Подтверждение от окна: автозадача действительно пошла в прогон (ok) или не смогла.
+// Без этого окна планировщик повторяет попытку и в конце честно говорит о неудаче.
+ipcMain.handle("tasks:auto-ack", (_e, key, ok, error) => {
+  const r = agentStore.tasksAutoAck(userDataDir(), key, ok !== false, error || "");
+  if (r.ok) {
+    emitTasksChanged();
+    armTaskWake();
+  }
+  return r;
+});
+ipcMain.handle("tasks:auto-rearm", (_e, key) => {
+  const r = agentStore.tasksAutoRearm(userDataDir(), key);
+  if (r.ok) {
+    emitTasksChanged();
+    armTaskWake();
+  }
   return r;
 });
 

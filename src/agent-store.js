@@ -639,6 +639,13 @@ const TASK_NOTE_MAX = 2000;
 const TASK_STATUSES = ["todo", "doing", "done", "canceled"];
 const TASK_PRIORITIES = ["low", "normal", "high"];
 const TASK_REMIND_BEFORE_MS = 15 * 60 * 1000; // напоминаем за 15 минут до срока
+// Автозапуск агентом идёт двумя шагами: приложение выдаёт дело на прогон (autoPending),
+// клиент подтверждает, что прогон действительно начался (tasksAutoAck). Пока подтверждения
+// нет дольше TASK_AUTO_PENDING_MS — выдаём снова, но не больше TASK_AUTO_TRIES_MAX раз.
+// Так дело не «сгорает» молча, если прогон не состоялся (нет модели, окно закрыто, сбой).
+const TASK_AUTO_PENDING_MS = 3 * 60 * 1000; // сколько ждём подтверждения запуска
+const TASK_AUTO_RETRY_MS = 2 * 60 * 1000; // пауза перед повторной попыткой
+const TASK_AUTO_TRIES_MAX = 3; // после этого сообщаем человеку и больше не пристаём
 const TASK_REPEAT_MAX_MIN = 60 * 24 * 31; // «каждые N минут» — не реже раза в месяц
 const TASK_ALLDAY_HOUR = 9; // срок «в этот день» без времени = 09:00
 const WEEKDAY_NAMES = ["воскресенье", "понедельник", "вторник", "среда", "четверг", "пятница", "суббота"];
@@ -964,6 +971,15 @@ function advanceRepeat(t, nowMs) {
   return true;
 }
 
+// Сброс состояния автозапуска: новый срок, повтор или отметка — попытки начинаются заново.
+function resetAutoState(t) {
+  t.autoPending = 0;
+  t.autoTries = 0;
+  t.autoNextAt = 0;
+  t.autoGaveUp = false;
+  t.autoLastError = "";
+}
+
 // Поиск дела по id («t7») или по куску названия. Возвращает { task } либо { error }.
 function tasksFind(data, key) {
   const k = String(key == null ? "" : key).trim();
@@ -1012,6 +1028,13 @@ function tasksAdd(userData, input, nowMs) {
     snoozeUntil: 0,
     firedAt: 0,
     runs: 0,
+    // Состояние автозапуска агентом (см. tasksTakeAuto / tasksAutoAck).
+    autoPending: 0, // выдали на прогон, ждём подтверждения
+    autoTries: 0, // попыток для текущего срока
+    autoNextAt: 0, // пауза перед следующей попыткой
+    autoGaveUp: false, // попытки кончились — сказали человеку
+    autoLastError: "", // почему не вышло (для человека)
+    autoAckedAt: 0, // когда прогон подтвердили
     createdAt: now,
     updatedAt: now,
     doneAt: 0,
@@ -1053,16 +1076,19 @@ function tasksUpdate(userData, key, patch) {
     t.allDay = !!dueR.allDay;
     t.remindedAt = 0; // новый срок — напомнить заново
     t.firedAt = 0; // новый срок — автозадача может сработать снова
+    resetAutoState(t);
   }
   if (p.repeat !== undefined) {
     const repR2 = parseRepeat(p.repeat);
     if (!repR2.ok) return { ok: false, error: repR2.error };
     t.repeat = repR2.repeat;
     t.firedAt = 0;
+    resetAutoState(t);
   }
   if (p.auto !== undefined) {
     t.auto = !!p.auto;
     t.firedAt = 0;
+    resetAutoState(t);
   }
   if (p.prompt !== undefined) t.prompt = String(p.prompt || "").trim().slice(0, TASK_NOTE_MAX);
   // Отсрочка: «напомни через час» — срок не меняем, но приставать перестаём до этого момента.
@@ -1071,6 +1097,7 @@ function tasksUpdate(userData, key, patch) {
     if (!snR.ok) return { ok: false, error: snR.error };
     t.snoozeUntil = snR.due ? new Date(snR.due).getTime() : 0;
     t.remindedAt = 0;
+    resetAutoState(t);
   }
   if (p.status !== undefined) {
     if (!TASK_STATUSES.includes(p.status)) {
@@ -1214,14 +1241,17 @@ function tasksBoard(userData, nowMs) {
 
 // Напоминания: дела, до срока которых осталось меньше 15 минут (и просроченные,
 // о которых ещё не напоминали). Сразу помечаем remindedAt — повторно не пристаём.
-function tasksTakeReminders(userData, nowMs) {
+// opts.includeAuto — напоминать и о делах «▶ агент»: это нужно, когда автозадачи
+// в настройках выключены, иначе такое дело молчит насовсем (ни агента, ни тоста).
+function tasksTakeReminders(userData, nowMs, opts) {
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const includeAuto = !!(opts && opts.includeAuto);
   const data = tasksLoad(userData);
   const out = [];
   let changed = false;
   for (const t of data.tasks) {
     if (t.status === "done" || t.status === "canceled") continue;
-    if (t.auto) continue; // автозадачу будит агент, а не тост
+    if (t.auto && !includeAuto) continue; // автозадачу будит агент, а не тост
     if (t.snoozeUntil && t.snoozeUntil > now) continue; // отсрочено — молчим
     const at = dueDate(t);
     if (!at) continue;
@@ -1236,13 +1266,18 @@ function tasksTakeReminders(userData, nowMs) {
   return { ok: true, tasks: out };
 }
 
-// Автозадачи: срок пришёл — пора будить агента. Повторяющиеся после запуска
-// сдвигаются на следующий раз, разовые остаются активными (закрыть их — дело
-// человека или агента). firedAt не даёт запустить одно и то же дважды.
+// Автозадачи: срок пришёл — пора будить агента. Выдаём двумя шагами: выдача
+// (autoPending) и подтверждение окна (tasksAutoAck). Пока подтверждения нет —
+// повторяем попытку, а повтор сдвигаем ТОЛЬКО по подтверждённому прогону:
+// сорвавшийся запуск не должен увозить расписание. Разовые остаются активными
+// (закрыть их — дело человека или агента). firedAt не даёт запустить одно и то же
+// дважды. Возвращает { tasks, failed }: tasks — что отдать на прогон, failed —
+// о чём сказать человеку.
 function tasksTakeAuto(userData, nowMs) {
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
   const data = tasksLoad(userData);
   const out = [];
+  const failed = [];
   let changed = false;
   for (const t of data.tasks) {
     if (t.status === "done" || t.status === "canceled") continue;
@@ -1251,15 +1286,76 @@ function tasksTakeAuto(userData, nowMs) {
     const at = dueDate(t);
     if (!at) continue;
     if (now < at.getTime()) continue; // срок ещё не пришёл
-    if (t.firedAt && t.firedAt >= at.getTime()) continue; // уже запускали для этого срока
+    if (t.firedAt && t.firedAt >= at.getTime()) {
+      // Уже выдали на этот срок. Ждём подтверждения от клиента; не дождались —
+      // повторяем попытку: иначе сорвавшийся прогон съедал срабатывание навсегда.
+      if (!t.autoPending) continue;
+      if (now - t.autoPending < TASK_AUTO_PENDING_MS) continue;
+      if ((t.autoTries || 0) >= TASK_AUTO_TRIES_MAX) {
+        t.autoPending = 0;
+        t.autoGaveUp = true;
+        t.updatedAt = now;
+        failed.push({ id: t.id, title: t.title, due: t.due, tries: t.autoTries || 0, error: t.autoLastError || "" });
+        changed = true;
+        continue;
+      }
+    }
+    if (t.autoNextAt && now < t.autoNextAt) continue; // пауза после неудачной попытки
     t.firedAt = at.getTime();
+    t.autoPending = now;
+    t.autoTries = (t.autoTries || 0) + 1;
+    t.autoNextAt = 0;
+    t.autoGaveUp = false;
     t.runs = (t.runs || 0) + 1;
-    out.push({ id: t.id, title: t.title, prompt: t.prompt || "", note: t.note || "", repeat: t.repeat || "", due: t.due, runs: t.runs });
-    if (t.repeat) advanceRepeat(t, now);
+    t.updatedAt = now;
+    out.push({ id: t.id, title: t.title, prompt: t.prompt || "", note: t.note || "", repeat: t.repeat || "", due: t.due, runs: t.runs, tries: t.autoTries });
+    // Повтор двигаем НЕ здесь, а по подтверждению прогона (tasksAutoAck):
+    // сорвавшийся запуск не должен увозить расписание.
     changed = true;
   }
   if (changed) tasksSave(userData, data);
-  return { ok: true, tasks: out };
+  return { ok: true, tasks: out, failed: failed };
+}
+
+// Подтверждение от клиента: прогон начался (ok) либо не смог начаться.
+// Срабатывание фиксируем и повтор сдвигаем ТОЛЬКО здесь. При отказе освобождаем срок
+// и пробуем снова через паузу — вместо прежнего молчаливого «сгорания» дела.
+function tasksAutoAck(userData, key, ok, error) {
+  const data = tasksLoad(userData);
+  const found = tasksFind(data, key);
+  if (!found.task) return { ok: false, error: found.error };
+  const t = found.task;
+  const now = Date.now();
+  if (ok === false) {
+    t.firedAt = 0;
+    t.autoPending = 0;
+    t.autoNextAt = now + TASK_AUTO_RETRY_MS;
+    t.autoLastError = String(error || "").slice(0, 200);
+  } else {
+    t.autoPending = 0;
+    t.autoNextAt = 0;
+    t.autoAckedAt = now;
+    t.autoLastError = "";
+    t.autoGaveUp = false;
+    if (t.repeat) advanceRepeat(t, now);
+  }
+  t.updatedAt = now;
+  tasksSave(userData, data);
+  return { ok: true, task: t };
+}
+
+// Ручной прогон («▶ сейчас») удался: снимаем «сдался», чтобы планировщик снова брал дело.
+function tasksAutoRearm(userData, key) {
+  const data = tasksLoad(userData);
+  const found = tasksFind(data, key);
+  if (!found.task) return { ok: false, error: found.error };
+  const t = found.task;
+  const now = Date.now();
+  resetAutoState(t);
+  if (t.repeat) advanceRepeat(t, now);
+  t.updatedAt = now;
+  tasksSave(userData, data);
+  return { ok: true, task: t };
 }
 
 // Через сколько миллисекунд наступит ближайший срок — чтобы будильник сработал
@@ -1373,6 +1469,9 @@ module.exports = {
   tasksSummary,
   tasksTakeReminders,
   tasksTakeAuto,
+  tasksAutoAck,
+  tasksAutoRearm,
+  TASK_AUTO_TRIES_MAX,
   tasksNextDue,
   tasksFormatText,
   tasksBrief,

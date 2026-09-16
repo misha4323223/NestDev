@@ -1041,7 +1041,12 @@
       if (!streaming) {
         requestAnimationFrame(() => {
           const inp = $("input");
-          if (inp && document.activeElement !== inp) inp.focus();
+          // Фокус отдаём только «пустому» экрану: если человек уже печатает в
+          // другом поле (дело, настройки, консоль), перерисовка ленты не имеет
+          // права выдирать у него курсор.
+          const cur = document.activeElement;
+          const busy = !!cur && cur !== document.body && cur !== document.documentElement;
+          if (inp && !busy && cur !== inp) inp.focus();
         });
       }
       return;
@@ -1818,9 +1823,39 @@
     return "⏰ Автозадача по сроку: «" + t.title + "»\n\n" + what;
   }
 
+  // «▶ Сейчас» из строки дела: тот же прогон, что и по сроку, но не по сроку и без правки
+  // расписания (manual) — чтобы человек мог проверить запуск, не дожидаясь часа.
+  function startAutoRunNow(t) {
+    if (!isElectron) { toast("Дела: автозапуск работает в приложении на ПК"); return; }
+    if (!t || !t.id) return;
+    if (!t.auto) { toast("Дела: сначала включи «▶ агент» в строке дела"); return; }
+    if (streaming) { toast("⏰ Агент занят другим прогоном — нажми «▶ сейчас» чуть позже"); return; }
+    runAutoTask({
+      id: t.id,
+      title: t.title,
+      prompt: t.prompt || "",
+      note: t.note || "",
+      repeat: t.repeat || "",
+      due: t.due,
+      auto: true,
+      manual: true,
+    });
+  }
+
   function flushAutoQueue() {
     if (streaming || !autoQueue.length) return;
     runAutoTask(autoQueue.shift());
+  }
+
+  // Подтверждение планировщику. Раньше его не было, и дело считалось запущенным ещё
+  // до прогона: не хватило модели, сорвался запрос, кончился прогон — и автозадача
+  // больше не срабатывала НИКОГДА. Теперь планировщик повторяет попытку и в конце
+  // говорит человеку вслух.
+  function autoAck(task, ok, error) {
+    if (!task || !task.id || task.manual) return;
+    try {
+      if (api && api.tasksAutoAck) api.tasksAutoAck(task.id, ok !== false, error || "");
+    } catch {}
   }
 
   async function runAutoTask(task) {
@@ -1828,14 +1863,27 @@
     // (событие срока уходит и на телефон).
     if (!isElectron) return;
     if (!task || !task.id) return;
-    if (streaming) { autoQueue.push(task); return; }
+    if (streaming) {
+      if (task.manual) { toast("⏰ Агент занят другим прогоном — нажми «▶ сейчас» чуть позже"); return; }
+      if (!autoQueue.some((q) => q.id === task.id)) autoQueue.push(task);
+      return;
+    }
     if (!settings.model) {
-      toast("⏰ Дело «" + task.title + "» — автозапуск пропущен: не выбрана модель");
+      autoAck(task, false, "не выбрана модель");
+      toast("⏰ Дело «" + task.title + "» — автозапуск отложен: не выбрана модель");
       return;
     }
     const chat = ensureAutoChat();
     if (chatsData.activeId !== chat.id) selectChat(chat.id);
-    const assistantMsg = await runTurn(chat, autoTaskText(task), {});
+    autoAck(task, true); // прогон начинается — срок закрыт, повтор сдвигается
+    let assistantMsg = null;
+    try {
+      assistantMsg = await runTurn(chat, autoTaskText(task), {});
+    } catch (e) {
+      autoAck(task, false, "прогон сорвался: " + (e && e.message ? e.message : e));
+      toast("⏰ Автозадача «" + task.title + "» сорвалась — смотри чат «Автозадачи»");
+      return;
+    }
     if (assistantMsg && assistantMsg.error) {
       toast("⏰ Автозадача «" + task.title + "» не выполнилась — смотри чат «Автозадачи»");
       return;
@@ -1843,6 +1891,11 @@
     // Разовое дело после выполнения закрываем: сделано — висеть просроченным незачем.
     if (!task.repeat && api && api.tasksDone) {
       try { await api.tasksDone(task.id); } catch {}
+      renderTasks();
+    }
+    // Ручной прогон удался — снимаем «сдался», планировщик снова берёт это дело.
+    if (task.manual && task.auto && api && api.tasksAutoRearm) {
+      try { await api.tasksAutoRearm(task.id); } catch {}
       renderTasks();
     }
   }
@@ -1916,8 +1969,24 @@
     if (ev && ev.type === "task-due") {
       if (!isElectron) return;
       const list = Array.isArray(ev.tasks) ? ev.tasks : [];
-      for (const t of list) autoQueue.push(t);
+      for (const t of list) {
+        // Планировщик повторяет попытку, пока прогон не подтвердится, — в очередь
+        // одно и то же дело попадает один раз.
+        if (t && t.id && !autoQueue.some((q) => q.id === t.id)) autoQueue.push(t);
+      }
       flushAutoQueue();
+      return;
+    }
+    // Автозадача так и не запустилась — об этом надо сказать вслух, а не молчать.
+    if (ev && ev.type === "task-auto-failed") {
+      const list = Array.isArray(ev.tasks) ? ev.tasks : [];
+      if (list.length === 1) {
+        const one = list[0];
+        toast("⚠ Автозадача «" + one.title + "» не запустилась" + (one.error ? ": " + one.error : ""));
+      } else if (list.length > 1) {
+        toast("⚠ Автозадач не запустилось: " + list.length);
+      }
+      renderTasks();
       return;
     }
     // Прогон запущен другим клиентом (обычно телефоном): у событий нет привязки к
@@ -2262,6 +2331,35 @@
     if (chats && sb) chats.classList.toggle("active", !sb.classList.contains("collapsed"));
   }
 
+  // Одна навигация — рельса слева: разделы переключаются только ей, а подсветка
+  // ровно одна. Кнопки шапки (видны лишь на телефоне) повторяют ту же подсветку.
+  const SP_TITLES = {
+    preview: "Превью",
+    console: "Консоль",
+    cloud: "Yandex Cloud",
+    deploy: "Деплой",
+    mission: "Миссия",
+    tasks: "Дела",
+  };
+  const PANEL_BTN = { console: "btn-toggle-console", preview: "btn-toggle-preview", cloud: "btn-toggle-cloud", deploy: "btn-toggle-deploy" };
+  const RAIL_PANEL = { console: "rail-console", preview: "rail-preview", cloud: "rail-cloud", deploy: "rail-deploy", mission: "rail-mission", tasks: "rail-tasks" };
+  function markPanelButtons() {
+    const open = sidePanelVisible();
+    for (const id of Object.values(PANEL_BTN)) {
+      const b = $(id);
+      if (b) b.classList.remove("active");
+    }
+    for (const tab of Object.keys(RAIL_PANEL)) {
+      const r = $(RAIL_PANEL[tab]);
+      if (r) r.classList.toggle("active", open && sideTab === tab);
+    }
+    if (open) {
+      const b = $(PANEL_BTN[sideTab]);
+      if (b) b.classList.add("active");
+    }
+    syncRail();
+  }
+
   // Свёрнутый список чатов (рельса остаётся на месте). Состояние запоминается:
   // привычка «работаю без списка» не должна сбрасываться при каждом запуске.
   function setSidebarCollapsed(v) {
@@ -2297,17 +2395,17 @@
     if (spTasksEl) spTasksEl.classList.toggle("hidden", sideTab !== "tasks");
     const spMissionEl = $("sp-mission");
     if (spMissionEl) spMissionEl.classList.toggle("hidden", sideTab !== "mission");
-    if ($("rail-mission")) $("rail-mission").classList.toggle("active", sideTab === "mission");
     if (sideTab === "mission") refreshMission();
     const spDeployEl = $("sp-deploy");
     if (spDeployEl) spDeployEl.classList.toggle("hidden", sideTab !== "deploy");
-    if ($("rail-deploy")) $("rail-deploy").classList.toggle("active", sideTab === "deploy");
     if (sideTab === "deploy" && window.DeployPanel) window.DeployPanel.open(settings.workingDir || "");
-    if ($("rail-tasks")) $("rail-tasks").classList.toggle("active", sideTab === "tasks");
     if (sideTab === "tasks") renderTasks();
-    $("btn-toggle-console").classList.add("active");
-    $("btn-toggle-preview").classList.add("active");
-    if ($("btn-toggle-cloud")) $("btn-toggle-cloud").classList.add("active");
+    // Название раздела в шапке панели: на широком экране вкладки скрыты, и это
+    // единственная подсказка, куда мы переключились (переключает рельса слева).
+    const spTitle = $("sp-title");
+    if (spTitle) spTitle.textContent = SP_TITLES[sideTab] || "";
+    // Подсветка ровно одна — по активному разделу (раньше загорались три сразу).
+    markPanelButtons();
     if (sideTab === "console") {
       ensureTerminal();
       setTimeout(() => $("term-input").focus(), 50);
@@ -2324,14 +2422,8 @@
 
   function closeSidePanel() {
     $("side-panel").classList.add("hidden");
-    $("btn-toggle-console").classList.remove("active");
-    $("btn-toggle-preview").classList.remove("active");
-    if ($("btn-toggle-cloud")) $("btn-toggle-cloud").classList.remove("active");
-    if ($("rail-tasks")) $("rail-tasks").classList.remove("active");
-    if ($("rail-mission")) $("rail-mission").classList.remove("active");
-    if ($("rail-deploy")) $("rail-deploy").classList.remove("active");
-    if ($("btn-toggle-deploy")) $("btn-toggle-deploy").classList.remove("active");
-    syncRail();
+    // Панель закрыта — снимаем всю подсветку разделов одним движением.
+    markPanelButtons();
   }
 
   function switchSideTab(tab) {
@@ -2508,12 +2600,41 @@
       rep.title = "Дело повторяется: " + repeatText(t.repeat);
       meta.appendChild(rep);
     }
+    // Автозапуск агентом — ВИДИМАЯ кнопка, а не скрытая галочка: раньше пометить дело
+    // было нечем, и планировщик его пропускал («ставлю время, а агента никто не дёргает»).
+    const autoBtn = document.createElement("button");
+    autoBtn.type = "button";
+    autoBtn.className = "task-tag tk-auto" + (t.auto ? " on" : "");
+    autoBtn.textContent = t.auto ? "▶ агент" : "▷ агент";
+    autoBtn.title = t.auto
+      ? "Агент выполнит это дело сам по сроку (ответ — в чате «Автозадачи»). Клик — выключить."
+      : "Клик — включить: приложение само разбудит агента в срок дела.";
+    autoBtn.onclick = async (e) => {
+      e.stopPropagation();
+      const r = await api.tasksUpdate(t.id, { auto: !t.auto });
+      if (r && r.ok === false) { toast("Дела: " + r.error); return; }
+      toast(!t.auto
+        ? "▶ Дело «" + t.title + "» запустит агент по сроку"
+        : "▷ Дело «" + t.title + "» больше не запускается агентом");
+      renderTasks();
+    };
+    meta.appendChild(autoBtn);
     if (t.auto) {
-      const bus = document.createElement("span");
-      bus.className = "task-tag";
-      bus.textContent = "▶ агент";
-      bus.title = "В срок приложение само запустит агента — ответ придёт в чат «Автозадачи»";
-      meta.appendChild(bus);
+      // Проверить запуск, не дожидаясь часа: тот же путь, что и по сроку.
+      const nowBtn = document.createElement("button");
+      nowBtn.type = "button";
+      nowBtn.className = "task-tag tk-now";
+      nowBtn.textContent = "▶ сейчас";
+      nowBtn.title = "Запустить агента прямо сейчас, не дожидаясь срока (срок и повтор не меняются)";
+      nowBtn.onclick = (e) => { e.stopPropagation(); startAutoRunNow(t); };
+      meta.appendChild(nowBtn);
+    }
+    if (t.auto && t.autoGaveUp) {
+      const failTag = document.createElement("span");
+      failTag.className = "task-tag tk-fail";
+      failTag.textContent = "⚠ не запустилась";
+      failTag.title = t.autoLastError ? "Последняя ошибка: " + t.autoLastError : "Прогон не подтвердился";
+      meta.appendChild(failTag);
     }
     if (t.project) {
       const tag = document.createElement("span");
@@ -2906,13 +3027,35 @@
     }
     updateTasksBadge(s);
   }
+  // «▶ агент» в строке добавления: новое дело можно сразу отдать агенту. Состояние
+  // живёт до следующего клика — как приоритет рядом.
+  let taskNewAuto = false;
+  function paintNewTaskAuto() {
+    const b = $("task-new-auto");
+    if (!b) return;
+    b.classList.toggle("active", taskNewAuto);
+    b.textContent = taskNewAuto ? "▶ агент" : "▷ агент";
+    b.title = taskNewAuto
+      ? "Новое дело получит «▶ агент»: приложение разбудит агента по сроку. Клик — выключить."
+      : "Клик — пометить новое дело «▶ агент»: агент выполнит его сам по сроку.";
+  }
+  function toggleNewTaskAuto() {
+    taskNewAuto = !taskNewAuto;
+    paintNewTaskAuto();
+  }
+
   async function addTaskFromPanel() {
     if (!tasksSupported()) { toast("Дела: список доступен в приложении на ПК"); return; }
     const titleEl = $("task-new-title");
     const dueEl = $("task-new-due");
     const title = (titleEl.value || "").trim();
     if (!title) { titleEl.focus(); toast("Дела: напиши, что нужно сделать"); return; }
-    const r = await api.tasksAdd({ title: title, due: (dueEl.value || "").trim(), priority: $("task-new-priority").value });
+    const r = await api.tasksAdd({
+      title: title,
+      due: (dueEl.value || "").trim(),
+      priority: $("task-new-priority").value,
+      auto: taskNewAuto, // «▶ агент» из строки добавления
+    });
     if (r && r.ok === false) { toast("Дела: " + r.error); return; }
     titleEl.value = "";
     dueEl.value = "";
@@ -2947,6 +3090,8 @@
   function initRolesAndTasks() {
     if ($("btn-role")) $("btn-role").onclick = () => toggleRolePopover();
     paintQuickDue();
+    paintNewTaskAuto();
+    if ($("task-new-auto")) $("task-new-auto").onclick = () => toggleNewTaskAuto();
     if ($("rail-tasks")) $("rail-tasks").onclick = () => {
       if (sidePanelVisible() && sideTab === "tasks") closeSidePanel();
       else openSidePanel("tasks");
@@ -4830,6 +4975,32 @@
     }
   }
 
+  // ── Мобильный доступ: QR-код «наведи камеру телефона» ──
+  // В коде — адрес моста и PIN: телефон подключается одним наведением камеры,
+  // без ручного ввода адреса и шести цифр. Код остаётся светлым даже в тёмной
+  // теме (QR.toSvg рисует белое поле): на тёмном фоне камера его не видит.
+  function renderMobileQr(st) {
+    const block = $("mobile-qr-block");
+    const host = $("mobile-qr");
+    if (!block || !host) return;
+    const urls = (st && st.urls) || [];
+    const pin = String((st && st.pin) || "");
+    if (!(st && st.enabled && st.running) || !urls.length || !pin || !window.QR) {
+      block.classList.add("hidden");
+      host.innerHTML = "";
+      return;
+    }
+    try {
+      host.innerHTML = window.QR.toSvg(urls[0].url + "/#pin=" + pin, { ecc: "M" });
+      block.classList.remove("hidden");
+    } catch (e) {
+      // Лучше показать адреса и PIN текстом, чем пустое место с чужой ошибкой.
+      block.classList.add("hidden");
+      host.innerHTML = "";
+      console.warn("QR-код не построен:", (e && e.message) || e);
+    }
+  }
+
   // ── Мобильный доступ: статус моста, PIN, адреса для телефона ──
   async function renderMobileStatus() {
     const box = $("mobile-fields");
@@ -4843,6 +5014,7 @@
       const st = await api.mobileStatus();
       if (!st) return;
       if ($("s-mobile-pin")) $("s-mobile-pin").value = st.pin || "";
+      renderMobileQr(st);
       urls.innerHTML = "";
       const list = (st.urls && st.urls.length) ? st.urls : [{ url: st.url || "—" }];
       for (const u of list) {

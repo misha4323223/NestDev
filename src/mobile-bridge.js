@@ -50,6 +50,17 @@ const STATIC_FILES = new Set([
   "highlight.js",
   "mobile-api.js",
   "bootstrap.js",
+  // Эти два файла телефон получает так же, как ПК. Без них на телефоне молча
+  // пропадало нужное: qr.js — построение кода подключения, field-guard.js —
+  // возврат фокуса в поле, когда клик по нему съел чужой слой.
+  "qr.js",
+  "field-guard.js",
+  // Панели Yandex Cloud и деплоя: они подключены в разметке, но телефон за ними
+  // получал 404 — на телефоне эти разделы просто не работали.
+  "yc-console.js",
+  "yc-console.css",
+  "deploy-panel.js",
+  "deploy-panel.css",
 ]);
 
 const MIME = {

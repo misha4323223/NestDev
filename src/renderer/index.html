@@ -110,23 +110,23 @@
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18" /></svg>
           </button>
           <button id="model-badge" class="badge" title="Провайдер и модель — нажми, чтобы изменить">—</button>
-          <button id="btn-toggle-console" class="btn btn-ghost icon-btn" title="Консоль — логи сервера и команды (как в Replit)">
+          <button id="btn-toggle-console" class="btn btn-ghost icon-btn hdr-dupe" title="Консоль — логи сервера и команды (как в Replit)">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6" /><path d="M12 19h8" /></svg>
           </button>
-          <button id="btn-toggle-preview" class="btn btn-ghost icon-btn" title="Превью — открыть сайт проекта, мобильный вид, новая вкладка">
+          <button id="btn-toggle-preview" class="btn btn-ghost icon-btn hdr-dupe" title="Превью — открыть сайт проекта, мобильный вид, новая вкладка">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" /><circle cx="12" cy="12" r="3" /></svg>
           </button>
-          <button id="btn-toggle-cloud" class="btn btn-ghost icon-btn" title="Yandex Cloud — ресурсы каталога, деплой">
+          <button id="btn-toggle-cloud" class="btn btn-ghost icon-btn hdr-dupe" title="Yandex Cloud — ресурсы каталога, деплой">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19a4.5 4.5 0 0 0 .5-8.97A6 6 0 0 0 6.34 8.5 4.5 4.5 0 0 0 7 17.5h10.5z" /></svg>
             <span class="hd-dot" id="btn-toggle-cloud-dot"></span>
           </button>
-          <button id="btn-toggle-deploy" class="btn btn-ghost icon-btn" title="Деплой — состояние, история, откат">
+          <button id="btn-toggle-deploy" class="btn btn-ghost icon-btn hdr-dupe" title="Деплой — состояние, история, откат">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3c3.5 2.5 5.5 6 5.5 9.5L12 21l-5.5-8.5C6.5 9 8.5 5.5 12 3z" /><circle cx="12" cy="10" r="2" /></svg>
           </button>
           <button id="btn-copy-chat" class="btn btn-ghost icon-btn" title="Скопировать весь чат в буфер обмена (markdown)">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
           </button>
-          <button id="btn-toggle-panel" class="btn btn-ghost icon-btn" title="Панель проекта: файлы, коммиты, откат изменений">
+          <button id="btn-toggle-panel" class="btn btn-ghost icon-btn hdr-dupe" title="Панель проекта: файлы, коммиты, откат изменений">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg>
           </button>
         </div>
@@ -210,12 +210,12 @@
           <textarea id="input" rows="1" placeholder="Напиши, что сделать..."></textarea>
           <div id="ctx-indicator" class="ctx-indicator" title="Заполняемость контекста модели"><span id="ctx-text"></span><div id="ctx-bar" class="ctx-bar"><div id="ctx-fill" class="ctx-fill"></div></div></div>
           <div class="composer-row">
-            <span class="input-hint">Enter — отправить · Shift+Enter — новая строка · Ctrl+V — вставить картинку · перетащи файл</span>
+            <span class="input-hint">Enter — отправить · Shift+Enter — новая строка</span>
             <div class="composer-btns">
               <input type="file" id="file-input" class="hidden" multiple accept="image/*,.txt,.js,.ts,.py,.json,.md,.html,.css,.csv,.log,.yaml,.yml,.xml,.sql,.sh,.dart,.go,.rs,.java,.cpp,.c,.rb,.php" />
               <button id="btn-attach-file" class="btn btn-ghost btn-small" title="Прикрепить файл или изображение">📎</button>
               <button id="btn-role" class="btn btn-ghost btn-small role-btn" title="Роль чата: как агент себя ведёт">🛠 Разработчик</button>
-              <button id="btn-plan" class="btn btn-ghost btn-small plan-toggle" title="Режим плана: сначала агент составит план и спросит разрешение, потом выполнит">📋 План-режим</button>
+              <button id="btn-plan" class="btn btn-ghost btn-small plan-toggle" title="Режим плана: сначала агент составит план и спросит разрешение, потом выполнит">📋 План</button>
               <button id="btn-stop" class="btn btn-danger icon-btn hidden" title="Остановить">
                 <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2.5" /></svg>
               </button>
@@ -260,6 +260,7 @@
             <span>Деплой</span>
           </button>
         </div>
+        <div id="sp-title" class="sp-title">Превью</div>
         <button id="btn-sp-close" class="btn btn-ghost icon-btn" title="Скрыть панель">✕</button>
       </div>
       <div id="sp-console" class="sp-body hidden">
@@ -343,6 +344,7 @@
           </div>
           <div class="tk-composer-line">
             <input id="task-new-due" class="tasks-due-input tk-new-due" placeholder="срок — завтра 14:00" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" title="Срок по-человечески: завтра 14:00, сегодня вечером, в пятницу, через 2 недели, 15.09" />
+            <button id="task-new-auto" class="tk-auto-toggle" type="button" title="Клик — пометить новое дело «▶ агент»: приложение разбудит агента по сроку.">▷ агент</button>
             <select id="task-new-priority" class="tasks-prio" title="Приоритет дела">
               <option value="normal">обычный</option>
               <option value="high">важное</option>
@@ -357,7 +359,7 @@
           <button id="btn-tasks-done-toggle" class="tk-done-toggle" title="Показать выполненные дела"><span class="tk-done-arrow">▸</span><span class="tk-done-label">Выполненные</span></button>
           <div id="tasks-done-list" class="tasks-groups hidden"></div>
         </div>
-        <div class="tasks-hint">Срок понимается по-человечески: <b>завтра 14:00</b>, <b>сегодня вечером</b>, <b>в пятницу</b>, <b>через 2 недели</b>. Дела живут в приложении (не в проекте) и переживают перезапуск.</div>
+        <div class="tasks-hint">Срок понимается по-человечески: <b>завтра 14:00</b>, <b>сегодня вечером</b>, <b>в пятницу</b>, <b>через 2 недели</b>. Дела живут в приложении (не в проекте) и переживают перезапуск. Кнопка <b>▷ агент</b> отдаёт дело агенту: в срок он запустится сам, ответ придёт в чат <b>«Автозадачи»</b>; <b>▶ сейчас</b> — проверить запуск немедленно.</div>
       </div>
       <div id="sp-deploy" class="sp-body hidden">
         <div class="dp-top">
@@ -938,7 +940,7 @@
             </div>
             <div class="field">
               <label class="check-row"><input id="s-task-auto" type="checkbox" /> <span>Автозадачи выполняет агент</span></label>
-              <div class="hint-block">Дело с отметкой «▶ агент» приложение запускает само по сроку: агент молча работает и кладёт ответ в чат «Автозадачи». Повторы — «каждый день», «по будням», «каждую пятницу», «каждый месяц», «каждые 2 часа». Без этой галочки дела только напоминают. Автозапуск работает, пока приложение открыто.</div>
+              <div class="hint-block">Отметка ставится в панели «Дела»: кнопка «▷ агент» в строке дела (или в строке добавления). Дело с отметкой «▶ агент» приложение запускает само по сроку: агент молча работает и кладёт ответ в чат «Автозадачи». Повторы — «каждый день», «по будням», «каждую пятницу», «каждый месяц», «каждые 2 часа». Без этой галочки дела только напоминают. Автозапуск работает, пока приложение открыто.</div>
             </div>
           </div>
           <div class="settings-section">
@@ -1074,6 +1076,15 @@
               <div class="input-row">
                 <input id="s-mobile-pin" readonly class="mobile-pin-input" spellcheck="false" autocomplete="off" />
                 <button id="btn-mobile-pin-regen" class="btn btn-ghost btn-small" title="Сгенерировать новый PIN">↻ Новый PIN</button>
+              </div>
+              <label>Подключение одним наведением камеры</label>
+              <div id="mobile-qr-block" class="mobile-qr-block hidden">
+                <div id="mobile-qr" class="mobile-qr"></div>
+                <div class="mobile-qr-side">
+                  <b>Наведи камеру телефона</b>
+                  <small>Откроется это же приложение на телефоне, PIN подставится сам — вводить его не надо.</small>
+                  <small>Телефон должен быть в той же Wi-Fi сети. Наводи камеру на белый квадрат целиком.</small>
+                </div>
               </div>
               <label>Адреса для телефона <span class="hint">(телефон должен быть в той же Wi-Fi сети)</span></label>
               <div id="mobile-urls" class="mobile-urls"></div>
@@ -1339,6 +1350,8 @@
   <script src="yc-console.js"></script>
   <script src="deploy-panel.js"></script>
   <script src="highlight.js"></script>
+  <script src="qr.js"></script>
+  <script src="field-guard.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

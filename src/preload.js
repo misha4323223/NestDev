@@ -74,6 +74,10 @@ contextBridge.exposeInMainWorld("api", {
   tasksUpdate: (key, patch) => ipcRenderer.invoke("tasks:update", key, patch || {}),
   tasksDone: (key, done) => ipcRenderer.invoke("tasks:done", key, done !== false),
   tasksDelete: (key) => ipcRenderer.invoke("tasks:delete", key),
+  // Планировщик ↔ окно: подтверждение, что автозадача действительно пошла в прогон.
+  // Без него приложение считало запуск состоявшимся и к делу больше не подходило.
+  tasksAutoAck: (key, ok, error) => ipcRenderer.invoke("tasks:auto-ack", key, ok !== false, error || ""),
+  tasksAutoRearm: (key) => ipcRenderer.invoke("tasks:auto-rearm", key),
   onTasksChanged: (cb) => {
     ipcRenderer.on("tasks:changed", (_e, payload) => cb(payload || {}));
   },
