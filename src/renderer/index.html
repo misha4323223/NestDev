@@ -713,6 +713,7 @@
                 <label>Скорость модели</label>
                 <button id="btn-probe-ollama" class="btn btn-ghost" title="Замерить локальную модель: связь, загрузку, чтение промпта, генерацию и память (считает видеокарта или процессор)">📈 Замерить скорость</button>
                 <pre id="ollama-probe-result" class="probe-result hidden"></pre>
+                <div class="hint-block">Замер покажет связь с сервером, загрузку модели, скорость чтения промпта и генерации, память (видеокарта или процессор) и сколько контекста поместится.</div>
               </div>
             </div>
           </div>
@@ -1339,6 +1340,7 @@
       <div class="settings-footer">
         <div id="settings-msg" class="settings-msg"></div>
         <div class="settings-footer-btns">
+          <button id="btn-probe-model" class="btn btn-ghost hidden" title="Замерить локальную модель: связь, загрузку, чтение промпта, генерацию и память (считает видеокарта или процессор)">📈 Замерить скорость</button>
           <button id="btn-test" class="btn btn-ghost">🔌 Проверить подключение</button>
           <button id="btn-save-settings" class="btn btn-primary">💾 Сохранить настройки</button>
         </div>
@@ -1350,15 +1352,23 @@
   <script src="context-window.js"></script>
   <script src="web-tools.js"></script>
   <script src="image-tools.js"></script>
+  <script src="prompts.js"></script>
+  <script src="tool-schemas.js"></script>
   <script src="agent-core.js"></script>
   <script src="markdown.js"></script>
   <script src="bootstrap.js"></script>
   <script src="mobile-api.js"></script>
   <script src="yc-console.js"></script>
+  <script src="yc-panel.js"></script>
   <script src="deploy-panel.js"></script>
+  <script src="dev-run.js"></script>
   <script src="highlight.js"></script>
   <script src="qr.js"></script>
   <script src="field-guard.js"></script>
+  <script src="chat-actions.js"></script>
+  <script src="web-chat.js"></script>
+  <script src="tasks-mission.js"></script>
+  <script src="secrets-panel.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

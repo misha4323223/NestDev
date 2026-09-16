@@ -94,6 +94,671 @@ function backendSrc() {
     .join("\n");
 }
 
+
+// Ядро агента ВМЕСТЕ с его данными. Текст правил (prompts.js) и таблица схем
+// инструментов (tool-schemas.js) вынесены из agent-core.js в свои модули (разрез
+// ядра, этап 1). Проверки вида «в промпте сказано X» и «в описании инструмента есть
+// Y» обязаны видеть данные, где бы они ни лежали — иначе падают на переехавшем
+// тексте, хотя поведение не менялось. Кто проверяет, что в САМОМ ядре чего-то
+// больше нет (тест «разрез ядра»), читает agent-core.js напрямую.
+function coreData() {
+  return ["agent-core.js", "prompts.js", "tool-schemas.js"]
+    .map((f) => fs.readFileSync(path.join(ROOT, "src", "renderer", f), "utf8"))
+    .join("\n");
+}
+
+// ── Быстрый запуск превью (src/renderer/dev-run.js) ─────────────────────────
+// Модуль вынесен из app.js, поэтому проверяем его поведение: состояние запуска,
+// команды в главный процесс, лог превью, вывод сервера в консоль и Tab-дополнение.
+// Заглушка DOM строгая: id, которого нет в настоящей разметке, — ошибка теста.
+async function testDevRun() {
+  await test("быстрый запуск превью: модуль ведёт состояние и шлёт команды", async () => {
+    const vm = require("vm");
+    const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "dev-run.js"), "utf8");
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const known = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
+    const els = new Map();
+    const el = () => {
+      const set = new Set();
+      return {
+        value: "", textContent: "", innerHTML: "", title: "", scrollTop: 0, scrollHeight: 40,
+        classList: {
+          add: (...c) => c.forEach((x) => set.add(x)),
+          remove: (...c) => c.forEach((x) => set.delete(x)),
+          contains: (c) => set.has(c),
+          toggle: (c, on) => (on ? set.add(c) : set.delete(c)),
+        },
+        querySelector: () => null,
+      };
+    };
+    const $ = (id) => {
+      assert.ok(known.has(id), "модуль ищет элемент, которого нет в разметке: " + id);
+      if (!els.has(id)) els.set(id, el());
+      return els.get(id);
+    };
+    const calls = { started: [], stopped: 0, toasts: [], opened: [], term: [], statusBar: 0 };
+    // Главный процесс держим «живым»: devStatus отвечает по текущему состоянию,
+    // иначе проверка после остановки видела бы старый «запущен» и панель была бы ни при чём.
+    let running = true;
+    const api = {
+      devStatus: async () => ({ ok: true, running: running, command: "npm run dev", detected: "vite" }),
+      devStart: async (dir, cmd) => { calls.started.push([dir, cmd]); running = true; return { ok: true, command: cmd || "npm run dev" }; },
+      devStop: async () => { calls.stopped++; running = false; return { ok: true }; },
+      termComplete: async () => ({ base: "npm ", matches: ["run"] }),
+    };
+    const sandbox = { module: { exports: {} }, window: {}, self: {}, console: { log() {}, warn() {}, error() {} } };
+    vm.runInNewContext(src, sandbox, { filename: "dev-run.js" });
+    assert.strictEqual(typeof sandbox.module.exports, "function", "модуль не отдал фабрику");
+    const run = sandbox.module.exports({
+      $, api, isElectron: true,
+      esc: (s) => String(s == null ? "" : s),
+      previewOpen: (u) => calls.opened.push(u),
+      projectDir: () => "/tmp/proj",
+      termAppend: (h) => calls.term.push(h),
+      toast: (t) => calls.toasts.push(t),
+      updateStatusBar: () => calls.statusBar++,
+      getSettings: () => ({ previewUrl: "http://localhost:5173" }),
+    });
+    assert.deepStrictEqual(Object.keys(run).sort(), ["devStartClick", "devStopClick", "onDevEvent", "previewRunning", "refreshDevControls", "termServerAppend", "termTabComplete"], "наружу торчит лишнее или чего-то не хватает");
+    assert.strictEqual(run.previewRunning, false, "до запуска состояние «не запущен»");
+
+    // 1. Проверка состояния: команда и «запущен» приходят из главного процесса.
+    await run.refreshDevControls();
+    assert.strictEqual(els.get("preview-cmd").value, "npm run dev", "команда проекта не подставилась в поле");
+    assert.strictEqual(run.previewRunning, true, "главный процесс сообщил «запущен», а панель это не учла");
+    assert.ok(calls.statusBar > 0, "строка состояния не обновляется");
+
+    // 2. Остановка: команда уходит в главный процесс, состояние сбрасывается.
+    await run.devStopClick();
+    assert.strictEqual(calls.stopped, 1, "остановка не дошла до главного процесса");
+    assert.strictEqual(run.previewRunning, false, "после остановки состояние не сброшено");
+
+    // 3. Запуск: команда из поля и каталог активного проекта.
+    await run.devStartClick();
+    assert.deepStrictEqual(calls.started, [["/tmp/proj", "npm run dev"]], "старт ушёл без каталога проекта или команды");
+    assert.strictEqual(run.previewRunning, true, "после старта состояние «запущен» (свойство живое, а не копия)");
+    assert.ok(calls.toasts.some((t) => /Проект запущен/.test(t)), "нет сообщения о запуске");
+    assert.deepStrictEqual(calls.opened, ["http://localhost:5173"], "превью открылось не на настроенном адресе");
+    assert.ok(els.get("preview-log").innerHTML.includes("pl-cmd"), "в лог превью ничего не попало");
+    assert.ok(els.get("btn-preview-stop").classList.contains("hidden") === false, "кнопка «стоп» осталась скрытой");
+
+    run.onDevEvent({ type: "out", text: "готово" });
+    assert.ok(els.get("preview-log").innerHTML.includes("готово"), "вывод сервера не попал в лог превью");
+    assert.ok(calls.term.join("").includes("готово"), "вывод сервера не продублирован в консоль");
+    run.onDevEvent({ type: "exit", code: 1 });
+    assert.strictEqual(run.previewRunning, false, "аварийный выход сервера не сбросил состояние");
+
+    // 4. Tab-дополнение команды в консоли (поле берём через тот же $, что и модуль).
+    $("term-input").value = "npm r";
+    await run.termTabComplete();
+    assert.strictEqual($("term-input").value, "npm run", "Tab не дополнил команду");
+  });
+}
+
+// ── Удобство чата (src/renderer/chat-actions.js) ─────────────────────────
+// Модуль вынесен из app.js: проверяется ПОВЕДЕНИЕ кнопок под сообщением —
+// скопировать, перегенерировать, вернуть своё сообщение в поле ввода, — а не
+// то, что функции где-то есть. Заглушка DOM строгая: id не из разметки — падение.
+async function testChatActions() {
+  await test("удобство чата: копирование, перегенерация и правка сообщения работают", () => {
+    const vm = require("vm");
+    const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "chat-actions.js"), "utf8");
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const known = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
+    const els = new Map();
+    const el = () => ({
+      value: "", textContent: "", title: "", style: {},
+      classList: { add() {}, remove() {}, contains: () => false, toggle() {} },
+      focus() {}, select() {}, appendChild() {}, removeChild() {},
+    });
+    const $ = (id) => {
+      assert.ok(known.has(id), "модуль ищет элемент, которого нет в разметке: " + id);
+      if (!els.has(id)) els.set(id, el());
+      return els.get(id);
+    };
+    const calls = { toasts: [], saved: 0, rendered: 0, sent: 0, resized: 0, clipboard: [], copied: 0 };
+    const chat = {
+      id: "c1",
+      title: "Разбор заявок",
+      messages: [
+        { role: "user", content: "первый вопрос" },
+        { role: "assistant", content: "первый ответ" },
+        { role: "user", content: "второй вопрос" },
+        { role: "assistant", content: "ответ с кодом" },
+        { role: "tool", toolName: "readFile", toolResult: "содержимое" },
+      ],
+    };
+    let streaming = false;
+    // Собираем модуль так же, как его собирает окно: фабрика + зависимости.
+    const build = (over) => {
+      const sandbox = {
+        module: { exports: {} },
+        window: {},
+        self: {},
+        console: { log() {}, warn() {}, error() {} },
+        document: {
+          createElement: () => el(),
+          body: { appendChild() {}, removeChild() {} },
+          execCommand: (cmd) => (cmd === "copy" ? (calls.copied++, true) : false),
+        },
+        navigator: { clipboard: { writeText: (x) => (calls.clipboard.push(x), Promise.resolve()) } },
+      };
+      vm.runInNewContext(src, sandbox, { filename: "chat-actions.js" });
+      assert.strictEqual(typeof sandbox.module.exports, "function", "модуль не отдал фабрику");
+      return sandbox.module.exports(
+        Object.assign(
+          {
+            $,
+            toast: (x) => calls.toasts.push(x),
+            getActiveChat: () => chat,
+            persistChats: () => calls.saved++,
+            renderMessages: () => calls.rendered++,
+            sendMessage: () => calls.sent++,
+            autoResize: () => calls.resized++,
+            msgText: (c) => String(c == null ? "" : c),
+            chatTitle: () => chat.title,
+            isStreaming: () => streaming,
+          },
+          over || {}
+        )
+      );
+    };
+    // Проводка в app.js: генерация передана ЖИВОЙ проверкой. Копия ("isStreaming: false",
+    // снимок в переменную) пропустила бы перегенерацию поверх идущего ответа.
+    const wiring = uiFind("  const ChatActions = window.ChatActions({", "  // ─────────────── Быстрое переключение модели").code;
+    assert.ok(/isStreaming: \(\) => streaming/.test(wiring), "идущая генерация передана в модуль копией, а не живой проверкой");
+    const A = build();
+    assert.deepStrictEqual(Object.keys(A).sort(), ["copyChat", "copyText", "editUserMessage", "isLastAssistant", "regenerate"], "наружу торчит лишнее или чего-то не хватает");
+
+    // 1. «Перегенерировать» показывается только у последнего ответа агента.
+    assert.strictEqual(A.isLastAssistant(chat.messages[1]), false, "кнопка перегенерации показана у старого ответа");
+    assert.strictEqual(A.isLastAssistant(chat.messages[3]), true, "у последнего ответа нет кнопки перегенерации");
+    assert.strictEqual(A.isLastAssistant(chat.messages[2]), false, "своё сообщение сочли ответом агента");
+
+    // 2. Перегенерация снимает ОТВЕТЫ запуска (вопрос остаётся — он и уходит заново),
+    //    возвращает вопрос в поле ввода и отправляет заново.
+    streaming = true;
+    A.regenerate(chat.messages[3]);
+    assert.strictEqual(chat.messages.length, 5, "во время генерации перегенерация всё равно сработала");
+    assert.strictEqual(calls.sent, 0, "во время генерации ушла повторная отправка");
+    streaming = false;
+    A.regenerate(chat.messages[3]);
+    assert.deepStrictEqual(chat.messages.map((m) => m.content), ["первый вопрос", "первый ответ", "второй вопрос"], "снят не весь запуск: " + JSON.stringify(chat.messages));
+    assert.strictEqual($("input").value, "второй вопрос", "вопрос не вернулся в поле ввода");
+    assert.strictEqual(calls.sent, 1, "повторная отправка не ушла");
+    assert.ok(calls.saved > 0 && calls.rendered > 0 && calls.resized > 0, "переписка не сохранена или не перерисована");
+
+    // 3. Правка своего сообщения: текст в поле ввода, само сообщение и всё после удалены.
+    chat.messages = [{ role: "user", content: "старый вопрос" }, { role: "assistant", content: "ответ" }];
+    A.editUserMessage(chat.messages[0]);
+    assert.strictEqual($("input").value, "старый вопрос", "текст не попал в поле ввода");
+    assert.strictEqual(chat.messages.length, 0, "правка не убрала сообщение и всё после него");
+
+    // 4. Копирование всего чата: заголовок, роли, блок инструмента.
+    chat.messages = [
+      { role: "user", content: "вопрос" },
+      { role: "assistant", content: "ответ" },
+      { role: "tool", toolName: "readFile", toolResult: "содержимое" },
+    ];
+    A.copyChat();
+    assert.strictEqual(calls.clipboard.length, 1, "чат не попал в буфер обмена");
+    const md = calls.clipboard[0] || "";
+    assert.ok(/# Разбор заявок/.test(md), "нет заголовка чата: " + md.slice(0, 60));
+    assert.ok(/\*\*Пользователь:\*\*/.test(md) && /\*\*Ассистент:\*\*/.test(md), "роли в markdown потеряны");
+    assert.ok(/Инструмент:\*\* readFile/.test(md) && /```/.test(md), "блок инструмента потерян");
+
+    // 5. Пустой чат — честное сообщение, а не пустая выгрузка.
+    chat.messages = [];
+    const before = calls.clipboard.length;
+    A.copyChat();
+    assert.strictEqual(calls.clipboard.length, before, "пустой чат всё равно ушёл в буфер");
+    assert.ok(calls.toasts.some((x) => /пуст/i.test(x)), "о пустом чате не сказано: " + calls.toasts.join(" | "));
+
+    // 6. Копирование строки: современный путь (clipboard) и запасной (execCommand).
+    A.copyText("строка");
+    assert.strictEqual(calls.clipboard[calls.clipboard.length - 1], "строка", "строка не скопирована");
+    const old = build({});
+    void old;
+    const sandbox2 = {
+      module: { exports: {} },
+      window: {},
+      self: {},
+      console: { log() {}, warn() {}, error() {} },
+      navigator: {}, // старый браузер без clipboard API
+      document: {
+        createElement: () => el(),
+        body: { appendChild() {}, removeChild() {} },
+        execCommand: (cmd) => (cmd === "copy" ? (calls.copied++, true) : false),
+      },
+    };
+    vm.runInNewContext(src, sandbox2, { filename: "chat-actions.js" });
+    const A2 = sandbox2.module.exports({
+      $, toast: (x) => calls.toasts.push(x), getActiveChat: () => chat, persistChats: () => calls.saved++,
+      renderMessages: () => calls.rendered++, sendMessage: () => calls.sent++, autoResize: () => calls.resized++,
+      msgText: (c) => String(c == null ? "" : c), chatTitle: () => chat.title, isStreaming: () => false,
+    });
+    A2.copyText("через execCommand");
+    assert.ok(calls.copied > 0, "запасной путь копирования (execCommand) не сработал");
+
+    // 7. Негативный контроль: забытая зависимость падает громко, а не молча.
+    const broken = build({ chatTitle: undefined });
+    chat.messages = [{ role: "user", content: "x" }];
+    assert.throws(() => broken.copyChat(), /chatTitle/, "забытая зависимость не привела к понятной ошибке");
+  });
+}
+
+// ── Веб-режим (src/renderer/web-chat.js) ─────────────────────────────────
+// Цикл чата в браузере: проверяем ПОВЕДЕНИЕ на живом ядре AgentCore и подменённой
+// сети — раунды, авто-переключение ключа при ошибке баланса, отказы для того,
+// что в браузере невозможно. Сеть отвечает настоящими Response.
+async function testWebChat() {
+  await test("веб-режим: раунды, авто-переключение ключа и честные отказы", async () => {
+    const vm = require("vm");
+    const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "web-chat.js"), "utf8");
+    const AgentCore2 = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
+    // В песочнице нет браузерных глобальных имён: fetch и таймеры подкладываем сами,
+    // иначе модуль честно скажет «Сетевая ошибка: fetch is not defined».
+    const sandbox = {
+      module: { exports: {} }, window: {}, self: {},
+      console: { log() {}, warn() {}, error() {} },
+      fetch: (...a) => global.fetch(...a), setTimeout, clearTimeout,
+    };
+    vm.runInNewContext(src, sandbox, { filename: "web-chat.js" });
+    assert.strictEqual(typeof sandbox.module.exports, "function", "модуль не отдал фабрику");
+    const settings = {
+      provider: "openai", model: "m1", openaiUrl: "https://a/v1", openaiApiKey: "ключ-1",
+      autoSwitchProfiles: true, openaiActiveProfile: "p1", workingDir: "",
+    };
+    const events = [];
+    let saved = 0;
+    const web = sandbox.module.exports({
+      AgentCore: AgentCore2,
+      getSettings: () => settings,
+      openaiProfilesArr: () => [
+        { id: "p1", name: "Первый", apiKey: "ключ-1", url: "https://a/v1", model: "m1" },
+        { id: "p2", name: "Второй", apiKey: "ключ-2", url: "https://b/v1", model: "m2" },
+      ],
+      persistSettings: () => saved++,
+      onEvent: (ev) => events.push(ev),
+      openAskModal: (q, cb) => cb("ответ агента"),
+    });
+    assert.deepStrictEqual(Object.keys(web), ["webSend"], "наружу торчит лишнее или чего-то не хватает");
+
+    // Проводка в app.js: именно этих зависимостей не хватало раньше, и авто-переключение
+    // профилей падало с ReferenceError ровно тогда, когда ключ кончился.
+    const wiring = uiFind("  const WebChat = window.WebChat({", "  // ─────────────── Настройки ───────────────").code;
+    assert.ok(/onEvent: onAiEvent/.test(wiring), "в модуль не передан обработчик событий: авто-переключение профилей снова упадёт");
+    assert.ok(/getSettings: \(\) => settings/.test(wiring), "настройки переданы копией — смена профиля не дойдёт до модуля");
+    assert.ok(/openaiProfilesArr: openaiProfilesArr/.test(wiring), "модуль не видит сохранённые подключения");
+
+    const sse = (parts) => new Response(parts.map((p) => "data: " + JSON.stringify(p) + "\n\n").join(""), { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    const realFetch = global.fetch;
+    const calls = [];
+    let script = null; // что отвечает подменённая сеть на каждый вызов
+    global.fetch = async (url, init) => {
+      calls.push({ url: String(url), headers: (init && init.headers) || {}, body: String((init && init.body) || "") });
+      return script(calls.length);
+    };
+    try {
+      // 1. Первый ключ отвечает «кончились средства» (402), второй отдаёт ответ потоком.
+      script = (n) =>
+        n === 1
+          ? new Response(JSON.stringify({ error: { message: "Insufficient Balance" } }), { status: 402, headers: { "Content-Type": "application/json" } })
+          : sse([{ choices: [{ delta: { content: "готово" } }] }, { choices: [{ delta: {}, finish_reason: "stop" }] }]);
+      await web.webSend([{ role: "user", content: "привет" }], (ev) => events.push(ev), undefined, {});
+      assert.strictEqual(calls.length, 2, "раунд не повторился после 402: вызовов " + calls.length);
+      assert.strictEqual(settings.openaiActiveProfile, "p2", "ключ не переключился на запасной");
+      assert.ok(saved > 0, "смена подключения не сохранена");
+      const switched = events.filter((e) => e.type === "profile_switched");
+      assert.strictEqual(switched.length, 1, "о переключении не сообщено (это и был ReferenceError onEvent)");
+      assert.strictEqual(switched[0].id, "p2", "сообщено не то подключение: " + JSON.stringify(switched[0]));
+      assert.ok(/ключ-2/.test(JSON.stringify(calls[1].headers)), "повторный запрос ушёл со старым ключом: " + JSON.stringify(calls[1].headers));
+      const text = events.filter((e) => e.type === "chunk").map((e) => e.text).join("");
+      assert.ok(/готово/.test(text), "ответ не дошёл до интерфейса: " + JSON.stringify(text));
+      assert.ok(events.some((e) => e.type === "done"), "прогон не завершился событием done");
+
+      // 2. Инструмент, которому нужен главный процесс: честный отказ, не выдумка.
+      events.length = 0;
+      calls.length = 0;
+      script = (n) =>
+        n === 1
+          ? sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "c1", function: { name: "readFile", arguments: '{"path":"a.txt"}' } }] } }] }])
+          : sse([{ choices: [{ delta: { content: "ок" } }] }]);
+      await web.webSend([{ role: "user", content: "прочитай файл" }], (ev) => events.push(ev), undefined, {});
+      const tr = events.filter((e) => e.type === "tool_result");
+      assert.strictEqual(tr.length, 1, "результат инструмента не вернулся: " + JSON.stringify(events.map((e) => e.type)));
+      assert.ok(/Файловые операции и git недоступны в веб-версии/.test(tr[0].result), "файлы в браузере не отказали честно: " + tr[0].result);
+      assert.ok(tr[0].result.indexOf("readFile") < 0 || /недоступн/i.test(tr[0].result), "отказ не объясняет причину");
+
+      // 3. Модель не выбрана — понятный отказ без единого запроса в сеть.
+      events.length = 0;
+      const before = calls.length;
+      settings.model = "";
+      await web.webSend([{ role: "user", content: "привет" }], (ev) => events.push(ev), undefined, {});
+      assert.strictEqual(calls.length, before, "запрос ушёл без выбранной модели");
+      assert.ok(events.some((e) => e.type === "error" && /модель/i.test(e.message)), "нет понятного отказа: " + JSON.stringify(events));
+    } finally {
+      global.fetch = realFetch;
+    }
+  });
+}
+
+// ── Роли, дела и миссия (src/renderer/tasks-mission.js) ────────────────────
+// Модуль вынесен из app.js: проверяется ПОВЕДЕНИЕ панелей на заглушках настоящей
+// разметки и живом обработчике событий — список дел, фильтры, добавление, роли и
+// карточка миссии (включая паузу, зависящую от идущей генерации).
+async function testTasksMission() {
+  await test("роли, дела и миссия: панели рисуются, фильтры и кнопки работают", async () => {
+    const vm = require("vm");
+    const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "tasks-mission.js"), "utf8");
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const known = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
+    const els = new Map();
+    // Заглушка ведёт className и classList ОДНОЙ коллекцией: в браузере это одно и то же,
+    // а модуль местами ставит класс строкой, местами через classList.
+    const el = () => {
+      let set = new Set();
+      let html = "";
+      return {
+        children: [], value: "", textContent: "", title: "", type: "",
+        style: {}, dataset: {}, disabled: false, checked: false, onclick: null, onchange: null,
+        onkeydown: null, onblur: null,
+        // В браузере запись innerHTML заменяет содержимое: пустая строка убирает узлы.
+        // Панель чистит список именно так — заглушка обязана это повторять, иначе
+        // строки дел копятся и проверка «фильтр сузил список» ничего не видит.
+        get innerHTML() { return html; },
+        set innerHTML(v) { html = String(v == null ? "" : v); if (!html) this.children.length = 0; },
+        get className() { return [...set].join(" "); },
+        set className(v) { set = new Set(String(v || "").split(/\s+/).filter(Boolean)); },
+        get childElementCount() { return this.children.length; },
+        classList: {
+          add: (...c) => c.forEach((x) => set.add(x)),
+          remove: (...c) => c.forEach((x) => set.delete(x)),
+          contains: (c) => set.has(c),
+          toggle: (c, on) => (on === undefined ? (set.has(c) ? set.delete(c) : set.add(c)) : on ? set.add(c) : set.delete(c)),
+        },
+        appendChild(c) { this.children.push(c); return c; },
+        append(...cs) { cs.forEach((c) => this.children.push(c)); },
+        contains: () => false, querySelector: () => null, querySelectorAll: () => [],
+        addEventListener() {}, focus() {}, scrollIntoView() {},
+      };
+    };
+    const $ = (id) => {
+      assert.ok(known.has(id), "модуль ищет элемент, которого нет в разметке: " + id);
+      if (!els.has(id)) els.set(id, el());
+      return els.get(id);
+    };
+    const hour = 3600e3;
+    const board = {
+      summary: { active: 2, overdue: 1, today: 1, tomorrow: 0 },
+      groups: [
+        { id: "overdue", title: "Просрочено", tasks: [{ id: "t1", title: "Позвонить в банк", due: Date.now() - hour, priority: "high", auto: true }] },
+        { id: "today", title: "Сегодня", tasks: [{ id: "t2", title: "Сдать отчёт", due: Date.now() + hour, repeat: "weekly:5" }] },
+      ],
+      done: [{ id: "t3", title: "Старое дело" }],
+    };
+    const mission = {
+      enabled: true,
+      active: {
+        id: "m1", title: "Разбор заявок", goal: "свести заявки в таблицу", status: "active",
+        steps: [{ title: "Прочитать заявки", state: "done" }, { title: "Свести таблицу", state: "todo" }],
+        createdAt: Date.now() - hour, startedAt: Date.now() - hour, metrics: { tokens: 10, compactions: 0 },
+      },
+      progress: { total: 2, done: 1, failed: 0, percent: 50, current: "Свести таблицу" },
+      running: true, rounds: 3, batches: 1, tokens: 42, compactions: 1, startedAt: Date.now() - hour,
+      journal: [{ ts: Date.now(), kind: "step", text: "Прочитал заявки" }],
+    };
+    const calls = { board: 0, add: [], update: [], done: [], toasts: [], opened: [], closed: 0, sent: 0, sidebar: 0, persisted: 0, subscribed: 0, resumed: 0 };
+    const api = {
+      tasksBoard: async () => { calls.board++; return board; },
+      tasksAdd: async (t) => { calls.add.push(t); return { ok: true }; },
+      tasksUpdate: async (id, patch) => { calls.update.push([id, patch]); return { ok: true }; },
+      tasksDone: async (id, done) => { calls.done.push([id, done]); return { ok: true }; },
+      tasksDelete: async () => ({ ok: true }),
+      onTasksChanged: (fn) => { calls.subscribed++; calls.changed = fn; },
+      setSettings: async () => ({ ok: true }),
+      missionState: async () => mission,
+      missionOpen: () => {},
+      missionPause: async () => ({ ok: true }),
+      missionStop: async () => ({ ok: true }),
+      missionResume: async () => { calls.resumed++; return { ok: true, text: "продолжай работу" }; },
+    };
+    const settings = { tasksEnabled: true, defaultRole: "dev" };
+    const chat = { id: "c1", role: "manager", messages: [] };
+    let streaming = false;
+    let sideTab = "tasks";
+    // Общие встроенные объекты отдаём в песочницу: тогда объект, собранный ВНУТРИ
+    // модуля, получает обычный прототип, и deepStrictEqual сравнивает значения,
+    // а не то, в каком контексте создан объект.
+    const common = () => ({ Object, Array, JSON, Date, Math, Promise, Error });
+    const sandbox = {
+      module: { exports: {} }, window: {}, self: {},
+      console: { log() {}, warn() {}, error() {} },
+      setInterval: () => 0, clearInterval: () => {},
+      document: { createElement: () => el(), addEventListener() {}, querySelector: () => null, querySelectorAll: () => [] },
+      ...common(),
+    };
+    vm.runInNewContext(src, sandbox, { filename: "tasks-mission.js" });
+    assert.strictEqual(typeof sandbox.module.exports, "function", "модуль не отдал фабрику");
+    const build = (over) => {      const box = {
+        module: { exports: {} }, window: {}, self: {},
+        console: { log() {}, warn() {}, error() {} },
+        setInterval: () => 0, clearInterval: () => {},
+        document: { createElement: () => el(), addEventListener() {}, querySelector: () => null, querySelectorAll: () => [] },
+        ...common(),
+      };
+      vm.runInNewContext(src, box, { filename: "tasks-mission.js" });
+      return box.module.exports(
+        Object.assign(
+          {
+            $, api, isElectron: true,
+            AgentCore: {
+              roleById: (id) => ({ id, icon: id === "dev" ? "🛠" : "🧭", title: id === "dev" ? "Разработчик" : "Менеджер", hint: "подсказка роли" }),
+              rolesList: () => [
+                { id: "dev", icon: "🛠", title: "Разработчик", hint: "код" },
+                { id: "manager", icon: "🧭", title: "Менеджер", hint: "дела" },
+              ],
+            },
+            toast: (t) => calls.toasts.push(t),
+            getActiveChat: () => chat,
+            selectChat: () => {},
+            sendMessage: () => calls.sent++,
+            autoResize: () => {},
+            persistChatsNow: () => calls.persisted++,
+            renderSidebar: () => calls.sidebar++,
+            openSidePanel: (tab) => calls.opened.push(tab),
+            closeSidePanel: () => calls.closed++,
+            sidePanelVisible: () => false,
+            startAutoRunNow: () => {},
+            getSettings: () => settings,
+            isStreaming: () => streaming,
+            getSideTab: () => sideTab,
+          },
+          over || {}
+        )
+      );
+    };
+    const M = build();
+    assert.deepStrictEqual(Object.keys(M).sort(), ["initRolesAndTasks", "missionFromEvent", "refreshMission", "renderTasks"], "наружу торчит лишнее или чего-то не хватает");
+
+    // 1. Навешивание: кнопки панелей и лентяи подписки.
+    M.initRolesAndTasks();
+    // Панель миссии спрашивает состояние у главного процесса асинхронно — даём ей такт.
+    await new Promise((r) => setTimeout(r, 0));
+    for (const id of ["btn-role", "task-new-auto", "rail-tasks", "rail-mission", "btn-task-add", "btn-tasks-refresh", "btn-tasks-done-toggle"]) {
+      assert.strictEqual(typeof $(id).onclick, "function", "нет обработчика на " + id);
+    }
+    for (const id of ["btn-mission-pause", "btn-mission-stop", "btn-mission-resume", "btn-mission-refresh", "btn-mission-folder"]) {
+      assert.strictEqual(typeof $(id).onclick, "function", "нет обработчика на " + id);
+    }
+    assert.strictEqual(calls.subscribed, 1, "модуль не подписан на изменения дел");
+    assert.strictEqual($("tasks-quick-due").children.length, 5, "быстрые сроки не построены");
+    assert.strictEqual($("task-new-auto").textContent, "▷ агент", "строка добавления не в режиме «не агенту»");
+    // Роль берётся из самого чата: у нас в чате «менеджер».
+    assert.ok(/Менеджер/.test($("btn-role").textContent), "роль чата не показана на кнопке: " + $("btn-role").textContent);
+    assert.ok($("btn-role").classList.contains("active"), "нестандартная роль не подсвечена");
+    // Миссия пришла из главного процесса и нарисовалась сразу.
+    assert.strictEqual($("ms-title").textContent, "Разбор заявок", "карточка миссии не заполнена");
+    assert.ok(/работает/.test($("ms-status").textContent) && /1\/2/.test($("ms-status").textContent), "ход миссии не показан: " + $("ms-status").textContent);
+    assert.strictEqual($("ms-fill").style.width, "50%", "полоса хода миссии не выставлена");
+
+    // 2. Список дел: счётчики, группы, строки и метки.
+    await M.renderTasks();
+    assert.ok(/Активных: 2/.test($("tasks-counts").innerHTML) && /просрочено 1/.test($("tasks-counts").innerHTML), "счётчики дел не собраны: " + $("tasks-counts").innerHTML);
+    assert.strictEqual($("rail-tasks-badge").textContent, "2", "значок дел на рельсе не обновлён");
+    assert.ok(!$("rail-tasks-badge").classList.contains("hidden"), "значок дел спрятан при активных делах");
+    assert.strictEqual($("tasks-groups").children.length, 4, "в списке дел не две группы по строке: " + $("tasks-groups").children.length);
+    const head = $("tasks-groups").children[0];
+    assert.ok(/Просрочено/.test(head.textContent), "заголовок группы потерян: " + head.textContent);
+    assert.ok(/overdue/.test(head.className), "просроченная группа не помечена");
+    const row = $("tasks-groups").children[1];
+    assert.ok(/task-row/.test(row.className) && /high/.test(row.className) && /late/.test(row.className), "строка дела потеряла метки: " + row.className);
+    // Строка дела: [флажок, тело, действия]; в теле [название, сроки и метки].
+    const metaOf = (r) => (r.children[1] && r.children[1].children[1]) || null;
+    const dueText = metaOf(row).children[0].textContent;
+    assert.ok(/просрочено/.test(dueText), "срок просроченного дела не показан: " + dueText);
+    // Значок «⚠» ровно один: он уже внутри текста срока. Раньше панель показывала
+    // «⚠ ⚠ просрочено» — проверка держит это исправленным.
+    assert.strictEqual((dueText.match(/⚠/g) || []).length, 1, "значок просрочки удвоен: " + dueText);
+    const autoTag = metaOf(row).children[1];
+    assert.ok(autoTag && autoTag.textContent === "▶ агент", "у дела с агентом нет метки автозапуска: " + (autoTag && autoTag.textContent));
+    const todayRow = $("tasks-groups").children[3];
+    const rep = metaOf(todayRow).children[1];
+    assert.ok(rep && /🔁 каждую пятницу/.test(rep.textContent), "повтор не расшифрован: " + (rep && rep.textContent));
+    // Фильтры: шесть плиток, «Все» активна.
+    assert.strictEqual($("tasks-filters").children.length, 6, "фильтры дел не построены");
+    assert.strictEqual($("tasks-filters").children[0].dataset.filter, "all", "нет фильтра «Все»");
+
+    // 3. Клик по фильтру «Просрочено»: список перечитывается и сужается.
+    const before = calls.board;
+    $("tasks-filters").children[1].onclick();
+    await new Promise((r) => setTimeout(r, 0));
+    assert.strictEqual(calls.board, before + 1, "фильтр не перечитал список дел");
+    assert.strictEqual($("tasks-groups").children.length, 2, "фильтр не сузил список: " + $("tasks-groups").children.length);
+
+    // 4. Добавление дела: пустое — подсказка и ни одного вызова; с названием — уходит агенту.
+    $("task-new-title").value = "  ";
+    await $("btn-task-add").onclick();
+    assert.strictEqual(calls.add.length, 0, "пустое дело всё равно ушло в главный процесс");
+    assert.ok(calls.toasts.some((t) => /напиши/.test(t)), "нет подсказки про пустое название: " + calls.toasts.join(" | "));
+    $("task-new-auto").onclick(); // «▶ агент» для нового дела
+    assert.strictEqual($("task-new-auto").textContent, "▶ агент", "переключатель «агенту» не сработал");
+    $("task-new-title").value = "Проверить отчёт";
+    $("task-new-due").value = "завтра 10:00";
+    $("task-new-priority").value = "high";
+    await $("btn-task-add").onclick();
+    // Модуль считает в своём контексте (vm), поэтому его объекты живут в другом
+    // наборе прототипов, а deepStrictEqual сверяет и их тоже. Сверяем значения.
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(calls.add)),
+      [{ title: "Проверить отчёт", due: "завтра 10:00", priority: "high", auto: true }],
+      "дело ушло не тем: " + JSON.stringify(calls.add)
+    );
+    assert.strictEqual($("task-new-title").value, "", "поле названия не очищено");
+
+    // 5. Миссия: «продолжить» не срабатывает во время генерации, потом работает.
+    streaming = true;
+    await $("btn-mission-resume").onclick();
+    assert.strictEqual(calls.resumed, 0, "миссия продолжилась поверх идущей генерации");
+    streaming = false;
+    await $("btn-mission-resume").onclick();
+    assert.strictEqual(calls.resumed, 1, "миссия не продолжилась, когда генерации нет");
+    assert.strictEqual($("input").value, "продолжай работу", "текст продолжения не попал в поле ввода");
+    assert.strictEqual(calls.sent, 1, "продолжение миссии не отправлено агенту");
+
+    // 6. Событие прогона: карточка обновляется из него, НЕ дожидаясь опроса.
+    M.missionFromEvent({ id: "m2", title: "Свести заявки", status: "active", steps: [{ title: "Шаг из события", state: "doing" }], tokens: 7 });
+    assert.strictEqual($("ms-title").textContent, "Свести заявки", "событие не обновило заголовок миссии сразу");
+    assert.ok(/Шаг из события/.test($("ms-steps").innerHTML), "шаги из события не нарисованы: " + $("ms-steps").innerHTML);
+    assert.ok(/✦ 7/.test($("ms-meta").innerHTML), "токены из события не показаны: " + $("ms-meta").innerHTML);
+    // А следом идёт опрос: слово главного процесса — последнее.
+    await new Promise((r) => setTimeout(r, 0));
+    assert.strictEqual($("ms-title").textContent, "Разбор заявок", "после опроса панель не взяла состояние главного процесса");
+
+    // 7. Негативный контроль: забытая зависимость падает громко, а не молча.
+    //    Навешивание ролей сразу зовёт getActiveChat — без неё будет ясная ошибка.
+    const broken = build({ getActiveChat: undefined });
+    assert.throws(() => broken.initRolesAndTasks(), /getActiveChat/, "забытая зависимость не привела к понятной ошибке");
+
+    // 8. Событие прогона без подробностей (старый движок/обрыв): панель не должна
+    //    падать на отсутствующих числах — только показать то, что есть.
+    M.missionFromEvent({ id: "m3", title: "Событие без чисел", status: "active" });
+    assert.strictEqual($("ms-title").textContent, "Событие без чисел", "событие без чисел не отрисовалось");
+    assert.ok(/⏱ 0:00/.test($("ms-meta").innerHTML) && /✦ \d+/.test($("ms-meta").innerHTML), "время и токены не собраны: " + $("ms-meta").innerHTML);
+    await new Promise((r) => setTimeout(r, 0));
+
+    // 9. Гонка на старте: событие приходит раньше, чем панель получила состояние.
+    //    Раньше панель прятала карточку и советовала «включи галочку в настройках»,
+    //    хотя миссия в этот момент идёт, и падала на отсутствующих metrics.
+    let slowState = null;
+    const race = build({ missionState: () => new Promise((r) => { slowState = r; }) });
+    race.missionFromEvent({ id: "m4", title: "Миссия из события", status: "active", steps: [] });
+    assert.strictEqual($("ms-title").textContent, "Миссия из события", "событие без опроса не нарисовало миссию");
+    assert.strictEqual($("ms-empty").classList.contains("hidden"), true, "пустое состояние не спрятано");
+    assert.strictEqual($("ms-card").classList.contains("hidden"), false, "карточка миссии осталась скрытой");
+    assert.ok(/включи галочку/.test(String($("ms-empty").textContent)) === false, "панель предлагает включить миссии при идущей миссии");
+    // У миссии из одного события нет metrics — панель обязана считать нули, а не падать.
+    assert.ok(/✦ 0/.test($("ms-meta").innerHTML), "миссия без metrics не показала нулевые токены: " + $("ms-meta").innerHTML);;
+    if (slowState) slowState({ enabled: true, active: null });
+    await new Promise((r) => setTimeout(r, 0));
+  });
+}
+// ── Текст интерфейса: код ищем там, где он лежит СЕЙЧАС ────────────────────
+// app.js разбирается по этапам: куски уезжают в свои модули src/renderer/*.js.
+// Проверки, которые берут кусок и исполняют его, должны находить код, а не знать
+// адрес — иначе каждый вынос роняет пачку тестов (так было на этапе 2).
+//   uiFile("имя.js") — один файл;  uiAll() — весь интерфейс (app.js последним, как
+//   при загрузке);  uiFind(начало[, конец]) — кусок с проверкой, что маркер не
+//   раздвоился: два одинаковых маркера в разных файлах — это ошибка, а не догадка.
+// Кто проверяет, что в САМОМ app.js чего-то больше нет, читает app.js напрямую:
+// это нарочно, и число таких чтений стережёт тест «бюджет прямых чтений app.js».
+const RENDERER_DIR = path.join(ROOT, "src", "renderer");
+const UI_ORDER = fs
+  .readdirSync(RENDERER_DIR)
+  .filter((f) => f.endsWith(".js") && f !== "app.js")
+  .sort()
+  .concat("app.js");
+const uiCache = new Map();
+function uiFile(name) {
+  if (!uiCache.has(name)) uiCache.set(name, fs.readFileSync(path.join(RENDERER_DIR, name), "utf8"));
+  return uiCache.get(name);
+}
+function uiAll() {
+  return UI_ORDER.map(uiFile).join("\n");
+}
+function uiFind(startMarker, endMarker) {
+  const hits = UI_ORDER.filter((f) => uiFile(f).indexOf(startMarker) !== -1);
+  assert.strictEqual(
+    hits.length,
+    1,
+    "маркер должен быть ровно в одном файле интерфейса: " + JSON.stringify(startMarker) + " → " + (hits.join(", ") || "нигде")
+  );
+  const file = hits[0];
+  const src = uiFile(file);
+  const start = src.indexOf(startMarker);
+  if (endMarker === undefined) return { file, start, code: src.slice(start) };
+  const end = src.indexOf(endMarker, start);
+  assert.ok(end > start, "не найден конец куска (" + JSON.stringify(endMarker) + ") в " + file);
+  return { file, start, end, code: src.slice(start, end) };
+}
+
+// Помощник обязан понимать и модули, и app.js: иначе он бесполезен на середине
+// разбора. Раздвоенный маркер — ошибка, а не догадка: молча взять первый попавшийся
+// кусок опаснее, чем упасть.
+async function testUiSearch() {
+  await test("поиск кусков интерфейса: uiFind находит код в модуле, в app.js и не угадывает", () => {
+    const inModule = uiFind("    loadDashboard: ycLoadDashboard,");
+    assert.strictEqual(inModule.file, "yc-panel.js", "код модуля не найден через uiFind");
+    const inShell = uiFind("  const YcPanel = window.YcPanel({");
+    assert.strictEqual(inShell.file, "app.js", "проводка панели не найдена в app.js");
+    assert.ok(inShell.code.includes("getSettings: () => settings"), "кусок найден неверно");
+    assert.throws(() => uiFind("window."), /ровно в одном файле/, "uiFind не заметил раздвоенный маркер");
+    assert.throws(() => uiFind("такого кода в интерфейсе нет"), /ровно в одном файле/, "uiFind не заметил отсутствующий маркер");
+    assert.ok(uiAll().length > uiFile("app.js").length, "uiAll не собирает интерфейс целиком");
+    assert.ok(uiAll().indexOf("root.YcPanel = factory") > 0, "в uiAll нет вынесенных модулей");
+  });
+}
+
 function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -1699,8 +2364,11 @@ async function testYcDiagnosis() {
   const yc = require(path.join(ROOT, "src", "yandex-cloud.js"));
   const mainSrc = backendSrc();
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+  // Панель Yandex Cloud вынесена в отдельный модуль (этап 2 разбора app.js):
+  // проверки интерфейса читают оба файла, а appSrc остаётся строго про app.js.
+  const uiSrc = appSrc + "\n" + fs.readFileSync(path.join(ROOT, "src", "renderer", "yc-panel.js"), "utf8");
   const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
-  const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+  const coreSrc = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
 
   const makeFetch = (handler) => {
     const calls = [];
@@ -1827,10 +2495,10 @@ async function testYcDiagnosis() {
     });
 
     await test("UI: ошибки дашборда и списка каталогов видны текстом", () => {
-      assert.ok(appSrc.includes('err.className = "yc-card-err"'), "ошибка сервиса не показывается текстом");
-      assert.ok(appSrc.includes("⚠️ Не ответили:"), "сводка не сообщает, сколько сервисов упало");
-      assert.ok(appSrc.includes("⏳ Загрузка каталогов…"), "нет состояния загрузки каталогов");
-      assert.ok(appSrc.includes("Каталоги не загрузились"), "пустой список каталогов не объясняет причину");
+      assert.ok(uiSrc.includes('err.className = "yc-card-err"'), "ошибка сервиса не показывается текстом");
+      assert.ok(uiSrc.includes("⚠️ Не ответили:"), "сводка не сообщает, сколько сервисов упало");
+      assert.ok(uiSrc.includes("⏳ Загрузка каталогов…"), "нет состояния загрузки каталогов");
+      assert.ok(uiSrc.includes("Каталоги не загрузились"), "пустой список каталогов не объясняет причину");
       assert.ok(htmlSrc.includes("галочка = РАЗРЕШЕНО"), "семантика чекбоксов разрешений не пояснена");
     });
 
@@ -1979,9 +2647,11 @@ async function testVault() {
 
   await test("vault: инструменты агента, тексты и интерфейс связаны", () => {
     const mainSrc = backendSrc();
-    const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+    const coreSrc = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
     const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
-    const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    // Код интерфейса ищем там, где он лежит СЕЙЧАС: блок паролей вынесен
+    // в src/renderer/secrets-panel.js (этап 3.5 разбора app.js).
+    const appSrc = uiAll();
 
     assert.ok(hasTool(mainSrc, "vaultList") && hasTool(mainSrc, "vaultFill"), "нет обработчиков vault-инструментов");
     assert.ok(mainSrc.includes("sitePasswords: []"), "нет настройки sitePasswords");
@@ -1995,7 +2665,7 @@ async function testVault() {
 
     for (const id of ["vault-list", "s-vault-name", "s-vault-url", "s-vault-login", "s-vault-pass", "s-vault-note", "btn-vault-add", "btn-vault-clear", "btn-vault-eye"]) {
       assert.ok(htmlSrc.includes('id="' + id + '"'), "нет id=" + id + " в index.html");
-      assert.ok(appSrc.includes('"' + id + '"'), "нет ссылки на " + id + " в app.js");
+      assert.ok(appSrc.includes('"' + id + '"'), "нет ссылки на " + id + " в интерфейсе");
     }
     assert.ok(htmlSrc.includes('id="s-vault-pass" type="password"'), "поле пароля должно быть скрытым");
     assert.ok(appSrc.includes("function renderVault") && appSrc.includes("function vaultAdd") && appSrc.includes("function vaultDelete"));
@@ -2004,12 +2674,11 @@ async function testVault() {
 
 // ── 4e. Интерфейс паролей: реальный код app.js + мини-DOM ──────────────────
 async function testVaultUi() {
-  const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+  // Код берём по маркерам через uiFind: блок паролей может переехать в свой модуль.
   const A = "  // ─────────────── Пароли сайтов (Настройки → Секреты) ───────────────";
   const B = "  // ─────────────── Секреты: переменные окружения (Настройки) ───────────────";
-  const i = appSrc.indexOf(A);
-  const j = appSrc.indexOf(B);
-  assert.ok(i > 0 && j > i, "не нашёл блок паролей в app.js");
+  const vaultBlock = uiFind(A, B);
+  assert.ok(vaultBlock.start > 0, "не нашёл блок паролей в интерфейсе");
 
   const mkEl = (tag) => ({
     tag, className: "", textContent: "", title: "", type: "", value: "",
@@ -2032,11 +2701,12 @@ async function testVaultUi() {
   const toasts = [];
   const settings = { sitePasswords: [] };
   let persisted = 0;
-  const code = appSrc.slice(i, j);
+  const code = vaultBlock.code;
+  // Модуль читает живые настройки через getSettings(): обёртке нужна эта точка.
   const mod = new Function(
-    "$", "document", "settings", "persistSettings", "toast", "confirm",
+    "$", "document", "getSettings", "persistSettings", "toast", "confirm",
     code + "\nreturn { renderVault, vaultAdd, vaultDelete, vaultLoadToForm, vaultClearForm, vaultArr };"
-  )($, { createElement: (t) => mkEl(t) }, settings, () => { persisted++; }, (t) => toasts.push(t), () => true);
+  )($, { createElement: (t) => mkEl(t) }, () => settings, () => { persisted++; }, (t) => toasts.push(t), () => true);
 
   await test("vault UI: пустой список показывает подсказку", () => {
     mod.renderVault();
@@ -2115,6 +2785,232 @@ async function testVaultUi() {
   });
 }
 
+// ── 4f. Секреты: панель (src/renderer/secrets-panel.js) ────────────────────
+// Модуль вынесен из app.js (этап 3.5). Проверяем ПОВЕДЕНИЕ на заглушках настоящей
+// разметки: переменные агента (добавление, выдача, удаление, импорт текстом и из
+// файла), почта (пресеты, проверка входа, последние письма) и то, что панель берёт
+// настройки ЖИВЫМИ, а не копией (иначе смена профиля до неё не дошла бы).
+async function testSecretsPanel() {
+  await test("секреты: панель переменных и почты работает на настоящей разметке", async () => {
+    const vm = require("vm");
+    const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "secrets-panel.js"), "utf8");
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const known = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
+    const els = new Map();
+    // Заглушка ведёт className и classList одной коллекцией: в браузере это одно и то же,
+    // а панель ставит классы и строкой, и через classList.
+    const el = () => {
+      let set = new Set();
+      let html = "";
+      return {
+        children: [], value: "", textContent: "", title: "", type: "", checked: false,
+        style: {}, dataset: {}, onclick: null, onchange: null,
+        get className() { return [...set].join(" "); },
+        set className(v) { set = new Set(String(v || "").split(/\s+/).filter(Boolean)); },
+        get innerHTML() { return html; },
+        set innerHTML(v) { html = String(v == null ? "" : v); if (!html) this.children.length = 0; },
+        classList: {
+          add: (...c) => c.forEach((x) => set.add(x)),
+          remove: (...c) => c.forEach((x) => set.delete(x)),
+          contains: (c) => set.has(c),
+          toggle: (c, on) => (on === undefined ? (set.has(c) ? set.delete(c) : set.add(c)) : on ? set.add(c) : set.delete(c)),
+        },
+        appendChild(c) { this.children.push(c); return c; },
+        append(...cs) { cs.forEach((x) => this.children.push(x)); },
+        addEventListener() {},
+      };
+    };
+    const $ = (id) => {
+      assert.ok(known.has(id), "модуль ищет элемент, которого нет в разметке: " + id);
+      if (!els.has(id)) els.set(id, el());
+      return els.get(id);
+    };
+    const calls = { toasts: [], persisted: 0, groups: 0, mailTest: 0, mailSend: 0, mailRecent: 0, asked: [] };
+    const settings = { agentEnv: {}, agentEnvScopes: {} };
+    const api = {
+      policyGroups: async () => {
+        calls.groups++;
+        return [{ group: "git", tools: 4 }, { group: "cloud", tools: 9 }];
+      },
+      mailTest: async () => { calls.mailTest++; return { ok: true, total: 7, servers: { imapHost: "imap.gmail.com", imapPort: 993, smtpHost: "smtp.gmail.com", smtpPort: 465 } }; },
+      mailTestSend: async () => { calls.mailSend++; return { ok: true }; },
+      mailRecent: async (n) => {
+        calls.mailRecent++;
+        calls.asked.push(n);
+        return { ok: true, total: 3, messages: [{ code: "4821", subject: "Код входа", from: "vk@vk.com", date: "12:00" }] };
+      },
+    };
+    const deps = {
+      $, api, isElectron: true,
+      toast: (t) => calls.toasts.push(t),
+      persistSettings: () => { calls.persisted++; },
+      getSettings: () => settings,
+    };
+    // Встроенные объекты отдаём в песочницу: так объект, собранный внутри модуля,
+    // получает обычный прототип (иначе deepStrictEqual сравнивал бы и происхождение).
+    const common = () => ({ Object, Array, JSON, Date, Math, Promise, Error, String, RegExp, Number, isNaN, parseInt });
+    const build = (over, extra) => {
+      const box = Object.assign({
+        module: { exports: {} }, window: {}, self: {},
+        console: { log() {}, warn() {}, error() {} },
+        document: { createElement: () => el(), addEventListener() {}, querySelector: () => null, querySelectorAll: () => [] },
+      }, common(), extra || {});
+      vm.runInNewContext(src, box, { filename: "secrets-panel.js" });
+      assert.strictEqual(typeof box.module.exports, "function", "модуль не отдал фабрику");
+      return box.module.exports(Object.assign({}, deps, over || {}));
+    };
+    const S = build();
+    assert.deepStrictEqual(
+      Object.keys(S).sort(),
+      ["envAdd", "envImportFile", "envImportText", "mailDoRecent", "mailDoTest", "mailDoTestSend", "mailFillServers", "renderEnvVars", "renderVault", "vaultAdd", "vaultClearForm"],
+      "наружу торчит лишнее или чего-то не хватает"
+    );
+
+    // 1. Пустой список — подсказка, ничего не падает.
+    S.renderEnvVars();
+    assert.ok(/Переменных пока нет/.test($("env-list").innerHTML), "нет подсказки про пустой список: " + $("env-list").innerHTML);
+
+    // 2. Добавление: имя проверяется, значение сохраняется, поля чистятся.
+    $("s-env-key").value = "1BAD";
+    $("s-env-value").value = "x";
+    S.envAdd();
+    assert.strictEqual(Object.keys(settings.agentEnv).length, 0, "имя переменной не проверяется");
+    assert.ok(/латиница/.test(calls.toasts[calls.toasts.length - 1]), "нет понятной подсказки про имя: " + calls.toasts.join(" | "));
+    $("s-env-key").value = " DATABASE_URL ";
+    $("s-env-value").value = "postgres://u:p@h/db";
+    S.envAdd();
+    assert.strictEqual(settings.agentEnv.DATABASE_URL, "postgres://u:p@h/db", "значение не сохранено");
+    assert.strictEqual(calls.persisted, 1, "настройки не сохранены");
+    assert.strictEqual($("s-env-key").value, "", "поле имени не очищено");
+    // Группы выдачи приходят из политики асинхронно — даём ответу дойти.
+    await new Promise((r) => setTimeout(r, 0));
+    assert.ok(calls.groups >= 1, "окно не спросило группы выдачи у главного процесса");
+
+    // 3. Список: значение только маской, выдача — выбором, группы подписаны по-человечески.
+    S.renderEnvVars();
+    const rows = $("env-list").children;
+    assert.strictEqual(rows.length, 1, "строк в списке: " + rows.length);
+    const cells = rows[0].children;
+    assert.strictEqual(cells.length, 4, "в строке должно быть имя, значение, выдача и 🗑: " + cells.length);
+    assert.strictEqual(cells[0].textContent, "DATABASE_URL");
+    assert.ok(!cells[1].textContent.includes("postgres://u:p"), "значение переменной показано в списке: " + cells[1].textContent);
+    assert.ok(/••••/.test(cells[1].textContent), "нет маски значения: " + cells[1].textContent);
+    const sel = cells[2];
+    assert.ok(/env-scope/.test(sel.className), "нет выбора выдачи: " + sel.className);
+    assert.strictEqual(sel.children.length, 4, "в выдаче не «Всем + никому + 2 группы»: " + sel.children.length);
+    assert.ok(sel.children.some((o) => o.textContent.indexOf("git и GitHub") !== -1), "группа политики не подписана по-человечески");
+    assert.strictEqual(sel.value, "*", "по умолчанию переменная не «всем»: " + sel.value);
+
+    // 4. Выбор группы: выдаётся, сохраняется, виден в списке; «Всем» — снова без записи.
+    sel.value = "git";
+    sel.onchange();
+    // Массив собран внутри модуля (свой контекст vm), поэтому сверяем значения.
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(settings.agentEnvScopes.DATABASE_URL)), ["git"], "выдача не записалась: " + JSON.stringify(settings.agentEnvScopes));
+    assert.strictEqual(calls.persisted, 2, "выдача не сохранена");
+    assert.strictEqual($("env-list").children[0].children[2].value, "git", "выдача не отражена в списке: " + $("env-list").children[0].children[2].value);
+    assert.ok(/limited/.test($("env-list").children[0].children[2].className), "ограничение не подсвечено");
+    $("env-list").children[0].children[2].value = "*";
+    $("env-list").children[0].children[2].onchange();
+    assert.ok(!("DATABASE_URL" in settings.agentEnvScopes), "«Всем» оставило запись ограничения");
+
+    // 5. Импорт текстом: комментарии, export, кавычки, мусор; пустой ввод — подсказка.
+    $("s-env-import").value = "   ";
+    S.envImportText();
+    assert.ok(/KEY=VALUE/.test(calls.toasts[calls.toasts.length - 1]), "нет подсказки про формат: " + calls.toasts.join(" | "));
+    $("s-env-import").value = "# коммент\nexport TOKEN='abc'\nBAD LINE\nPLAIN=42\nQUOTED=\"a b\"";
+    S.envImportText();
+    assert.strictEqual(settings.agentEnv.TOKEN, "abc", "export/кавычки разобраны неверно: " + settings.agentEnv.TOKEN);
+    assert.strictEqual(settings.agentEnv.PLAIN, "42");
+    assert.strictEqual(settings.agentEnv.QUOTED, "a b", "кавычки не сняты: " + settings.agentEnv.QUOTED);
+    assert.strictEqual(settings.agentEnv["BAD LINE"], undefined, "мусорная строка попала в переменные");
+    assert.strictEqual($("s-env-import").value, "", "поле импорта не очищено");
+
+    // 6. Импорт из файла: текст читает FileReader, переменные попадают в настройки.
+    // FileReader отдаёт содержимое переданного файла: пустой файл обязан честно
+    // сказать, что строк KEY=VALUE в нём нет.
+    const FileReaderStub = function () {
+      this.readAsText = (file) => { this.result = (file && file.text) || ""; this.onload(); };
+    };
+    const filePanel = build({}, { FileReader: FileReaderStub });
+    filePanel.envImportFile({ name: ".env", text: "FROM_FILE=yes" });
+    assert.strictEqual(settings.agentEnv.FROM_FILE, "yes", "импорт из файла не сработал");
+    assert.ok(/Импортировано из файла: 1/.test(calls.toasts[calls.toasts.length - 1]), "нет отчёта об импорте: " + calls.toasts.join(" | "));
+    const beforeToasts = calls.toasts.length;
+    filePanel.envImportFile(null); // файл не выбран — молча ничего
+    assert.strictEqual(calls.toasts.length, beforeToasts, "вызов без файла что-то сообщил: " + calls.toasts[calls.toasts.length - 1]);
+    filePanel.envImportFile({}); // файл без содержимого — честный отчёт
+    assert.ok(/нет строк вида KEY=VALUE/.test(calls.toasts[calls.toasts.length - 1]), "пустой файл не объяснён: " + calls.toasts[calls.toasts.length - 1]);
+
+    // 7. Удаление кнопкой 🗑 в строке: переменная уходит вместе со своей выдачей
+    //    (осиротевшее ограничение ожило бы, когда переменную создадут заново).
+    settings.agentEnv = { KILL_ME: "x" };
+    settings.agentEnvScopes.KILL_ME = ["git"];
+    S.renderEnvVars();
+    const killRow = $("env-list").children[0];
+    assert.strictEqual(killRow.children[0].textContent, "KILL_ME");
+    killRow.children[3].onclick();
+    assert.strictEqual(settings.agentEnv.KILL_ME, undefined, "переменная не удалена кнопкой");
+    assert.ok(!("KILL_ME" in settings.agentEnvScopes), "выдача удалённой переменной осталась");
+    assert.ok(/Удалено: KILL_ME/.test(calls.toasts[calls.toasts.length - 1]), "нет отчёта об удалении: " + calls.toasts[calls.toasts.length - 1]);
+
+    // 8. Почта: пресеты по адресу, заполнение серверов, подсказки провайдеров.
+    $("s-mail-address").value = "user@gmail.com";
+    S.mailFillServers();
+    assert.strictEqual($("s-mail-imap-host").value, "imap.gmail.com");
+    assert.strictEqual($("s-mail-smtp-host").value, "smtp.gmail.com");
+    assert.strictEqual($("s-mail-smtp-port").value, "465");
+    assert.ok(/пароль приложения/.test($("mail-msg").textContent), "нет подсказки Gmail: " + $("mail-msg").textContent);
+    $("s-mail-address").value = "user@outlook.com";
+    S.mailFillServers();
+    assert.strictEqual($("s-mail-starttls").checked, true, "STARTTLS для Outlook не включён");
+    $("s-mail-address").value = "user@some-company.io";
+    S.mailFillServers();
+    assert.strictEqual($("s-mail-imap-host").value, "imap.some-company.io", "неизвестный провайдер не угадан по домену: " + $("s-mail-imap-host").value);
+
+    // 9. Проверка входа: успех, отказ с подсказкой и честный отказ в веб-режиме.
+    await S.mailDoTest();
+    assert.strictEqual(calls.mailTest, 1);
+    assert.ok(/Вход выполнен/.test($("mail-msg").textContent) && /imap.gmail.com:993/.test($("mail-msg").textContent), "успех не показан: " + $("mail-msg").textContent);
+    assert.ok(!$("mail-msg").classList.contains("error"), "успех помечен как ошибка");
+    const bad = build({ api: Object.assign({}, api, { mailTest: async () => ({ ok: false, error: "Неверный пароль", servers: { note: "Проверь пароль приложения" } }) }) });
+    await bad.mailDoTest();
+    assert.ok(/Неверный пароль/.test($("mail-msg").textContent) && /Проверь пароль приложения/.test($("mail-msg").textContent), "отказ не объяснён: " + $("mail-msg").textContent);
+    assert.ok($("mail-msg").classList.contains("error"), "отказ не помечен как ошибка");
+    const web = build({ isElectron: false });
+    await web.mailDoTest();
+    assert.ok(/desktop-приложении/.test($("mail-msg").textContent), "в веб-режиме нет честного отказа: " + $("mail-msg").textContent);
+    assert.strictEqual(calls.mailTest, 1, "в веб-режиме запрос к главному процессу всё равно ушёл");
+
+    // 10. Последние письма: код письма подписан, список нарисован, счёт в статусе.
+    await S.mailDoRecent();
+    assert.deepStrictEqual(calls.asked, [5], "запрошено не 5 писем: " + JSON.stringify(calls.asked));
+    assert.ok(/🔑 4821/.test($("mail-list").children[0].children[0].textContent), "код письма не показан: " + $("mail-list").children[0].children[0].textContent);
+    assert.ok(/Последние письма: 1 из 3/.test($("mail-msg").textContent), "счёт писем не показан: " + $("mail-msg").textContent);
+
+    // 11. Настройки берутся ЖИВЫМИ: снаружи объект перезаписывают (смена профиля),
+    //     панель обязана увидеть новый, а не прежнюю копию.
+    const fresh = { agentEnv: { ONLY_NEW: "1" }, agentEnvScopes: {} };
+    const live = build({ getSettings: () => fresh });
+    live.renderEnvVars();
+    assert.strictEqual($("env-list").children.length, 1, "панель читает старые настройки: " + $("env-list").children.length);
+    assert.strictEqual($("env-list").children[0].children[0].textContent, "ONLY_NEW");
+
+    // 12. Негативный контроль: забытая зависимость падает громко, а не молча.
+    const broken = build({ getSettings: undefined });
+    assert.throws(() => broken.renderEnvVars(), /getSettings/, "забытая зависимость не привела к понятной ошибке");
+
+    // 13. Проводка: оболочка строит панель и отдаёт ей ЖИВЫЕ настройки да IPC.
+    const appSrc2 = uiFile("app.js");
+    const wiring = appSrc2.slice(appSrc2.indexOf("window.SecretsPanel({"));
+    const wiringCall = wiring.slice(0, wiring.indexOf("});"));
+    for (const need of ["$: $", "api: api", "isElectron: isElectron", "toast: toast", "persistSettings: persistSettings", "getSettings: () => settings"]) {
+      assert.ok(wiringCall.includes(need), "в проводке панели секретов нет " + need + ": " + wiringCall.replace(/\s+/g, " "));
+    }
+    assert.ok(/SecretsPanel\.mailDoTest\b/.test(appSrc2), "кнопка проверки почты не связана с панелью");
+    assert.ok(/SecretsPanel\.envAdd\b/.test(appSrc2), "кнопка добавления переменной не связана с панелью");
+  });
+}
+
 // ── 4c. Сессия и контекст: индикатор, профиль браузера, «Дописать ответ» ───
 async function testSessionExtras() {
   const mainSrc = backendSrc();
@@ -2130,12 +3026,11 @@ async function testSessionExtras() {
   });
 
   // Отрисовку индикатора берём как реальный код из app.js и подставляем простой DOM.
-  const s0 = appSrc.indexOf("  function fmtTokens(n) {");
-  const s1 = appSrc.indexOf("  // Состояние постоянного профиля браузера");
-  assert.ok(s0 > 0 && s1 > s0, "не нашёл функции индикатора контекста в app.js");
+  const ctxSlice = uiFind("  function fmtTokens(n) {", "  // Состояние постоянного профиля браузера");
+  assert.ok(ctxSlice.start > 0, "не нашёл функции индикатора контекста в интерфейсе");
   const ctxMod = new Function(
     "$",
-    appSrc.slice(s0, s1) + "\nreturn { renderContext: renderContext, fmtTokens: fmtTokens };"
+    ctxSlice.code + "\nreturn { renderContext: renderContext, fmtTokens: fmtTokens };"
   );
   const cls = new Set();
   const dom = {
@@ -2190,10 +3085,9 @@ async function testSessionExtras() {
 
     // Поведенчески — на настоящем коде app.js: тянем вниз, но не выдёргиваем
     // пользователя, который сам читает выше.
-    const t0 = appSrc.indexOf("function thinkAutoScroll(body, force) {");
-    const t1 = appSrc.indexOf("\n  }\n", t0);
-    assert.ok(t0 > 0 && t1 > t0, "не нашёл thinkAutoScroll в app.js");
-    const thinkAutoScroll = new Function(appSrc.slice(t0, t1 + 4) + "\nreturn thinkAutoScroll;")();
+    const thinkSlice = uiFind("function thinkAutoScroll(body, force) {", "\n  }\n");
+    assert.ok(thinkSlice.start > 0, "не нашёл thinkAutoScroll в интерфейсе");
+    const thinkAutoScroll = new Function(thinkSlice.code + "\n  }" + "\nreturn thinkAutoScroll;")();
     const mkBody = () => ({ dataset: {}, scrollTop: 0, scrollHeight: 900, clientHeight: 200 });
     const a = mkBody();
     thinkAutoScroll(a);
@@ -2341,6 +3235,15 @@ async function testMobileBridge() {
       assert.strictEqual(gate.status, 200, "mobile-api.js перестал отдаваться");
       const escaped = await get(b.port, "/../package.json");
       assert.strictEqual(escaped.status, 404, "мост отдал файл вне renderer");
+      // Данные агента (промпт и таблица схем) телефон обязан получать так же, как ПК:
+      // без них на телефоне ядро стартует без правил и без инструментов.
+      const prm = await get(b.port, "/prompts.js");
+      assert.strictEqual(prm.status, 200, "промпт не отдаётся телефону (" + prm.status + ")");
+      assert.ok(prm.body.indexOf("SYSTEM_PROMPT") > 0, "отдан не файл промпта");
+      const sch = await get(b.port, "/tool-schemas.js");
+      assert.strictEqual(sch.status, 200, "таблица схем не отдаётся телефону (" + sch.status + ")");
+      assert.ok(sch.body.indexOf("TOOL_DEFINITIONS") > 0, "отдан не файл схем");
+      assert.ok(sch.body.indexOf("findTools") > 0, "в схемах нет инструментов");
     } finally {
       b.stop();
     }
@@ -2820,9 +3723,9 @@ async function testChatPersistence() {
   });
 
   // Восстановление «подвисших» сообщений после аварийного закрытия.
-  const sIdx = appSrc.indexOf("  function sanitizeChats(d) {");
-  assert.ok(sIdx > 0, "не нашёл sanitizeChats в app.js");
-  const rawLines = appSrc.slice(sIdx).split("\n");
+  const sanitizeSliceA = uiFind("  function sanitizeChats(d) {");
+  assert.ok(sanitizeSliceA.start > 0, "не нашёл sanitizeChats в интерфейсе");
+  const rawLines = sanitizeSliceA.code.split("\n");
   let endLine = -1;
   for (let i = 1; i < rawLines.length; i++) {
     if (rawLines[i] === "  }") { endLine = i; break; }
@@ -2964,7 +3867,7 @@ async function testMail() {
     }
     const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
     assert.ok(app.includes('settings.mailAddress = $("s-mail-address")'), "app.js не сохраняет адрес почты");
-    assert.ok(app.includes("mailDoTest") && app.includes("mailFillServers"), "app.js не содержит логики почты");
+    assert.ok(uiAll().includes("mailDoTest") && uiAll().includes("mailFillServers"), "в интерфейсе нет логики почты");
   });
 }
 
@@ -2977,7 +3880,7 @@ async function testYandexCloud() {
   const yc = require(path.join(ROOT, "src", "yandex-cloud.js"));
   const ycSrc = fs.readFileSync(path.join(ROOT, "src", "yandex-cloud.js"), "utf8");
   const mainSrc = backendSrc();
-  const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+  const coreSrc = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
   // Тот же простой мок сети, что и в yc-тестах выше: считает запросы и «в полёте».
   const makeFetch = (route) => {
     let inflight = 0;
@@ -3255,10 +4158,99 @@ async function testYandexCloud() {
     for (const s of ["ycCliStatus", "ycInstallCli"]) assert.ok(preload.includes(s), "в preload нет " + s);
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     for (const id of ["btn-yc-install-cli", "yc-cli-status"]) assert.ok(html.includes('id="' + id + '"'), "в index.html нет " + id);
-    const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
-    assert.ok(app.includes("api.ycInstallCli()"), "app.js не устанавливает yc CLI");
-    assert.ok(app.includes("api.ycCliStatus()"), "app.js не показывает статус yc CLI");
-    assert.ok(app.includes('$("btn-yc-install-cli")'), "в app.js нет обработчика кнопки");
+    // Панель Yandex Cloud вынесена в src/renderer/yc-panel.js (этап 2 разбора app.js):
+    // проверяем интерфейс целиком — сам app.js и модуль панели.
+    const app = ["app.js", "yc-panel.js"]
+      .map((f) => fs.readFileSync(path.join(ROOT, "src", "renderer", f), "utf8"))
+      .join("\n");
+    assert.ok(app.includes("api.ycInstallCli()"), "интерфейс не устанавливает yc CLI");
+    assert.ok(app.includes("api.ycCliStatus()"), "интерфейс не показывает статус yc CLI");
+    assert.ok(app.includes('$("btn-yc-install-cli")'), "нет обработчика кнопки установки yc CLI");
+  });
+
+  await test("Yandex Cloud: панель вынесена в yc-panel.js, собирается с заглушками и находит элементы разметки", () => {
+    const vm = require("vm");
+    const panelPath = path.join(ROOT, "src", "renderer", "yc-panel.js");
+    assert.ok(fs.existsSync(panelPath), "нет файла src/renderer/yc-panel.js");
+    const panelSrc = fs.readFileSync(panelPath, "utf8");
+    const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+
+    // 1. Разметка грузит модуль раньше app.js: иначе фабрика ещё не объявлена.
+    const iPanel = html.indexOf('src="yc-panel.js"');
+    assert.ok(iPanel > 0, "разметка не грузит yc-panel.js");
+    assert.ok(iPanel < html.indexOf('src="app.js"'), "yc-panel.js подключён после app.js");
+    // 2. Телефон получает модуль так же, как ПК.
+    const bridge = fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8");
+    assert.ok(/"yc-panel\.js"/.test(bridge), "мобильный мост не отдаёт yc-panel.js");
+    // 3. В app.js не осталось кода панели — только сборка модуля с зависимостями.
+    assert.ok(!/function ycLoadDashboard|const YC_CREATABLE/.test(appSrc), "код панели остался в app.js");
+    assert.ok(/const YcPanel = window\.YcPanel\(\{/.test(appSrc), "app.js не собирает панель");
+    for (const dep of ["$: $", "api: api", "isElectron: isElectron", "toast: toast", "termAppend: termAppend",
+      "confirmModal: confirmModal", "inputDialog: inputDialog", "openSettings: openSettings",
+      "openSidePanel: openSidePanel", "getSettings: () => settings"]) {
+      assert.ok(appSrc.includes(dep), "в проводку панели не передан " + dep);
+    }
+    // 4. Границы модуля: настройки только через getSettings(), в чужие глобалы не лезем.
+    assert.ok(!/(^|[^\w.])settings\./.test(panelSrc), "модуль ходит в settings напрямую вместо getSettings()");
+    assert.ok(!/AgentCore|window\.api\b|localStorage/.test(panelSrc), "модуль лезет в чужие глобалы");
+
+    // 5. Настоящая сборка в браузерной песочнице: модуль должен подняться и повесить
+    //    обработчики на те id, которые реально есть в разметке (иначе тут TypeError).
+    const ids = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
+    const stubs = new Map();
+    const makeEl = (id) => {
+      const set = new Set();
+      return {
+        id, style: {}, dataset: {}, children: [], value: "", textContent: "", innerHTML: "",
+        title: "", checked: false, disabled: false,
+        classList: {
+          add: (...c) => c.forEach((x) => set.add(x)),
+          remove: (...c) => c.forEach((x) => set.delete(x)),
+          contains: (c) => set.has(c),
+          toggle: (c) => (set.has(c) ? set.delete(c) : set.add(c)),
+        },
+        setAttribute() {}, getAttribute: () => "", removeAttribute() {}, hasAttribute: () => false,
+        appendChild(c) { this.children.push(c); return c; }, removeChild() {},
+        insertBefore(c) { this.children.push(c); return c; },
+        addEventListener() {}, removeEventListener() {}, querySelector: () => null, querySelectorAll: () => [],
+        focus() {}, blur() {}, click() {}, remove() {}, scrollIntoView() {}, closest: () => null,
+        clientHeight: 100, scrollHeight: 100, offsetHeight: 100,
+      };
+    };
+    const $ = (id) => {
+      if (!ids.has(id)) return null;
+      if (!stubs.has(id)) stubs.set(id, makeEl(id));
+      return stubs.get(id);
+    };
+    const win = { YcConsole: { open() {}, close() {}, isOpen: () => false } };
+    const sandbox = {
+      window: win, self: win,
+      document: { getElementById: $, createElement: (t) => makeEl(t), querySelector: () => null, querySelectorAll: () => [] },
+      navigator: { clipboard: { readText: async () => "" } },
+      console: { log() {}, warn() {}, error() {} },
+      setTimeout, clearTimeout, setInterval, clearInterval,
+    };
+    vm.runInNewContext(panelSrc, sandbox, { filename: "yc-panel.js" });
+    assert.strictEqual(typeof win.YcPanel, "function", "модуль не отдал фабрику в window.YcPanel");
+    const built = win.YcPanel({
+      $, isElectron: true,
+      api: { ycCliStatus: async () => ({ ok: true }), ycInstallCli: async () => ({ ok: true }) },
+      toast() {}, termAppend() {}, confirmModal() {}, inputDialog() {},
+      openSettings() {}, openSidePanel() {},
+      getSettings: () => ({ ycFolderId: "folder-1", ycCloudId: "cloud-1" }),
+    });
+    for (const id of ["btn-yc-connect", "btn-yc-get-token", "btn-yc-logout", "btn-yc-refresh-folders",
+      "s-yc-folder", "s-yc-allow-create", "s-yc-allow-delete", "s-yc-allow-update", "btn-yc-install-cli",
+      "btn-yc-dash-refresh", "btn-yc-dash-settings", "btn-yc-open-dash", "btn-yc-onboard-settings",
+      "btn-yc-onboard-token", "btn-yc-paste-token", "btn-yc-deploy", "btn-yc-deploy-open"]) {
+      const el = stubs.get(id);
+      const handler = el && (el.onchange || el.onclick);
+      assert.ok(typeof handler === "function", "модуль не повесил обработчик на " + id);
+    }
+    assert.deepStrictEqual(Object.keys(built).sort(), ["loadDashboard", "refreshSettingsUI"], "наружу торчит лишнее");
+    assert.strictEqual(typeof built.loadDashboard, "function");
+    assert.strictEqual(typeof built.refreshSettingsUI, "function");
   });
 
   await test("readYcLogsText: берёт реальный код модуля и собирает запрос из настроек", async () => {
@@ -3761,9 +4753,12 @@ async function testYandexCloud() {
     assert.ok(/ycSetPermissions: \(allowCreate, allowDelete, allowUpdate\)/.test(preload), "preload не передаёт третье разрешение");
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     assert.ok(html.includes('id="s-yc-allow-update"'), "нет чекбокса «Разрешить агенту менять контейнеры»");
-    const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
-    assert.ok(/s-yc-allow-update"\)\.onchange/.test(app), "app.js не слушает третий чекбокс");
-    assert.ok(/api\.ycSetPermissions\(create, del, upd\)/.test(app), "app.js не сохраняет третье разрешение");
+    // обработчики разрешений Yandex Cloud переехали в src/renderer/yc-panel.js (этап 2)
+    const app = ["app.js", "yc-panel.js"]
+      .map((f) => fs.readFileSync(path.join(ROOT, "src", "renderer", f), "utf8"))
+      .join("\n");
+    assert.ok(/s-yc-allow-update"\)\.onchange/.test(app), "интерфейс не слушает третий чекбокс");
+    assert.ok(/api\.ycSetPermissions\(create, del, upd\)/.test(app), "интерфейс не сохраняет третье разрешение");
     const main = backendSrc();
     assert.ok(hasTool(main, "ycContainer"), "нет обработчика ycContainer");
     assert.ok(/allowUpdate \? "разрешено"/.test(main), "ycStatus не сообщает про право менять контейнеры");
@@ -3802,7 +4797,7 @@ async function testYandexCloud() {
 async function testShellAndCdp() {
   const http = require("http");
   const mainFull = backendSrc();
-  const core2 = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+  const core2 = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
   const pre2 = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
   const html2 = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
   const app2 = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
@@ -4330,7 +5325,7 @@ async function testShellAndCdp() {
 async function testContextMemory() {
   const store = require(path.join(ROOT, "src", "agent-store.js"));
   const mainSrc = backendSrc();
-  const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+  const coreSrc = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
   const preloadSrc = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
   const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
@@ -4509,6 +5504,9 @@ async function testContextMemory() {
 async function testYcFolderPersistence() {
   const mainSrc = backendSrc();
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+  // Панель Yandex Cloud вынесена в отдельный модуль (этап 2 разбора app.js):
+  // проверки интерфейса читают оба файла, а appSrc остаётся строго про app.js.
+  const uiSrc = appSrc + "\n" + fs.readFileSync(path.join(ROOT, "src", "renderer", "yc-panel.js"), "utf8");
 
   const a = mainSrc.indexOf('ipcMain.handle("settings:set"');
   const endMark = "  saveSettings(merged);\n  mobileBridge.applySettings(merged);\n  return merged;\n});";
@@ -4577,8 +5575,8 @@ async function testYcFolderPersistence() {
     assert.ok(/parts\.push\(ycLine\)/.test(mainSrc), "строка YC не попадает в САММАРИ проекта");
     assert.ok(/Yandex Cloud: каталог «/.test(mainSrc), "нет формулировки про каталог");
     assert.ok(/каталог НЕ выбран/.test(mainSrc), "нет строки для случая «каталог не выбран»");
-    assert.ok(/settings\.ycFolderId = st\.folderId/.test(appSrc), "UI не синхронизирует каталог из статуса");
-    assert.ok(/settings\.ycFolderId = sel\.value/.test(appSrc), "UI не синхронизирует каталог при выборе");
+    assert.ok(/getSettings\(\)\.ycFolderId = st\.folderId/.test(uiSrc), "интерфейс не синхронизирует каталог из статуса");
+    assert.ok(/getSettings\(\)\.ycFolderId = sel\.value/.test(uiSrc), "интерфейс не синхронизирует каталог при выборе");
     // Инструменты по-прежнему читают свежие настройки, а не снимок начала ответа
     const ycCases = toolBody(mainSrc, "ycStatus", "ycInstall");
     assert.ok(/ycConfig\(loadSettings\(\)\)/.test(ycCases), "yc-инструменты читают устаревший снимок настроек");
@@ -4591,16 +5589,15 @@ async function testYcFolderPersistence() {
 async function testPlanPanel() {
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
   const mainSrc = backendSrc();
-  const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+  const coreSrc = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
   const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
   const cssSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "styles.css"), "utf8");
   const AgentCore = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
 
   // ── Срез блока плана: чистые функции + отрисовка (без остального приложения) ──
-  const p0 = appSrc.indexOf("  // ─────────── План работ (todoWrite):");
-  const p1 = appSrc.indexOf("  // ─────────────── Рендер ───────────────", p0);
-  assert.ok(p0 > 0 && p1 > p0, "не нашёл блок плана в app.js (маркеры съехали)");
-  const planSrc = appSrc.slice(p0, p1);
+  const planSlice = uiFind("  // ─────────── План работ (todoWrite):", "  // ─────────────── Рендер ───────────────");
+  assert.ok(planSlice.start > 0, "не нашёл блок плана в интерфейсе (маркеры съехали)");
+  const planSrc = planSlice.code;
 
   // Игрушечный DOM: ровно те свойства, которые нужны панели.
   const mkEl = (tag) => {
@@ -4837,8 +5834,11 @@ async function testPlanPanel() {
     assert.ok(/if \(planRotate\(getActiveChat\(\)\)\) renderPlanPanel\(\);/.test(appSrc), "новый запрос не поворачивает план");
     assert.ok(/renderPlanPanel\(\);\n    const chat = getActiveChat\(\);|renderPlanPanel\(\);/.test(appSrc), "панель не перерисовывается вместе с чатом");
     // Веб-режим: todoWrite работает как структура, а не «недоступно в веб-версии».
-    const webIdx = appSrc.indexOf('c.name === "todoWrite"');
-    const webElse = appSrc.indexOf('"⚠️ Файловые операции и git недоступны в веб-версии');
+    // Веб-режим вынесен в свой модуль (src/renderer/web-chat.js): спрашиваем
+    // «этот код есть в интерфейсе», а не «он лежит именно в app.js».
+    const webUi = uiAll();
+    const webIdx = webUi.indexOf('c.name === "todoWrite"');
+    const webElse = webUi.indexOf('"⚠️ Файловые операции и git недоступны в веб-версии');
     assert.ok(webIdx > 0 && webIdx < webElse, "в веб-режиме todoWrite падает в общий отказ");
   });
 
@@ -4996,9 +5996,9 @@ async function testPlanPanel() {
   });
 
   await test("план: о появлении панели сообщают тостом (один раз на план)", () => {
-    const i = appSrc.indexOf("function tryPlanFromRunText");
-    assert.ok(i > 0, "нет tryPlanFromRunText");
-    const fn = appSrc.slice(i, i + 1200);
+    const planFn = uiFind("function tryPlanFromRunText");
+    assert.ok(planFn.start > 0, "нет tryPlanFromRunText");
+    const fn = planFn.code.slice(0, 1200);
     assert.ok(fn.indexOf("if (!hadPlan) toast(") !== -1, "о появлении плана не сообщается");
     assert.ok(fn.indexOf("const hadPlan = !!(chat && chat.plan);") !== -1, "нет защиты от повторных тостов");
     assert.ok(fn.indexOf("planFromText(chat, runTextOf(chat, aMsg))") !== -1, "разбор плана из текста запуска пропал");
@@ -5018,7 +6018,7 @@ async function testPlanPanel() {
     assert.ok(/if \(planFromText\(chat, runTextOf\(chat, aMsg\)\)\)/.test(appSrc), "интерфейс не разбирает план, написанный текстом");    assert.ok(/planRoundStarted\(chat, seg\.id\);/.test(appSrc), "новый раунд ответа не двигает галочки текстового плана");
     assert.ok(/if \(planTextFinish\(chat\)\)/.test(appSrc), "финиш запуска не закрывает шаг текстового плана");
     // Веб-версия: в План-режиме список инструментов больше не пуст — todoWrite доходит до модели.
-    assert.ok(/tools: planMode \? AgentCore\.PLAN_MODE_TOOL_DEFINITIONS : AgentCore\.TOOL_DEFINITIONS,/.test(appSrc), "в веб-версии План-режим без todoWrite");
+    assert.ok(/tools: planMode \? AgentCore\.PLAN_MODE_TOOL_DEFINITIONS : AgentCore\.TOOL_DEFINITIONS,/.test(uiAll()), "в веб-версии План-режим без todoWrite");
   });
 
   await test("план: план из размышлений — «План уже составлен. Сейчас нужно:»", () => {
@@ -5129,9 +6129,9 @@ async function testPlanPanel() {
   await test("план: битый план в chats.json не мешает запуску (sanitizeChats)", () => {
     // sanitizeChats извлекается ровно как в соседнем тесте и исполняется отдельно,
     // поэтому нормализатор и лимит передаём параметрами.
-    const sIdx = appSrc.indexOf("  function sanitizeChats(d) {");
-    assert.ok(sIdx > 0, "не нашёл sanitizeChats");
-    const rawLines = appSrc.slice(sIdx).split("\n");
+  const sanitizeSliceB = uiFind("  function sanitizeChats(d) {");
+  assert.ok(sanitizeSliceB.start > 0, "не нашёл sanitizeChats в интерфейсе");
+    const rawLines = sanitizeSliceB.code.split("\n");
     let endLine = -1;
     for (let i = 1; i < rawLines.length; i++) {
       if (rawLines[i] === "  }") { endLine = i; break; }
@@ -5199,7 +6199,7 @@ async function testBrowserOverlays() {
   const dom = require(path.join(ROOT, "src", "dom-map.js"));
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
   const mainSrc = backendSrc();
-  const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+  const coreSrc = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
   const AgentCore = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
 
   // ── Мини-DOM с диалогом поверх страницы ──
@@ -5625,7 +6625,7 @@ async function testBrowserReplayData() {
   const bt = require(path.join(ROOT, "src", "browser-tools.js"));
   const os = require("os");
   const toolsSrc = backendSrc();
-  const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+  const coreSrc = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
   const policySrc = fs.readFileSync(path.join(ROOT, "src", "tool-policy.js"), "utf8");
   const vkGuide = fs.readFileSync(path.join(ROOT, "src", "agent-guides", "vk.md"), "utf8");
@@ -6043,9 +7043,8 @@ async function testStreamThrottle() {
   });
 
   await test("стрим: очередь копит текст и рисует последнее состояние за один кадр", () => {
-    const s0 = appSrc.indexOf("  let pinnedToBottom = true;");
-    const s1 = appSrc.indexOf("  // ─────────────── Отправка ───────────────");
-    assert.ok(s0 > 0 && s1 > s0, "не нашёл блок прокрутки/стрима в app.js");
+    const streamSlice = uiFind("  let pinnedToBottom = true;", "  // ─────────────── Отправка ───────────────");
+    assert.ok(streamSlice.start > 0, "не нашёл блок прокрутки/стрима в интерфейсе");
 
     const dom = {
       messages: { scrollTop: 0, scrollHeight: 500 },
@@ -6065,7 +7064,7 @@ async function testStreamThrottle() {
         "$",
         "msgEls",
         "msgHtml",
-        appSrc.slice(s0, s1) +
+        streamSlice.code +
           "\nreturn { queueBubbleRender: queueBubbleRender, scrollBottom: scrollBottom, scrollBottomSoon: scrollBottomSoon };"
       )($, msgEls, msgHtml);
 
@@ -6134,7 +7133,7 @@ async function testBrowserSpeed() {
   const bt = require(path.join(ROOT, "src", "browser-tools.js"));
   const mainSrc = backendSrc();
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
-  const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+  const coreSrc = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
 
   const mkEl = (o) => Object.assign({ visible: true, text: "", name: "" }, o);
 
@@ -6321,7 +7320,7 @@ async function testBrowserSenses() {
   const bt = require(path.join(ROOT, "src", "browser-tools.js"));
   const mainSrc = backendSrc();
   const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
-  const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+  const coreSrc = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
   const AgentCore = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
 
   const mkEl = (o) => Object.assign({ visible: true, text: "", name: "", role: "button", tag: "button", inViewport: true }, o);
@@ -6629,7 +7628,7 @@ async function testBrowserSenses() {
       assert.ok(/browserScroll: "↕️"/.test(appSrc) && /browserNetwork: "📡"/.test(appSrc) && /agentGuide: "📘"/.test(appSrc), "нет иконок новых инструментов");
       assert.ok(/browserScroll: "Прокрутка страницы"/.test(appSrc) && /waitForIdle: "Ожидание покоя страницы"/.test(appSrc), "нет подписей новых инструментов");
       // Веб-версия: справочники и браузер честно недоступны, ожидание покоя = пауза.
-      assert.ok(/agentGuide\) доступны в desktop-приложении/.test(appSrc), "веб-версия не отвечает про agentGuide");
+      assert.ok(/agentGuide\) доступны в desktop-приложении/.test(uiAll()), "веб-версия не отвечает про agentGuide");
     });
 
     await test("зрение на скриншоте: включается по модели с ключом и спрашивает про кликабельное", () => {
@@ -7419,7 +8418,7 @@ async function testToolRouter() {
     const mainSrc = backendSrc();
     const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
     const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
-    const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+    const coreSrc = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
     // A: реальный вызов вне набора дотягивает группу и повторяет раунд со схемой.
     assert.ok(/const gid = groupOfTool\(c\.name\);/.test(mainSrc), "нет предохранителя A");
     assert.ok(/stickyGroups\.add\(gid\);\s*\n\s*fresh\.push\(gid\);/.test(mainSrc), "группа вызова не добавляется на ходу");
@@ -7789,7 +8788,6 @@ async function testOllamaWindow() {
 // ── Контекст длинного чата и кнопка «Продолжить контекст» ───────────────────
 async function testChatContextTransfer() {
   const core = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
-  const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
 
   await test("trimConversation: на длинном чате остаётся свежий хвост, а не одно сообщение", () => {
     // Регрессия: прежний проход «с начала» тратил бюджет на старые сообщения, а на чате
@@ -7811,25 +8809,23 @@ async function testChatContextTransfer() {
   });
 
   await test("история чата уходит в модель целиком и со служебными заметками", () => {
-    const i = appSrc.indexOf("let history = chat.messages");
-    const j = appSrc.indexOf("session = { chatId: chat.id");
-    assert.ok(i > 0 && j > i, "не нашёл сборку истории в sendMessage");
-    const block = appSrc.slice(i, j);
+    const historySlice = uiFind("let history = chat.messages", "session = { chatId: chat.id");
+    assert.ok(historySlice.start > 0, "не нашёл сборку истории в sendMessage");
+    const block = historySlice.code;
     assert.ok(!block.includes("AgentCore.trimConversation(history"), "история по-прежнему режется в интерфейсе по полному бюджету");
     assert.ok(block.includes('m.role === "system"'), "служебные заметки чата не попадают в контекст");
     assert.ok(block.includes('m.role === "user"') && block.includes('m.role === "assistant"'), "user/assistant не попадают в контекст");
   });
 
   await test("кнопка «Продолжить контекст» переносит последний запрос и хвост диалога", () => {
-    const i = appSrc.indexOf("function buildContinuationContext");
-    const j = appSrc.indexOf('$("btn-continue-chat").onclick');
-    assert.ok(i > 0, "нет сборки контекста для кнопки");
-    assert.ok(j > i, "кнопка не использует новую сборку контекста");
-    const fn = appSrc.slice(i, j);
+    const contSlice = uiFind("function buildContinuationContext", "$(\"btn-continue-chat\").onclick");
+    assert.ok(contSlice.start > 0, "нет сборки контекста для кнопки");
+    assert.ok(contSlice.end > contSlice.start, "кнопка не использует новую сборку контекста");
+    const fn = contSlice.code;
     assert.ok(fn.includes("Последний запрос пользователя"), "в контекст не попадает последний запрос пользователя");
     assert.ok(fn.includes("Последний ответ агента"), "в контекст не попадает последний ответ");
     assert.ok(fn.includes("Хвост диалога"), "в контекст не попадает хвост диалога");
-    const handler = appSrc.slice(j, j + 900);
+    const handler = uiFind("$(\"btn-continue-chat\").onclick").code.slice(0, 900);
     assert.ok(handler.includes("buildContinuationContext(prev)"), "кнопка не собирает контекст новой функцией");
     assert.ok(!handler.includes("lastAssistant.slice"), "кнопка по-прежнему шлёт только последний ответ");
   });
@@ -8113,6 +9109,13 @@ function miniDom() {
   const fOllama = attach(el("div", "field", { text: "Ollama URL" }));
   fOllama.appendChild(attach(el("input", "", { placeholder: "http://localhost:11434" })));
   accOllama.appendChild(fOllama);
+  // Поле замера: подпись «Скорость модели», слова «замерить» в подписи нет —
+  // оно живёт в тексте кнопки и в её подсказке, как в настоящей разметке.
+  const fProbe = attach(el("div", "field", { text: "Скорость модели" }));
+  const btnProbe = attach(el("button", "btn btn-ghost", { text: "Замерить скорость" }));
+  btnProbe.title = "Замерить локальную модель: связь, загрузку, чтение промпта, генерацию и память";
+  fProbe.appendChild(btnProbe);
+  accOllama.appendChild(fProbe);
   const accOpenai = attach(el("div", "acc"));
   accOpenai.setAttribute("data-acc", "openai");
   const fKey = attach(el("div", "field", { text: "API-ключ" }));
@@ -8157,13 +9160,11 @@ function miniDom() {
 }
 
 async function testSettingsSearchLogic() {
-  const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
 
   await test("поиск настроек: фильтрует по всем вкладкам, включая карточки провайдеров", () => {
-    const a = appSrc.indexOf("  // ── Поиск по настройкам ──");
-    const b = appSrc.indexOf("\n  function setPreset(p) {");
-    assert.ok(a > 0 && b > a, "не нашёл функции поиска в app.js");
-    const code = 'let lastSettingsTab = "model";\n' + appSrc.slice(a, b) + "\nreturn settingsSearchApply;";
+    const searchSlice = uiFind("  // ── Поиск по настройкам ──", "\n  function setPreset(p) {");
+    assert.ok(searchSlice.start > 0, "не нашёл функции поиска в интерфейсе");
+    const code = 'let lastSettingsTab = "model";\n' + searchSlice.code + "\nreturn settingsSearchApply;";
     const d = miniDom();
     const apply = new Function("document", "$", code)(d.document, d.$);
 
@@ -8202,6 +9203,61 @@ async function testSettingsSearchLogic() {
     assert.ok(!d.accOpenai.classList.contains("sfilter-open") && !d.accOpenai.classList.contains("open"), "карточка осталась раскрытой поиском");
     assert.ok(!d.secProvider.classList.contains("sfilter-hide"), "после очистки остались скрытые секции");
     assert.ok(d.hints.classList.contains("hidden"), "служебный .hidden не должен сниматься поиском");
+
+    // 5. Замер локальной модели находится поиском: подпись поля слова «замерить»
+    // не содержит, а кнопка и её подсказка — содержат.
+    apply("замерить");
+    assert.ok(d.accOllama.classList.contains("sfilter-hide") === false, "поиск по «замерить» не нашёл замер скорости");
+    assert.ok(d.accOpenai.classList.contains("sfilter-hide") === true, "чужая карточка показана при поиске замера");
+    assert.ok(d.accOllama.classList.contains("sfilter-open"), "карточка с замером не раскрылась для показа");
+    apply("чтение промпта");
+    assert.ok(d.accOllama.classList.contains("sfilter-hide") === false, "подсказка кнопки замера не участвует в поиске");
+  });
+
+  await test("замер локальной модели: отчёт рисуется в панели, кнопка видна только для местной модели", () => {
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const render = uiFind("  function renderProbeResult(res) {", "  // Кнопка «Замерить скорость» в подвале").code;
+    const shown = { text: "", cls: new Set(["probe-result", "hidden"]) };
+    const box = {
+      set textContent(v) { shown.text = v; },
+      get textContent() { return shown.text; },
+      classList: { remove: (c) => shown.cls.delete(c), add: (c) => shown.cls.add(c) },
+    };
+    const draw = new Function("$", render + "\nreturn renderProbeResult;")((id) => (id === "ollama-probe-result" ? box : null));
+    draw({ ok: true, lines: ["Сервер отвечает за 12 мс", "Генерация: 6 ток/с"], advice: ["Возьми модель поменьше"] });
+    assert.ok(/12 мс/.test(shown.text), "цифры отчёта не дошли до панели: " + shown.text);
+    assert.ok(/6 ток\/с/.test(shown.text), "скорость генерации не показана: " + shown.text);
+    assert.ok(/Возьми модель поменьше/.test(shown.text), "советы не показаны: " + shown.text);
+    assert.ok(!shown.cls.has("hidden"), "панель отчёта осталась скрытой");
+    // Отказ тоже объясняется словами, а не пустой панелью.
+    shown.text = "";
+    draw({ ok: false, lines: [] });
+    assert.ok(/не удался|не измерена/.test(shown.text), "отказ показан непонятно: " + shown.text);
+
+    // Видимость кнопки: местная модель — видна, облако — спрятана.
+    const show = uiFind("  function refreshProbeButton() {", "  async function probeLocalModelUI() {").code;
+    const run = (local) => {
+      const btn = { cls: new Set(["btn", "hidden"]) };
+      btn.classList = {
+        add: (c) => btn.cls.add(c),
+        remove: (c) => btn.cls.delete(c),
+        toggle: (c, on) => (on ? btn.cls.add(c) : btn.cls.delete(c)),
+      };
+      const fn = new Function("$", "AgentCore", "settings", show + "\nreturn refreshProbeButton;")((id) => (id === "btn-probe-model" ? btn : null), { isLocalEndpoint: () => local }, {});
+      fn();
+      return btn.cls;
+    };
+    assert.ok(run(true).has("hidden") === false, "для местной модели кнопка замера спрятана");
+    assert.ok(run(false).has("hidden") === true, "для облачной модели кнопка замера показана");
+
+    // Разметка и проводка: кнопка есть, спрятана до проверки типа модели, нажатие подключено.
+    assert.ok(html.indexOf('id="btn-probe-model"') !== -1, "кнопки замера нет в подвале настроек");
+    assert.ok(/id="btn-probe-model"[^>]*class="[^>]*hidden/.test(html), "кнопка в подвале видна до проверки типа модели");
+    const appSrc2 = uiFile("app.js");
+    assert.ok(/\$\("btn-probe-model"\)\.onclick/.test(appSrc2), "кнопка в подвале не подключена");
+    const setProv = uiFind("  function setProviderUI(p) {", "  // Переключение вкладок настроек").code;
+    assert.ok(/refreshProbeButton\(\);/.test(setProv), "видимость кнопки замера не обновляется при смене провайдера");
+    assert.ok(/Замерить скорость локальной модели/.test(appSrc2), "в палитре команд нет замера");
   });
 }
 
@@ -8246,14 +9302,12 @@ async function testLeftRail() {
   await test("рельса: нажатия переключают панели, подсветка синхронна", () => {
     // Живая логика: берём из app.js синхронизацию и навешивание обработчиков и
     // прогоняем на игрушечном DOM — проверяем поведение, а не наличие строк.
-    const a1 = appSrc.indexOf("  // Рельса слева (как в Replit): иконки переиспользуют");
-    const a2 = appSrc.indexOf("  function sidePanelVisible() {", a1);
-    const a3 = appSrc.indexOf("  // ── Рельса слева: иконки нажимают те же кнопки шапки ──");
-    const a4 = appSrc.indexOf('  $("btn-sp-close")', a3);
-    assert.ok(a1 > 0 && a2 > a1 && a3 > a2 && a4 > a3, "не нашёл логику рельсы в app.js");
+    const railLogic = uiFind("  // Рельса слева (как в Replit): иконки переиспользуют", "  function sidePanelVisible() {");
+    const railWiring = uiFind("  // ── Рельса слева: иконки нажимают те же кнопки шапки ──", "  $(\"btn-sp-close\")");
+    assert.ok(railLogic.start > 0 && railWiring.start > 0, "не нашёл логику рельсы в интерфейсе");
     const code =
-      appSrc.slice(a1, a2) +
-      appSrc.slice(a3, a4) +
+      railLogic.code +
+      railWiring.code +
       "\nreturn { syncRail, setSidebarCollapsed, toggleSidebarCollapsed };";
 
     const el = () => {
@@ -8427,7 +9481,7 @@ async function testSandboxObstacles() {
 
     // Веб-режим (превью и телефон) раньше падал на 429 сразу: своей обработки там не было
     // вовсе, и прогон заканчивался ошибкой до всякого ожидания.
-    const webSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    const webSrc = uiAll(); // веб-режим живёт в src/renderer/web-chat.js
     assert.ok(/if \(res\.status === 429\) \{/.test(webSrc), "в веб-режиме 429 не обрабатывается");
     assert.ok(/RATE_WAIT_BUDGET_MS = 10 \* 60 \* 1000/.test(webSrc), "в веб-режиме нет бюджета ожидания");
     assert.ok(/rateWaitedMs \+= waitMs;/.test(webSrc), "в веб-режиме ожидание не накапливается");
@@ -8750,7 +9804,7 @@ async function testTasks() {
     const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
     const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
-    const core = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+    const core = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
     const tools = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
     assert.ok(main.includes("tasksTakeAuto"), "планировщик не берёт автозадачи");
     assert.ok(main.includes('type: "task-due"'), "событие срока автозадачи не отправляется");
@@ -11211,6 +12265,44 @@ async function testImageTools() {
   });
 }
 
+// Код без строк и комментариев. Имя, попавшее В СТРОКУ, модуль уронить не может
+// («X is not defined» случается только в коде), а таблицы данных — промпт и схемы
+// инструментов — состоят из строк почти целиком: без этой чистки они выглядели как
+// утечка. Заодно снимается старая ошибка наивного среза комментариев: «//» внутри
+// строки («https://…») съедал остаток строки вместе с кодом, и утечка пряталась.
+function codeOnly(src) {
+  const TICK = String.fromCharCode(96); // обратная кавычка без вложенных кавычек
+  let out = "";
+  let i = 0;
+  let mode = ""; // "" | "line" | "block" | TICK | двойная | одинарная
+  while (i < src.length) {
+    const c = src[i];
+    const d = src[i + 1];
+    if (mode === "line") {
+      if (c === "\n") { mode = ""; out += c; }
+      i++;
+      continue;
+    }
+    if (mode === "block") {
+      if (c === "*" && d === "/") { mode = ""; i += 2; continue; }
+      i++;
+      continue;
+    }
+    if (mode === TICK || mode === '"' || mode === "'") {
+      if (c === "\\") { i += 2; continue; }
+      if (c === mode) { mode = ""; out += c; }
+      i++;
+      continue;
+    }
+    if (c === "/" && d === "/") { mode = "line"; i += 2; continue; }
+    if (c === "/" && d === "*") { mode = "block"; i += 2; continue; }
+    if (c === TICK || c === '"' || c === "'") { mode = c; out += c; i++; continue; }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
 // ── Разрез ядра: связность ──────────────────────────────────────────────────
 // Модуль, который никто не подключил, в Electron main работает (require), а в окне
 // молча падает: window.WebTools нет, и приложение остаётся пустым. Поэтому проверяем
@@ -11230,9 +12322,37 @@ async function testCoreSplit() {
     assert.ok(/require\("\.\/web-tools\.js"\)/.test(coreSrc), "ядро не требует web-tools в CommonJS");
     assert.ok(/require\("\.\/image-tools\.js"\)/.test(coreSrc), "ядро не требует image-tools в CommonJS");
     assert.ok(
-      /factory\(root\.ProviderConfig, root\.ProviderTransport, root\.ContextWindow, root\.WebTools, root\.ImageTools\)/.test(coreSrc),
+      /factory\(root\.ProviderConfig, root\.ProviderTransport, root\.ContextWindow, root\.WebTools, root\.ImageTools, root\.Prompts, root\.ToolSchemas\)/.test(coreSrc),
       "браузерная ветка ядра не получает модули"
     );
+    // Данные агента вынесены в свои модули: промпт — текст правил, схемы — таблица
+    // инструментов. Проверяем все три пути загрузки, иначе в окне агент стартует
+    // без правил и без инструментов (в Electron main require бы сработал).
+    assert.ok(/require\("\.\/prompts\.js"\)/.test(coreSrc), "ядро не требует prompts.js в CommonJS");
+    assert.ok(/require\("\.\/tool-schemas\.js"\)/.test(coreSrc), "ядро не требует tool-schemas.js в CommonJS");
+    const posPrompt = html.indexOf('src="prompts.js"');
+    const posSchemas = html.indexOf('src="tool-schemas.js"');
+    assert.ok(posPrompt > 0 && posSchemas > 0, "в index.html нет тегов данных агента");
+    assert.ok(posPrompt < posCore && posSchemas < posCore, "данные подключены ПОСЛЕ ядра — window.Prompts будет пустым");
+    assert.ok(/"prompts\.js"/.test(bridge) && /"tool-schemas\.js"/.test(bridge), "preview-мост не отдаёт данные агента телефону");
+    // Само ядро больше не хранит ни текста правил, ни таблицы схем: иначе правки
+    // уходили бы в две копии и расходились.
+    assert.ok(!/const SYSTEM_PROMPT = `/.test(coreSrc), "текст промпта остался в ядре");
+    assert.ok(!/const TOOL_DEFINITIONS = \[/.test(coreSrc), "таблица схем осталась в ядре");
+    // А через общий объект они доступны по-прежнему — main.js и тесты не менялись.
+    assert.ok(typeof core.SYSTEM_PROMPT === "string" && core.SYSTEM_PROMPT.length > 20000, "ядро перестало отдавать SYSTEM_PROMPT");
+    assert.ok(Array.isArray(core.TOOL_DEFINITIONS) && core.TOOL_DEFINITIONS.length >= 90, "ядро перестало отдавать TOOL_DEFINITIONS");
+    // Модули данных самостоятельны: ни require, ни обращений к window внутри.
+    const promptSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "prompts.js"), "utf8");
+    const schemaSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "tool-schemas.js"), "utf8");
+    // Смотрим КОД, а не текст данных: в описании инструмента законно встречается
+    // «window.__x» — это строка для модели, а не обращение к объекту окна.
+    for (const pair of [["prompts.js", promptSrc], ["tool-schemas.js", schemaSrc]]) {
+      const code = codeOnly(pair[1]);
+      assert.ok(!/require\(/.test(code), pair[0] + " тянет за собой модули — данные должны быть самодостаточны");
+      assert.ok(!/window\./.test(code), pair[0] + " лезет в window");
+      assert.ok(!/AgentCore/.test(code), pair[0] + " ссылается на ядро");
+    }
     assert.ok(/require\("\.\/provider-config\.js"\)/.test(coreSrc), "ядро не требует provider-config в CommonJS");
     const posCfg = html.indexOf('src="provider-config.js"');
     assert.ok(posCfg > 0 && posCfg < posCore, "подключение к провайдеру подключено ПОСЛЕ ядра — window.ProviderConfig будет пустым");
@@ -11273,6 +12393,40 @@ async function testCoreSplit() {
     assert.strictEqual(core.generateImageRemote.name, img.generateImageRemote.name, "ядро отдаёт не модульную генерацию изображений");
   });
 
+  await test("разрез ядра: в окне (теги из index.html по порядку) ядро поднимается и данные на месте", () => {
+    const vm = require("vm");
+    // Порядок берём ИЗ РАЗМЕТКИ, а не из головы: если тег забудут или переставят,
+    // это и есть тот случай, когда в приложении агент стартует без правил.
+    const tags = (html.match(/<script src="[^"]+"><\/script>/g) || []).map((t) => /src="([^"]+)"/.exec(t)[1]);
+    const needed = tags.filter((f) => /^(provider-config|provider-transport|context-window|web-tools|image-tools|prompts|tool-schemas|agent-core)\.js$/.test(f));
+    assert.strictEqual(needed.length, 8, "в разметке не все модули ядра: " + needed.join(", "));
+    const sandbox = { console: console, setTimeout: setTimeout, clearTimeout: clearTimeout };
+    sandbox.self = sandbox;
+    sandbox.window = sandbox;
+    sandbox.fetch = () => {
+      throw new Error("в этом тесте сеть не нужна");
+    };
+    vm.createContext(sandbox);
+    for (const f of needed) {
+      vm.runInContext(fs.readFileSync(path.join(ROOT, "src", "renderer", f), "utf8"), sandbox, { filename: f });
+    }
+    const win = sandbox.window.AgentCore;
+    assert.ok(win, "в окне не появилось ядро — модули не подключены или идут после ядра");
+    const electron = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
+    // Одни и те же данные: в окне и в главном процессе не может быть двух промптов.
+    assert.strictEqual(win.SYSTEM_PROMPT, electron.SYSTEM_PROMPT, "промпт в окне и в main разошлись");
+    assert.strictEqual(JSON.stringify(win.TOOL_DEFINITIONS), JSON.stringify(electron.TOOL_DEFINITIONS), "таблица схем в окне и в main разошлась");
+    assert.strictEqual(win.PLAN_MODE_TOOL_DEFINITIONS.length, 1, "режим плана потерял todoWrite");
+    // И главный путь ядра работает в живой странице: запрос к Ollama собирается.
+    const req = win.buildChatRequest(
+      { provider: "ollama", ollamaUrl: "http://127.0.0.1:11434" },
+      { model: "qwen3:8b", messages: [{ role: "user", content: "привет" }], tools: win.TOOL_DEFINITIONS, numCtxBudget: 14000 }
+    );
+    const body = JSON.parse(req.body);
+    assert.strictEqual(body.tools.length, win.TOOL_DEFINITIONS.length, "в окне инструменты не доехали до запроса");
+    // Контекст считается в живом окне по той же формуле: бюджет + запас на ответ.
+    assert.ok(body.options && body.options.num_ctx === 14000 + 4096, "в окне неверно посчитан num_ctx: " + JSON.stringify(body.options));
+  });
   await test("разрез ядра: вынесенные модули не тянут за собой ядро", () => {
     // Обратная ошибка: модуль «самостоятелен» только на бумаге и на деле берёт
     // помощники из ядра. Тогда его нельзя ни проверить, ни переиспользовать.
@@ -11289,12 +12443,11 @@ async function testCoreSplit() {
       },
       "web-tools.js": { src: require(path.join(ROOT, "src", "renderer", "web-tools.js")), deps: [] },
       "image-tools.js": { src: require(path.join(ROOT, "src", "renderer", "image-tools.js"))(stubDeps), deps: ["apiHeaders", "proxiedBase", "readApiError"] },
+      "prompts.js": { src: require(path.join(ROOT, "src", "renderer", "prompts.js")), deps: [] },
+      "tool-schemas.js": { src: require(path.join(ROOT, "src", "renderer", "tool-schemas.js")), deps: [] },
     };
     for (const [file, info] of Object.entries(allowed)) {
-      const src = fs
-        .readFileSync(path.join(ROOT, "src", "renderer", file), "utf8")
-        .replace(/\/\*[\s\S]*?\*\//g, " ")
-        .replace(/\/\/[^\n]*/g, " ");
+      const src = codeOnly(fs.readFileSync(path.join(ROOT, "src", "renderer", file), "utf8"));
       // Свои имена модуля (в том числе экспортируемые) — не утечка: ядро раздаёт их же.
       const own = new Set(Object.keys(info.src));
       // Имена, ОБЪЯВЛЕННЫЕ внутри модуля (в том числе полученные из deps), — это и есть
@@ -11488,7 +12641,7 @@ async function testMissions() {
     const main = mainOnlySrc();
     const tools = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
     const policy = fs.readFileSync(path.join(ROOT, "src", "tool-policy.js"), "utf8");
-    const core = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+    const core = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
     const pre = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
@@ -11541,6 +12694,7 @@ async function testMissions() {
   await testSessionExtras();
   await testVault();
   await testVaultUi();
+  await testSecretsPanel();
   await testMail();
   await testYandexCloud();
   await testYcDiagnosis();
@@ -11579,6 +12733,11 @@ async function testMissions() {
   await testWebTools();
   await testImageTools();
   await testCoreSplit();
+  await testUiSearch();
+  await testDevRun();
+  await testChatActions();
+  await testWebChat();
+  await testTasksMission();
   await testProviderConfig();
   await testProviderTransport();
   await testContextWindow();
@@ -11779,16 +12938,20 @@ async function testSecretScopes() {
   });
 
   await test("секреты: выдача видна в настройках и доступна с телефона", () => {
+    // Список переменных и выдача живут в src/renderer/secrets-panel.js (этап 3.5).
     const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    const ui = uiAll();
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     const preload = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
     const mobile = fs.readFileSync(path.join(ROOT, "src", "renderer", "mobile-api.js"), "utf8");
-    const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
-    assert.ok(app.includes("agentEnvScopes"), "настройки в окне не знают про выдачу");
-    assert.ok(app.includes('sel.className = "env-scope"'), "в списке переменных нет выбора выдачи");
-    assert.ok(app.includes("setEnvScope(k, sel.value)"), "выбор выдачи ни к чему не привязан");
-    assert.ok(app.includes("api.policyGroups"), "окно не спрашивает группы выдачи");
-    assert.ok(app.includes("envScopeLabel"), "группы не переводятся на человеческий язык");
+    const coreSrc = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
+    assert.ok(ui.includes("agentEnvScopes"), "настройки в окне не знают про выдачу");
+    assert.ok(ui.includes('sel.className = "env-scope"'), "в списке переменных нет выбора выдачи");
+    assert.ok(ui.includes("setEnvScope(k, sel.value)"), "выбор выдачи ни к чему не привязан");
+    assert.ok(ui.includes("api.policyGroups"), "окно не спрашивает группы выдачи");
+    assert.ok(ui.includes("envScopeLabel"), "группы не переводятся на человеческий язык");
+    // Живые настройки, а не копия: список берёт их через getSettings() каждый раз.
+    assert.ok(ui.includes("getSettings().agentEnvScopes"), "список и настройки не связаны живыми настройками");
     assert.ok(preload.includes('"policy:groups"'), "мост не отдаёт группы выдачи");
     assert.ok(mobile.includes('"policy:groups"'), "с телефона выдача недоступна");
     assert.ok(html.includes("выдача"), "в интерфейсе не объяснено, что такое выдача");
@@ -11844,10 +13007,9 @@ async function testOneNavigation() {
   });
 
   await test("одна навигация: ровно одна подсветка вместо трёх", () => {
-    const a1 = appSrc.indexOf("  // Рельса слева (как в Replit): иконки переиспользуют");
-    const a2 = appSrc.indexOf("  function sidePanelVisible() {", a1);
-    assert.ok(a1 > 0 && a2 > a1, "не нашёл блок навигации в app.js");
-    const openBody = appSrc.slice(appSrc.indexOf("  function openSidePanel(tab) {"), appSrc.indexOf("  function closeSidePanel() {"));
+    const navLogic = uiFind("  // Рельса слева (как в Replit): иконки переиспользуют", "  function sidePanelVisible() {");
+    assert.ok(navLogic.start > 0, "не нашёл блок навигации в интерфейсе");
+    const openBody = uiFind("  function openSidePanel(tab) {", "  function closeSidePanel() {").code;
     assert.ok(openBody.indexOf("markPanelButtons();") !== -1, "openSidePanel не пересчитывает подсветку");
     assert.ok(openBody.indexOf('.classList.add("active")') === -1, "openSidePanel снова включает подсветку вручную");
     assert.ok(/function markPanelButtons\(\)/.test(appSrc), "нет единой точки подсветки разделов");
@@ -11858,7 +13020,7 @@ async function testOneNavigation() {
     const code =
       "let sideTab = 'preview';\n" +
       "function sidePanelVisible() { return !$('side-panel').classList.contains('hidden'); }\n" +
-      appSrc.slice(a1, a2) +
+      navLogic.code +
       "\nreturn { markPanelButtons: markPanelButtons, setTab: function (t) { sideTab = t; } };";
     const el = () => {
       const e = { _c: new Set(), title: "", onclick: null };
@@ -12530,7 +13692,7 @@ async function testVkFieldFixes() {
     assert.ok(/aria-setsize/.test(guide), "нет объяснения про aria-setsize");
     assert.ok(/batch\.call/.test(guide), "нет объяснения про бандл методов");
     assert.ok(/sessionStorage/.test(guide), "нет подсказки про sessionStorage");
-    const core = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+    const core = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
     assert.ok(/И В ТЕЛЕ запроса/.test(core), "browserReplay не говорит про поиск в теле");
     assert.ok(/aria-setsize/.test(core), "browserScroll не знает про aria-setsize");
     assert.ok(/klienty-vk/.test(core), "noteSave не объясняет перевод ключа");

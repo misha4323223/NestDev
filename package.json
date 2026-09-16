@@ -1,6 +1,6 @@
 {
   "name": "ai-agent",
-  "version": "1.5.99",
+  "version": "1.5.108",
   "private": true,
   "description": "AI Developer Agent — чат с AI-агентом (Ollama / Groq / внешние API), файловые операции и git",
   "author": "AI Developer Agent",
@@ -15,7 +15,8 @@
     "test:live:desktop": "node scripts/live-desktop.js",
     "test:live:yc": "node scripts/live-yc-console.js",
     "test:live:deploy": "node scripts/live-deploy.js",
-    "test:live:yc:real": "node scripts/live-yc-real.js"
+    "test:live:yc:real": "node scripts/live-yc-real.js",
+    "test:boot": "node scripts/live-boot.js"
   },
   "devDependencies": {
     "electron": "^33.2.0",

@@ -262,7 +262,7 @@
     if (isElectron && api.g4fTest) {
       result = await api.g4fTest({ url: base, provider: p.name, model });
     } else {
-      termServerAppend('<span class="ts-err">Полный тест доступен в десктоп-приложении (в браузере локальный g4f недоступен).</span>');
+      DevRun.termServerAppend('<span class="ts-err">Полный тест доступен в десктоп-приложении (в браузере локальный g4f недоступен).</span>');
       setSettingsMsg("Тест G4F доступен в приложении на ПК.", true);
       return;
     }
@@ -273,7 +273,7 @@
       const cls = l.level === "err" ? "ts-err" : l.level === "ok" ? "ts-ok" : l.level === "warn" ? "ts-warn" : "ts-info";
       if (l.level === "err") errCount++;
       if (l.level === "ok") okCount++;
-      termServerAppend('<span class="' + cls + '">' + esc(l.text) + "</span>");
+      DevRun.termServerAppend('<span class="' + cls + '">' + esc(l.text) + "</span>");
     }
     const verdict = errCount
       ? "Провайдер «" + p.name + "»: есть проблемы — смотри логи в консоли (правая панель)."
@@ -1214,11 +1214,11 @@
         actions.appendChild(b);
       };
       if (m.role === "assistant") {
-        addBtn("⧉", "Скопировать ответ", () => copyText(msgText(m.content)));
-        if (isLastAssistant(m)) addBtn("↻", "Сгенерировать ответ заново", () => regenerate(m));
+        addBtn("⧉", "Скопировать ответ", () => ChatActions.copyText(msgText(m.content)));
+        if (ChatActions.isLastAssistant(m)) addBtn("↻", "Сгенерировать ответ заново", () => ChatActions.regenerate(m));
       } else if (m.role === "user") {
-        addBtn("⧉", "Скопировать сообщение", () => copyText(msgText(m.content)));
-        addBtn("✏️", "Редактировать — вставить в поле ввода и переотправить", () => editUserMessage(m));
+        addBtn("⧉", "Скопировать сообщение", () => ChatActions.copyText(msgText(m.content)));
+        addBtn("✏️", "Редактировать — вставить в поле ввода и переотправить", () => ChatActions.editUserMessage(m));
       }
       wrap.appendChild(actions);
     }
@@ -1745,7 +1745,7 @@
       } else {
         webAbort = new AbortController();
         try {
-          await webSend(history, onAiEvent, webAbort.signal, { plan: usePlan, role: chat.role || "dev", chatId: chat.id });
+          await WebChat.webSend(history, onAiEvent, webAbort.signal, { plan: usePlan, role: chat.role || "dev", chatId: chat.id });
         } catch (e) {
           if (e.name !== "AbortError") onAiEvent({ type: "error", message: e.message || String(e) });
         }
@@ -1891,12 +1891,12 @@
     // Разовое дело после выполнения закрываем: сделано — висеть просроченным незачем.
     if (!task.repeat && api && api.tasksDone) {
       try { await api.tasksDone(task.id); } catch {}
-      renderTasks();
+      TasksMission.renderTasks();
     }
     // Ручной прогон удался — снимаем «сдался», планировщик снова берёт это дело.
     if (task.manual && task.auto && api && api.tasksAutoRearm) {
       try { await api.tasksAutoRearm(task.id); } catch {}
-      renderTasks();
+      TasksMission.renderTasks();
     }
   }
 
@@ -1962,7 +1962,7 @@
           : late ? "⚠ Просроченных дел: " + late : "⏰ Подошёл срок: " + list.length + " дел";
         toast(text);
       }
-      renderTasks();
+      TasksMission.renderTasks();
       return;
     }
     // Срок автозадачи: приложение будит агента само (чат «Автозадачи»).
@@ -1986,7 +1986,7 @@
       } else if (list.length > 1) {
         toast("⚠ Автозадач не запустилось: " + list.length);
       }
-      renderTasks();
+      TasksMission.renderTasks();
       return;
     }
     // Прогон запущен другим клиентом (обычно телефоном): у событий нет привязки к
@@ -2155,7 +2155,7 @@
       }
       case "mission": {
         // Движок миссии: батч, пауза, лимит, смена шага — панель обновляется сразу.
-        missionFromEvent(ev);
+        TasksMission.missionFromEvent(ev);
         break;
       }
       case "checkpoint": {
@@ -2395,11 +2395,11 @@
     if (spTasksEl) spTasksEl.classList.toggle("hidden", sideTab !== "tasks");
     const spMissionEl = $("sp-mission");
     if (spMissionEl) spMissionEl.classList.toggle("hidden", sideTab !== "mission");
-    if (sideTab === "mission") refreshMission();
+    if (sideTab === "mission") TasksMission.refreshMission();
     const spDeployEl = $("sp-deploy");
     if (spDeployEl) spDeployEl.classList.toggle("hidden", sideTab !== "deploy");
     if (sideTab === "deploy" && window.DeployPanel) window.DeployPanel.open(settings.workingDir || "");
-    if (sideTab === "tasks") renderTasks();
+    if (sideTab === "tasks") TasksMission.renderTasks();
     // Название раздела в шапке панели: на широком экране вкладки скрыты, и это
     // единственная подсказка, куда мы переключились (переключает рельса слева).
     const spTitle = $("sp-title");
@@ -2411,11 +2411,11 @@
       setTimeout(() => $("term-input").focus(), 50);
     }
     if (sideTab === "preview") {
-      refreshDevControls();
+      DevRun.refreshDevControls();
       if (!previewLoaded && settings.previewUrl) previewOpen(settings.previewUrl);
     }
     if (sideTab === "cloud") {
-      ycLoadDashboard(false);
+      YcPanel.loadDashboard(false);
     }
     syncRail();
   }
@@ -2430,706 +2430,30 @@
     openSidePanel(tab);
   }
 
-  // ── Роли чата ────────────────────────────────────────────────────────────
-  // Роль — режим всего чата: текст роли уходит в системный промпт каждый раунд, а её
-  // инструменты включены с первого раунда (см. AGENT_ROLES в ядре). Выбор хранится в
-  // самом чате, поэтому переписка с менеджером остаётся менеджерской и после перезапуска.
-  function roleEsc(s) {
-    return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-  }
-  function chatRole() {
-    const c = getActiveChat();
-    return AgentCore.roleById((c && c.role) || settings.defaultRole || "dev");
-  }
-  function renderRoleButton() {
-    const btn = $("btn-role");
-    if (!btn) return;
-    const role = chatRole();
-    btn.textContent = role.icon + " " + role.title;
-    btn.classList.toggle("active", role.id !== "dev");
-    btn.title = role.hint + " · клик — сменить роль";
-  }
-  function renderRolePopover() {
-    const box = $("role-popover");
-    if (!box) return;
-    const cur = chatRole();
-    box.innerHTML = '<div class="role-popover-head">Роль держится весь чат: агент иначе себя ведёт и сразу включает нужные инструменты. Выбор запоминается в чате.</div>';
-    for (const r of AgentCore.rolesList()) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "role-card" + (r.id === cur.id ? " active" : "");
-      b.innerHTML = '<span class="role-card-ic">' + roleEsc(r.icon) + '</span><span><span class="role-card-title">' + roleEsc(r.title) + '</span><div class="role-card-hint">' + roleEsc(r.hint) + "</div></span>";
-      b.onclick = () => { setChatRole(r.id); toggleRolePopover(false); };
-      box.appendChild(b);
-    }
-  }
-  function toggleRolePopover(show) {
-    const box = $("role-popover");
-    if (!box) return;
-    const next = show === undefined ? box.classList.contains("hidden") : !!show;
-    if (next) renderRolePopover();
-    box.classList.toggle("hidden", !next);
-  }
-  function setChatRole(id) {
-    const role = AgentCore.roleById(id);
-    const chat = getActiveChat();
-    if (chat) {
-      chat.role = role.id;
-      persistChatsNow();
-      renderSidebar();
-    }
-    // Новые чаты наследуют последнюю выбранную роль.
-    settings.defaultRole = role.id;
-    if (api && api.setSettings) api.setSettings({ defaultRole: role.id }).catch(() => {});
-    renderRoleButton();
-    renderRoleChips();
-    toast(role.icon + " Роль: " + role.title);
-    if (role.id === "manager") {
-      openSidePanel("tasks");
-      renderTasks();
-    }
-  }
-  function renderRoleChips() {
-    const box = $("role-chips");
-    if (!box) return;
-    const chips = chatRole().chips || [];
-    box.innerHTML = "";
-    box.classList.toggle("hidden", !chips.length);
-    for (const c of chips) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "chip action role-chip";
-      b.textContent = c.t;
-      b.onclick = () => {
-        const input = $("input");
-        input.value = c.t;
-        autoResize();
-        if (c.send) sendMessage();
-        else input.focus();
-      };
-      box.appendChild(b);
-    }
-  }
-
-  // ── Дела (задачи и сроки) ────────────────────────────────────────────────
-  let tasksShowDone = false;
-  function tasksSupported() {
-    return !!(isElectron && api.tasksBoard);
-  }
-  function dayStart(ts) {
-    const d = new Date(ts);
-    d.setHours(0, 0, 0, 0);
-    return d.getTime();
-  }
-  // Срок по-человечески: «сегодня 14:00», «завтра», «⚠ просрочено 2 ч назад».
-  function tasksDueText(t) {
-    if (!t.due) return "без срока";
-    const at = new Date(t.due);
-    if (isNaN(at.getTime())) return String(t.due);
-    const now = Date.now();
-    const time = t.allDay ? "" : " " + String(at.getHours()).padStart(2, "0") + ":" + String(at.getMinutes()).padStart(2, "0");
-    if (at.getTime() < now) {
-      const mins = Math.max(1, Math.round((now - at.getTime()) / 60000));
-      const ago = mins < 60 ? mins + " мин" : Math.round(mins / 60) + " ч";
-      return "⚠ просрочено" + time + " · " + ago + " назад";
-    }
-    const diff = Math.round((dayStart(at.getTime()) - dayStart(now)) / 86400000);
-    if (diff === 0) return "сегодня" + time + (t.allDay ? " (весь день)" : "");
-    if (diff === 1) return "завтра" + time + (t.allDay ? " (весь день)" : "");
-    if (diff > 1 && diff < 7) return "через " + diff + " дн" + time;
-    return at.toLocaleDateString("ru-RU", { day: "numeric", month: "long" }) + time;
-  }
-  // Повтор по-человечески — та же строка, что хранит приложение («daily», «weekly:5»…).
-  const REPEAT_TEXT = { daily: "каждый день", weekdays: "по будням", weekly: "каждую неделю", monthly: "каждый месяц" };
-  const WEEKDAY_ACC = ["воскресенье", "понедельник", "вторник", "среду", "четверг", "пятницу", "субботу"];
-  function repeatText(r) {
-    const s = String(r || "");
-    if (!s) return "";
-    if (REPEAT_TEXT[s]) return REPEAT_TEXT[s];
-    if (s.startsWith("weekly:")) {
-      const d = parseInt(s.slice(7), 10);
-      return d >= 0 && d <= 6 ? "каждую " + WEEKDAY_ACC[d] : "каждую неделю";
-    }
-    if (s.startsWith("every:")) {
-      const mins = parseInt(s.slice(6), 10) || 60;
-      return mins % 60 === 0 && mins >= 60 ? "каждые " + mins / 60 + " ч" : "каждые " + mins + " мин";
-    }
-    return s;
-  }
-  function updateTasksBadge(s) {
-    const b = $("rail-tasks-badge");
-    if (!b) return;
-    const n = (s && (s.overdue || 0) + (s.today || 0)) || 0;
-    b.textContent = n > 99 ? "99+" : String(n);
-    b.classList.toggle("hidden", n === 0);
-  }
-  function taskRow(t, done) {
-    const high = t.priority === "high";
-    const row = document.createElement("div");
-    row.className = "task-row" + (done ? " done" : "") + (high ? " high" : "");
-    const at = t.due ? new Date(t.due) : null;
-    const late = !!(at && !isNaN(at.getTime()) && !done && at.getTime() < Date.now());
-    if (late) row.classList.add("late");
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.className = "task-check";
-    cb.checked = !!done;
-    cb.title = done ? "Снять отметку «выполнено»" : "Отметить выполненным";
-    cb.onchange = async () => { await api.tasksDone(t.id, !done); renderTasks(); };
-    // Название и срок живут в одном блоке: длинные дела переносятся, а метки
-    // не разъезжаются по всей ширине панели.
-    const body = document.createElement("div");
-    body.className = "task-body";
-    const title = document.createElement("div");
-    title.className = "task-title";
-    title.textContent = t.title;
-    if (t.note) title.title = t.note;
-    title.onclick = () => startTaskEdit(row, title, t, "title");
-    const meta = document.createElement("div");
-    meta.className = "task-meta";
-    const due = document.createElement("span");
-    due.className = "task-due" + (late ? " late" : t.due ? "" : " none");
-    due.textContent = (late ? "⚠ " : t.due ? "🕒 " : "— ") + tasksDueText(t);
-    due.title = "Клик — изменить срок (например: завтра 14:00)";
-    due.onclick = () => startTaskEdit(row, due, t, "due");
-    meta.appendChild(due);
-    if (t.repeat) {
-      const rep = document.createElement("span");
-      rep.className = "task-tag";
-      rep.textContent = "🔁 " + repeatText(t.repeat);
-      rep.title = "Дело повторяется: " + repeatText(t.repeat);
-      meta.appendChild(rep);
-    }
-    // Автозапуск агентом — ВИДИМАЯ кнопка, а не скрытая галочка: раньше пометить дело
-    // было нечем, и планировщик его пропускал («ставлю время, а агента никто не дёргает»).
-    const autoBtn = document.createElement("button");
-    autoBtn.type = "button";
-    autoBtn.className = "task-tag tk-auto" + (t.auto ? " on" : "");
-    autoBtn.textContent = t.auto ? "▶ агент" : "▷ агент";
-    autoBtn.title = t.auto
-      ? "Агент выполнит это дело сам по сроку (ответ — в чате «Автозадачи»). Клик — выключить."
-      : "Клик — включить: приложение само разбудит агента в срок дела.";
-    autoBtn.onclick = async (e) => {
-      e.stopPropagation();
-      const r = await api.tasksUpdate(t.id, { auto: !t.auto });
-      if (r && r.ok === false) { toast("Дела: " + r.error); return; }
-      toast(!t.auto
-        ? "▶ Дело «" + t.title + "» запустит агент по сроку"
-        : "▷ Дело «" + t.title + "» больше не запускается агентом");
-      renderTasks();
-    };
-    meta.appendChild(autoBtn);
-    if (t.auto) {
-      // Проверить запуск, не дожидаясь часа: тот же путь, что и по сроку.
-      const nowBtn = document.createElement("button");
-      nowBtn.type = "button";
-      nowBtn.className = "task-tag tk-now";
-      nowBtn.textContent = "▶ сейчас";
-      nowBtn.title = "Запустить агента прямо сейчас, не дожидаясь срока (срок и повтор не меняются)";
-      nowBtn.onclick = (e) => { e.stopPropagation(); startAutoRunNow(t); };
-      meta.appendChild(nowBtn);
-    }
-    if (t.auto && t.autoGaveUp) {
-      const failTag = document.createElement("span");
-      failTag.className = "task-tag tk-fail";
-      failTag.textContent = "⚠ не запустилась";
-      failTag.title = t.autoLastError ? "Последняя ошибка: " + t.autoLastError : "Прогон не подтвердился";
-      meta.appendChild(failTag);
-    }
-    if (t.project) {
-      const tag = document.createElement("span");
-      tag.className = "task-tag";
-      tag.textContent = t.project;
-      tag.title = "Проект: " + t.project;
-      meta.appendChild(tag);
-    }
-    if (high || t.priority === "low") {
-      const tag = document.createElement("span");
-      tag.className = "task-tag" + (high ? " high" : "");
-      tag.textContent = high ? "важное" : "мелкое";
-      meta.appendChild(tag);
-    }
-    body.append(title, meta);
-    const actions = document.createElement("div");
-    actions.className = "task-actions";
-    const del = document.createElement("button");
-    del.className = "task-edit";
-    del.textContent = "🗑";
-    del.title = "Удалить дело";
-    del.onclick = async () => {
-      if (!window.confirm("Удалить дело «" + t.title + "»?")) return;
-      await api.tasksDelete(t.id);
-      renderTasks();
-    };
-    actions.appendChild(del);
-    row.append(cb, body, actions);
-    return row;
-  }
-  // Правка прямо в строке: клик по названию или сроку. В Electron window.prompt нет,
-  // поэтому редактируем на месте и сохраняем по Enter или потере фокуса.
-  function startTaskEdit(row, el, t, field) {
-    if (row.querySelector(".task-edit-input")) return;
-    const input = document.createElement("input");
-    input.className = "task-edit-input";
-    input.value = field === "due" ? t.due || "" : t.title;
-    if (field === "due") input.placeholder = "завтра 14:00 / в пятницу / пусто — без срока";
-    el.replaceWith(input);
-    input.focus();
-    if (field === "title") input.select();
-    const save = async () => {
-      const value = input.value.trim();
-      input.onblur = null;
-      if (!value && field === "title") { renderTasks(); return; }
-      const patch = {};
-      patch[field] = value;
-      const r = await api.tasksUpdate(t.id, patch);
-      if (r && r.ok === false) toast("Дела: " + r.error);
-      renderTasks();
-    };
-    input.onkeydown = (e) => {
-      if (e.key === "Enter") { e.preventDefault(); save(); }
-      if (e.key === "Escape") { input.onblur = null; renderTasks(); }
-    };
-    input.onblur = save;
-  }
-  // Фильтр панели: «Все» либо конкретная группа сроков (клик по плитке).
-  let tasksFilter = "all";
-  const TASK_FILTERS = [
-    { id: "all", title: "Все" },
-    { id: "overdue", title: "Просрочено" },
-    { id: "today", title: "Сегодня" },
-    { id: "tomorrow", title: "Завтра" },
-    { id: "week", title: "На неделе" },
-    { id: "none", title: "Без срока" },
-  ];
-  function paintTaskFilters(board) {
-    const box = $("tasks-filters");
-    if (!box) return;
-    const groups = board.groups || [];
-    const total = groups.reduce((n, g) => n + g.tasks.length, 0);
-    // Фильтр, в котором ничего не осталось, сам возвращается к «Все» —
-    // иначе панель выглядела бы пустой без причины.
-    if (tasksFilter !== "all" && !groups.some((g) => g.id === tasksFilter && g.tasks.length)) tasksFilter = "all";
-    box.innerHTML = "";
-    for (const f of TASK_FILTERS) {
-      const n = f.id === "all" ? total : ((groups.find((g) => g.id === f.id) || { tasks: [] }).tasks.length);
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "tk-chip" + (tasksFilter === f.id ? " active" : "") + (n ? "" : " zero") + (f.id === "overdue" && n ? " late" : "");
-      b.dataset.filter = f.id;
-      b.title = "Показать: " + f.title.toLowerCase();
-      const label = document.createElement("span");
-      label.textContent = f.title;
-      const num = document.createElement("span");
-      num.className = "tk-n";
-      num.textContent = String(n);
-      b.append(label, num);
-      b.onclick = () => { tasksFilter = f.id; renderTasks(); };
-      box.appendChild(b);
-    }
-  }
-
-  // ── Миссия (долгая работа агента) ──────────────────────────────────────────
-  // Агент, который работает часами, должен быть виден: цель, шаги, живой журнал,
-  // время и токены. Данные приходят из main (файлы .agent/) — панель их только рисует.
-  let missionCache = null;
-  let missionTimer = null;
-  const MISSION_STATUS_LABEL = {
-    active: "работает",
-    paused: "на паузе",
-    done: "завершена",
-    failed: "с ошибкой",
-    stopped: "остановлена",
-  };
-  const MISSION_STEP_ICON = { done: "✓", failed: "!", doing: "▸", todo: "○" };
-
-  function missionSupported() {
-    return !!(isElectron && api.missionState);
-  }
-
-  function missionClock(ms) {
-    const total = Math.max(0, Math.round((Number(ms) || 0) / 1000));
-    const h = Math.floor(total / 3600);
-    const m = Math.floor((total % 3600) / 60);
-    const sec = total % 60;
-    return (h ? h + ":" + String(m).padStart(2, "0") : String(m)) + ":" + String(sec).padStart(2, "0");
-  }
-
-  async function refreshMission() {
-    if (!missionSupported()) return null;
-    try {
-      missionCache = await api.missionState();
-    } catch {
-      missionCache = null;
-    }
-    renderMission();
-    return missionCache;
-  }
-
-  function missionDot(active) {
-    const dot = $("sp-mission-dot");
-    if (dot) dot.classList.toggle("hidden", !active);
-    const badge = $("rail-mission-badge");
-    if (badge) {
-      badge.classList.toggle("hidden", !active);
-      if (active) badge.textContent = "●";
-    }
-  }
-
-  function renderMission() {
-    const host = $("sp-mission");
-    if (!host) return;
-    const st = missionCache;
-    if (!st || !st.enabled) {
-      const empty = $("ms-empty");
-      if (empty) {
-        empty.classList.remove("hidden");
-        empty.textContent = st && !st.enabled
-          ? "Долгая работа выключена: включи галочку «Долгая работа агента (миссии)» в настройках — тогда большие задачи будут вестись миссиями с файлами в папке .agent/."
-          : "Миссий пока нет. Они появляются сами, когда работа агента становится длинной: цель, план и журнал работы ложатся файлами в папку .agent/ рядом с проектом.";
-      }
-      if ($("ms-card")) $("ms-card").classList.add("hidden");
-      if ($("ms-list")) $("ms-list").innerHTML = "";
-      missionDot(false);
-      return;
-    }
-    const m = st.active;
-    if ($("ms-empty")) $("ms-empty").classList.toggle("hidden", !!m);
-    const card = $("ms-card");
-    if (card) card.classList.toggle("hidden", !m);
-    missionDot(!!(m && (m.status === "active" || m.status === "paused")));
-
-    if (m) {
-      const pr = st.progress || m.progress || { total: 0, done: 0, failed: 0, current: "" };
-      const running = st.running && m.status === "active";
-      if ($("ms-title")) $("ms-title").textContent = m.title || "Миссия";
-      const statusEl = $("ms-status");
-      if (statusEl) {
-        const label = MISSION_STATUS_LABEL[m.status] || m.status;
-        statusEl.textContent = (running ? "работает" : label) + " · " + pr.done + "/" + pr.total;
-        statusEl.className = "ms-status ms-" + m.status;
-      }
-      if ($("ms-goal")) $("ms-goal").textContent = m.goal || "";
-      if ($("ms-fill")) $("ms-fill").style.width = Math.max(2, pr.percent || 0) + "%";
-      const elapsed = running && st.startedAt ? Date.now() - st.startedAt : (m.finishedAt || m.updatedAt || m.createdAt) - (m.startedAt || m.createdAt);
-      if ($("ms-meta")) {
-        $("ms-meta").innerHTML =
-          '<span title="Время работы">⏱ ' + missionClock(elapsed) + "</span>" +
-          '<span title="Раундов пройдено">⚙ ' + (st.rounds || m.rounds || 0) + "</span>" +
-          '<span title="Батчей (отрезков по 25 раундов)">◆ ' + (st.batches || m.batches || 0) + "</span>" +
-          '<span title="Токенов израсходовано">✦ ' + (st.tokens || m.metrics.tokens || 0) + "</span>" +
-          '<span title="Сжатий контекста">🧠 ' + (st.compactions || m.metrics.compactions || 0) + "</span>" +
-          (pr.failed ? '<span class="ms-bad" title="Шагов не удалось">⚠ ' + pr.failed + "</span>" : "") +
-          (m.reason ? '<span class="ms-reason" title="Причина остановки">' + roleEsc(m.reason) + "</span>" : "");
-      }
-      const steps = m.steps || [];
-      const sbox = $("ms-steps");
-      if (sbox) {
-        sbox.innerHTML = steps.length
-          ? steps.map((s, i) =>
-              '<div class="ms-step ms-step-' + (s.state || "todo") + '">' +
-              '<i>' + (MISSION_STEP_ICON[s.state] || "○") + "</i>" +
-              '<span class="ms-step-text">' + (i + 1) + ". " + roleEsc(s.title || "") + "</span>" +
-              (s.note ? '<span class="ms-step-note" title="' + roleEsc(s.note) + '">' + roleEsc(s.note) + "</span>" : "") +
-              "</div>"
-            ).join("")
-          : '<div class="ms-muted">План пока не составлен — агент добавит шаги по ходу работы.</div>';
-      }
-      const jbox = $("ms-journal");
-      if (jbox) {
-        const rows = st.journal || [];
-        jbox.innerHTML = rows.length
-          ? rows.slice().reverse().map((r) =>
-              '<div class="ms-line ms-line-' + roleEsc(r.kind || "note") + '">' +
-              '<span class="ms-time">' + new Date(r.ts).toLocaleTimeString().slice(0, 5) + "</span>" +
-              "<span>" + roleEsc(r.text || "") + "</span></div>"
-            ).join("")
-          : '<div class="ms-muted">Журнал пуст — работа ещё не начиналась.</div>';
-      }
-      const pauseBtn = $("btn-mission-pause");
-      if (pauseBtn) pauseBtn.disabled = !running;
-      const resumeBtn = $("btn-mission-resume");
-      if (resumeBtn) resumeBtn.disabled = running || !!streaming;
-      const stopBtn = $("btn-mission-stop");
-      if (stopBtn) stopBtn.disabled = !st.running;
-    }
-
-    const list = (st.list || []).filter((x) => !m || x.id !== m.id);
-    const lbox = $("ms-list");
-    if (lbox) {
-      lbox.innerHTML = list.length
-        ? list.map((x) =>
-            '<div class="ms-past" data-id="' + roleEsc(x.id) + '">' +
-            '<span class="ms-past-title">' + roleEsc(x.title || x.id) + "</span>" +
-            '<span class="ms-past-meta">' + (MISSION_STATUS_LABEL[x.status] || x.status) + " · " +
-            (x.progress ? x.progress.done + "/" + x.progress.total : "0/0") + "</span>" +
-            '<button class="btn btn-ghost btn-small ms-past-open" title="Открыть папку миссии">📂</button>' +
-            "</div>"
-          ).join("")
-        : '<div class="ms-muted">Прошлых миссий нет.</div>';
-      for (const row of lbox.querySelectorAll(".ms-past-open")) {
-        row.onclick = (e) => {
-          e.stopPropagation();
-          const box = row.closest(".ms-past");
-          if (box && api.missionOpen) api.missionOpen(box.dataset.id);
-        };
-      }
-    }
-    const pastTitle = $("ms-past-title");
-    if (pastTitle) pastTitle.classList.toggle("hidden", !list.length);
-  }
-
-  function missionTickStart() {
-    if (missionTimer) return;
-    missionTimer = setInterval(() => {
-      if (!missionCache || !missionCache.active || !missionCache.running || sideTab !== "mission") return;
-      renderMission();
-    }, 1000);
-  }
-
-  function initMissionPanel() {
-    if ($("btn-mission-refresh")) $("btn-mission-refresh").onclick = () => refreshMission();
-    if ($("btn-mission-pause")) {
-      $("btn-mission-pause").onclick = async () => {
-        try {
-          await api.missionPause();
-          toast("⏸ Пауза: работа сохранена, миссия ждёт продолжения");
-        } catch {}
-      };
-    }
-    if ($("btn-mission-stop")) {
-      $("btn-mission-stop").onclick = async () => {
-        try {
-          await api.missionStop();
-          toast("⏹ Останавливаю прогон");
-        } catch {}
-      };
-    }
-    if ($("btn-mission-resume")) {
-      $("btn-mission-resume").onclick = async () => {
-        if (streaming) return;
-        let r = null;
-        try {
-          r = await api.missionResume();
-        } catch {}
-        if (!r || !r.ok) {
-          toast((r && r.error) || "Незакрытых миссий нет");
-          return;
-        }
-        const chat = getActiveChat();
-        if (chat) selectChat(chat.id);
-        $("input").value = r.text;
-        autoResize();
-        sendMessage();
-      };
-    }
-    if ($("btn-mission-folder")) {
-      $("btn-mission-folder").onclick = () => {
-        const id = missionCache && missionCache.active ? missionCache.active.id : "";
-        if (api.missionOpen) api.missionOpen(id);
-      };
-    }
-    if (missionSupported()) {
-      refreshMission();
-      missionTickStart();
-    }
-  }
-
-  // Событие прогона: агент или движок что-то записали в миссию — обновляем панель.
-  function missionFromEvent(ev) {
-    if (!missionSupported() || !ev) return;
-    if (ev.id) {
-      missionCache = Object.assign({}, missionCache || {}, {
-        active: Object.assign({}, (missionCache && missionCache.active) || {}, {
-          id: ev.id,
-          title: ev.title,
-          goal: ev.goal,
-          status: ev.status,
-          steps: ev.steps || [],
-          reason: ev.reason || "",
-        }),
-        progress: ev.progress || null,
-        rounds: ev.rounds,
-        batches: ev.batches,
-        tokens: ev.tokens,
-        compactions: ev.compactions,
-        startedAt: ev.startedAt,
-        running: true,
-      });
-      renderMission();
-    }
-    refreshMission();
-  }
-
-  async function renderTasks() {
-    if (!tasksSupported()) {
-      const c0 = $("tasks-counts");
-      if (c0) c0.textContent = "Дела работают в приложении на ПК (в веб-превью список недоступен).";
-      return;
-    }
-    const box = $("tasks-groups");
-    if (!box) return;
-    let board = null;
-    try { board = await api.tasksBoard(); } catch { board = null; }
-    if (!board || !board.groups) {
-      const c = $("tasks-counts");
-      if (c) c.textContent = "Не удалось прочитать список дел.";
-      return;
-    }
-    const s = board.summary || {};
-    const counts = $("tasks-counts");
-    if (counts) {
-      counts.innerHTML = "Активных: " + (s.active || 0) +
-        (s.overdue ? ' · <span class="tc-late">просрочено ' + s.overdue + "</span>" : "") +
-        " · сегодня " + (s.today || 0) + " · завтра " + (s.tomorrow || 0);
-    }
-    paintTaskFilters(board);
-    box.innerHTML = "";
-    for (const g of board.groups) {
-      if (!g.tasks.length) continue;
-      if (tasksFilter !== "all" && g.id !== tasksFilter) continue;
-      const head = document.createElement("div");
-      head.className = "tasks-group-head" + (g.id === "overdue" ? " overdue" : "");
-      head.textContent = g.title + " · " + g.tasks.length;
-      box.appendChild(head);
-      for (const t of g.tasks) box.appendChild(taskRow(t, false));
-    }
-    const empty = $("tasks-empty");
-    if (empty) {
-      const nothing = box.childElementCount === 0;
-      empty.classList.toggle("hidden", !nothing);
-      if (nothing) {
-        const filtered = tasksFilter !== "all";
-        empty.innerHTML =
-          '<span class="tk-empty-ic">' + (filtered ? "🔍" : "🗒") + "</span>" +
-          '<div class="tk-empty-t">' + (filtered ? "В этом фильтре дел нет" : "Дел пока нет") + "</div>" +
-          '<div class="tk-empty-s">' + (filtered
-            ? "Сбрось фильтр кнопкой «Все» выше — или добавь дело с таким сроком."
-            : "Добавь первое дело в поле выше — или попроси агента: «запиши дело позвонить в банк завтра в 10».") + "</div>";
-      }
-    }
-    const doneBox = $("tasks-done-list");
-    if (doneBox) {
-      doneBox.classList.toggle("hidden", !tasksShowDone);
-      doneBox.innerHTML = "";
-      const toggle = $("btn-tasks-done-toggle");
-      if (toggle) {
-        const n = (board.done || []).length;
-        toggle.classList.toggle("active", tasksShowDone);
-        toggle.title = tasksShowDone ? "Скрыть выполненные дела" : "Показать выполненные дела";
-        const label = toggle.querySelector(".tk-done-label");
-        if (label) label.textContent = "Выполненные" + (n ? " · " + n : "");
-      }
-      if (tasksShowDone) {
-        if (!board.done.length) doneBox.innerHTML = '<div class="tasks-empty">Выполненных дел пока нет.</div>';
-        else for (const t of board.done) doneBox.appendChild(taskRow(t, true));
-      }
-    }
-    updateTasksBadge(s);
-  }
-  // «▶ агент» в строке добавления: новое дело можно сразу отдать агенту. Состояние
-  // живёт до следующего клика — как приоритет рядом.
-  let taskNewAuto = false;
-  function paintNewTaskAuto() {
-    const b = $("task-new-auto");
-    if (!b) return;
-    b.classList.toggle("active", taskNewAuto);
-    b.textContent = taskNewAuto ? "▶ агент" : "▷ агент";
-    b.title = taskNewAuto
-      ? "Новое дело получит «▶ агент»: приложение разбудит агента по сроку. Клик — выключить."
-      : "Клик — пометить новое дело «▶ агент»: агент выполнит его сам по сроку.";
-  }
-  function toggleNewTaskAuto() {
-    taskNewAuto = !taskNewAuto;
-    paintNewTaskAuto();
-  }
-
-  async function addTaskFromPanel() {
-    if (!tasksSupported()) { toast("Дела: список доступен в приложении на ПК"); return; }
-    const titleEl = $("task-new-title");
-    const dueEl = $("task-new-due");
-    const title = (titleEl.value || "").trim();
-    if (!title) { titleEl.focus(); toast("Дела: напиши, что нужно сделать"); return; }
-    const r = await api.tasksAdd({
-      title: title,
-      due: (dueEl.value || "").trim(),
-      priority: $("task-new-priority").value,
-      auto: taskNewAuto, // «▶ агент» из строки добавления
-    });
-    if (r && r.ok === false) { toast("Дела: " + r.error); return; }
-    titleEl.value = "";
-    dueEl.value = "";
-    titleEl.focus();
-    renderTasks();
-  }
-  // Быстрые сроки у поля добавления: клик подставляет срок, а если название уже
-  // написано — сразу добавляет дело (не надо тянуться к кнопке).
-  const QUICK_DUE = ["через час", "сегодня вечером", "завтра 10:00", "в пятницу", "через неделю"];
-  function paintQuickDue() {
-    const box = $("tasks-quick-due");
-    if (!box) return;
-    box.innerHTML = "";
-    for (const q of QUICK_DUE) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.textContent = q;
-      b.title = "Срок: " + q;
-      b.onclick = () => {
-        const dueEl = $("task-new-due");
-        if (dueEl) dueEl.value = q;
-        const titleEl = $("task-new-title");
-        if (titleEl && titleEl.value.trim()) addTaskFromPanel();
-        else if (titleEl) titleEl.focus();
-      };
-      box.appendChild(b);
-    }
-  }
+  // ── Роли чата, дела и миссия — код в src/renderer/tasks-mission.js ──
   // Отдельные модули интерфейса (консоль Yandex Cloud) — в своём файле и не видят
   // замыкание app.js. Тост отдаём наружу явно, а не дублируем его реализацию.
   window.uiToast = toast;
-  function initRolesAndTasks() {
-    if ($("btn-role")) $("btn-role").onclick = () => toggleRolePopover();
-    paintQuickDue();
-    paintNewTaskAuto();
-    if ($("task-new-auto")) $("task-new-auto").onclick = () => toggleNewTaskAuto();
-    if ($("rail-tasks")) $("rail-tasks").onclick = () => {
-      if (sidePanelVisible() && sideTab === "tasks") closeSidePanel();
-      else openSidePanel("tasks");
-    };
-    if ($("rail-mission")) $("rail-mission").onclick = () => {
-      if (sidePanelVisible() && sideTab === "mission") closeSidePanel();
-      else openSidePanel("mission");
-    };
-    initMissionPanel();
-    if ($("btn-task-add")) $("btn-task-add").onclick = addTaskFromPanel;
-    if ($("task-new-title")) $("task-new-title").onkeydown = (e) => {
-      if (e.key === "Enter") { e.preventDefault(); addTaskFromPanel(); }
-    };
-    if ($("task-new-due")) $("task-new-due").onkeydown = (e) => {
-      if (e.key === "Enter") { e.preventDefault(); addTaskFromPanel(); }
-    };
-    if ($("btn-tasks-refresh")) $("btn-tasks-refresh").onclick = () => renderTasks();
-    if ($("btn-tasks-done-toggle")) $("btn-tasks-done-toggle").onclick = () => {
-      tasksShowDone = !tasksShowDone;
-      $("btn-tasks-done-toggle").classList.toggle("active", tasksShowDone);
-      renderTasks();
-    };
-    // Клик вне попапа ролей закрывает его (иначе он перекрывает поле ввода).
-    document.addEventListener("mousedown", (e) => {
-      const box = $("role-popover");
-      if (!box || box.classList.contains("hidden")) return;
-      if (box.contains(e.target) || ($("btn-role") && $("btn-role").contains(e.target))) return;
-      toggleRolePopover(false);
-    });
-    if (api && api.onTasksChanged) {
-      api.onTasksChanged(() => {
-        renderTasks();
-      });
-    }
-    renderRoleButton();
-    renderRoleChips();
-    if (tasksSupported()) api.tasksBoard().then((b) => updateTasksBadge(b && b.summary)).catch(() => {});
-  }
+  const TasksMission = window.TasksMission({
+    $: $,
+    api: api,
+    isElectron: isElectron,
+    AgentCore: AgentCore,
+    toast: toast,
+    getActiveChat: getActiveChat,
+    selectChat: selectChat,
+    sendMessage: sendMessage,
+    autoResize: autoResize,
+    persistChatsNow: persistChatsNow,
+    renderSidebar: renderSidebar,
+    openSidePanel: openSidePanel,
+    closeSidePanel: closeSidePanel,
+    sidePanelVisible: sidePanelVisible,
+    startAutoRunNow: startAutoRunNow,
+    getSettings: () => settings,
+    isStreaming: () => streaming,
+    getSideTab: () => sideTab,
+  });
 
   // ── Консоль ──
   function termAppend(html) {
@@ -3173,7 +2497,7 @@
     if (ev.type === "metrics") {
       // Метрики раунда агента из main.js: сколько токенов ушло, попал ли префикс в
       // кэш, сколько ждали ответа. Тихой строкой в «Консоль» (правая панель).
-      termServerAppend('<span class="ts-metrics">▤ ' + esc(ev.text || "") + "</span>");
+      DevRun.termServerAppend('<span class="ts-metrics">▤ ' + esc(ev.text || "") + "</span>");
     } else if (ev.type === "out") {
       const escTxt = esc(ev.text || "");
       termAppend('<span class="term-plain">' + escTxt + "</span>");
@@ -3226,213 +2550,36 @@
     else window.open(u, "_blank");
   }
 
-  // ── Быстрый запуск проекта в превью: старт/стоп dev-сервера, освобождение порта ──
-  let previewLogLines = [];
-  let previewRunning = false;
-
-  function previewLogAppend(html) {
-    previewLogLines.push(html);
-    if (previewLogLines.length > 500) previewLogLines.splice(0, previewLogLines.length - 500);
-    const log = $("preview-log");
-    const wrap = $("preview-log-wrap");
-    if (log) {
-      log.innerHTML = previewLogLines.join("");
-      wrap.classList.remove("hidden");
-      wrap.scrollTop = wrap.scrollHeight;
-    }
-  }
-
-  function setPreviewStatus(running, err) {
-    previewRunning = !!running;
-    $("btn-preview-start").classList.toggle("hidden", running);
-    $("btn-preview-stop").classList.toggle("hidden", !running);
-    const st = $("preview-status");
-    if (!st) return;
-    const dot = st.querySelector(".ps-dot");
-    const txt = st.querySelector("span");
-    if (dot) dot.className = "ps-dot" + (running ? " on" : err ? " err" : " off");
-    if (txt) txt.textContent = running ? "Запущен" : err ? "Ошибка" : "Остановлено";
-    updateStatusBar();
-  }
-
-  function refreshDevControls() {
-    if (!isElectron || !api.devStatus) return;
-    api.devStatus(projectDir()).then((st) => {
-      if (!st || !st.ok) return;
-      const cmdInp = $("preview-cmd");
-      if (cmdInp) {
-        if (st.command && !cmdInp.value.trim()) cmdInp.value = st.command;
-        if (!st.command && !cmdInp.value.trim() && st.detected) {
-          cmdInp.value = st.detected;
-          cmdInp.placeholder = st.detected;
-        }
-      }
-      setPreviewStatus(st.running, false);
-    });
-  }
-
-  async function devStartClick() {
-    if (!isElectron || !api.devStart) return;
-    if (previewRunning) return; // уже запускаем/запущен
-    const cmd = $("preview-cmd").value.trim();
-    setPreviewStatus(true, false);
-    previewLogAppend('<div class="pl-cmd">▶ ' + esc(cmd || "…") + "</div>");
-    const r = await api.devStart(projectDir(), cmd);
-    if (!r || !r.ok) {
-      setPreviewStatus(false, true);
-      previewLogAppend('<div class="pl-err">✕ ' + esc((r && r.error) || "Не удалось запустить") + "</div>");
-      toast((r && r.error) || "Не удалось запустить проект");
-      return;
-    }
-    toast("Проект запущен: " + r.command);
-    // Сразу открываем превью на настроенном адресе (по умолчанию http://localhost:5000).
-    previewOpen(settings.previewUrl || "http://localhost:5000");
-    refreshDevControls();
-  }
-
-  async function devStopClick() {
-    if (!isElectron || !api.devStop) return;
-    await api.devStop();
-    previewLogAppend('<div class="pl-exit">⏹ процесс остановлен, порт освобождён</div>');
-    setPreviewStatus(false, false);
-    refreshDevControls();
-  }
-
-  // Логи запущенного сервера дублируются в консоль (вкладка «Консоль»)
-  function termServerAppend(html) {
-    termAppend('<div class="term-server">' + html + "</div>");
-  }
-
-  function onDevEvent(ev) {
-    if (!ev) return;
-    if (ev.type === "start") {
-      previewLogAppend('<div class="pl-exit">— запуск: ' + esc(ev.command || "") + " в " + esc(ev.cwd || "") + " —</div>");
-      termServerAppend('<span class="ts-info">— сервер запущен: ' + esc(ev.command || "") + " в " + esc(ev.cwd || "") + " —</span>");
-      setPreviewStatus(true, false);
-    } else if (ev.type === "out") {
-      previewLogAppend("<span>" + esc(ev.text || "") + "</span>");
-      termServerAppend("<span>" + esc(ev.text || "") + "</span>");
-    } else if (ev.type === "exit") {
-      const tail =
-        "— сервер завершён (код " +
-        esc(String(ev.code ?? "?")) +
-        (ev.error ? ", " + esc(ev.error) : "") +
-        ") —";
-      previewLogAppend('<div class="pl-exit">' + tail + "</div>");
-      termServerAppend('<span class="ts-err">' + tail + "</span>");
-      setPreviewStatus(false, !!(ev.error || (ev.code != null && ev.code !== 0)));
-    } else if (ev.type === "stopped") {
-      previewLogAppend('<div class="pl-exit">— остановлено пользователем —</div>');
-      termServerAppend('<span class="ts-info">— сервер остановлен —</span>');
-      setPreviewStatus(false, false);
-    }
-  }
-
-  // Tab-дополнение команды в терминале: один вариант — дополняем, несколько — показываем список
-  function termTabComplete() {
-    if (!isElectron || !api.termComplete) return;
-    const inp = $("term-input");
-    const line = inp.value;
-    api.termComplete(line).then((r) => {
-      if (!r) return;
-      const matches = r.matches || [];
-      if (matches.length === 1) {
-        inp.value = (r.base || "") + matches[0];
-      } else if (matches.length > 1) {
-        termAppend('<div class="term-exit">' + matches.slice(0, 12).map((m) => esc(m)).join("  ") + (matches.length > 12 ? "  …" : "") + "</div>");
-      }
-    });
-  }
+  // ── Быстрый запуск проекта в превью — код в src/renderer/dev-run.js ──
+  const DevRun = window.DevRun({
+    $: $,
+    api: api,
+    isElectron: isElectron,
+    esc: esc,
+    previewOpen: previewOpen,
+    projectDir: projectDir,
+    termAppend: termAppend,
+    toast: toast,
+    updateStatusBar: updateStatusBar,
+    getSettings: () => settings,
+  });
 
   // ─────────────── Удобство: копирование, регенерация, редактирование ───────────────
-  function copyText(text) {
-    const done = () => toast("Скопировано в буфер обмена");
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(done, done);
-    } else {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      try { document.execCommand("copy"); } catch {}
-      document.body.removeChild(ta);
-      done();
-    }
-  }
-
-  // «↻ Перегенерировать» показываем только у последнего ответа агента
-  function isLastAssistant(m) {
-    const chat = getActiveChat();
-    if (!chat) return false;
-    for (let i = chat.messages.length - 1; i >= 0; i--) {
-      if (chat.messages[i].role !== "tool") return chat.messages[i] === m;
-    }
-    return false;
-  }
-
-  function regenerate(m) {
-    if (streaming) return;
-    const chat = getActiveChat();
-    if (!chat) return;
-    const idx = chat.messages.indexOf(m);
-    if (idx <= 0) return;
-    // Ответ агента может состоять из нескольких сегментов текста и действий —
-    // убираем весь запуск: от последнего user-сообщения до конца.
-    let start = idx;
-    for (let i = idx - 1; i >= 0; i--) {
-      if (chat.messages[i].role === "user") {
-        start = i + 1;
-        break;
-      }
-    }
-    chat.messages.splice(start);
-    persistChats();
-    renderMessages();
-    const lastUser = [...chat.messages].reverse().find((x) => x.role === "user");
-    if (lastUser) {
-      const inp = $("input");
-      inp.value = lastUser.content;
-      autoResize();
-      sendMessage();
-    }
-  }
-
-  function editUserMessage(m) {
-    if (streaming) return;
-    const chat = getActiveChat();
-    if (!chat) return;
-    const idx = chat.messages.indexOf(m);
-    if (idx < 0) return;
-    const inp = $("input");
-    inp.value = msgText(m.content);
-    autoResize();
-    inp.focus();
-    chat.messages.splice(idx); // удалить это сообщение и всё после — текст уже в поле ввода
-    persistChats();
-    renderMessages();
-  }
-
-  // Скопировать активный чат в буфер обмена в виде markdown
-  function copyChat() {
-    const chat = getActiveChat();
-    if (!chat || !chat.messages.length) {
-      toast("Чат пуст");
-      return;
-    }
-    const lines = ["# " + chatTitle(chat), ""];
-    for (const m of chat.messages) {
-      if (m.role === "user") {
-        lines.push("**Пользователь:**", "", m.content || "", "");
-      } else if (m.role === "assistant") {
-        lines.push("**Ассистент:**", "", m.content || "", "");
-      } else if (m.role === "tool") {
-        lines.push("**Инструмент:** " + (m.toolName || ""), "", "```", m.toolResult || "", "```", "");
-      }
-    }
-    copyText(lines.join("\n"));
-  }
+  // Код живёт в src/renderer/chat-actions.js: копирование, повторная генерация и
+  // правка сообщения. «Идёт генерация» отдаётся живой функцией — иначе кнопки
+  // могли бы перебить уже идущий ответ.
+  const ChatActions = window.ChatActions({
+    $: $,
+    toast: toast,
+    getActiveChat: getActiveChat,
+    persistChats: persistChats,
+    renderMessages: renderMessages,
+    sendMessage: sendMessage,
+    autoResize: autoResize,
+    msgText: msgText,
+    chatTitle: chatTitle,
+    isStreaming: () => streaming,
+  });
 
   // ─────────────── Быстрое переключение модели (попап в шапке) ───────────────
   function toggleModelPopup() {
@@ -3539,413 +2686,15 @@
     inp.addEventListener("blur", () => finish(true));
   }
 
-  // ─────────────── Пароли сайтов (Настройки → Секреты) ───────────────
-  // Записи живут в settings.sitePasswords и уходят в main.js вместе с настройками —
-  // там они шифруются (secrets.json + safeStorage/DPAPI). В интерфейсе пароль
-  // никогда не показывается: только пометка «пароль: ••••••«.
-  function vaultArr() {
-    return Array.isArray(settings.sitePasswords) ? settings.sitePasswords : [];
-  }
-
-  let vaultEditingId = ""; // id записи, которую правим (пусто — добавляем новую)
-
-  function renderVault() {
-    const box = $("vault-list");
-    if (!box) return;
-    const list = vaultArr();
-    box.innerHTML = "";
-    if (!list.length) {
-      box.innerHTML =
-        '<div class="env-note">Записей пока нет. Добавь сайт ниже — агент сможет входить на него сам (vaultFill), не спрашивая пароль в чате.</div>';
-      return;
-    }
-    for (const e of list) {
-      if (!e || typeof e !== "object") continue;
-      const row = document.createElement("div");
-      row.className = "env-row";
-      const name = document.createElement("span");
-      name.className = "env-key";
-      name.textContent = e.name || e.url || "Сайт";
-      name.title = e.name || "";
-      const val = document.createElement("span");
-      val.className = "env-val";
-      const bits = [];
-      if (e.url) bits.push(e.url);
-      bits.push(e.login ? "логин: " + e.login : "логин не задан");
-      bits.push(e.password ? "пароль: ••••••" : "пароль не задан");
-      if (e.note) bits.push("📝 " + e.note);
-      val.textContent = bits.join(" · ");
-      val.title = e.note ? "Заметка: " + e.note : "";
-      const edit = document.createElement("button");
-      edit.type = "button";
-      edit.className = "btn btn-ghost btn-small";
-      edit.textContent = "✏️";
-      edit.title = "Загрузить запись в форму для правки";
-      edit.onclick = () => vaultLoadToForm(e);
-      const del = document.createElement("button");
-      del.type = "button";
-      del.className = "btn btn-ghost btn-small env-del";
-      del.textContent = "🗑";
-      del.title = "Удалить запись " + (e.name || e.url || "");
-      del.onclick = () => vaultDelete(e.id);
-      row.appendChild(name);
-      row.appendChild(val);
-      row.appendChild(edit);
-      row.appendChild(del);
-      box.appendChild(row);
-    }
-  }
-
-  function vaultLoadToForm(e) {
-    vaultEditingId = e.id || "";
-    $("s-vault-name").value = e.name || "";
-    $("s-vault-url").value = e.url || "";
-    $("s-vault-login").value = e.login || "";
-    $("s-vault-pass").value = "";
-    $("s-vault-note").value = e.note || "";
-    toast("Запись загружена. Пароль введи заново — в форме он не показывается.");
-  }
-
-  function vaultClearForm() {
-    vaultEditingId = "";
-    for (const id of ["s-vault-name", "s-vault-url", "s-vault-login", "s-vault-pass", "s-vault-note"]) {
-      if ($(id)) $(id).value = "";
-    }
-  }
-
-  function vaultAdd() {
-    const entry = {
-      id: vaultEditingId || "v" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-      name: $("s-vault-name").value.trim(),
-      url: $("s-vault-url").value.trim(),
-      login: $("s-vault-login").value.trim(),
-      password: $("s-vault-pass").value,
-      note: $("s-vault-note").value.trim(),
-    };
-    if (!entry.name && !entry.url) {
-      toast("Укажи название или адрес сайта");
-      return;
-    }
-    if (!entry.login && !entry.password) {
-      toast("Заполни хотя бы логин или пароль");
-      return;
-    }
-    if (!Array.isArray(settings.sitePasswords)) settings.sitePasswords = [];
-    const i = settings.sitePasswords.findIndex((x) => x && x.id === entry.id);
-    if (i >= 0) settings.sitePasswords[i] = entry;
-    else settings.sitePasswords.push(entry);
-    persistSettings();
-    vaultClearForm();
-    renderVault();
-    toast(i >= 0 ? "Запись обновлена" : "Запись сохранена зашифрованно");
-  }
-
-  function vaultDelete(id) {
-    const list = vaultArr();
-    const e = list.find((x) => x && x.id === id);
-    if (!e) return;
-    if (!confirm("Удалить запись «" + (e.name || e.url || "сайт") + "»?")) return;
-    settings.sitePasswords = list.filter((x) => x && x.id !== id);
-    persistSettings();
-    renderVault();
-    toast("Запись удалена");
-  }
-
-  // ─────────────── Почта (Настройки → ✉️ Почта) ───────────────
-  function renderMailStatus(text, isError) {
-    const box = $("mail-msg");
-    if (!box) return;
-    box.textContent = text || "";
-    box.classList.toggle("error", !!isError);
-  }
-
-  // Пресеты провайдеров (та же логика, что в src/mail.js) — чтобы кнопка
-  // «Определить по адресу» работала и без запроса к main-процессу.
-  function mailGuessed() {
-    const a = String($("s-mail-address") ? $("s-mail-address").value : "").trim().toLowerCase();
-    if (/@(gmail|googlemail)\.com$/.test(a)) return { imapHost: "imap.gmail.com", imapPort: 993, smtpHost: "smtp.gmail.com", smtpPort: 465, starttls: false, note: "Gmail: нужен «пароль приложения» (включается при двухфакторной аутентификации)." };
-    if (/@(yandex|ya)\.(ru|com|kz|by|ua)$/.test(a)) return { imapHost: "imap.yandex.ru", imapPort: 993, smtpHost: "smtp.yandex.ru", smtpPort: 465, starttls: false, note: "Яндекс: включи IMAP в «Все настройки → Почтовые программы» и создай пароль приложения." };
-    if (/@mail\.ru$/.test(a)) return { imapHost: "imap.mail.ru", imapPort: 993, smtpHost: "smtp.mail.ru", smtpPort: 465, starttls: false, note: "Mail.ru: нужен пароль для внешнего приложения." };
-    if (/@(outlook|hotmail|live|msn)\./.test(a)) return { imapHost: "outlook.office365.com", imapPort: 993, smtpHost: "smtp.office365.com", smtpPort: 587, starttls: true, note: "Outlook: SMTP через STARTTLS (587)." };
-    if (/@rambler\.ru$/.test(a)) return { imapHost: "imap.rambler.ru", imapPort: 993, smtpHost: "smtp.rambler.ru", smtpPort: 465, starttls: false, note: "" };
-    const d = a.includes("@") ? a.split("@").pop() : "";
-    return {
-      imapHost: d ? "imap." + d : "",
-      imapPort: 993,
-      smtpHost: d ? "smtp." + d : "",
-      smtpPort: 465,
-      starttls: false,
-      note: d ? "Провайдер не опознан — проверь адреса серверов и порты." : "",
-    };
-  }
-
-  function mailFillServers() {
-    const g = mailGuessed();
-    if (g.imapHost) $("s-mail-imap-host").value = g.imapHost;
-    if (g.imapPort) $("s-mail-imap-port").value = String(g.imapPort);
-    if (g.smtpHost) $("s-mail-smtp-host").value = g.smtpHost;
-    if (g.smtpPort) $("s-mail-smtp-port").value = String(g.smtpPort);
-    $("s-mail-starttls").checked = !!g.starttls;
-    renderMailStatus(g.note || "Серверы заполнены — проверь и нажми «Сохранить настройки».", false);
-  }
-
-  function mailRenderList(res) {
-    const box = $("mail-list");
-    if (!box) return;
-    box.innerHTML = "";
-    if (!res || !res.ok) { renderMailStatus((res && res.error) || "Не удалось прочитать почту.", true); return; }
-    if (!res.messages || !res.messages.length) { renderMailStatus("Входящих писем нет.", false); return; }
-    for (const m of res.messages) {
-      const row = document.createElement("div");
-      row.className = "env-row";
-      const subj = document.createElement("div");
-      subj.className = "env-key";
-      subj.textContent = (m.code ? "🔑 " + m.code + " · " : "") + (m.subject || "(без темы)");
-      const meta = document.createElement("div");
-      meta.className = "env-val";
-      meta.textContent = (m.from || "") + " · " + (m.date || "");
-      row.appendChild(subj);
-      row.appendChild(meta);
-      box.appendChild(row);
-    }
-    renderMailStatus("Последние письма: " + res.messages.length + " из " + (res.total || res.messages.length) + ".", false);
-  }
-
-  async function mailDoTest() {
-    if (!isElectron) { renderMailStatus("Проверка почты доступна в desktop-приложении.", true); return; }
-    renderMailStatus("Проверяю вход в ящик…", false);
-    try {
-      const r = await api.mailTest();
-      if (r && r.ok) {
-        const s = r.servers || {};
-        renderMailStatus(
-          "✓ Вход выполнен. Писем в ящике: " + (r.total || 0) +
-          " · IMAP " + (s.imapHost || "") + ":" + (s.imapPort || "") +
-          " · SMTP " + (s.smtpHost || "") + ":" + (s.smtpPort || ""),
-          false
-        );
-      } else {
-        const note = r && r.servers && r.servers.note ? "\n" + r.servers.note : "";
-        renderMailStatus("✗ " + ((r && r.error) || "Не удалось войти.") + note, true);
-      }
-    } catch (e) {
-      renderMailStatus("✗ Ошибка: " + ((e && e.message) || e), true);
-    }
-  }
-
-  async function mailDoTestSend() {
-    if (!isElectron) { renderMailStatus("Отправка доступна в desktop-приложении.", true); return; }
-    renderMailStatus("Отправляю тестовое письмо…", false);
-    try {
-      const r = await api.mailTestSend();
-      const addr = $("s-mail-address") ? $("s-mail-address").value.trim() : "";
-      renderMailStatus(r && r.ok ? "✓ Тестовое письмо отправлено на " + addr + ". Проверь входящие." : "✗ " + ((r && r.error) || "Не удалось отправить."), !(r && r.ok));
-    } catch (e) {
-      renderMailStatus("✗ Ошибка: " + ((e && e.message) || e), true);
-    }
-  }
-
-  async function mailDoRecent() {
-    if (!isElectron) { renderMailStatus("Чтение почты доступно в desktop-приложении.", true); return; }
-    renderMailStatus("Читаю последние письма…", false);
-    try {
-      mailRenderList(await api.mailRecent(5));
-    } catch (e) {
-      renderMailStatus("✗ Ошибка: " + ((e && e.message) || e), true);
-    }
-  }
-
-
-  // ─────────────── Секреты: переменные окружения (Настройки) ───────────────
-  // ── Выдача секретов: кому подставлять переменную ───────────────────────────
-  // Названия групп приходят из таблицы прав главного процесса (policy:groups):
-  // список у интерфейса свой, но собирается он из политики — разойтись не могут.
-  let envScopeGroupList = null;
-  const ENV_SCOPE_LABELS = {
-    agent: "ожидание", api: "внешние API", app: "окно приложения", browser: "браузер",
-    clipboard: "буфер обмена", cloud: "облако", db: "базы данных", files: "файлы проекта",
-    git: "git и GitHub", mail: "почта", media: "картинки", notes: "заметки и чекпоинты",
-    preview: "превью и ссылки", project: "сборка, тесты, зависимости", screen: "экран",
-    secrets: "переменные агента", self: "обновление приложения", system: "система",
-    tasks: "дела", terminal: "терминал и команды", vault: "пароли сайтов", web: "поиск в сети",
-  };
-  function envScopeLabel(g) {
-    return ENV_SCOPE_LABELS[g] || g;
-  }
-  function envScopeGroups() {
-    if (envScopeGroupList) return envScopeGroupList;
-    if (!isElectron || !api.policyGroups) return [];
-    api.policyGroups().then((list) => {
-      envScopeGroupList = Array.isArray(list) ? list : [];
-      renderEnvVars(); // группы пришли после первой отрисовки — перерисовываем один раз
-    }).catch(() => {
-      envScopeGroupList = [];
-    });
-    return [];
-  }
-  // Выдача переменной: "*" — всем, "none" — никому, группа/имя — ей, "__multi" — несколько.
-  function envScopeValue(k) {
-    const sc = settings.agentEnvScopes || {};
-    if (!(k in sc)) return "*";
-    const list = Array.isArray(sc[k]) ? sc[k] : [];
-    if (!list.length) return "none";
-    if (list.indexOf("*") !== -1) return "*";
-    return list.length === 1 ? list[0] : "__multi";
-  }
-  function setEnvScope(k, v) {
-    if (!settings.agentEnvScopes) settings.agentEnvScopes = {};
-    // «Всем» — это отсутствие записи: так файл настроек остаётся чистым, а поведение
-    // по умолчанию (как раньше) видно по самому отсутствию ограничения.
-    if (v === "*") delete settings.agentEnvScopes[k];
-    else if (v === "none") settings.agentEnvScopes[k] = [];
-    else if (v !== "__multi") settings.agentEnvScopes[k] = [v];
-    persistSettings();
-    renderEnvVars();
-  }
-
-  function renderEnvVars() {
-    const box = $("env-list");
-    if (!box) return;
-    const vars = settings.agentEnv || {};
-    const keys = Object.keys(vars);
-    box.innerHTML = "";
-    if (!keys.length) {
-      box.innerHTML = '<div class="env-note">Переменных пока нет. Добавь вручную ниже или импортируй из файла .env.</div>';
-      return;
-    }
-    const groups = envScopeGroups();
-    for (const k of keys) {
-      const v = String(vars[k] || "");
-      const row = document.createElement("div");
-      row.className = "env-row";
-      const kEl = document.createElement("span");
-      kEl.className = "env-key";
-      kEl.textContent = k;
-      kEl.title = k;
-      const vEl = document.createElement("span");
-      vEl.className = "env-val";
-      vEl.textContent = v ? "•••••••• (" + v.length + " симв.)" : "(пусто)";
-      vEl.title = v ? "Значение скрыто — оно подставляется только тем, кому выдано" : "";
-      // Выдача: кому эта переменная подставляется.
-      const current = envScopeValue(k);
-      const sel = document.createElement("select");
-      sel.className = "env-scope" + (current === "*" ? "" : " limited");
-      sel.title = "Кому подставлять «" + k + "»";
-      const add = (value, text) => {
-        const o = document.createElement("option");
-        o.value = value;
-        o.textContent = text;
-        sel.appendChild(o);
-      };
-      add("*", "Всем командам");
-      add("none", "Ни одному инструменту");
-      const stored = (settings.agentEnvScopes || {})[k];
-      if (current === "__multi") add("__multi", "Несколько: " + (Array.isArray(stored) ? stored.join(", ") : ""));
-      for (const g of groups) add(g.group, envScopeLabel(g.group) + " — " + g.tools + " инстр.");
-      // Точная capability (её задал envSet) в списке групп не найдётся — показываем как есть.
-      if (Array.isArray(stored)) {
-        for (const s of stored) {
-          if (s === "*") continue;
-          if (!groups.some((g) => g.group === s)) add(s, s);
-        }
-      }
-      sel.value = current;
-      sel.onchange = () => setEnvScope(k, sel.value);
-      const del = document.createElement("button");
-      del.type = "button";
-      del.className = "btn btn-ghost btn-small env-del";
-      del.textContent = "🗑";
-      del.title = "Удалить " + k;
-      del.onclick = () => envDelete(k);
-      row.appendChild(kEl);
-      row.appendChild(vEl);
-      row.appendChild(sel);
-      row.appendChild(del);
-      box.appendChild(row);
-    }
-  }
-
-  function envAdd() {
-    const k = $("s-env-key").value.trim();
-    const v = $("s-env-value").value;
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) {
-      toast("Имя переменной: латиница, цифры, подчёркивание (например DATABASE_URL)");
-      return;
-    }
-    if (!settings.agentEnv) settings.agentEnv = {};
-    settings.agentEnv[k] = v;
-    persistSettings();
-    $("s-env-key").value = "";
-    $("s-env-value").value = "";
-    renderEnvVars();
-    toast("Переменная " + k + " сохранена");
-  }
-
-  function envDelete(k) {
-    if (!settings.agentEnv || !(k in settings.agentEnv)) return;
-    delete settings.agentEnv[k];
-    // Выдача живёт вместе с переменной: осиротевшее ограничение потом выдало бы
-    // себя, когда переменную создадут заново.
-    if (settings.agentEnvScopes && k in settings.agentEnvScopes) delete settings.agentEnvScopes[k];
-    persistSettings();
-    renderEnvVars();
-    toast("Удалено: " + k);
-  }
-
-  // Парсит .env-текст: строки KEY=VALUE, комментарии # и ;, префикс export, кавычки значения.
-  function parseEnvText(text) {
-    const vars = {};
-    for (const rawLine of String(text || "").split(/\r?\n/)) {
-      let line = rawLine.trim();
-      if (!line || line.startsWith("#") || line.startsWith(";")) continue;
-      if (line.startsWith("export ")) line = line.slice(7).trim();
-      const eq = line.indexOf("=");
-      if (eq <= 0) continue;
-      const key = line.slice(0, eq).trim();
-      let val = line.slice(eq + 1).trim();
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-        val = val.slice(1, -1);
-      }
-      vars[key] = val;
-    }
-    return vars;
-  }
-
-  function envImportText() {
-    const text = $("s-env-import").value;
-    if (!text.trim()) {
-      toast("Вставь список строк вида KEY=VALUE");
-      return;
-    }
-    const vars = parseEnvText(text);
-    const keys = Object.keys(vars);
-    if (!keys.length) {
-      toast("Не нашёл строк вида KEY=VALUE");
-      return;
-    }
-    if (!settings.agentEnv) settings.agentEnv = {};
-    for (const k of keys) settings.agentEnv[k] = vars[k];
-    persistSettings();
-    $("s-env-import").value = "";
-    renderEnvVars();
-    toast("Импортировано переменных: " + keys.length);
-  }
-
-  function envImportFile(file) {
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      const vars = parseEnvText(String(reader.result || ""));
-      const keys = Object.keys(vars);
-      if (!settings.agentEnv) settings.agentEnv = {};
-      for (const k of keys) settings.agentEnv[k] = vars[k];
-      persistSettings();
-      renderEnvVars();
-      toast(keys.length ? "Импортировано из файла: " + keys.length + " переменных" : "В файле нет строк вида KEY=VALUE");
-    };
-    reader.readAsText(file);
-  }
+  // ── Секреты: пароли сайтов, почта и переменные окружения — код в src/renderer/secrets-panel.js ──
+  const SecretsPanel = window.SecretsPanel({
+    $: $,
+    api: api,
+    isElectron: isElectron,
+    toast: toast,
+    persistSettings: persistSettings,
+    getSettings: () => settings,
+  });
 
   // ── Модалка «вопрос агента» (askUser) ──
   let askOnAnswer = null;
@@ -4136,319 +2885,16 @@
   }
 
   // ─────────────── Веб-режим: чат напрямую из браузера ───────────────
-  // Единый цикл на общем транспорте AgentCore (те же правила, что и в Electron main).
-  // Инструменты (файлы/git) в браузере недоступны — только чат.
-  let webAutoSwitches = 0; // счётчик авто-переключений за запуск (защита от бесконечного круга)
-  const webProfileCooldown = new Map(); // profileId → timestamp: провинившийся ключ откладываем
-
-  // Авто-переключение между сохранёнными OpenAI-подключениями при ошибке (браузерный путь).
-  // Возвращает true, если переключились (вызывающий должен повторить раунд).
-  function tryWebAutoSwitch(errText) {
-    if (!settings.autoSwitchProfiles || settings.provider !== "openai") return false;
-    // Меняем ключ только если ошибка про ключ/баланс/лимит (400, контент, сеть — не про ключ).
-    const cls = (typeof AgentCore !== "undefined" && AgentCore.classifyKeyError)
-      ? AgentCore.classifyKeyError(errText)
-      : { key: true, cooldownMs: 60 * 1000 };
-    if (!cls.key) return false;
-    const profs = openaiProfilesArr().filter((p) => p && p.id && String(p.apiKey || "").trim());
-    if (profs.length < 2) return false;
-    if (webAutoSwitches >= profs.length) return false; // прошли полный круг — стоп
-    const cur = settings.openaiActiveProfile;
-    const idx = Math.max(0, profs.findIndex((p) => p.id === cur));
-    const now = Date.now();
-    webProfileCooldown.set(cur, now + cls.cooldownMs); // провинившийся ключ отлеживается
-    for (let step = 1; step <= profs.length; step++) {
-      const next = profs[(idx + step) % profs.length];
-      if (!next || next.id === cur) continue;
-      if ((webProfileCooldown.get(next.id) || 0) > now) continue; // ещё в кулдауне
-      webAutoSwitches++;
-      settings.openaiActiveProfile = next.id;
-      settings.openaiUrl = next.url || settings.openaiUrl;
-      settings.openaiApiKey = next.apiKey || "";
-      if (next.model) settings.openaiModel = next.model;
-      if (next.project !== undefined) settings.openaiProject = next.project || "";
-      persistSettings();
-      onEvent({ type: "profile_switched", name: next.name || next.id, id: next.id, error: String(errText || "").slice(0, 160) });
-      return true;
-    }
-    return false; // все ключи в кулдауне — переключать некуда
-  }
-
-  async function webSend(messages, onEvent, signal, opts) {
-    opts = opts || {};
-    webAutoSwitches = 0; // сброс счётчика авто-переключений на каждый запуск
-    const planMode = !!opts.plan;
-    const provider = settings.provider || "openai";
-    if (!settings.model) {
-      onEvent({ type: "error", message: "Не выбрана модель. Открой Настройки." });
-      return;
-    }
-    // Контекст-окно (в браузере те же бюджеты, что и в Electron)
-    let budget = AgentCore.contextBudget(provider, settings.model);
-    let contextRetried = false; // при переполнении контекста пробуем ещё раз с меньшим бюджетом
-    try {
-      messages = AgentCore.trimConversation(messages, budget);
-    } catch {}
-    let apiMessages = [
-      {
-        role: "system",
-        content:
-          AgentCore.SYSTEM_PROMPT +
-          (settings.workingDir ? "\n\nРабочая директория: " + settings.workingDir : "") +
-          (planMode
-            ? "\n\nРЕЖИМ ПЛАНА: сейчас НЕ выполняй инструменты и НЕ изменяй файлы. Составь пошаговый план работ и перечисли файлы, которые затронешь. Жди команды пользователя."
-            : ""),
-      },
-      ...messages,
-    ];
-    const maxRounds = planMode ? 3 : 10;
-    let finalText = "";
-    // Лимит провайдера (429) в веб-режиме: ждём сами до потолка, как в приложении.
-    // Раньше здесь 429 сразу завершал прогон ошибкой и требовал «напиши продолжай».
-    const RATE_WAIT_BUDGET_MS = 10 * 60 * 1000;
-    let rateWaitedMs = 0;
-
-    for (let round = 0; round < maxRounds; round++) {
-      let collected = "";
-      const toolCalls = [];
-      const stripper = AgentCore.createThinkingStripper({ onHidden: (t) => onEvent({ type: "thinking", text: t }) });
-
-      // Контекст-менеджмент: держим историю в рамках бюджета между раундами
-      if (apiMessages.length > 1) {
-        apiMessages = [apiMessages[0], ...AgentCore.trimConversation(apiMessages.slice(1), budget)];
-      }
-      // Финальный предохранитель перед отправкой: осиротевшие tool-сообщения
-      // (role:"tool" без предшествующего assistant с tool_calls) — 400 wrong_api_format.
-      if (apiMessages.length > 1) {
-        apiMessages = [apiMessages[0], ...AgentCore.sanitizeToolPairs(apiMessages.slice(1))];
-      }
-
-      const req = AgentCore.buildChatRequest(settings, {
-        model: settings.model,
-        messages: apiMessages,
-        tools: planMode ? AgentCore.PLAN_MODE_TOOL_DEFINITIONS : AgentCore.TOOL_DEFINITIONS,
-        fromBrowser: true,
-      });
-      let res;
-      try {
-        res = await fetch(req.url, { method: "POST", headers: req.headers, body: req.body, signal });
-      } catch (e) {
-        if (e.name === "AbortError") throw e;
-        if (tryWebAutoSwitch(e.message)) { round--; continue; }
-        onEvent({ type: "error", message: "Сетевая ошибка: " + e.message });
-        return;
-      }
-      if (!res.ok) {
-        const detail = await AgentCore.readApiError(res);
-        // Лимиты провайдера (Groq free ~7K токенов/мин): понятное объяснение вместо сырого JSON.
-        const friendly = AgentCore.friendlyRateLimitError(res.status, detail, settings);
-        if (friendly) {
-          if (tryWebAutoSwitch(friendly)) { round--; continue; }
-          onEvent({ type: "error", message: friendly });
-          return;
-        }
-        // 429: ждём окно лимита и повторяем ТОТ ЖЕ раунд — без участия пользователя.
-        if (res.status === 429) {
-          const info = AgentCore.rateLimitInfo(res.status, res.headers, detail);
-          const wantMs = Math.max(2000, Math.min(info.retryMs || 5000, 60000));
-          const leftMs = RATE_WAIT_BUDGET_MS - rateWaitedMs;
-          if (leftMs >= 1000) {
-            const waitMs = Math.min(wantMs, leftMs);
-            rateWaitedMs += waitMs;
-            onEvent({
-              type: "notice",
-              text:
-                "⏳ Лимит провайдера на запросы: жду " + Math.max(1, Math.round(waitMs / 1000)) + " с и повторю сам" +
-                (info.rpm ? ", лимит ≈" + Math.round(info.rpm) + " запросов/мин" : "") +
-                ". Писать ничего не нужно.",
-            });
-            await new Promise((r) => setTimeout(r, waitMs));
-            round--;
-            continue;
-          }
-        }
-        // Переполнение контекста: один раз повторяем с резко урезанной историей
-        if (!contextRetried && /context|too long|maximum|num_ctx|token/i.test(detail) && budget > 3000) {
-          contextRetried = true;
-          budget = Math.max(3000, Math.floor(budget * 0.4));
-          if (apiMessages.length > 1) {
-            apiMessages = [apiMessages[0], ...AgentCore.trimConversation(apiMessages.slice(1), budget)];
-          }
-          round--;
-          continue;
-        }
-        if (res.status === 402) {
-          if (tryWebAutoSwitch("API error 402: недостаточно средств")) { round--; continue; }
-          onEvent({
-            type: "error",
-            message: "API error 402: Недостаточно средств на балансе провайдера. Пополни счёт (platform.deepseek.com → Top up) или выбери другого провайдера/модель в настройках.",
-          });
-          return;
-        }
-        if (tryWebAutoSwitch("API error " + res.status + ": " + detail)) { round--; continue; }
-        onEvent({ type: "error", message: "API error " + res.status + ": " + detail });
-        return;
-      }
-
-      await AgentCore.consumeProviderStream({
-        response: res,
-        provider,
-        onText: (text) => {
-          const vis = stripper.push(text);
-          if (vis) {
-            collected += vis;
-            onEvent({ type: "chunk", text: vis });
-          }
-        },
-        onToolCall: (tc) => toolCalls.push(tc),
-        onThinking: (t) => onEvent({ type: "thinking", text: t }),
-      });
-
-      const tail = stripper.finish();
-      if (tail) {
-        collected += tail;
-        onEvent({ type: "chunk", text: tail });
-      }
-      finalText = collected;
-
-      // Запасной способ вызова инструментов (модель напечатала JSON текстом).
-      // В режиме плана инструменты не выполняются — план только составляется.
-      if (toolCalls.length === 0 && !planMode) {
-        const fallbackCalls = AgentCore.extractToolCallsFromText(finalText);
-        for (const fc of fallbackCalls) {
-          toolCalls.push({ id: AgentCore.genCallId(), name: fc.name, args: fc.args });
-        }
-        if (fallbackCalls.length) {
-          let cleaned = finalText;
-          for (const fc of fallbackCalls) {
-            cleaned = cleaned.split(fc.raw).join("");
-          }
-          cleaned = cleaned.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
-          if (cleaned) onEvent({ type: "text_override", text: cleaned });
-        }
-      }
-      if (toolCalls.length === 0) {
-        onEvent({ type: "done" });
-        return;
-      }
-
-      // Нормализуем имена, назначаем стабильные id и убираем дубли одного раунда
-      const seenCalls = new Set();
-      const calls = [];
-      for (const tc of toolCalls) {
-        const norm = {
-          id: tc.id || AgentCore.genCallId(),
-          name: AgentCore.normalizeToolName(tc.name),
-          args: tc.args && typeof tc.args === "object" ? tc.args : {},
-          // Gemini 3.x: extra_content с thought signature нужно вернуть дословно,
-          // иначе следующий раунд упадёт с 400 (missing thought_signature).
-          ...(tc.extraContent ? { extraContent: tc.extraContent } : {}),
-        };
-        const sig = norm.name + "|" + JSON.stringify(norm.args);
-        if (seenCalls.has(sig)) continue;
-        seenCalls.add(sig);
-        calls.push(norm);
-      }
-      // Все вызовы раунда оказались дублями — завершаем без «пустых» tool_calls.
-      if (!calls.length) {
-        if (!String(finalText || "").trim()) finalText = "Готово.";
-        onEvent({ type: "chunk", text: finalText });
-        onEvent({ type: "done" });
-        return;
-      }
-      apiMessages.push({
-        role: "assistant",
-        content: finalText || null,
-        tool_calls: calls.map((c) => {
-          const call = {
-            id: c.id,
-            type: "function",
-            function: { name: c.name, arguments: JSON.stringify(c.args || {}) },
-          };
-          if (c.extraContent) call.extra_content = c.extraContent;
-          return call;
-        }),
-      });
-      for (const c of calls) {
-        onEvent({ type: "tool_start", name: c.name, args: c.args });
-        let result;
-        if (c.name === "askUser") {
-          // В веб-режиме askUser тоже работает: спрашиваем через модалку
-          const question = (c.args && c.args.question) || "Уточни, пожалуйста";
-          result = await new Promise((resolve) => openAskModal(question, resolve));
-          result = result && String(result).trim() ? String(result).trim() : "(пользователь не дал ответ)";
-        } else if (c.name === "webSearch" || c.name === "webFetch") {
-          // Веб-поиск и чтение страниц работают и в браузере: запрос идёт через
-          // preview-сервер (/api/…), потому что DuckDuckGo и сайты блокируют CORS.
-          const q = c.name === "webSearch"
-            ? encodeURIComponent(((c.args && (c.args.query || c.args.q)) || "").trim())
-            : encodeURIComponent(((c.args && c.args.url) || "").trim());
-          const endpoint = c.name === "webSearch" ? "/api/search?q=" : "/api/fetch?url=";
-          try {
-            const r = await fetch(endpoint + q);
-            result = r.ok ? await r.text() : "Ошибка " + c.name + ": HTTP " + r.status;
-          } catch (e) {
-            result = "Ошибка " + c.name + ": " + (e && e.message ? e.message : "сеть недоступна");
-          }
-        } else if (c.name === "waitUntil") {
-          // Обычная пауза — работает и в браузере.
-          const secs = Math.max(1, Math.min(parseInt((c.args && c.args.seconds) || "5", 10) || 5, 300));
-          await new Promise((r) => setTimeout(r, secs * 1000));
-          result = "OK — подождал " + secs + " с. Теперь перепроверь состояние (checkPort/checkUrl/backgroundOutput).";
-        } else if (c.name === "todoWrite") {
-          // План работ — чистая структура, работает и в веб-превью.
-          const webTasks = AgentCore.normalizePlanTasks(c.args && (c.args.tasks != null ? c.args.tasks : c.args.items));
-          if (!webTasks.length) {
-            result = "Ошибка: план пуст — пришли непустой массив tasks (до 7 пунктов).";
-          } else {
-            onEvent({ type: "plan", tasks: webTasks, title: String((c.args && c.args.title) || "").slice(0, 80) });
-            const wp = AgentCore.planSummary(webTasks);
-            result = planMode
-              ? "OK — план показан пользователю (" + wp.total + " пункт(ов)). Режим плана: инструменты не выполняются — жди команды «Выполнить»."
-              : "OK — план показан пользователю: " + wp.done + " из " + wp.total + " готово" +
-                (wp.failed ? ", сбоев: " + wp.failed : "") +
-                ". Продолжай со следующего пункта и после каждого шага вызывай todoWrite заново с полным списком.";
-          }
-        } else if (c.name === "semanticSearch") {
-          result =
-            "⚠️ Семантический поиск (semanticSearch) доступен только в desktop-приложении. Запустите приложение на Windows (bun run dist:win).";
-        } else if (c.name === "otaStatus" || c.name === "otaCheck" || c.name === "otaRollback") {
-          result =
-            "⚠️ Инструменты самообновления (otaStatus/otaCheck/otaRollback) доступны только в desktop-приложении. Запустите приложение на Windows (bun run dist:win).";
-        } else if (c.name === "applyPatch" || c.name === "gitStash" || c.name === "gitCherryPick" || c.name === "gitBlame") {
-          result =
-            "⚠️ Инструменты applyPatch и gitStash/gitCherryPick/gitBlame доступны только в desktop-приложении. Запустите приложение на Windows (bun run dist:win).";
-        } else if (c.name === "agentGuide") {
-          // Справочники лежат рядом с кодом приложения — в браузере их не читать.
-          result =
-            "⚠️ Справочники по сайтам (agentGuide) доступны в desktop-приложении (bun run dist:win). В веб-версии ищи по DOM: browserSnapshot/browserScroll недоступны — работай через webFetch.";
-        } else if (c.name === "waitForIdle") {
-          // Обычная пауза — в браузере тоже работает (нечего ждать по DOM-мутациям).
-          const secs = Math.max(1, Math.min(parseInt((c.args && (c.args.quietMs || c.args.timeout)) || "1500", 10) / 1000, 30));
-          await new Promise((r) => setTimeout(r, Math.round(secs * 1000)));
-          result = "OK — подождал " + secs.toFixed(1) + " с (в веб-версии ожидание покоя = пауза).";
-        } else if (c.name && (c.name.startsWith("browser") || c.name.startsWith("app"))) {
-          // Браузерные (Playwright) и app-инструменты (управление собственным окном)
-          // работают только в desktop-приложении (main-процесс Electron).
-          result =
-            "⚠️ Инструменты браузера (browserOpen и др.) и управления окном приложения (appRead/appClick и др.) доступны только в desktop-приложении. Запустите приложение на Windows (bun run dist:win).";
-        } else if (c.name && (c.name === "noteSave" || c.name === "noteRead" || c.name === "noteList" || c.name === "noteDelete" || c.name === "checkpointSave" || c.name === "checkpointList" || c.name === "checkpointRollback")) {
-          // Память проекта и точки отката работают только в desktop-приложении.
-          result =
-            "⚠️ Инструменты памяти проекта (noteSave/noteRead/noteList/noteDelete) и точек отката (checkpointSave/checkpointList/checkpointRollback) доступны только в desktop-приложении. Запустите приложение на Windows (bun run dist:win).";
-        } else if (c.name === "ycStatus" || c.name === "ycList" || c.name === "ycCreate" || c.name === "ycDelete" || c.name === "ycDeploy" || c.name === "ycLogs" || c.name === "ycContainer") {
-          result =
-            "⚠️ Инструменты Yandex Cloud (ycStatus/ycList/ycCreate/ycDelete) доступны только в desktop-приложении. Запустите приложение на Windows (bun run dist:win).";
-        } else {
-          result =
-            "⚠️ Файловые операции и git недоступны в веб-версии. Запустите приложение на Windows (bun run dist:win).";
-        }
-        onEvent({ type: "tool_result", name: c.name, result });
-        apiMessages.push({ role: "tool", tool_call_id: c.id, content: result });
-      }
-    }
-    onEvent({ type: "error", message: "Превышено максимальное число раундов вызова инструментов (" + maxRounds + ")." });
-  }
+  // Код живёт в src/renderer/web-chat.js: тот же цикл чата на общем транспорте
+  // AgentCore, когда окно открыто в браузере (веб-превью, телефон).
+  const WebChat = window.WebChat({
+    AgentCore: AgentCore,
+    getSettings: () => settings,
+    openaiProfilesArr: openaiProfilesArr,
+    persistSettings: persistSettings,
+    onEvent: onAiEvent, // то же окно событий, что и у desktop-цикла
+    openAskModal: openAskModal,
+  });
 
   // ─────────────── Настройки ───────────────
   function providerLabel() {
@@ -4490,6 +2936,7 @@
     settings.model = settings[MODEL_KEY[p]] || "";
     updateBadge();
     renderModelHints(null, null); // подсказки моделей относятся к активному провайдеру
+    refreshProbeButton(); // замер в подвале настроек виден только для местной модели
   }
 
   // Переключение вкладок настроек. Последняя открытая вкладка запоминается на сессию:
@@ -4527,6 +2974,11 @@
     let t = f.textContent || "";
     f.querySelectorAll("input, textarea, select").forEach((el) => {
       t += " " + (el.placeholder || "") + " " + (el.title || "");
+    });
+    // Кнопка внутри поля тоже объясняет, что здесь делается: «Замерить скорость»
+    // находится поиском по слову «замерить», хотя в подписи поля его нет.
+    f.querySelectorAll("button").forEach((el) => {
+      t += " " + (el.textContent || "") + " " + (el.title || "");
     });
     return t.toLowerCase();
   }
@@ -4852,8 +3304,8 @@
   }
 
   function openSettings(tab) {
-    renderEnvVars();
-    renderVault();
+    SecretsPanel.renderEnvVars();
+    SecretsPanel.renderVault();
     fillSettingsUI();
     // Без явной вкладки открываем ту, где остановились в прошлый раз. Вызовы, которым
     // нужна конкретная вкладка («Настройки: модель», «выбрать модель»), передают её явно.
@@ -4873,7 +3325,7 @@
     if (!found) setPreset(settings.openaiUrl ? "custom" : "deepseek");
     renderModelHints(null, null); // прячем подсказки моделей (провайдер мог смениться)
     renderGithubSection();
-    ycRefreshSettingsUI(); // Yandex Cloud: статус подключения, каталог, разрешения
+    YcPanel.refreshSettingsUI(); // Yandex Cloud: статус подключения, каталог, разрешения
     $("settings-overlay").classList.remove("hidden");
     setSettingsMsg("", false);
   }
@@ -4994,7 +3446,26 @@
     box.classList.remove("hidden");
   }
 
+  // Кнопка «Замерить скорость» в подвале настроек: показываем её только там, где
+  // замер имеет смысл — модель считается местной (Ollama всегда; OpenAI-совместимый
+  // сервер на своём ПК или в домашней сети). Для облака замер бессмыслен: он измерил
+  // бы задержку чужого дата-центра, а не нашего ПК. Та же кнопка живёт в карточке Ollama.
+  function refreshProbeButton() {
+    const btn = $("btn-probe-model");
+    if (!btn) return;
+    const local = !!(AgentCore.isLocalEndpoint && AgentCore.isLocalEndpoint(settings));
+    btn.classList.toggle("hidden", !local);
+  }
+
   async function probeLocalModelUI() {
+    // Показываем то, что измеряем, и саму кнопку: карточки провайдеров свёрнуты,
+    // если активен другой, и замер без этого выглядел бы как «ничего не произошло».
+    for (const key of [settings.provider || "openai", "ollama"]) {
+      const acc = document.querySelector('.acc[data-acc="' + key + '"]');
+      if (acc && !acc.classList.contains("open")) acc.classList.add("open");
+    }
+    const probeBtn = $("btn-probe-ollama");
+    if (probeBtn && probeBtn.scrollIntoView) probeBtn.scrollIntoView({ block: "center" });
     collectSettingsFromUI();
     const provider = settings.provider || "openai";
     const base = $(URL_INPUT[provider]).value.trim();
@@ -5463,554 +3934,21 @@
       title: title ? title + " (продолжение)" : "Новый чат (продолжение)",
     });
   };
-  // ── Yandex Cloud (дашборд + настройки) ──
-  const YC_CREATABLE = ["ydb", "lockbox", "containerRegistry", "storage", "dns", "serverlessContainers", "vpc"];
-  const YC_FORMS = {
-    apiGateway: ["шлюз", "шлюза", "шлюзов"],
-    certificateManager: ["сертификат", "сертификата", "сертификатов"],
-    cdn: ["ресурс", "ресурса", "ресурсов"],
-    dns: ["зона", "зоны", "зон"],
-    logging: ["группа", "группы", "групп"],
-    postbox: ["адрес", "адреса", "адресов"],
-    containerRegistry: ["реестр", "реестра", "реестров"],
-    iam: ["сервисный аккаунт", "сервисных аккаунта", "сервисных аккаунтов"],
-    lockbox: ["секрет", "секрета", "секретов"],
-    ydb: ["база", "базы", "баз"],
-    storage: ["бакет", "бакета", "бакетов"],
-    serverlessContainers: ["контейнер", "контейнера", "контейнеров"],
-    vpc: ["сеть", "сети", "сетей"],
-  };
-  let ycStatusCache = null;
-  let ycServicesCache = null;
-  let ycDashKey = ""; // ключ развёрнутой карточки дашборда
-  let ycTotal = null; // всего ресурсов в каталоге («Облако в цифрах»)
-  let ycActiveServices = null; // сервисов с ресурсами
-
-  function ycNounPlural(key, n) {
-    const forms = YC_FORMS[key] || ["ресурс", "ресурса", "ресурсов"];
-    const n10 = n % 10;
-    const n100 = n % 100;
-    if (n10 === 1 && n100 !== 11) return n + " " + forms[0];
-    if (n10 >= 2 && n10 <= 4 && (n100 < 12 || n100 > 14)) return n + " " + forms[1];
-    return n + " " + forms[2];
-  }
-
-  async function ycRefreshSettingsUI() {
-    if (!isElectron) {
-      // веб-превью: управление облаком живёт в main-процессе Electron
-      const m = $("yc-settings-msg");
-      if (m) m.textContent = "⚠️ Управление Yandex Cloud работает в desktop-приложении (на ПК): здесь можно только посмотреть поля настроек.";
-      return;
-    }
-    const msg = $("yc-settings-msg");
-    try {
-      const st = await api.ycStatus();
-      ycStatusCache = st;
-      // Держим локальный объект настроек синхронным: иначе устаревший ycFolderId
-      // из формы мог бы затереть только что выбранный каталог при «Сохранить».
-      if (st) {
-        if (st.folderId !== undefined) settings.ycFolderId = st.folderId;
-        if (st.folderName !== undefined) settings.ycFolderName = st.folderName;
-        if (st.cloudId !== undefined) settings.ycCloudId = st.cloudId;
-      }
-      const acc = $("yc-conn-account");
-      if (st.loggedIn && st.iamOk) {
-        $("yc-conn-status").textContent = "✅ Подключено" + (st.folderName ? " · каталог «" + st.folderName + "»" : "");
-        $("yc-conn-status").classList.add("ok");
-        ycSetHeaderDot(st.folderId ? "ok" : "warn");
-        if (acc) {
-          acc.textContent = "Аккаунт: " + ((st.clouds && st.clouds[0] && st.clouds[0].name) || "Yandex") + " · облако: " + (st.cloudId || "—");
-          acc.classList.remove("hidden");
-        }
-        $("yc-token-row").classList.add("hidden");
-        $("yc-folder-field").classList.remove("hidden");
-        $("yc-perms").classList.remove("hidden");
-        const sel = $("s-yc-folder");
-        sel.innerHTML = "";
-        for (const f of st.folders || []) {
-          const o = document.createElement("option");
-          o.value = f.id;
-          o.textContent = f.name || f.id;
-          sel.appendChild(o);
-        }
-        if (!(st.folders || []).length) {
-          const o = document.createElement("option");
-          o.value = "";
-          o.textContent =
-            "⚠️ Каталоги не загрузились" + (st.error ? " — " + String(st.error).slice(0, 80) : "") + " (нажми ↻)";
-          sel.appendChild(o);
-        }
-        if (st.folderId) sel.value = st.folderId;
-        $("s-yc-allow-create").checked = !!st.allowCreate;
-        $("s-yc-allow-delete").checked = !!st.allowDelete;
-        $("s-yc-allow-update").checked = !!st.allowUpdate;
-        // Встроенный yc CLI: показываем, стоит ли он (и где) — настройка живёт в папке приложения.
-        if (isElectron && api.ycCliStatus) {
-          api.ycCliStatus()
-            .then((cl) => {
-              const el = $("yc-cli-status");
-              if (el) el.textContent = cl && cl.installed ? "встроен: " + cl.path : "не установлен";
-            })
-            .catch(() => {});
-        }
-      } else {
-        $("yc-conn-status").textContent = "Не подключено" + (st.error ? " — " + st.error : "");
-        $("yc-conn-status").classList.remove("ok");
-        ycSetHeaderDot("off");
-        if (acc) acc.classList.add("hidden");
-        $("yc-token-row").classList.remove("hidden");
-        $("yc-folder-field").classList.add("hidden");
-        $("yc-perms").classList.add("hidden");
-      }
-      if (msg) msg.textContent = "";
-    } catch (e) {
-      if (msg) msg.textContent = "Ошибка: " + ((e && e.message) || String(e));
-    }
-  }
-
-  // Экран-подсказка, когда дашборд не может показать ресурсы (нет токена / веб-версия)
-  function ycShowOnboard(icon, title, text) {
-    const box = $("yc-dash");
-    if (box) box.innerHTML = "";
-    const sum = $("yc-summary");
-    if (sum) sum.classList.add("hidden");
-    ycSetHeaderDot("off");
-    const onboard = $("yc-onboard");
-    if (!onboard) return;
-    const ic = onboard.querySelector(".yc-onboard-ic");
-    const t = onboard.querySelector(".yc-onboard-title");
-    const x = onboard.querySelector(".yc-onboard-text");
-    if (ic && icon) ic.textContent = icon;
-    if (t && title) t.textContent = title;
-    if (x && text) x.textContent = text;
-    onboard.classList.remove("hidden");
-  }
-
-  function ycHideOnboard() {
-    const onboard = $("yc-onboard");
-    if (onboard) onboard.classList.add("hidden");
-  }
-
-  async function ycLoadDashboard(force) {
-    const statusEl = $("yc-dash-status");
-    const box = $("yc-dash");
-    if (!statusEl || !box) return;
-    if (!isElectron) {
-      statusEl.textContent = "Только в desktop-приложении";
-      ycShowOnboard(
-        "🖥",
-        "Дашборд доступен в приложении на ПК",
-        "Ресурсы Yandex Cloud, деплой и управление из чата работают в desktop-приложении (Windows/macOS/Linux). В веб-превью доступны только настройки: токен, каталог и разрешения агента."
-      );
-      return;
-    }
-    if (!ycStatusCache) {
-      try {
-        ycStatusCache = await api.ycStatus();
-      } catch (e) {
-        ycStatusCache = { error: (e && e.message) || String(e) };
-      }
-    }
-    const st = ycStatusCache || {};
-    if (!st.loggedIn) {
-      statusEl.textContent = "🔑 Не подключено";
-      ycShowOnboard(
-        "☁️",
-        "Yandex Cloud не подключён",
-        "Подключи OAuth-токен Yandex — и здесь появится живой дашборд: базы YDB, бакеты Object Storage, реестр образов, Serverless-контейнеры, DNS-зоны, секреты Lockbox, API-шлюз и CDN. Агент сможет управлять ресурсами прямо из чата."
-      );
-      return;
-    }
-    ycHideOnboard();
-    ycSetHeaderDot(st.iamOk === false ? "warn" : "ok");
-    statusEl.textContent = "Каталог: " + (st.folderName || st.folderId || "—") + (st.iamOk === false ? " · ⚠️ " + (st.error || "") : "");
-    if (!force && ycServicesCache) {
-      ycRenderDash();
-      return;
-    }
-    box.innerHTML = '<div class="yc-loading">Загрузка ресурсов…</div>';
-    let r;
-    try {
-      r = await api.ycResources();
-    } catch (e) {
-      r = { ok: false, error: (e && e.message) || String(e) };
-    }
-    if (!r || !r.ok) {
-      statusEl.textContent = "⚠️ " + ((r && r.error) || "Ошибка загрузки");
-      box.innerHTML = "";
-      return;
-    }
-    ycServicesCache = r.services;
-    ycTotal = r.total != null ? r.total : null;
-    ycActiveServices = r.activeServices != null ? r.activeServices : null;
-    ycRenderDash();
-  }
-
-  function ycRenderSummary(total, active) {
-    const sum = $("yc-summary");
-    if (!sum) return;
-    sum.classList.remove("hidden");
-    sum.innerHTML = "";
-    const mk = (text) => {
-      const s = document.createElement("span");
-      s.className = "yc-summary-item";
-      s.textContent = text;
-      return s;
-    };
-    sum.appendChild(mk("🧮 Ресурсов: " + (total == null ? "—" : total)));
-    sum.appendChild(mk("Сервисов с ресурсами: " + (active == null ? "—" : active)));
-    const failed = (ycServicesCache || []).filter((s) => !s.ok);
-    if (failed.length) {
-      sum.appendChild(mk("⚠️ Не ответили: " + failed.length + " — " + failed.map((s) => s.title).slice(0, 3).join(", ")));
-    }
-  }
-
-  function ycRenderDash() {
-    const box = $("yc-dash");
-    if (!box) return;
-    box.innerHTML = "";
-    ycRenderSummary(ycTotal, ycActiveServices);
-    const svcs = ycServicesCache || [];
-    const grid = document.createElement("div");
-    grid.className = "yc-grid";
-    for (const s of svcs) {
-      const card = document.createElement("div");
-      card.className = "yc-card" + (ycDashKey === s.key ? " open" : "");
-      card.title = s.ok ? "Клик — список ресурсов" : (s.error ? s.error : "API недоступно");
-      const head = document.createElement("div");
-      head.className = "yc-card-head";
-      const icon = document.createElement("span");
-      icon.className = "yc-card-icon";
-      icon.textContent = s.icon || "☁️";
-      const title = document.createElement("span");
-      title.className = "yc-card-title";
-      title.textContent = s.title;
-      head.appendChild(icon);
-      head.appendChild(title);
-      const body = document.createElement("div");
-      body.className = "yc-card-body";
-      const count = document.createElement("div");
-      count.className = "yc-card-count" + (s.ok ? "" : " err");
-      count.textContent = s.ok ? ycNounPlural(s.key, s.count) : "⚠ ошибка API";
-      body.appendChild(count);
-      if (!s.ok) {
-        const err = document.createElement("div");
-        err.className = "yc-card-err";
-        err.textContent = String(s.error || "API недоступно").slice(0, 200);
-        body.appendChild(err);
-      }
-      if (s.ok && YC_CREATABLE.includes(s.key)) {
-        const add = document.createElement("button");
-        add.type = "button";
-        add.className = "btn btn-small yc-add";
-        add.textContent = "＋ Создать";
-        add.title = "Создать новый ресурс («" + s.title + "»). Может быть платным.";
-        add.onclick = (e) => {
-          e.stopPropagation();
-          ycCreateFlow(s.key, s.title);
-        };
-        body.appendChild(add);
-      }
-      card.appendChild(head);
-      card.appendChild(body);
-      if (ycDashKey === s.key) {
-        const list = document.createElement("div");
-        list.className = "yc-card-list";
-        if (!s.ok) {
-          list.textContent = "Ошибка API: " + (s.error || "недоступно");
-        } else if (!s.items || !s.items.length) {
-          list.textContent = "Ресурсов нет — нажми «＋ Создать».";
-        } else {
-          for (const it of s.items.slice(0, 50)) {
-            const row = document.createElement("div");
-            row.className = "yc-item";
-            const nm = document.createElement("span");
-            nm.className = "yc-item-name ykc-openable";
-            nm.textContent = it.name || it.id || "—";
-            nm.title = "Открыть карточку ресурса (" + (it.id || "") + ")";
-            // Клик по имени — вход в карточку: поля ресурса и связанные объекты
-            // (подсети, образы, ключи, ревизии). Раньше список был тупиком.
-            nm.onclick = (e) => {
-              e.stopPropagation();
-              if (!window.YcConsole) return;
-              window.YcConsole.open({
-                serviceKey: s.key,
-                title: s.title,
-                item: it,
-                folderId: (ycStatusCache && ycStatusCache.folderId) || "",
-              });
-            };
-            row.appendChild(nm);
-            const actions = document.createElement("div");
-            actions.className = "yc-item-actions";
-            if (s.key === "serverlessContainers" && it.status) {
-              const st = document.createElement("span");
-              st.className = "yc-status " + String(it.status).toLowerCase();
-              st.textContent = it.status;
-              actions.appendChild(st);
-            }
-            if (s.key === "serverlessContainers" && it.url) {
-              const go = document.createElement("button");
-              go.type = "button";
-              go.className = "btn btn-ghost btn-small";
-              go.textContent = "↗";
-              go.title = "Открыть URL контейнера: " + it.url;
-              go.onclick = (e) => {
-                e.stopPropagation();
-                if (isElectron) api.openExternal(it.url);
-              };
-              actions.appendChild(go);
-            }
-            if (s.key === "serverlessContainers") {
-              const lg = document.createElement("button");
-              lg.type = "button";
-              lg.className = "btn btn-ghost btn-small";
-              lg.textContent = "📜";
-              lg.title = "Логи контейнера (нужен yc CLI)";
-              lg.onclick = async (e) => {
-                e.stopPropagation();
-                let r;
-                try {
-                  r = await api.ycLogs(s.key, it.id);
-                } catch (err) {
-                  r = { ok: false, error: (err && err.message) || String(err) };
-                }
-                if (r && r.ok && r.logs && r.logs.length) {
-                  toast("📜 Логи: " + r.logs.length + " записей — открыты в консоли приложения");
-                  termAppend("📜 Логи контейнера:\n" + r.logs.slice(-30).join("\n"));
-                } else {
-                  toast("❌ " + ((r && r.error) || "Логов нет за последние 3 часа"));
-                }
-              };
-              actions.appendChild(lg);
-            }
-            const del = document.createElement("button");
-            del.type = "button";
-            del.className = "btn btn-danger btn-small";
-            del.textContent = "🗑";
-            del.title = "Удалить «" + (it.name || it.id) + "» (необратимо)";
-            del.onclick = (e) => {
-              e.stopPropagation();
-              ycDeleteFlow(s.key, s.title, it);
-            };
-            actions.appendChild(del);
-            row.appendChild(actions);
-            list.appendChild(row);
-          }
-          if (s.items.length > 50) {
-            const more = document.createElement("div");
-            more.className = "yc-item-more";
-            more.textContent = "… и ещё " + (s.items.length - 50);
-            list.appendChild(more);
-          }
-        }
-        card.appendChild(list);
-      }
-      card.onclick = () => {
-        // Возврат к дашборду закрывает карточку ресурса — иначе она перекрывала бы
-        // список, который пользователь только что открыл.
-        if (window.YcConsole && window.YcConsole.isOpen()) window.YcConsole.close();
-        ycDashKey = ycDashKey === s.key ? "" : s.key;
-        ycRenderDash();
-      };
-      grid.appendChild(card);
-    }
-    box.appendChild(grid);
-  }
-
-  function ycCreateFlow(serviceKey, title) {
-    // Цена — до создания: иначе платный ресурс создаётся вслепую, а счёт
-    // пользователь увидит только в Yandex Cloud. Согласие — нажатие «Создать».
-    Promise.resolve(api.ycCosts ? api.ycCosts(serviceKey, {}) : null).then((c) => {
-      const est = c && c.ok ? c.estimate : null;
-      const head = est
-        ? (est.needsConfirm ? "Платный ресурс: " : "Ресурс: ") + (est.levelLabel || "") + (est.approxMonth != null ? " · ≈ " + String(est.approxMonth).replace(".", ",") + " ₽/мес" : "")
-        : "Цену ресурса проверить не удалось.";
-      const lines = c && c.ok && c.lines ? c.lines.slice(0, 6) : [];
-      const hint = [head, ...lines, "", "Имя: латиница, цифры, дефис (2–63 символа)."].join("\n");
-      inputDialog("＋ Создать: " + title, hint, "Создать").then(async (name) => {
-      if (!name) return;
-      let r;
-      try {
-        r = await api.ycCreate(serviceKey, name, { confirmed: true });
-      } catch (e) {
-        r = { ok: false, error: (e && e.message) || String(e) };
-      }
-      if (r && r.ok) {
-        toast("✅ " + r.message);
-        ycServicesCache = null;
-        ycLoadDashboard(true);
-      } else {
-        toast("❌ " + ((r && r.error) || "Ошибка создания"));
-      }
-      });
-    });
-  }
-
-  function ycDeleteFlow(serviceKey, title, item) {
-    confirmModal("🗑 Удалить «" + (item.name || item.id) + "»?", title + ": удаление необратимо и может стереть данные. Продолжить?", async () => {
-      let r;
-      try {
-        r = await api.ycDelete(serviceKey, item.id);
-      } catch (e) {
-        r = { ok: false, error: (e && e.message) || String(e) };
-      }
-      if (r && r.ok) {
-        toast("✅ " + r.message);
-        ycServicesCache = null;
-        ycLoadDashboard(true);
-      } else {
-        toast("❌ " + ((r && r.error) || "Ошибка удаления"));
-      }
-    }, true);
-  }
-
-  // Обработчики Yandex Cloud
-  $("btn-yc-connect").onclick = async () => {
-    const t = $("s-yc-token").value.trim();
-    if (!t) {
-      toast("Вставь OAuth-токен (кнопка «🔑 Получить токен»)");
-      return;
-    }
-    $("btn-yc-connect").disabled = true;
-    let r;
-    try {
-      r = await api.ycSetToken(t);
-    } catch (e) {
-      r = { ok: false, error: (e && e.message) || String(e) };
-    }
-    $("btn-yc-connect").disabled = false;
-    if (r && r.ok) {
-      toast("✅ Подключено к Yandex Cloud" + (r.folderName ? " · каталог «" + r.folderName + "»" : ""));
-      ycStatusCache = null;
-      ycServicesCache = null;
-      ycRefreshSettingsUI();
-      ycLoadDashboard(true);
-    } else {
-      toast("❌ " + ((r && r.error) || "Не удалось войти"));
-    }
-  };
-  function ycTokenUrl() {
-    return (ycStatusCache && ycStatusCache.oauthUrl) || "https://oauth.yandex.ru/authorize?response_type=token&client_id=1a6990aa636648e9b2ef855fa7bec2fb";
-  }
-  function ycOpenTokenPage() {
-    const url = ycTokenUrl();
-    if (isElectron) api.openExternal(url);
-    else window.open(url, "_blank");
-  }
-  // Точка у кнопки «☁️» в шапке: зелёная — подключено, жёлтая — нужен каталог/IAM
-  function ycSetHeaderDot(state) {
-    const cls = "hd-dot" + (state === "ok" ? " ok" : state === "warn" ? " warn" : "");
-    const d = $("btn-toggle-cloud-dot");
-    if (d) d.className = cls;
-    const rd = $("rail-cloud-dot");
-    if (rd) rd.className = cls;
-    const b = $("btn-toggle-cloud");
-    if (b) {
-      b.title =
-        state === "ok"
-          ? "Yandex Cloud подключён — ресурсы каталога и деплой"
-          : state === "warn"
-            ? "Yandex Cloud: проверь каталог или токен"
-            : "Yandex Cloud — ресурсы каталога и деплой";
-    }
-  }
-  $("btn-yc-get-token").onclick = ycOpenTokenPage;
-  $("btn-yc-logout").onclick = () => {
-    confirmModal("Выйти из Yandex Cloud?", "OAuth-токен будет удалён из приложения. Ресурсы в облаке не пострадают.", async () => {
-      await api.ycLogout();
-      ycStatusCache = null;
-      ycServicesCache = null;
-      ycRefreshSettingsUI();
-      ycLoadDashboard(true);
-      toast("Выход выполнен");
-    });
-  };
-  $("btn-yc-refresh-folders").onclick = async () => {
-    const sel0 = $("s-yc-folder");
-    if (sel0) sel0.innerHTML = '<option value="">⏳ Загрузка каталогов…</option>';
-    const r = await api.ycFolders();
-    if (!r || !r.ok) {
-      const msg = (r && r.error) || "Не удалось загрузить каталоги";
-      // Раньше список просто оставался пустым (и «висел» без объяснения причины).
-      if (sel0) sel0.innerHTML = '<option value="">⚠️ ' + String(msg).slice(0, 120) + ' — повтори ↻</option>';
-      toast("❌ " + msg);
-      return;
-    }
-    const sel = $("s-yc-folder");
-    sel.innerHTML = "";
-    for (const f of r.folders || []) {
-      const o = document.createElement("option");
-      o.value = f.id;
-      o.textContent = f.name || f.id;
-      sel.appendChild(o);
-    }
-    if (ycStatusCache && ycStatusCache.folderId) sel.value = ycStatusCache.folderId;
-    toast("Каталогов: " + ((r.folders || []).length));
-  };
-  $("s-yc-folder").onchange = () => {
-    const sel = $("s-yc-folder");
-    const f = (ycStatusCache && ycStatusCache.folders || []).find((x) => x.id === sel.value);
-    api.ycSetFolder(sel.value, (f && f.name) || sel.value, (f && f.cloudId) || (ycStatusCache && ycStatusCache.cloudId) || "");
-    // Каталог сохранён в main — отражаем это и в локальном объекте настроек.
-    settings.ycFolderId = sel.value;
-    settings.ycFolderName = (f && f.name) || sel.value;
-    settings.ycCloudId = (f && f.cloudId) || (ycStatusCache && ycStatusCache.cloudId) || "";
-    ycStatusCache = null;
-    ycServicesCache = null;
-    toast("Каталог: " + (f && f.name ? f.name : sel.value));
-    ycLoadDashboard(true);
-  };
-  // Одна точка сохранения разрешений: чекбоксов три, а вызов один — иначе легко
-  // забыть передать третье поле и молча сбросить его в false.
-  function saveYcPerms() {
-    const create = $("s-yc-allow-create").checked;
-    const del = $("s-yc-allow-delete").checked;
-    const upd = $("s-yc-allow-update").checked;
-    api.ycSetPermissions(create, del, upd);
-    return { create, del, upd };
-  }
-  $("s-yc-allow-create").onchange = () => {
-    toast(saveYcPerms().create ? "Агенту разрешено создавать ресурсы" : "Создание агентом выключено");
-  };
-  $("s-yc-allow-delete").onchange = () => {
-    toast(saveYcPerms().del ? "Агенту разрешено удалять ресурсы" : "Удаление агентом выключено");
-  };
-  $("s-yc-allow-update").onchange = () => {
-    const p = saveYcPerms();
-    toast(p.upd ? "Агенту разрешено менять контейнеры и деплоить ревизии" : "Правка контейнеров агентом выключена");
-  };
-  if ($("btn-yc-install-cli")) {
-    $("btn-yc-install-cli").onclick = async () => {
-      if (!isElectron || !api.ycInstallCli) {
-        toast("yc CLI ставится в desktop-приложении");
-        return;
-      }
-      const btn = $("btn-yc-install-cli");
-      const stEl = $("yc-cli-status");
-      btn.disabled = true;
-      if (stEl) stEl.textContent = "скачиваю официальный yc CLI…";
-      try {
-        const r = await api.ycInstallCli();
-        if (r && r.ok) {
-          if (stEl) stEl.textContent = "встроен: " + (r.path || "");
-          toast(r.already ? "yc CLI уже установлен" : "✅ yc CLI установлен" + (r.version ? " (версия " + r.version + ")" : ""));
-        } else {
-          if (stEl) stEl.textContent = "не установлен";
-          toast("❌ " + ((r && r.error) || "не удалось установить yc CLI"));
-        }
-      } catch (e) {
-        if (stEl) stEl.textContent = "не установлен";
-        toast("❌ " + ((e && e.message) || String(e)));
-      }
-      btn.disabled = false;
-    };
-  }
-  $("btn-yc-dash-refresh").onclick = () => {
-    ycServicesCache = null;
-    ycLoadDashboard(true);
-  };
-  $("btn-yc-dash-settings").onclick = () => openSettings("yandex");
+  // ── Yandex Cloud (дашборд + настройки) — код в src/renderer/yc-panel.js ──
+  // Отдаём панели ровно то, что принадлежит оболочке окна: DOM, IPC, всплывашки,
+  // переходы и живой доступ к настройкам.
+  const YcPanel = window.YcPanel({
+    $: $,
+    api: api,
+    isElectron: isElectron,
+    toast: toast,
+    termAppend: termAppend,
+    confirmModal: confirmModal,
+    inputDialog: inputDialog,
+    openSettings: openSettings,
+    openSidePanel: openSidePanel,
+    getSettings: () => settings,
+  });
   // Кнопка «☁️» в шапке — дашборд Yandex Cloud в правой панели
   if ($("btn-toggle-cloud")) {
     $("btn-toggle-cloud").onclick = () => {
@@ -6025,84 +3963,6 @@
       else openSidePanel("deploy");
     };
   }
-  // Из настроек — сразу открыть дашборд
-  if ($("btn-yc-open-dash")) {
-    $("btn-yc-open-dash").onclick = () => {
-      $("settings-overlay").classList.add("hidden");
-      openSidePanel("cloud");
-    };
-  }
-  if ($("btn-yc-onboard-settings")) {
-    $("btn-yc-onboard-settings").onclick = () => {
-      openSettings("yandex");
-    };
-  }
-  if ($("btn-yc-onboard-token")) $("btn-yc-onboard-token").onclick = ycOpenTokenPage;
-  $("btn-yc-paste-token").onclick = async () => {
-    try {
-      const t = await navigator.clipboard.readText();
-      if (t && t.trim()) {
-        $("s-yc-token").value = t.trim();
-        toast("Токен вставлен из буфера — нажми «Войти»");
-      } else {
-        toast("Буфер обмена пуст");
-      }
-    } catch (e) {
-      toast("Не удалось прочитать буфер: " + ((e && e.message) || String(e)));
-    }
-  };
-  $("btn-yc-deploy").onclick = () => {
-    if (!isElectron) {
-      toast("Деплой доступен в desktop-приложении");
-      return;
-    }
-    const dir = settings.workingDir || "";
-    if (!dir) {
-      toast("Сначала выбери рабочую директорию (Настройки → 📁 Проект и GitHub)");
-      return;
-    }
-    inputDialog("🚀 Деплой на Yandex Cloud", "Папка: " + dir + "\nИмя приложения (латиница, 2–63 символа). Docker должен быть установлен и запущен.", "Задеплоить").then(async (name) => {
-      if (!name) return;
-      const box = $("yc-deploy-box");
-      const stepsEl = $("yc-deploy-steps");
-      const resultEl = $("yc-deploy-result");
-      box.classList.remove("hidden");
-      stepsEl.innerHTML = "";
-      resultEl.classList.add("hidden");
-      stepsEl.innerHTML = '<div class="yc-loading">⏳ Деплой… (docker build может занять несколько минут)</div>';
-      let r;
-      try {
-        r = await api.ycDeploy(dir, name, {});
-      } catch (e) {
-        r = { ok: false, error: (e && e.message) || String(e) };
-      }
-      stepsEl.innerHTML = "";
-      for (const s of (r && r.steps) || []) {
-        const d = document.createElement("div");
-        d.className = "yc-step";
-        d.textContent = s;
-        stepsEl.appendChild(d);
-      }
-      if (r && r.ok) {
-        if (r.url) {
-          $("yc-deploy-url").textContent = r.url;
-          resultEl.classList.remove("hidden");
-        }
-        toast("✅ Деплой завершён");
-        ycServicesCache = null;
-        ycLoadDashboard(true);
-      } else {
-        const d = document.createElement("div");
-        d.className = "yc-step err";
-        d.textContent = "❌ " + ((r && r.error) || "Ошибка деплоя");
-        stepsEl.appendChild(d);
-      }
-    });
-  };
-  $("btn-yc-deploy-open").onclick = () => {
-    const u = $("yc-deploy-url").textContent.trim();
-    if (u && isElectron) api.openExternal(u);
-  };
 
   $("btn-settings").onclick = () => openSettings();
   $("model-badge").onclick = toggleModelPopup;
@@ -6245,6 +4105,10 @@
     loadModels();
   };
   $("btn-probe-ollama").onclick = () => {
+    probeLocalModelUI();
+  };
+  // Кнопка в подвале настроек делает ровно то же самое: один и тот же замер.
+  $("btn-probe-model").onclick = () => {
     probeLocalModelUI();
   };
   $("btn-test").onclick = () => {
@@ -6424,7 +4288,7 @@
     refreshProject();
     refreshProjects();
     refreshRepo();
-    refreshDevControls();
+    DevRun.refreshDevControls();
   }
 
   // ── Файлы ──
@@ -7229,7 +5093,7 @@
     const rtxt = $("sb-run-text");
     const runBtn = $("sb-run");
     if (dot && rtxt) {
-      dot.className = "sb-dot" + (previewRunning ? " on" : "");
+      dot.className = "sb-dot" + (DevRun.previewRunning ? " on" : "");
       let port = "";
       try {
         const u = new URL(settings.previewUrl || "http://localhost:5000");
@@ -7237,8 +5101,8 @@
       } catch {
         port = "";
       }
-      rtxt.textContent = previewRunning ? "dev-сервер" + (port ? " :" + port : "") : "не запущен";
-      if (runBtn) runBtn.title = previewRunning ? "Dev-сервер запущен — открыть превью" : "Dev-сервер остановлен — открыть превью";
+      rtxt.textContent = DevRun.previewRunning ? "dev-сервер" + (port ? " :" + port : "") : "не запущен";
+      if (runBtn) runBtn.title = DevRun.previewRunning ? "Dev-сервер запущен — открыть превью" : "Dev-сервер остановлен — открыть превью";
     }
     const mtxt = $("sb-model-text");
     if (mtxt) mtxt.textContent = settings.model ? providerLabel() + " · " + settings.model : "Модель не выбрана";
@@ -8175,17 +6039,17 @@
   })();
 
   // ── Секреты: переменные окружения ──
-  $("btn-env-add").onclick = envAdd;
-  $("btn-env-import").onclick = envImportText;
+  $("btn-env-add").onclick = SecretsPanel.envAdd;
+  $("btn-env-import").onclick = SecretsPanel.envImportText;
   $("btn-env-file").onclick = () => $("env-file-input").click();
   $("env-file-input").addEventListener("change", (e) => {
-    envImportFile(e.target.files && e.target.files[0]);
+    SecretsPanel.envImportFile(e.target.files && e.target.files[0]);
     e.target.value = "";
   });
 
   // ── Секреты: пароли сайтов ──
-  if ($("btn-vault-add")) $("btn-vault-add").onclick = vaultAdd;
-  if ($("btn-vault-clear")) $("btn-vault-clear").onclick = vaultClearForm;
+  if ($("btn-vault-add")) $("btn-vault-add").onclick = SecretsPanel.vaultAdd;
+  if ($("btn-vault-clear")) $("btn-vault-clear").onclick = SecretsPanel.vaultClearForm;
   if ($("btn-vault-eye")) $("btn-vault-eye").onclick = () => toggleKey("s-vault-pass");
   if ($("s-vault-pass")) {
     // Enter в любом поле формы сохраняет запись.
@@ -8194,7 +6058,7 @@
       if (el) el.addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
           e.preventDefault();
-          vaultAdd();
+          SecretsPanel.vaultAdd();
         }
       });
     }
@@ -8258,7 +6122,7 @@
   $("term-input").addEventListener("keydown", (e) => {
     if (e.key === "Tab") {
       e.preventDefault();
-      termTabComplete();
+      DevRun.termTabComplete();
     } else if (e.key === "Enter") {
       e.preventDefault();
       termSend();
@@ -8281,15 +6145,15 @@
   };
   $("btn-preview-open").onclick = () => previewOpen($("preview-url").value);
   // Быстрый запуск/остановка проекта в превью
-  $("btn-preview-start").onclick = devStartClick;
-  $("btn-preview-stop").onclick = devStopClick;
+  $("btn-preview-start").onclick = DevRun.devStartClick;
+  $("btn-preview-stop").onclick = DevRun.devStopClick;
   $("preview-cmd").addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      devStartClick();
+      DevRun.devStartClick();
     }
   });
-  if (isElectron && api.onDevEvent) api.onDevEvent(onDevEvent);
+  if (isElectron && api.onDevEvent) api.onDevEvent(DevRun.onDevEvent);
   $("preview-url").addEventListener("keydown", (e) => {
     if (e.key === "Enter") previewOpen($("preview-url").value);
   });
@@ -8304,7 +6168,7 @@
   });
 
   // ── Удобство: копирование чата, умная прокрутка, горячие клавиши, ресайзер панели ──
-  $("btn-copy-chat").onclick = copyChat;
+  $("btn-copy-chat").onclick = ChatActions.copyChat;
   $("btn-scroll-bottom").onclick = jumpToBottom;
   $("messages").addEventListener("scroll", updatePinState, { passive: true });
 
@@ -8493,7 +6357,7 @@
       $("chat-search").focus();
       $("chat-search").select();
     });
-    A("📋", "Скопировать чат в буфер", "markdown", "Чат", () => copyChat());
+    A("📋", "Скопировать чат в буфер", "markdown", "Чат", () => ChatActions.copyChat());
     A("⏹", "Остановить агента", "", "Чат", () => stop(), () => streaming);
 
     A("📄", "Открыть файл…", "Ctrl+P", "Файлы и проект", () => enterFileMode(), () => isElectron);
@@ -8980,15 +6844,15 @@
   $("btn-toggle-vision-key").onclick = () => toggleKey("s-vision-key");
   $("btn-toggle-serper-key").onclick = () => toggleKey("s-serper-key");
   if ($("btn-mail-eye")) $("btn-mail-eye").onclick = () => toggleKey("s-mail-pass");
-  if ($("btn-mail-detect")) $("btn-mail-detect").onclick = mailFillServers;
-  if ($("btn-mail-test")) $("btn-mail-test").onclick = mailDoTest;
-  if ($("btn-mail-test-send")) $("btn-mail-test-send").onclick = mailDoTestSend;
-  if ($("btn-mail-recent")) $("btn-mail-recent").onclick = mailDoRecent;
+  if ($("btn-mail-detect")) $("btn-mail-detect").onclick = SecretsPanel.mailFillServers;
+  if ($("btn-mail-test")) $("btn-mail-test").onclick = SecretsPanel.mailDoTest;
+  if ($("btn-mail-test-send")) $("btn-mail-test-send").onclick = SecretsPanel.mailDoTestSend;
+  if ($("btn-mail-recent")) $("btn-mail-recent").onclick = SecretsPanel.mailDoRecent;
   $("btn-refresh-vision-models").onclick = () => loadAuxModels("vision");
   $("btn-refresh-image-models").onclick = () => loadAuxModels("image");
   if ($("s-vision-url")) $("s-vision-url").addEventListener("input", renderVisionDetect);
   if ($("s-vision-enabled")) $("s-vision-enabled").addEventListener("change", renderVisionDetect);
-  initRolesAndTasks();
+  TasksMission.initRolesAndTasks();
   $("btn-mobile-menu").onclick = () => $("sidebar").classList.toggle("open");
   $("chat-list").addEventListener("click", () => {
     if (window.innerWidth <= 900) $("sidebar").classList.remove("open");

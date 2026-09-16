@@ -45,6 +45,10 @@ const STATIC_FILES = new Set([
   "context-window.js",
   "web-tools.js",
   "image-tools.js",
+  // Текст промпта и таблица схем инструментов: ядро берёт их из window — без этих
+  // двух файлов на телефоне агент стартовал бы без правил и без инструментов.
+  "prompts.js",
+  "tool-schemas.js",
   "agent-core.js",
   "markdown.js",
   "highlight.js",
@@ -58,8 +62,14 @@ const STATIC_FILES = new Set([
   // Панели Yandex Cloud и деплоя: они подключены в разметке, но телефон за ними
   // получал 404 — на телефоне эти разделы просто не работали.
   "yc-console.js",
+  "yc-panel.js",
   "yc-console.css",
   "deploy-panel.js",
+  "dev-run.js",
+  "chat-actions.js",
+  "web-chat.js",
+  "tasks-mission.js",
+  "secrets-panel.js",
   "deploy-panel.css",
 ]);
 
