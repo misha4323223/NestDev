@@ -58,6 +58,7 @@ const {
   modelWindow,
   ollamaModelInfo,
   ollamaNumCtx,
+  probeLocalModel,
   isLocalEndpoint,
   toolsAsText,
   // инструменты ОС (парсеры, whitelist)
@@ -150,6 +151,10 @@ const DEFAULT_SETTINGS = {
   mobileEnabled: false,
   mobilePort: 9090,
   mobilePin: "",
+  // Какой адрес показывать телефону (QR-код и список адресов). Автоопределение берёт
+  // первый LAN-адрес ПК, а у машины их обычно несколько (Hyper-V, WSL, Docker) — и
+  // телефон уходит на недостижимый. Здесь адрес задаётся явно.
+  mobileHost: "192.168.1.72",
   // Вспомогательная модель (второй ключ OpenRouter): зрение + генерация картинок
   visionEnabled: false,
   visionAuto: true,
@@ -4265,6 +4270,37 @@ ipcMain.handle("ai:models", async (_e, ui) => {
     return { ok: true, models: await fetchModels(s) };
   } catch (e) {
     return { ok: false, message: e.message || String(e), models: [] };
+  }
+});
+// ── Замер локальной модели: сколько она думает и на чём считает ───────────────
+// Проверка подключения говорит только «сервер жив». Здесь считаем то, что важно для
+// местной модели: время загрузки, скорость чтения промпта, скорость генерации и
+// сколько весов лежит в видеопамяти. Размер контекста берём РОВНО тот, с которым
+// работает чат, — иначе замер шёл бы про другую конфигурацию и (хуже) заставил бы
+// Ollama перезагрузить модель прямо перед следующим ответом.
+ipcMain.handle("ai:probeLocal", async (_e, ui) => {
+  const s = normalizeSettings({ ...loadSettings(), ...(ui || {}) });
+  try {
+    const provider = s.provider || "openai";
+    let win = 0;
+    try {
+      win = await modelWindow(s, s.model);
+    } catch {}
+    let budget = contextBudget(provider, s.model);
+    if (win > 0) budget = windowBudget(provider, budget, win, { local: isLocalEndpoint(s) });
+    const numCtx = provider === "ollama" ? ollamaNumCtx(budget, win) : 0;
+    // «Наш обычный запрос»: системный промпт + потолок схем инструментов + история.
+    // Это верхняя оценка того, что уйдёт модели в обычном раунде.
+    const promptTokens = estimateTokens(SYSTEM_PROMPT) + ROUTER_MAX_TOKENS + 3000;
+    return await probeLocalModel(s, s.model, {
+      window: win,
+      budget: budget,
+      numCtx: numCtx,
+      promptTokens: promptTokens,
+    });
+  } catch (e) {
+    const why = (e && e.message) || String(e);
+    return { ok: false, error: why, lines: ["❌ Локальная модель не измерена: " + why] };
   }
 });
 

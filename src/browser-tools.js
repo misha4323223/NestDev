@@ -1638,6 +1638,79 @@ async function screenshot(args) {
 
 // ── Инструменты поверх стандартных ─────────────────────────────────────────
 
+// Выполняется В СТРАНИЦЕ (исходник вклеивается в запрос): привести значение к
+// тому, что реально проходит через мост. Playwright отдаёт undefined для
+// несериализуемых значений — DOM-узел, Map, объект с циклами, bigint — и агент
+// читал «ничего не вернуло» там, где код отработал и значение было.
+function evalValueToPlain(v) {
+  try {
+    if (v === undefined) return { __p: "undef" };
+    const ty = typeof v;
+    if (v === null || ty === "string" || ty === "number" || ty === "boolean") return { __p: "json", v: v };
+    if (ty === "bigint" || ty === "symbol" || ty === "function") return { __p: "text", s: String(v) };
+    if (ty === "object" && v.nodeType === 1) return { __p: "text", s: String(v.outerHTML || "") };
+    if (ty === "object" && (v.nodeType === 3 || v.nodeType === 8)) return { __p: "text", s: String(v.textContent || v.nodeValue || "") };
+    if (Array.isArray(v)) {
+      try {
+        return { __p: "text", s: JSON.stringify(v) };
+      } catch (e) {
+        return { __p: "text", s: "[массив " + v.length + " элементов, но внутри есть объекты с циклами — верни примитивы: .length, Array.from(…).map(x => x.id)]" };
+      }
+    }
+    if (v instanceof Map) return { __p: "text", s: JSON.stringify(Array.from(v.entries())) };
+    if (v instanceof Set) return { __p: "text", s: JSON.stringify(Array.from(v)) };
+    try {
+      return { __p: "text", s: JSON.stringify(v) };
+    } catch (e) {
+      return { __p: "text", s: "[объект с циклами — верни примитивы: Object.keys(…), v.id, v.length]" };
+    }
+  } catch (e) {
+    return { __p: "text", s: "[значение не удалось привести к тексту: " + String((e && e.message) || e) + "]" };
+  }
+}
+
+// Разворачивает ответ сериализатора: {__p:"undef"} → undefined, {__p:"json", v}
+// → значение, {__p:"text", s} → текст. Остальное — как есть (код со своим return
+// возвращает значение напрямую).
+function unwrapEvalValue(value) {
+  if (!value || typeof value !== "object") return value;
+  const keys = Object.keys(value);
+  if (value.__p === "undef" && keys.length === 1) return undefined;
+  if (value.__p === "json" && keys.length === 2 && "v" in value) return value.v;
+  if (value.__p === "text" && keys.length === 2 && "s" in value) return value.s;
+  return value;
+}
+
+// Выполняется В СТРАНИЦЕ: значение переменной, которую код записал сам (обычно
+// window.__rows). Нужно, когда скрипт — набор операторов: он выполнился, ничего
+// не вернул, а результат лежит в переменной. Без этого агент видел «ничего не
+// вернуло» и считал, что код не сработал.
+function varValueInPage(a) {
+  a = a || {};
+  const max = Math.max(200, Math.min(Number(a.max) || 4000, 40000));
+  let v;
+  try {
+    v = (typeof window !== "undefined" ? window : globalThis)[String(a.name || "")];
+  } catch (e) {
+    return { found: false, error: String((e && e.message) || e) };
+  }
+  if (v === undefined) return { found: false };
+  const plain = evalValueToPlain(v);
+  const base = plain.s != null ? plain.s : typeof plain.v === "string" ? plain.v : plain.v === null ? "null" : JSON.stringify(plain.v);
+  const text = String(base == null ? "" : base).slice(0, max);
+  const kind = v === null ? "null" : Array.isArray(v) ? "array" : v.nodeType === 1 ? "element" : typeof v;
+  const length = Array.isArray(v) || typeof v === "string" || kind === "element" ? Number(v.length != null ? v.length : text.length) : text.length;
+  return { found: true, kind: kind, text: text, length: length };
+}
+
+// Короткое описание значения для ответа агента: «42 элемента», «1200 символов».
+function describeVar(v) {
+  if (!v || !v.found) return "пусто";
+  if (v.kind === "array") return v.length + " элементов";
+  if (v.kind === "string") return v.length + " символов";
+  if (v.kind === "element") return v.length + " символов разметки";
+  return String(v.kind);
+}
 // Выполнить JS на странице и вернуть результат. Самый надёжный путь через любые
 // слои: перекрытый чекбокс, кнопка в диалоге, значение из JS-состояния страницы.
 async function evalJs(args) {
@@ -1657,23 +1730,63 @@ async function evalJs(args) {
   const withReturn = /\breturn\b/.test(script);
   let value;
   let err = "";
+  let asStatements = false; // сработал запасной путь: это был набор операторов
   try {
-    value = await t.tab.page.evaluate("(async () => {\n" + (withReturn ? script : "return (" + script + ");") + "\n})()");
+    // Значение проходит через сериализатор В СТРАНИЦЕ: без него DOM-узел, Map,
+    // объект с циклами и bigint превращаются в undefined (Playwright такие
+    // значения не отдаёт), и агент видел пустоту вместо результата.
+    value = unwrapEvalValue(
+      await t.tab.page.evaluate(
+        "(async () => {\n const __ser = " + evalValueToPlain.toString() + ";\n" +
+          (withReturn ? script : "const __v = (" + script + ");\nreturn __ser(__v);") +
+          "\n})()"
+      )
+    );
   } catch (e1) {
     try {
+      // Не выражение, а набор операторов (многострочный код без return):
+      // выполняем как есть — эффекты важнее значения.
+      asStatements = true;
       value = await t.tab.page.evaluate("(async () => {\n" + script + "\n})()");
     } catch (e2) {
       err = String((e2 && e2.message) || e1 || "").slice(0, 300);
     }
   }
   if (err) return "Ошибка browserEval: " + err;
-  let text = "";
-  try {
-    text = value === undefined ? "(выражение ничего не вернуло)" : typeof value === "string" ? value : JSON.stringify(value);
-  } catch (e) {
-    text = String(value);
+  // Код мог сам положить результат в window.__x — забираем его оттуда:
+  // «ничего не вернуло» без значения выглядит как «код не сработал».
+  const assignedTo = (script.match(/\b(?:window|globalThis)\.([A-Za-z_$][A-Za-z0-9_$]*)\s*=/) || [])[1] || "";
+  let wroteVar = null;
+  if (value === undefined && assignedTo) {
+    try {
+      wroteVar = await t.tab.page.evaluate(varValueInPage, { name: assignedTo, max: Math.min(max * 4, 40000) });
+    } catch (e) {}
   }
-  if (text == null) text = "(выражение ничего не вернуло)";
+  let text = "";
+  let note = "";
+  if (value === undefined) {
+    if (wroteVar && wroteVar.found) {
+      text = wroteVar.text;
+      note =
+        "Код выполнен" + (asStatements ? " (это набор операторов, а не выражение)" : "") +
+        " и значения не вернул — взял то, что он сам положил: window." + assignedTo + " (" + describeVar(wroteVar) + ").";
+    } else {
+      text = "(код выполнен, но ничего не вернул)";
+      note =
+        "Код выполнен. Значение не вернулось, потому что " +
+        (asStatements ? "это набор операторов, а не выражение" : "само выражение даёт undefined") +
+        ": закончи код словом return — например { …; return window.__rows.length; }." +
+        (asStatements && !assignedTo ? " Результат удобно класть в window.__x и читать следующим вызовом." : "") +
+        " Если возвращал DOM-узел — верни .outerHTML, .textContent или .length: узел целиком мост не отдаёт.";
+    }
+  } else {
+    try {
+      text = typeof value === "string" ? value : JSON.stringify(value);
+    } catch (e) {
+      text = String(value);
+    }
+    if (text == null) text = "(код выполнен, но ничего не вернул)";
+  }
   const info = await pageInfo(t.tab.page);
   // save / saveToFile: результат пишется В ФАЙЛ и переживает перезагрузку вкладки.
   // Раньше большие данные складывали в window.__var и резали ответ до maxChars —
@@ -1696,6 +1809,7 @@ async function evalJs(args) {
     const head = text.slice(0, Math.min(max, 800));
     return (
       "browserEval выполнен. URL: " + (info.url || "—") +
+      (note ? "\n" + note : "") +
       "\nРезультат сохранён В ФАЙЛ: " + file +
       "\nСимволов: " + text.length + " (файл переживает перезагрузку вкладки — не держи накопленное в window)." +
       "\nДальше: readFile { path: \"" + file + "\" } — или разбирай файл своим кодом (runCommand).\n" +
@@ -1705,7 +1819,7 @@ async function evalJs(args) {
   const shown = text.length > max
     ? text.slice(0, max) + "\n… [обрезано, всего " + text.length + " символов. Нужен весь ответ — повтори с save: true]"
     : text;
-  return "browserEval выполнен. URL: " + (info.url || "—") + "\nРезультат: " + shown;
+  return "browserEval выполнен. URL: " + (info.url || "—") + "\nРезультат: " + shown + (note ? "\n" + note : "");
 }
 
 // HTML вокруг селектора (или ref из карты) — чтобы понять структуру незнакомого
@@ -2142,6 +2256,9 @@ async function clearProfile() {
 // раскрывались, а после клика он гадал по DOM, что ответил сервер.
 
 const NET_MAX = 200; // кольцевой буфер запросов на вкладку
+// Тело POST держим целиком: бандл batch.call/execute у ВК бывает в десятки КБ,
+// а обрезанное тело — это повтор не того запроса (сервер отвечает invalid v).
+const NET_POST_MAX = 100000;
 const NET_STATIC = { image: 1, font: 1, stylesheet: 1, media: 1, script: 1, other: 1 };
 
 // Состояние прокрутки страницы и её внутренних контейнеров: SPA часто скроллят
@@ -2413,15 +2530,21 @@ async function loadAllScroll(page, args) {
     page.evaluate(() => String((document.body && document.body.innerText) || "").length).catch(() => 0);
   const itemState = async () =>
     itemSel ? await page.evaluate(itemsKeyInPage, { item: itemSel }).catch(() => null) : null;
+  let lastItems = null; // состояние строк последнего шага (сколько их и сколько всего)
   const mark = async () => {
     if (itemSel) {
       const s = await itemState();
+      lastItems = s;
       if (s) return "items:" + s.count + ":" + s.joined;
     }
+    lastItems = null;
     return lazyKeyOf(await readState(), await textLen());
   };
 
   let prev = await mark();
+  // Сколько строк всего обещает список: по этой цифре понимаем, что «два пустых
+  // шага» — это не конец, а переиспользование узлов виртуальным списком.
+  const target = lastItems && Number(lastItems.setsize) ? Number(lastItems.setsize) : 0;
   let steps = 0;
   let grew = 0;
   let sameRuns = 0;
@@ -2456,21 +2579,31 @@ async function loadAllScroll(page, args) {
       sameRuns = 0;
     }
     prev = now;
-    if (sameRuns >= 2) break;
+    // «Пусто дважды» — конец только если список не обещал больше строк.
+    if (sameRuns >= 2 && (!target || (lastItems && lastItems.uniq >= target))) break;
   }
   const st = await readState();
   const atEnd = up ? Number(st.y || 0) <= 2 : Number(st.max || 0) - Number(st.y || 0) <= 2;
   const its = itemSel ? await itemState() : null;
+  // Список не кончился, хотя прокрутка буксовала: виртуальный список обещает
+  // больше строк, чем успел показать. Молчать нельзя — иначе агент соберёт
+  // 16 диалогов из 110 и будет считать работу законченной.
+  const short = !!(target && its && its.uniq < target);
   let out =
     "OK — " + (box ? "догрузил контейнер «" + boxDesc + "» " : "догрузил страницу ") + how + ", шагов: " + steps +
     ". Новое содержимое появилось на " + grew + " " + (grew === 1 ? "шаге" : "шагах") +
-    (sameRuns >= 2
-      ? ", дальше пусто — это конец списка."
-      : atEnd
-        ? ", похоже, это конец списка."
-        : ", упёрся в предел " + maxSteps + " шагов — вызови ещё раз, если нужно больше.");
+    (short
+      ? ", но список НЕ кончился: в DOM " + its.uniq + " строк из ~" + target + " (aria-setsize) — виртуальный список переиспользует узлы. Собери данные запросом (browserReplay) или вызови browserScroll ещё раз."
+      : sameRuns >= 2
+        ? ", дальше пусто — это конец списка."
+        : atEnd
+          ? ", похоже, это конец списка."
+          : ", упёрся в предел " + maxSteps + " шагов — вызови ещё раз, если нужно больше.");
   if (its) {
-    out += "\nСтрок в списке: " + its.count + " (уникальных: " + its.uniq + ").";
+    out += "\nСтрок в списке: " + its.count + " (уникальных: " + its.uniq + (target ? " из ~" + target : "") + ").";
+    if (!its.count) {
+      out += "\nСелектор строки ничего не нашёл — проверь его через browserDOM (в ВК строки диалога: .ConvoListItem, старый клиент — .convo-item).";
+    }
     if (its.sample && its.sample.length) out += "\nВидно: " + its.sample.join(" · ");
   }
   out += "\n" + posLine(st);
@@ -2640,7 +2773,7 @@ function netRecorder(page) {
           method: req.method ? req.method() : "GET",
           url: String(req.url ? req.url() : ""),
           type: req.resourceType ? String(req.resourceType()) : "",
-          post: post.slice(0, 8000),
+          post: post.slice(0, NET_POST_MAX),
           ts: Date.now(),
         });
       } catch (e) {}
@@ -3078,7 +3211,13 @@ function itemsKeyInPage(a) {
     let id = "";
     try {
       id = String(
-        (el.getAttribute && (el.getAttribute("data-peer") || el.getAttribute("data-id") || el.getAttribute("data-uid"))) || el.id || ""
+        (el.getAttribute &&
+          (el.getAttribute("data-peer-id") ||
+            el.getAttribute("data-peer") ||
+            el.getAttribute("data-id") ||
+            el.getAttribute("data-uid"))) ||
+          el.id ||
+          ""
       );
     } catch (e) {}
     let first = "";
@@ -3089,9 +3228,20 @@ function itemsKeyInPage(a) {
     if (key) keys.push(key);
     if (sample.length < 8 && first) sample.push(first.slice(0, 40));
   }
+  // Сколько строк ВСЕГО обещает сам список (aria-setsize): при виртуализации в DOM
+  // живут только видимые ~16 узлов, и без этой цифры «остановился» выглядит как
+  // «список кончился» — агент собирал 16 диалогов из 110 и считал работу готовой.
+  let setsize = 0;
+  for (const el of nodes) {
+    try {
+      const n = parseInt(el.getAttribute && el.getAttribute("aria-setsize"), 10) || 0;
+      if (n > setsize) setsize = n;
+    } catch (e) {}
+  }
+
   const uniq = {};
   for (const k of keys) uniq[k] = 1;
-  return { count: nodes.length, uniq: Object.keys(uniq).length, joined: keys.join("~"), sample: sample };
+  return { count: nodes.length, uniq: Object.keys(uniq).length, joined: keys.join("~"), sample: sample, setsize: setsize };
 }
 
 // Выполняется В СТРАНИЦЕ: прокрутить последнюю (или первую — при чтении вверх)
@@ -3110,18 +3260,27 @@ function scrollItemIntoViewInPage(a) {
   return { ok: true, count: nodes.length };
 }
 
-// Образец для повтора: последний запрос страницы (xhr/fetch), который подходит.
+// Образец для повтора: последний подходящий запрос страницы (xhr/fetch).
+// Совпадение ищем И В ТЕЛЕ, а не только в адресе: ВК шлёт методы бандлом
+// (POST api.vk.ru/method/batch.call, а «messages.getItems» лежит внутри тела),
+// и по адресу такой метод не находится — replay брал чужой запрос (поллинг) со
+// старой версией API и получал ошибку про неверный v.
 function replayFindSample(rec, args) {
   const match = String(args.match || args.filter || "").toLowerCase();
   const wantGet = String(args.method || "").toUpperCase() === "GET";
-  for (let i = rec.entries.length - 1; i >= 0; i--) {
-    const e = rec.entries[i];
+  const afterTs = Number(args.afterTs) || 0;
+  const list = (rec && rec.entries) || [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const e = list[i];
     const method = String(e.method || "").toUpperCase();
     if (!wantGet && method !== "POST") continue;
     if (String(e.url || "").indexOf("http") !== 0) continue;
+    // Отбрасываем только заведомо не-API запросы (картинки, стили, скрипты).
+    // Раньше принимались лишь xhr/fetch, и запрос с типом «other» не находился.
     const type = String(e.type || "");
-    if (type && type !== "xhr" && type !== "fetch") continue;
-    if (match && e.url.toLowerCase().indexOf(match) < 0) continue;
+    if (type === "image" || type === "font" || type === "stylesheet" || type === "media" || type === "script" || type === "document") continue;
+    if (afterTs && Number(e.ts || 0) <= afterTs) continue;
+    if (match && (String(e.url || "").toLowerCase() + "\n" + String(e.post || "").toLowerCase()).indexOf(match) < 0) continue;
     if (!e.post) continue;
     return e;
   }
@@ -3139,13 +3298,21 @@ async function replay(args) {
   let method = String(args.method || "").toUpperCase();
   let body = String(args.body != null ? args.body : "");
   let from = "указан вручную";
+  let sampleTs = 0;
   if (!url || !body) {
     const sample = replayFindSample(rec, args);
     if (sample) {
       if (!url) url = String(sample.url || "");
       if (!method) method = String(sample.method || "POST").toUpperCase();
       if (!body) body = String(sample.post || "");
+      sampleTs = Number(sample.ts) || 0;
       from = "из перехвата сети (страница сама отправила такой запрос)";
+      // Совпадение в теле — это бандл (batch.call/execute), а не адрес: говорим
+      // прямо, иначе непонятно, откуда взялся повторяемый запрос.
+      const mLow = String(args.match || args.filter || "").toLowerCase();
+      if (mLow && String(sample.url || "").toLowerCase().indexOf(mLow) < 0) {
+        from += ", совпадение найдено в ТЕЛЕ запроса (метод внутри бандла batch/execute)";
+      }
     }
   }
   if (!url) {
@@ -3183,6 +3350,25 @@ async function replay(args) {
   }
   let cursorParam = String(args.cursorParam || args.cursorParamName || args.cursor || "").trim();
   if (!cursorParam) cursorParam = findCursorParam(pairs);
+  // Свежий перехват: сервер отверг образец (истёк токен сессии, сменилась версия
+  // клиента) — берём тот же запрос, который страница отправила ПОЗЖЕ, и один раз
+  // повторяем, а не заставляем человека догадываться о причине отказа.
+  const refreshSample = () => {
+    if (args.url) return false;
+    const fresh = replayFindSample(rec, Object.assign({}, args, { afterTs: sampleTs }));
+    if (!fresh || String(fresh.post || "") === body) return false;
+    sampleTs = Number(fresh.ts) || 0;
+    url = String(fresh.url || url);
+    method = String(fresh.method || "POST").toUpperCase();
+    body = String(fresh.post || "");
+    const next = parseForm(body);
+    pairs.length = 0;
+    for (const p of next) pairs.push(p);
+    if (cursorParam) setPair(cursorParam, cursor);
+    return true;
+  };
+  let refreshed = false;
+
   let cursorPath = String(args.cursorPath || "").trim();
   let itemsPath = String(args.itemsPath || "").trim();
   let totalPath = String(args.totalPath || "").trim();
@@ -3210,7 +3396,16 @@ async function replay(args) {
     if (!res || res.error) { stop = "запрос не прошёл — " + ((res && res.error) || "нет ответа"); break; }
     if (!res.json) { stop = "ответ не JSON (статус " + res.status + "): " + String(res.text || "").slice(0, 300); break; }
     const j = res.json;
-    if (j && j.error) { stop = "сервер вернул ошибку: " + JSON.stringify(j.error).slice(0, 300); break; }
+    if (j && j.error) {
+      if (!refreshed && step === 0 && refreshSample()) {
+        refreshed = true;
+        from = "из СВЕЖЕГО перехвата (сервер отверг прежний образец — страница успела отправить запрос заново)";
+        step--;
+        continue;
+      }
+      stop = "сервер вернул ошибку: " + JSON.stringify(j.error).slice(0, 300);
+      break;
+    }
     if (!itemsPath) itemsPath = findItemsPath(j);
     if (!totalPath) totalPath = findTotalPath(j);
     if (!cursorPath) cursorPath = findCursorPath(j);
@@ -3325,6 +3520,11 @@ module.exports = {
   keyOfItem,
   // тесты: строки списка и прокрутка строки в кадр
   itemsKeyInPage,
+  // тесты: разбор значения из страницы (DOM-узел, циклы, undefined),
+  evalValueToPlain,
+  unwrapEvalValue,
+  varValueInPage,
+  describeVar,
   scrollItemIntoViewInPage,
   fetchJsonInPage,
   replayFindSample,

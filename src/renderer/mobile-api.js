@@ -109,6 +109,7 @@
     stopMessage: invoke("ai:stop"),
     testConnection: invoke("ai:test"),
     listModels: invoke("ai:models"),
+    probeLocalModel: invoke("ai:probeLocal"), // замер локальной модели (с телефона тоже)
     policyGroups: invoke("policy:groups"), // группы выдачи секретов (настройки с телефона)
     pickDirectory: invoke("dialog:pickDir"),
     onAiEvent: on("ai:event"),

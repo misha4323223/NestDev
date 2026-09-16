@@ -272,6 +272,7 @@ class MobileBridge {
     this.handlerMap = opts && opts.handlerMap; // Map<channel, fn>
     this.port = 9090;
     this.pin = "";
+    this.host = ""; // предпочитаемый адрес для телефона ("" — автоопределение)
     this.enabled = false;
     this.server = null;
     this.clients = new Set();
@@ -288,6 +289,7 @@ class MobileBridge {
     const enabled = !!(s && s.mobileEnabled);
     const port = (s && s.mobilePort) || 9090;
     const pin = (s && s.mobilePin) || "";
+    this.host = String((s && s.mobileHost) || "").trim();
     const portChanged = this.server && port !== this.port;
     if (portChanged) this.stop();
     this.enabled = enabled;
@@ -332,22 +334,45 @@ class MobileBridge {
     const ifs = os.networkInterfaces();
     for (const name of Object.keys(ifs)) {
       for (const ni of ifs[name] || []) {
-        if (ni.family === "IPv4" && !ni.internal) out.push(ni.address);
+        if (ni.family === "IPv4" && !ni.internal) out.push({ ip: ni.address, name });
       }
     }
-    return [...new Set(out)];
+    // Порядок важен: телефону показывают ПЕРВЫЙ адрес из списка (он же уходит в
+    // QR-код). У ПК почти всегда есть виртуальные адаптеры (Hyper-V, WSL, Docker) со
+    // своими 172.17–31.x — с телефона они не открываются, поэтому отодвигаем их назад
+    // и ставим домашнюю сеть 192.168.x.x вперёд.
+    const score = (it) => {
+      if (/vethernet|hyper-v|wsl|docker|vmware|virtualbox|loopback|tailscale|zerotier/i.test(it.name)) return 3;
+      if (/^192\.168\./.test(it.ip)) return 0;
+      if (/^10\./.test(it.ip)) return 1;
+      if (/^172\.(1[6-9]|2\d|3[01])\./.test(it.ip)) return 2;
+      return 1;
+    };
+    const seen = new Set();
+    return out
+      .filter((it) => (seen.has(it.ip) ? false : (seen.add(it.ip), true)))
+      .sort((a, b) => score(a) - score(b))
+      .map((it) => it.ip);
   }
 
   status() {
     const ips = this.lanIps();
+    // Предпочитаемый адрес из настроек («Адрес для телефона»). Если такого адреса на
+    // этой машине нет (сменилась сеть) — показывать его нельзя: телефон уйдёт в
+    // пустоту. Тогда работаем по автоопределению и сообщаем об этом флагом hostActive.
+    const want = String(this.host || "").trim();
+    const active = !!want && ips.indexOf(want) >= 0;
+    const order = active ? [want].concat(ips.filter((ip) => ip !== want)) : ips;
     return {
       enabled: this.enabled,
       running: !!this.server,
       port: this.port,
       pin: this.pin || "",
       ips,
-      url: ips.length ? "http://" + ips[0] + ":" + this.port : "",
-      urls: ips.map((ip) => ({ ip, url: "http://" + ip + ":" + this.port })),
+      host: want,
+      hostActive: active,
+      url: order.length ? "http://" + order[0] + ":" + this.port : "",
+      urls: order.map((ip) => ({ ip, url: "http://" + ip + ":" + this.port })),
     };
   }
 

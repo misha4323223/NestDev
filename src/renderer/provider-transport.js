@@ -667,7 +667,7 @@
     const now = Date.now();
     const hit = _ollamaInfoCache.get(key);
     if (hit && now - hit.ts <= _OLLAMA_INFO_TTL) return hit;
-    const info = { ts: now, window: 0, tools: false, vision: false, known: false };
+    const info = { ts: now, window: 0, tools: false, vision: false, known: false, layers: 0, kvPerToken: 0 };
     if (name) {
       try {
         const timeout = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined;
@@ -706,6 +706,28 @@
           const defCtx = mnum ? Number(mnum[1]) : 0;
           info.window = max > 0 ? max : defCtx;
           info.defaultCtx = defCtx;
+          // Цена одного токена контекста в памяти: 2 (K и V) × слои × головы KV ×
+          // размер головы × 2 байта (f16). Нужна, чтобы честно сказать, сколько ГБ
+          // съест запрошенный num_ctx — самая частая причина «модель ушла на CPU».
+          const miNum = (key) => {
+            const direct = Number(mi[arch + "." + key]) || 0;
+            if (direct) return direct;
+            for (const k of Object.keys(mi)) {
+              if (k !== key && !k.endsWith("." + key)) continue;
+              const n = Number(mi[k]);
+              if (n > 0) return n;
+            }
+            return 0;
+          };
+          const layers = miNum("block_count");
+          const kvHeads = miNum("attention.head_count_kv");
+          const heads = miNum("attention.head_count");
+          const emb = miNum("embedding_length");
+          const headDim = heads > 0 && emb > 0 ? emb / heads : 0;
+          info.layers = layers;
+          if (layers > 0 && kvHeads > 0 && headDim > 0) {
+            info.kvPerToken = Math.round(2 * layers * kvHeads * headDim * 2);
+          }
         }
       } catch {}
     }
@@ -801,6 +823,252 @@
     return 0;
   }
 
+  // ── Проверка локальной модели: не «есть связь», а «сколько она думает» ─────
+  // Обычная проверка подключения отвечает только на «сервер жив». Пользователь
+  // спрашивает другое: «тормозит ноутбук или настройки?». Ответ даёт сам сервер —
+  // Ollama кладёт в каждый ответ длительности (загрузка модели, чтение промпта,
+  // генерация), а /api/ps показывает, сколько весов реально лежит в видеопамяти.
+  function _probeTimeout(ms) {
+    return typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(ms) : undefined;
+  }
+  function probeSec(ms) {
+    const s = (Number(ms) || 0) / 1000;
+    if (s <= 0) return "—";
+    if (s < 1) return Math.round(Number(ms)) + " мс";
+    if (s < 60) return Math.round(s * 10) / 10 + " с";
+    const m = Math.floor(s / 60);
+    return m + " мин " + Math.round(s - m * 60) + " с";
+  }
+  function probeGb(bytes) {
+    return (Number(bytes || 0) / 1073741824).toFixed(1).replace(/\.0$/, "") + " ГБ";
+  }
+  function probeSpeed(tokens, ms) {
+    const sec = (Number(ms) || 0) / 1000;
+    if (!tokens || sec <= 0) return 0;
+    return Math.round((Number(tokens) / sec) * 10) / 10;
+  }
+  // Загруженные модели и их память: size — всего, size_vram — сколько в видеопамяти.
+  // Есть не во всех сборках Ollama, поэтому молчание сервера — не ошибка проверки.
+  async function ollamaPs(base, headers) {
+    try {
+      const res = await fetch(base + "/api/ps", { headers, signal: _probeTimeout(5000) });
+      if (!res.ok) return [];
+      const d = await res.json();
+      return Array.isArray(d.models) ? d.models : [];
+    } catch {
+      return [];
+    }
+  }
+  function _psEntry(list, name) {
+    for (const m of list || []) {
+      const n = String((m && (m.name || m.model)) || "");
+      if (n === name || n.split(":")[0] === name.split(":")[0]) return m || {};
+    }
+    return {};
+  }
+  function probeVerdict(r) {
+    const known = r.weightsBytes > 0;
+    const onCpu = known && r.gpuShare < 0.02;
+    const partial = known && r.gpuShare >= 0.02 && r.gpuShare < 0.98;
+    const slowGen = r.genPerSec > 0 && r.genPerSec < 8;
+    const slowRead = r.prefillPerSec > 0 && r.prefillPerSec < 60;
+    if (onCpu && slowGen) return "модель целиком считает процессор (" + r.genPerSec + " ток/с) — упор в железо, а не в подключение (это localhost).";
+    if (partial && (slowGen || slowRead)) return "часть весов в видеопамяти, остальное считает процессор (" + Math.round(r.gpuShare * 100) + "% на GPU) — узкое место в железе, а не в подключении.";
+    if (slowRead && !slowGen) return "генерация бодрая, а чтение промпта медленное: тормозит объём запроса (системный промпт + схемы инструментов), а не модель.";
+    if (slowRead) return "и чтение промпта, и генерация медленные — это скорость железа.";
+    if (slowGen) return "ответы идут медленно (" + r.genPerSec + " ток/с) — модель тяжёлая для этой машины.";
+    if (r.genPerSec > 0) return "скорости в норме — железо справляется, в подключении узкого места нет.";
+    return "сервер ответил, но разбивку по скоростям не отдал — судить не по чему.";
+  }
+  function probeAdvice(r) {
+    const a = [];
+    const slowGen = r.genPerSec > 0 && r.genPerSec < 8;
+    const midGen = r.genPerSec > 0 && r.genPerSec < 25;
+    if (r.gpuShare > 0 && r.gpuShare < 0.98) {
+      a.push("Веса не влезли в видеопамять целиком: модель поменьше или квантизация полегче дадут разы, а не проценты.");
+    } else if (!r.weightsBytes && slowGen) {
+      a.push("Генерация ниже 8 ток/с — это уровень процессора: такой ноутбук эту модель не тянет.");
+    }
+    if (r.kvBytes > 0 && r.numCtx > 16384 && (slowGen || midGen)) {
+      a.push("num_ctx " + r.numCtx + " — это ~" + probeGb(r.kvBytes) + " KV-кэша: ручные 8–16k освободят память и ускорят чтение промпта.");
+    }
+    if (r.estimateSec > 60) {
+      a.push("Наш обычный запрос читается " + probeSec(r.estimateSec * 1000) + " — это объём системного промпта и схем инструментов, а не размер истории.");
+    }
+    if (midGen) {
+      a.push("У моделей с размышлениями (qwen3, deepseek-r1) перед ответом идут сотни токенов — при такой скорости это минуты на каждый шаг.");
+    }
+    return a.slice(0, 3);
+  }
+  function probeLines(r) {
+    const out = [];
+    out.push("📊 " + r.model + " @ " + (r.base || "—"));
+    out.push("• Связь: сервер ответил за " + probeSec(r.connectMs));
+    if (r.provider === "ollama") {
+      out.push(
+        "• Загрузка модели: " + (r.loadMs > 0 ? probeSec(r.loadMs) : "без загрузки") +
+          (r.wasLoaded ? " (модель уже была в памяти)" : " (модель была выгружена)")
+      );
+    }
+    if (r.weightsBytes > 0) {
+      const where = r.gpuShare >= 0.98
+        ? "целиком в видеопамяти (GPU)"
+        : r.gpuShare > 0
+          ? "в видеопамяти " + probeGb(r.vramBytes) + " из " + probeGb(r.weightsBytes) + " — часть считает процессор"
+          : "в видеопамяти 0 — считает процессор";
+      out.push("• Память: веса " + probeGb(r.weightsBytes) + ", " + where);
+    }
+    if (r.prefillMs > 0) {
+      out.push("• Чтение промпта: " + r.prefillTokens + " токенов за " + probeSec(r.prefillMs) + " — " + r.prefillPerSec + " ток/с");
+    }
+    if (r.genMs > 0) {
+      out.push("• Генерация: " + r.genTokens + " токенов за " + probeSec(r.genMs) + " — " + r.genPerSec + " ток/с");
+    } else if (r.genPerSec > 0) {
+      out.push("• Полный ответ: " + r.genTokens + " токенов за " + probeSec(r.totalMs) + " (" + r.genPerSec + " ток/с; разбивку сервер не отдаёт)");
+    }
+    if (r.window || r.numCtx) {
+      let ctx = "• Контекст: окно модели " + (r.window || "неизвестно") + ", запросим num_ctx " + (r.numCtx || "по умолчанию");
+      if (r.kvBytes > 0) ctx += " — KV-кэш ≈ " + probeGb(r.kvBytes);
+      out.push(ctx);
+    }
+    if (r.estimateSec > 0) {
+      out.push("• Наш обычный запрос (~" + r.promptTokens + " токенов) только читается ≈ " + probeSec(r.estimateSec * 1000));
+    }
+    out.push("Вердикт: " + probeVerdict(r));
+    return out;
+  }
+
+  // Шаги замера у Ollama: связь → пробный ответ (длительности) → память → окно.
+  // num_ctx передаётся ТОТ ЖЕ, что у боевого чата: другой размер контекста заставил бы
+  // Ollama перезагрузить модель, и сама проверка испортила бы следующий ответ.
+  async function _probeOllama(s, name, r, headers, o, timeoutMs) {
+    const base = baseFor("ollama", s);
+    r.base = base;
+    const t0 = Date.now();
+    const tags = await fetch(base + "/api/tags", { headers, signal: _probeTimeout(Math.min(15000, timeoutMs)) });
+    if (!tags.ok) throw new Error("Ollama ответила " + tags.status + " на /api/tags: " + (await tags.text()).slice(0, 200));
+    r.connectMs = Date.now() - t0;
+    const before = await ollamaPs(base, headers);
+    const pre = _psEntry(before, name);
+    r.wasLoaded = !!(pre.name || pre.model);
+    // Балласт для честного замера чтения промпта: на тридцати токенах скорость скачет.
+    const chars = Math.max(0, Math.round(Number(o.probeChars) || 1200));
+    const body = {
+      model: name,
+      messages: [{
+        role: "user",
+        content: "Повтори одно слово: готов" + (chars
+          ? "\n\nСлужебный текст для замера скорости (отвечать на него не нужно): " + "замер ".repeat(Math.round(chars / 6)).trim()
+          : ""),
+      }],
+      stream: false,
+      keep_alive: OLLAMA_KEEP_ALIVE,
+      options: { num_predict: 24, temperature: 0 },
+    };
+    if (r.numCtx > 0) body.options.num_ctx = r.numCtx;
+    const t1 = Date.now();
+    const res = await fetch(base + "/api/chat", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: _probeTimeout(timeoutMs),
+    });
+    if (!res.ok) throw new Error("Ollama ответила " + res.status + " на /api/chat: " + (await res.text()).slice(0, 200));
+    const d = await res.json();
+    r.totalMs = Date.now() - t1;
+    r.loadMs = Math.round((Number(d.load_duration) || 0) / 1e6);
+    r.prefillTokens = Number(d.prompt_eval_count) || 0;
+    r.prefillMs = Math.round((Number(d.prompt_eval_duration) || 0) / 1e6);
+    r.genTokens = Number(d.eval_count) || 0;
+    r.genMs = Math.round((Number(d.eval_duration) || 0) / 1e6);
+    r.prefillPerSec = probeSpeed(r.prefillTokens, r.prefillMs);
+    r.genPerSec = probeSpeed(r.genTokens, r.genMs);
+    // Память смотрим ПОСЛЕ запроса: теперь модель гарантированно загружена.
+    const me = _psEntry(await ollamaPs(base, headers), name);
+    r.weightsBytes = Number(me.size) || 0;
+    r.vramBytes = Number(me.size_vram) || 0;
+    r.gpuShare = r.weightsBytes > 0 ? r.vramBytes / r.weightsBytes : 0;
+    const info = await ollamaModelInfo(s, name);
+    if (info) {
+      if (!r.window && info.window) r.window = info.window;
+      if (info.known) r.tools = !!info.tools;
+      r.kvPerToken = Number(info.kvPerToken) || 0;
+    }
+    if (!r.numCtx && r.window) r.numCtx = ollamaNumCtx(o.budget, r.window);
+    if (r.kvPerToken > 0 && r.numCtx > 0) r.kvBytes = Math.round(r.kvPerToken * r.numCtx);
+  }
+
+  // Местный сервер OpenAI-совместимого API (LM Studio, llama.cpp, g4f): разбивку
+  // «чтение промпта / генерация» он не отдаёт, поэтому меряем полное время ответа.
+  async function _probeCompatible(s, name, r, headers, o, timeoutMs) {
+    const provider = (s && s.provider) || "openai";
+    const base = baseFor(provider, s);
+    r.base = base;
+    const t0 = Date.now();
+    const res = await fetch(proxiedBase(base) + "/models", { headers, signal: _probeTimeout(10000) });
+    r.connectMs = Date.now() - t0;
+    if (!res.ok) throw new Error("сервер ответил " + res.status + " на /models: " + (await res.text()).slice(0, 200));
+    const t1 = Date.now();
+    const res2 = await fetch(proxiedBase(base) + "/chat/completions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: name,
+        messages: [{ role: "user", content: "Повтори одно слово: готов" }],
+        max_tokens: 16,
+        stream: false,
+        temperature: 0,
+      }),
+      signal: _probeTimeout(timeoutMs),
+    });
+    if (!res2.ok) throw new Error("сервер ответил " + res2.status + " на /chat/completions: " + (await res2.text()).slice(0, 200));
+    const d = await res2.json();
+    r.totalMs = Date.now() - t1;
+    const u = d.usage || {};
+    r.prefillTokens = Number(u.prompt_tokens) || 0;
+    r.genTokens = Number(u.completion_tokens) || 0;
+    r.genPerSec = probeSpeed(r.genTokens, r.totalMs);
+  }
+
+  /**
+   * Измеряет локальную модель: связь, загрузку, чтение промпта, генерацию и память.
+   * opts: { numCtx, window, budget, promptTokens, probeChars, timeoutMs, fromBrowser }
+   * Возвращает { ok, …метрики, lines: [готовые строки отчёта], advice: [...], error }.
+   */
+  async function probeLocalModel(s, model, opts) {
+    const o = opts || {};
+    const provider = (s && s.provider) || "openai";
+    const name = String(model || (s && s.model) || "");
+    const headers = apiHeaders(provider, apiKeyFor(provider, s), !!o.fromBrowser, projectHeader(s));
+    const r = {
+      ok: false, provider: provider, model: name, base: "",
+      connectMs: 0, totalMs: 0,
+      loadMs: 0, wasLoaded: false,
+      prefillTokens: 0, prefillMs: 0, prefillPerSec: 0,
+      genTokens: 0, genMs: 0, genPerSec: 0,
+      weightsBytes: 0, vramBytes: 0, gpuShare: 0,
+      window: Math.round(Number(o.window) || 0),
+      numCtx: Math.round(Number(o.numCtx) || 0),
+      kvBytes: 0, kvPerToken: 0,
+      promptTokens: Math.round(Number(o.promptTokens) || 0),
+      estimateSec: 0, tools: null, lines: [], advice: [], error: "",
+    };
+    const timeoutMs = Math.max(5000, Number(o.timeoutMs) || 300000);
+    try {
+      if (!name) throw new Error("не выбрана модель — укажи её в настройках или нажми ↻ рядом со списком");
+      if (provider === "ollama") await _probeOllama(s, name, r, headers, o, timeoutMs);
+      else await _probeCompatible(s, name, r, headers, o, timeoutMs);
+      if (r.promptTokens > 0 && r.prefillPerSec > 0) r.estimateSec = Math.round(r.promptTokens / r.prefillPerSec);
+      r.lines = probeLines(r);
+      r.advice = probeAdvice(r);
+      r.ok = true;
+    } catch (e) {
+      r.error = (e && e.message) || String(e);
+      r.lines = ["❌ Локальная модель не измерена: " + r.error];
+    }
+    return r;
+  }
+
   return {
     partsText,
     partsImages,
@@ -822,6 +1090,7 @@
     ollamaModelInfo,
     ollamaNumCtx,
     modelWindow,
+    probeLocalModel,
     OLLAMA_KEEP_ALIVE,
   };
 });

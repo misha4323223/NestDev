@@ -4632,6 +4632,7 @@
     }
     $("s-mobile-enabled").checked = !!settings.mobileEnabled;
     $("s-mobile-port").value = settings.mobilePort || 9090;
+    $("s-mobile-host").value = settings.mobileHost || "";
     renderMobileStatus();
     $("s-vision-enabled").checked = !!settings.visionEnabled;
     $("s-vision-auto").checked = settings.visionAuto !== false;
@@ -4697,6 +4698,7 @@
     }
     settings.mobileEnabled = !!$("s-mobile-enabled").checked;
     settings.mobilePort = parseInt($("s-mobile-port").value, 10) || 9090;
+    settings.mobileHost = $("s-mobile-host").value.trim();
     settings.visionEnabled = !!$("s-vision-enabled").checked;
     settings.visionAuto = !!$("s-vision-auto").checked;
     settings.visionUrl = $("s-vision-url").value.trim();
@@ -4974,6 +4976,66 @@
       setSettingsMsg("Ошибка: " + (res.error || "не удалось подключиться"), true);
     }
   }
+  // ── Замер локальной модели ─────────────────────────────────────────────────
+  // «Проверить подключение» отвечает только «сервер жив». Этой кнопкой спрашиваем
+  // у сервера главное для местной модели: сколько он грузится, как быстро читает
+  // промпт и генерирует и сколько весов лежит в видеопамяти. Строки отчёта готовит
+  // ядро (AgentCore.probeLocalModel) — здесь только показ.
+  function renderProbeResult(res) {
+    const box = $("ollama-probe-result");
+    if (!box) return;
+    const r = res || {};
+    const lines = Array.isArray(r.lines) && r.lines.length ? r.lines : ["❌ Замер не удался."];
+    let text = lines.join("\n");
+    if (Array.isArray(r.advice) && r.advice.length) {
+      text += "\n\nЧто ускорит:\n" + r.advice.map((a) => "— " + a).join("\n");
+    }
+    box.textContent = text;
+    box.classList.remove("hidden");
+  }
+
+  async function probeLocalModelUI() {
+    collectSettingsFromUI();
+    const provider = settings.provider || "openai";
+    const base = $(URL_INPUT[provider]).value.trim();
+    if (!base) {
+      setSettingsMsg("Заполни базовый URL провайдера.", true);
+      return;
+    }
+    const model = $(MODEL_INPUT[provider]).value.trim();
+    if (!model) {
+      setSettingsMsg("Сначала выбери модель — замерять нечего (кнопка ↻ рядом со списком).", true);
+      return;
+    }
+    const cfg = { ...settings, provider, [URL_KEY[provider]]: base, [MODEL_KEY[provider]]: model };
+    const btn = $("btn-probe-ollama");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "⏳ Замеряю…";
+    }
+    // Честно предупреждаем про время: на процессоре чтение промпта идёт минутами.
+    setSettingsMsg("Замеряю модель: на слабом ПК это может занять минуты — жди, окно не зависло.", false);
+    try {
+      const res = isElectron
+        ? await api.probeLocalModel(cfg)
+        : await AgentCore.probeLocalModel(cfg, { fromBrowser: true });
+      renderProbeResult(res);
+      const ok = !!(res && res.ok);
+      setSettingsMsg(
+        ok ? "Замер готов: вердикт и цифры — под кнопкой." : "Замер не удался: " + ((res && (res.error || res.message)) || "нет ответа"),
+        !ok
+      );
+    } catch (e) {
+      const why = (e && e.message) || String(e);
+      renderProbeResult({ ok: false, lines: ["❌ Замер не удался: " + why] });
+      setSettingsMsg("Замер не удался: " + why, true);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "📈 Замерить скорость";
+      }
+    }
+  }
 
   // ── Мобильный доступ: QR-код «наведи камеру телефона» ──
   // В коде — адрес моста и PIN: телефон подключается одним наведением камеры,
@@ -5031,6 +5093,13 @@
         span.className = "mobile-url-none";
         span.textContent = "Нет доступных адресов — проверь подключение ПК к сети.";
         urls.appendChild(span);
+      }
+      // Адрес задан вручную, но такого IP на этом ПК нет: телефон по нему не дойдёт.
+      if (st.host && !st.hostActive) {
+        const warn = document.createElement("div");
+        warn.className = "mobile-url-none";
+        warn.textContent = "⚠ Адрес " + st.host + " на этом ПК не найден — показываю реальные. Поправь «Адрес для телефона».";
+        urls.appendChild(warn);
       }
       if (st.enabled && !st.running) {
         const err = document.createElement("div");
@@ -6174,6 +6243,9 @@
     collectSettingsFromUI();
     persistSettings();
     loadModels();
+  };
+  $("btn-probe-ollama").onclick = () => {
+    probeLocalModelUI();
   };
   $("btn-test").onclick = () => {
     collectSettingsFromUI();
@@ -8474,6 +8546,10 @@
     A("🛠", "Проверить подключение к модели", "", "Настройки", () => {
       openSettings("model");
       testConnection();
+    });
+    A("📈", "Замерить скорость локальной модели", "", "Настройки", () => {
+      openSettings("model");
+      probeLocalModelUI();
     });
     return acts;
   }

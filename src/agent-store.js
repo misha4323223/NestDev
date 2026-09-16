@@ -22,6 +22,35 @@ const crypto = require("crypto");
 
 // ── Заметки ────────────────────────────────────────────────────────────────
 const NOTE_KEY_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
+// Кириллица в ключе — не ошибка человека, а естественная попытка записать заметку
+// по-русски («Клиенты ВК»): раньше такая заметка просто не сохранялась, и агент
+// читал отказ формата. Переводим ключ в латиницу сами.
+const NOTE_TRANSLIT = {
+  а: "a", б: "b", в: "v", г: "g", д: "d", е: "e", ё: "e", ж: "zh", з: "z", и: "i", й: "y",
+  к: "k", л: "l", м: "m", н: "n", о: "o", п: "p", р: "r", с: "s", т: "t", у: "u", ф: "f",
+  х: "h", ц: "ts", ч: "ch", ш: "sh", щ: "sch", ъ: "", ы: "y", ь: "", э: "e", ю: "yu", я: "ya",
+};
+function translitNoteKey(key) {
+  const src = String(key || "").trim().toLowerCase();
+  let out = "";
+  for (const ch of src) out += NOTE_TRANSLIT[ch] != null ? NOTE_TRANSLIT[ch] : ch;
+  return out
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[-._]+/, "")
+    .replace(/[-._]+$/, "")
+    .slice(0, 64);
+}
+
+// Годный ключ заметки: { key, transliterated }; key === null — формат не спасти.
+function noteKeyOf(key) {
+  const k = String(key || "").trim();
+  if (NOTE_KEY_RE.test(k)) return { key: k, transliterated: false };
+  const t = translitNoteKey(k);
+  if (t && NOTE_KEY_RE.test(t)) return { key: t, transliterated: true };
+  return { key: null, transliterated: false };
+}
 const NOTE_MAX_LEN = 6000; // символов на заметку
 const NOTE_MAX_COUNT = 100; // заметок на проект
 
@@ -44,15 +73,21 @@ function memorySave(file, data) {
 }
 
 function noteValidateKey(key) {
-  const k = String(key || "").trim();
-  return NOTE_KEY_RE.test(k) ? k : null;
+  return noteKeyOf(key).key;
 }
 
 // Сохранить/перезаписать заметку key. Возвращает { ok, message } или { ok:false, error }.
 function noteSave(userData, workdir, key, content) {
-  const k = noteValidateKey(key);
+  const got = noteKeyOf(key);
+  const k = got.key;
   if (!k) {
-    return { ok: false, error: "key может содержать только латиницу, цифры, точку, дефис и подчёркивание (1–64 символа)." };
+    return {
+      ok: false,
+      error:
+        "key может содержать латиницу, цифры, точку, дефис и подчёркивание (1–64 символа). " +
+        "Кириллицу писать можно — она переводится в латиницу сама («Клиенты ВК» → klienty-vk). " +
+        "Перевести нечего только у пустого или пробельного ключа.",
+    };
   }
   const text = String(content ?? "");
   if (!text.trim()) return { ok: false, error: "Укажи content — текст заметки." };
@@ -68,7 +103,12 @@ function noteSave(userData, workdir, key, content) {
   memorySave(file, data);
   return {
     ok: true,
-    message: "Заметка «" + k + "» сохранена (" + text.length + " симв.). В следующих сессиях она доступна через noteRead.",
+    transliterated: got.transliterated,
+    key: k,
+    message:
+      "Заметка «" + k + "» сохранена" +
+      (got.transliterated ? " (ключ приведён к латинице: «" + String(key || "").trim() + "» → " + k + ")" : "") +
+      " (" + text.length + " симв.). В следующих сессиях она доступна через noteRead.",
     count: Object.keys(data).length,
   };
 }
@@ -77,7 +117,8 @@ function noteSave(userData, workdir, key, content) {
 function noteRead(userData, workdir, key) {
   const file = memoryFile(userData, workdir);
   const data = memoryLoad(file);
-  const k = String(key || "").trim();
+  // Читаем по тому же правилу, что и запись: «Клиенты ВК» найдёт klienty-vk.
+  const k = key ? noteValidateKey(key) || String(key).trim() : "";
   if (k) {
     const rec = data[k];
     if (!rec) return { ok: false, error: "Заметка «" + k + "» не найдена. Смотри noteList." };

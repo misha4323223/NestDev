@@ -783,8 +783,15 @@ async function testAgentStore() {
     const userData = tmpdir("as-val-");
     const proj = path.join(userData, "p");
     fs.mkdirSync(proj);
-    assert.ok(!store.noteSave(userData, proj, "плохой ключ", "x").ok, "пропустил пробел в key");
-    assert.ok(!store.noteSave(userData, proj, "a/b", "x").ok, "пропустил слэш в key");
+    // «Плохой» ключ — это пустой или пробельный: кириллица и пробелы переводятся
+    // в латиницу сами, иначе естественная попытка записать заметку по-русски
+    // превращалась в отказ формата.
+    const ru = store.noteSave(userData, proj, "разбор переписок", "x");
+    assert.ok(ru.ok, "русский ключ отклонён: " + (ru.error || ""));
+    assert.strictEqual(ru.key, "razbor-perepisok", "ключ переведён не так: " + ru.key);
+    assert.strictEqual(ru.transliterated, true, "о переводе ключа не сказано");
+    assert.ok(store.noteSave(userData, proj, "zadacha na segodnya", "x").ok, "латиница с пробелом отклонена");
+    assert.ok(!store.noteSave(userData, proj, "   ", "x").ok, "пропустил пустой key");
     assert.ok(!store.noteSave(userData, proj, "valid", "   ").ok, "пропустил пустой content");
     assert.ok(!store.noteSave(userData, proj, "valid", "x".repeat(store.NOTE_MAX_LEN + 1)).ok, "пропустил слишком длинный content");
     assert.ok(store.noteSave(userData, proj, "valid", "x").ok, "валидная заметка отклонена");
@@ -2263,6 +2270,60 @@ async function testMobileBridge() {
     assert.ok(conn.authed, "не авторизовался правильным PIN");
     assert.strictEqual(b.authFailCount, 0, "счётчик не сброшен после успеха");
   });
+  await test("mobile-bridge: «Адрес для телефона» из настроек идёт первым", () => {
+    const realIfs = os.networkInterfaces;
+    os.networkInterfaces = () => ({
+      "Wi-Fi": [{ family: "IPv4", internal: false, address: "192.168.1.72" }],
+      "vEthernet (WSL)": [{ family: "IPv4", internal: false, address: "172.28.96.1" }],
+      Loopback: [{ family: "IPv4", internal: true, address: "127.0.0.1" }],
+    });
+    try {
+      const b = new MobileBridge({ handlerMap: new Map() });
+      b.applySettings({ mobileEnabled: false, mobilePort: 9090, mobileHost: "192.168.1.72" });
+      const st = b.status();
+      assert.strictEqual(st.host, "192.168.1.72", "адрес из настроек не сохранён");
+      assert.strictEqual(st.hostActive, true, "адрес не найден на ПК");
+      assert.strictEqual(st.url, "http://192.168.1.72:9090", "первый адрес: " + st.url);
+      assert.strictEqual(st.urls[0].url, "http://192.168.1.72:9090", "QR-код покажет не тот адрес");
+      // Виртуальные адаптеры уходят в конец: с телефона они не открываются.
+      assert.strictEqual(st.urls[st.urls.length - 1].ip, "172.28.96.1", "виртуальный адаптер остался первым");
+      assert.strictEqual(st.urls.length, 2, "внутренний адрес 127.0.0.1 не должен попадать в список");
+    } finally {
+      os.networkInterfaces = realIfs;
+    }
+  });
+
+  await test("mobile-bridge: без настройки домашняя сеть впереди виртуальной, чужой адрес не подменяет реальный", () => {
+    const realIfs = os.networkInterfaces;
+    os.networkInterfaces = () => ({
+      "vEthernet (Default Switch)": [{ family: "IPv4", internal: false, address: "172.20.144.1" }],
+      Ethernet: [{ family: "IPv4", internal: false, address: "192.168.1.72" }],
+    });
+    try {
+      const b = new MobileBridge({ handlerMap: new Map() });
+      b.applySettings({ mobilePort: 9090, mobileHost: "" });
+      assert.strictEqual(b.status().urls[0].ip, "192.168.1.72", "первым ушёл виртуальный адаптер");
+      // Адрес, которого на ПК нет: телефон по нему не дойдёт — показываем реальные.
+      b.applySettings({ mobilePort: 9090, mobileHost: "192.168.99.99" });
+      const st = b.status();
+      assert.strictEqual(st.hostActive, false, "чужой адрес сочли живым");
+      assert.strictEqual(st.urls[0].ip, "192.168.1.72", "показан недостижимый адрес: " + st.urls[0].ip);
+      assert.strictEqual(st.urls.length, 2, "реальные адреса потерялись");
+    } finally {
+      os.networkInterfaces = realIfs;
+    }
+  });
+
+  await test("mobile-bridge: поле «Адрес для телефона» есть в настройках и сохраняется", () => {
+    const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    assert.ok(/id="s-mobile-host"/.test(htmlSrc), "нет поля «Адрес для телефона»");
+    const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    assert.ok(/settings\.mobileHost = \$\("s-mobile-host"\)\.value\.trim\(\)/.test(appSrc), "поле не сохраняется");
+    assert.ok(/st\.host && !st\.hostActive/.test(appSrc), "нет предупреждения о недостижимом адресе");
+    const mainS = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    assert.ok(/mobileHost: "192\.168\.1\.72"/.test(mainS), "адрес по умолчанию не задан");
+  });
+
 
   await test("mobile-bridge: отдаёт monochrome.css и highlight.js", async () => {
     const b = new MobileBridge({ handlerMap: new Map() });
@@ -5405,7 +5466,10 @@ async function testBrowserOverlays() {
     await test("browserEval: выражение оборачивается в return, результат отдаётся текстом", async () => {
       const r = await bt.evalJs({ script: "document.title" });
       assert.ok(/ЗАГОЛОВОК/.test(r), "результат не вернулся: " + r);
-      assert.ok(/return \(document\.title\);/.test(String(log[log.length - 1].fn)), "выражение не обёрнуто в return: " + log[log.length - 1].fn);
+      const fnSrc = String(log[log.length - 1].fn);
+      assert.ok(/const __v = \(document\.title\);/.test(fnSrc), "выражение не обёрнуто: " + fnSrc);
+      assert.ok(/return __ser\(__v\);/.test(fnSrc), "результат не проходит сериализатор (DOM-узел потерялся бы): " + fnSrc);
+      assert.ok(!/return \(__v\)/.test(fnSrc), "сериализатор обёрнут повторно")
       const code = await bt.evalJs({ script: "const a = 1; return a + 1;" });
       assert.ok(/return a \+ 1;/.test(String(log[log.length - 1].fn)), "код со своим return переписан: " + log[log.length - 1].fn);
       assert.ok(!/return \(const/.test(String(log[log.length - 1].fn)), "код со своим return обёрнут повторно");
@@ -6974,6 +7038,136 @@ async function testPromptCacheAndUsage() {
       }).body
     );
     assert.strictEqual(ol.stream_options, undefined, "stream_options ушёл в Ollama");
+  });
+
+  await test("замер локальной модели: скорости, память и вердикт по ответу Ollama", async () => {
+    const realFetch = global.fetch;
+    const calls = [];
+    global.fetch = async (url, init) => {
+      calls.push({ url: String(url), init: init || {} });
+      const u = String(url);
+      if (/\/api\/tags$/.test(u)) return { ok: true, status: 200, json: async () => ({ models: [{ name: "qwen3:8b" }] }) };
+      if (/\/api\/ps$/.test(u)) {
+        const asked = calls.some((c) => /\/api\/chat$/.test(c.url));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ models: asked ? [{ name: "qwen3:8b", size: 5 * 1073741824, size_vram: 0 }] : [] }),
+        };
+      }
+      if (/\/api\/chat$/.test(u)) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            message: { content: "готов" },
+            total_duration: 30e9,
+            load_duration: 20e9,
+            prompt_eval_count: 600,
+            prompt_eval_duration: 20e9,
+            eval_count: 24,
+            eval_duration: 4e9,
+          }),
+        };
+      }
+      if (/\/api\/show$/.test(u)) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            capabilities: ["completion", "tools"],
+            model_info: {
+              "general.architecture": "qwen3",
+              "qwen3.context_length": 40960,
+              "qwen3.block_count": 36,
+              "qwen3.attention.head_count": 32,
+              "qwen3.attention.head_count_kv": 8,
+              "qwen3.embedding_length": 4096,
+            },
+          }),
+        };
+      }
+      return { ok: false, status: 404, text: async () => "", json: async () => ({}) };
+    };
+    try {
+      const r = await core.probeLocalModel(
+        { provider: "ollama", ollamaUrl: "http://127.0.0.1:11434" },
+        "qwen3:8b",
+        { numCtx: 36864, window: 40960, promptTokens: 24000, probeChars: 600 }
+      );
+      assert.ok(r.ok, "замер не прошёл: " + r.error);
+      // 24 токена за 4 с и 600 токенов за 20 с — из этих чисел и строится вердикт.
+      assert.strictEqual(r.genPerSec, 6, "скорость генерации: " + r.genPerSec);
+      assert.strictEqual(r.prefillPerSec, 30, "скорость чтения промпта: " + r.prefillPerSec);
+      assert.strictEqual(r.gpuShare, 0, "доля весов в видеопамяти");
+      assert.strictEqual(r.wasLoaded, false, "модель сочли загруженной до запроса");
+      assert.strictEqual(r.loadMs, 20000, "время загрузки модели");
+      // KV-кэш: 2 × 36 слоёв × 8 голов KV × 128 (4096 / 32) × 2 байта = 147 456 Б/токен.
+      assert.strictEqual(r.kvPerToken, 147456, "размер KV на токен: " + r.kvPerToken);
+      assert.strictEqual(r.kvBytes, 147456 * 36864, "KV-кэш посчитан неверно");
+      assert.strictEqual(r.estimateSec, 800, "оценка нашего запроса: " + r.estimateSec);
+      const body = JSON.parse(calls.find((c) => /\/api\/chat$/.test(c.url)).init.body);
+      assert.strictEqual(body.options.num_ctx, 36864, "замер ушёл с другим num_ctx — Ollama перезагрузит модель");
+      assert.strictEqual(body.stream, false, "замер должен быть не-стримом: длительности приходят в финале");
+      assert.ok(body.messages[0].content.length > 300, "пробный промпт без балласта — скорость чтения будет скакать");
+      const text = r.lines.join("\n");
+      assert.ok(/процессор/.test(text), "в отчёте нет вывода про процессор: " + text);
+      assert.ok(/KV-кэш/.test(text), "в отчёте нет цены контекста: " + text);
+      assert.ok(/13 мин/.test(text), "нет оценки нашего обычного запроса: " + text);
+      assert.ok(r.advice.length >= 1, "нет советов, что ускорит");
+    } finally {
+      global.fetch = realFetch;
+    }
+  });
+
+  await test("замер локальной модели: сервер молчит — честный отказ без выдуманных цифр", async () => {
+    const realFetch = global.fetch;
+    global.fetch = async () => {
+      throw new Error("connect ECONNREFUSED 127.0.0.1:11434");
+    };
+    try {
+      const r = await core.probeLocalModel({ provider: "ollama", ollamaUrl: "http://127.0.0.1:11434" }, "qwen3:8b", {});
+      assert.strictEqual(r.ok, false, "отказ должен остаться отказом");
+      assert.ok(/ECONNREFUSED/.test(r.error), "причина потеряна: " + r.error);
+      assert.ok(/не измерена/.test(r.lines.join("\n")), "нет понятной строки для панели");
+      assert.strictEqual(r.genPerSec, 0, "цифры выдуманы без ответа сервера");
+      assert.deepStrictEqual(r.advice, [], "у отказа не должно быть советов");
+    } finally {
+      global.fetch = realFetch;
+    }
+  });
+
+  await test("замер локальной модели: без модели в настройках не стучимся в сервер", async () => {
+    const realFetch = global.fetch;
+    let touched = 0;
+    global.fetch = async () => {
+      touched++;
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    try {
+      const r = await core.probeLocalModel({ provider: "ollama", ollamaUrl: "http://127.0.0.1:11434" }, "", {});
+      assert.strictEqual(r.ok, false, "замер без модели не должен считаться удачным");
+      assert.strictEqual(touched, 0, "запросы ушли без выбранной модели");
+      assert.ok(/модель/i.test(r.error), "не сказано, что нужна модель: " + r.error);
+    } finally {
+      global.fetch = realFetch;
+    }
+  });
+
+  await test("замер локальной модели: канал IPC, preload, мобильный API и кнопка на месте", () => {
+    const mainS = mainOnlySrc();
+    assert.ok(/ipcMain\.handle\("ai:probeLocal"/.test(mainS), "нет канала ai:probeLocal");
+    assert.ok(/probeLocalModel\(s, s\.model,\s*\{/.test(mainS), "обработчик не вызывает замер");
+    assert.ok(/numCtx = provider === "ollama" \? ollamaNumCtx\(budget, win\)/.test(mainS), "num_ctx для замера не тот, что у чата");
+    const preloadSrc = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
+    assert.ok(/probeLocalModel: \(ui\) => ipcRenderer\.invoke\("ai:probeLocal"/.test(preloadSrc), "нет метода в preload");
+    const mobileSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "mobile-api.js"), "utf8");
+    assert.ok(/probeLocalModel: invoke\("ai:probeLocal"\)/.test(mobileSrc), "нет метода в мобильном API");
+    const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    assert.ok(/\$\("btn-probe-ollama"\)\.onclick/.test(appSrc), "кнопка замера не подключена");
+    assert.ok(/AgentCore\.probeLocalModel\(cfg, \{ fromBrowser: true \}\)/.test(appSrc), "в веб-превью замер недоступен");
+    const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    assert.ok(/id="ollama-probe-result"/.test(htmlSrc), "нет блока отчёта в настройках");
   });
 
   await test("метрики: токен-отчёт разных провайдеров приводится к одному виду", () => {
@@ -11369,6 +11563,7 @@ async function testMissions() {
   await testSettingsSearchLogic();
   await testLeftRail();
   await testSandboxObstacles();
+  await testVkFieldFixes();
   await testLongChatRecovery();
   await testTasks();
   await testMissions();
@@ -12078,5 +12273,269 @@ async function testProductionGate() {
     assert.ok(ipc.includes("allowFailingTests: o.allowFailingTests"), "мост не пропускает явное разрешение");
     assert.ok(ipc.includes("browserCheck: o.browserCheck"), "мост не пропускает режим проверки страницы");
     assert.ok(ipc.includes("environment: o.environment"), "мост не пропускает окружение выката");
+  });
+}
+
+// ── 4f. Отчёт песочницы по ВК: честные ответы инструментов ───────────────
+async function testVkFieldFixes() {
+  const bt = require("../src/browser-tools");
+
+  await test("browserEval: DOM-узел, объект с циклами и undefined объясняются", () => {
+    // Значение проходит сериализатор В СТРАНИЦЕ: иначе Playwright отдаёт
+    // undefined для DOM-узла и объекта с циклами — и агент читал пустоту.
+    assert.strictEqual(bt.unwrapEvalValue({ __p: "undef" }), undefined, "undefined не развернулся");
+    assert.strictEqual(bt.unwrapEvalValue({ __p: "json", v: 5 }), 5, "число не развернулось");
+    assert.strictEqual(bt.unwrapEvalValue({ __p: "text", s: "<b>x</b>" }), "<b>x</b>", "текст не развернулся");
+    assert.strictEqual(bt.unwrapEvalValue("строка"), "строка", "обычное значение испортилось");
+    const node = bt.evalValueToPlain({ nodeType: 1, outerHTML: "<div>Привет</div>" });
+    assert.strictEqual(node.__p, "text", "DOM-узел не превращён в текст");
+    assert.ok(/Привет/.test(node.s), "разметка узла потерялась: " + JSON.stringify(node));
+    const cyc = {};
+    cyc.self = cyc;
+    const cycPlain = bt.evalValueToPlain(cyc);
+    assert.ok(/цикл/i.test(cycPlain.s), "объект с циклами не объяснён: " + JSON.stringify(cycPlain));
+    const big = [];
+    big.push({ self: big });
+    const arrPlain = bt.evalValueToPlain(big);
+    assert.ok(/цикл|примитив/i.test(arrPlain.s), "массив с циклами не объяснён: " + JSON.stringify(arrPlain));
+    assert.strictEqual(bt.evalValueToPlain(new Set([1, 2])).__p, "text", "Set не приведён к тексту");
+    assert.strictEqual(bt.evalValueToPlain(new Map([[1, 2]])).__p, "text", "Map не приведён к тексту");
+
+    // Переменная, которую код записал сам: значение берётся оттуда, а не «пусто».
+    global.window = { __rows: [1, 2, 3], __title: "Диалоги", __none: undefined };
+    try {
+      const rows = bt.varValueInPage({ name: "__rows" });
+      assert.strictEqual(rows.found, true, "массив не найден");
+      assert.strictEqual(rows.kind, "array", "массив назван «" + rows.kind + "»");
+      assert.strictEqual(bt.describeVar(rows), "3 элементов", "описание значения: " + bt.describeVar(rows));
+      assert.strictEqual(bt.varValueInPage({ name: "__title" }).text, "Диалоги", "строка отдана не как есть");
+      assert.strictEqual(bt.varValueInPage({ name: "__none" }).found, false, "пустая переменная считается найденной");
+    } finally {
+      delete global.window;
+    }
+  });
+
+  await test("browserEval: код-операторы объясняется, значение берётся из window.__x", async () => {
+    const Module_ = require("module");
+    const origRequire = Module_.prototype.require;
+    const seen = [];
+    const page = {
+      url: () => "https://vk.com/im",
+      async title() { return "ВК"; },
+      on() {},
+      async goto() {},
+      locator: () => ({ first() { return this; }, async count() { return 1; }, async isVisible() { return true; }, async click() {}, async evaluate() { return ""; } }),
+      getByRole: () => ({ first() { return this; }, async count() { return 1; }, async isVisible() { return true; }, async click() {} }),
+      async evaluate(fn, arg) {
+        seen.push({ fn, arg });
+        // Первый вызов это набор операторов — так же, как в живом окне, падает
+        // обёртка «const __v = (…);», и срабатывает запасной путь.
+        if (typeof fn === "string" && fn.indexOf("const __v = (") >= 0) throw new Error("Unexpected token");
+        if (fn && fn.name === "varValueInPage") return { found: true, kind: "array", text: "[1,2,3]", length: 3 };
+        return undefined;
+      },
+    };
+    Module_.prototype.require = function (id) {
+      if (id === "playwright") {
+        return { chromium: { executablePath: () => "", async launch() { return { isConnected: () => true, on() {}, async newPage() { return page; }, async close() {} }; }, async launchPersistentContext() { return { pages: () => [page], on() {}, async newPage() { return page; }, async close() {} }; } } };
+      }
+      return origRequire.apply(this, arguments);
+    };
+    try {
+      bt.setProfileDir("");
+      bt.setPlaywright(null);
+      await bt.stop().catch(() => {});
+      await bt.open({ url: "https://vk.com/im" });
+      const r = await bt.evalJs({ script: "window.__rows = []; for (const c of document.querySelectorAll('.convo-item')) window.__rows.push(c);" });
+      assert.ok(/набор операторов/.test(r), "не сказано, что это набор операторов: " + r.slice(0, 200));
+      assert.ok(/\[1,2,3\]/.test(r), "значение из window.__rows не подставлено: " + r.slice(0, 200));
+      assert.ok(/window\.__rows/.test(r), "не сказано, откуда взято значение: " + r.slice(0, 200));
+      assert.ok(seen.some((c) => c.fn && c.fn.name === "varValueInPage"), "переменная со страницы не прочитана");
+      // Ответ про undefined без переменной: подсказка про return и DOM-узел.
+      const empty = await bt.evalJs({ script: "const a = 1; a + 1;" });
+      assert.ok(/return/.test(empty), "нет подсказки про return: " + empty.slice(0, 200));
+    } finally {
+      Module_.prototype.require = origRequire;
+      await bt.stop().catch(() => {});
+      bt.setPlaywright(null);
+    }
+  });
+
+  await test("browserReplay: образец найден в ТЕЛЕ бандла, а не в адресе", () => {
+    const rec = {
+      entries: [
+        { method: "POST", url: "https://api.vk.ru/method/messages.getItems", type: "xhr", post: "v=5.285&access_token=старый", ts: 100 },
+        // Поллинг идёт ПОЗЖЕ — раньше последним POST-запросом оказывался именно он,
+        // и replay повторял чужой запрос со старой версией API («invalid v»).
+        { method: "POST", url: "https://queuev4.vk.com/im374?act=a_check", type: "xhr", post: "key=abc&ts=1", ts: 200 },
+        { method: "POST", url: "https://api.vk.ru/method/batch.call", type: "other", post: "v=5.285&batch=%5B%7B%22method%22%3A%22messages.getItems%22%7D%5D&access_token=живой", ts: 300 },
+      ],
+    };
+    const s = bt.replayFindSample(rec, { match: "messages.getitems" });
+    assert.ok(s, "образец не найден");
+    assert.ok(/batch\.call/.test(s.url), "выбран не бандл: " + (s && s.url));
+    assert.ok(/access_token=живой/.test(s.post), "тело образца не то: " + (s && s.post));
+    // Только свежее: образцы раньше указанного времени не берём.
+    const fresh = bt.replayFindSample(rec, { match: "messages.getitems", afterTs: 200 });
+    assert.ok(fresh && fresh.ts === 300, "фильтр по свежести не работает: " + JSON.stringify(fresh && fresh.ts));
+    const none = bt.replayFindSample(rec, { match: "messages.getitems", afterTs: 300 });
+    assert.strictEqual(none, null, "нашёлся образец старше указанного времени");
+    // Тип «other» (свой транспорт сайта) больше не отбрасывается.
+    assert.ok(bt.replayFindSample(rec, {}), "запрос с типом other не найден");
+  });
+
+  await test("виртуальный список: aria-setsize не даёт объявить конец раньше времени", async () => {
+    const makePage = (setsize) => {
+      const page = {
+        viewportSize: () => ({ width: 1000, height: 800 }),
+        mouse: { move: async () => {}, wheel: async () => {} },
+        evaluate: async (fn) => {
+          if (fn && fn.name === "scrollStateInPage") return { y: 300, max: 900, vh: 800, docH: 1700, inner: [] };
+          if (fn && fn.name === "itemsKeyInPage") return { count: 18, uniq: 18, joined: "k1~k18", sample: ["Диалог"], setsize: setsize };
+          if (fn && fn.name === "scrollItemIntoViewInPage") return { ok: true, count: 18 };
+          return "";
+        },
+      };
+      return page;
+    };
+    const short = await bt.loadAllScroll(makePage(110), { times: 6, item: ".ConvoListItem" });
+    assert.ok(/НЕ кончился/.test(short), "не сказал, что список не кончился: " + short.slice(0, 220));
+    assert.ok(/из ~110/.test(short), "не названо обещанное число строк: " + short.slice(0, 220));
+    assert.ok(/browserReplay/.test(short), "не подсказал взять данные запросом: " + short.slice(0, 240));
+    // Список собрал всё, что обещал, — тогда «дальше пусто» честно.
+    const full = await bt.loadAllScroll(makePage(18), { times: 6, item: ".ConvoListItem" });
+    assert.ok(/конец списка/.test(full), "не объявил конец собранного списка: " + full.slice(0, 220));
+    assert.ok(!/НЕ кончился/.test(full), "собранный список назван неполным");
+  });
+
+  await test("строка списка: ключ диалога берётся из data-peer-id, число строк — из aria-setsize", () => {
+    const mk = (attrs, href) => ({
+      getAttribute: (n) => (attrs[n] == null ? null : attrs[n]),
+      querySelector: () => (href ? { getAttribute: () => href } : null),
+      innerText: attrs.text || "",
+      id: attrs.id || "",
+    });
+    global.document = {
+      querySelectorAll: () => [
+        mk({ "data-peer-id": "143668553", "aria-setsize": "110", text: "Евгения" }),
+        mk({ "data-peer-id": "273947588", "aria-setsize": "110", text: "Дмитрий" }),
+      ],
+    };
+    try {
+      const st = bt.itemsKeyInPage({ item: ".ConvoListItem" });
+      assert.strictEqual(st.count, 2, "строки не посчитаны: " + JSON.stringify(st));
+      assert.strictEqual(st.uniq, 2, "уникальные ключи не посчитаны: " + JSON.stringify(st));
+      assert.strictEqual(st.setsize, 110, "aria-setsize не прочитан: " + JSON.stringify(st));
+      // Разные диалоги не должны склеиваться в один ключ.
+      assert.ok(st.joined.indexOf("143668553") >= 0 && st.joined.indexOf("273947588") >= 0, "ключи диалогов потерялись: " + st.joined);
+    } finally {
+      delete global.document;
+    }
+  });
+
+  await test("заметка: кириллический ключ переводится, а не отвергается", () => {
+    const store = require("../src/agent-store");
+    const os = require("os");
+    const ud = fs.mkdtempSync(path.join(os.tmpdir(), "note-ru-"));
+    const wd = path.join(ud, "proj");
+    fs.mkdirSync(wd, { recursive: true });
+    try {
+      const saved = store.noteSave(ud, wd, "Клиенты ВК", "разбор переписок");
+      assert.strictEqual(saved.ok, true, "заметка с русским ключом не сохранилась: " + saved.error);
+      assert.strictEqual(saved.key, "klienty-vk", "ключ переведён не так: " + saved.key);
+      assert.strictEqual(saved.transliterated, true, "о переводе ключа не сказано");
+      assert.ok(/klienty-vk/.test(saved.message), "в ответе нет ключа: " + saved.message);
+      const read = store.noteRead(ud, wd, "Клиенты ВК");
+      assert.strictEqual(read.ok, true, "заметку не нашли по русскому ключу: " + read.error);
+      assert.strictEqual(read.content, "разбор переписок", "содержимое вернулось не то");
+      assert.strictEqual(store.noteDelete(ud, wd, "Клиенты ВК").ok, true, "удаление по русскому ключу не сработало");
+      // Мусорный ключ по-прежнему отказ, но с объяснением перевода.
+      const bad = store.noteSave(ud, wd, "   ", "x");
+      assert.strictEqual(bad.ok, false, "пустой ключ принят");
+      assert.ok(/переводится|перевод/i.test(bad.error), "отказ не объясняет перевод: " + bad.error);
+      // Латинский ключ работает как раньше.
+      const latin = store.noteSave(ud, wd, "architecture", "ok");
+      assert.strictEqual(latin.key, "architecture", "латинский ключ изменился: " + latin.key);
+      assert.strictEqual(latin.transliterated, false, "латинский ключ назван переведённым");
+    } finally {
+      fs.rmSync(ud, { recursive: true, force: true });
+    }
+  });
+
+  await test("writeFile: синтаксис и JSON проверяются, окружение названо", () => {
+    const src = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
+    const start = src.indexOf("const CHECK_CODE_EXT");
+    const end = src.indexOf("function createAgentTools(deps) {");
+    assert.ok(start > 0 && end > start, "не нашёл хелперы проверки файла");
+    const mod = new Function("require", src.slice(start, end) + "\nreturn { checkWrittenFile, envNoteFor };")(require);
+    const os = require("os");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wf-"));
+    try {
+      const good = path.join(dir, "good.js");
+      fs.writeFileSync(good, "const a = 1;\n");
+      assert.strictEqual(mod.checkWrittenFile(good, "const a = 1;\n").problem, "", "целый файл назван сломанным");
+      const bad = path.join(dir, "bad.js");
+      fs.writeFileSync(bad, "function f( {\n");
+      const badRes = mod.checkWrittenFile(bad, "function f( {\n");
+      assert.strictEqual(badRes.checked, true, "сломанный JS не проверен");
+      assert.ok(/синтаксис/i.test(badRes.problem), "поломка синтаксиса не названа: " + badRes.problem);
+      const json = path.join(dir, "x.json");
+      assert.strictEqual(mod.checkWrittenFile(json, '{"a":1}').problem, "", "целый JSON назван сломанным");
+      assert.ok(/JSON/.test(mod.checkWrittenFile(json, '{"a":}').problem), "сломанный JSON не пойман");
+      assert.strictEqual(mod.checkWrittenFile(path.join(dir, "t.txt"), "текст").checked, false, "текст проверяется зря");
+      assert.ok(/Node\.js|bun/.test(mod.envNoteFor(good)), "не сказано, чем запускать JS: " + mod.envNoteFor(good));
+      assert.ok(/Python/.test(mod.envNoteFor(path.join(dir, "a.py"))), "не сказано, чем запускать Python");
+      assert.strictEqual(mod.envNoteFor(path.join(dir, "t.txt")), "", "для текста выдумано окружение");
+      assert.ok(/installPackage/.test(mod.envNoteFor(good)), "про зависимости не сказано");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    // Сам инструмент обязан показывать результат проверки в ответе.
+    const toolsSrc = src.replace(/\r/g, "");
+    assert.ok(/checkWrittenFile\(p, content\)/.test(toolsSrc), "writeFile не проверяет записанный файл");
+    assert.ok(/envNoteFor\(p\)/.test(toolsSrc), "writeFile не говорит про окружение");
+  });
+
+  await test("миссия: повторный missionFinish объясняет, что она уже закрыта", () => {
+    const missionStore = require("../src/mission-store");
+    const os = require("os");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mission-done-"));
+    try {
+      const created = missionStore.missionCreate(dir, { goal: "разобрать заявки", steps: ["прочитать", "свести"] });
+      assert.strictEqual(created.ok, true, "миссия не создалась: " + created.error);
+      const fin = missionStore.missionFinish(dir, created.mission.id, { report: "готово", status: "done" });
+      assert.strictEqual(fin.ok, true, "миссия не закрылась: " + fin.error);
+      assert.strictEqual(missionStore.missionActive(dir), null, "закрытая миссия считается активной");
+      // Именно это и читает обработчик, когда миссию закрывают второй раз.
+      const last = missionStore.missionList(dir, { limit: 1 })[0];
+      assert.ok(last, "список миссий пуст");
+      assert.strictEqual(last.status, "done", "состояние закрытой миссии: " + last.status);
+      assert.ok(last.finishedAt > 0, "у закрытой миссии нет времени закрытия");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    const toolsSrc = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
+    assert.ok(/missionList\(msDir4, \{ limit: 1 \}\)/.test(toolsSrc), "повторный missionFinish не ищет последнюю миссию");
+    assert.ok(/уже закрыта/.test(toolsSrc), "повторный missionFinish не говорит, что миссия закрыта");
+    assert.ok(/missionStart\(goal, steps\)/.test(toolsSrc), "не подсказано, как начать новую миссию");
+    // План обязателен с первого шага миссии — про это сказано в ответе missionStart.
+    assert.ok(/ПЕРВЫМ ДЕЛОМ вызови todoWrite/.test(toolsSrc), "в missionStart нет требования плана");
+  });
+
+  await test("справочники и описания знают новые факты про ВК и инструменты", () => {
+    const guide = fs.readFileSync(path.join(ROOT, "src", "agent-guides", "vk.md"), "utf8");
+    assert.ok(/ConvoTitle__author/.test(guide), "нет селектора имени собеседника");
+    assert.ok(/data-peer-id/.test(guide), "нет ключа диалога");
+    assert.ok(/ConvoListItem__name/.test(guide) && /не существует/.test(guide), "выдуманный класс не помечен как несуществующий");
+    assert.ok(/aria-setsize/.test(guide), "нет объяснения про aria-setsize");
+    assert.ok(/batch\.call/.test(guide), "нет объяснения про бандл методов");
+    assert.ok(/sessionStorage/.test(guide), "нет подсказки про sessionStorage");
+    const core = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
+    assert.ok(/И В ТЕЛЕ запроса/.test(core), "browserReplay не говорит про поиск в теле");
+    assert.ok(/aria-setsize/.test(core), "browserScroll не знает про aria-setsize");
+    assert.ok(/klienty-vk/.test(core), "noteSave не объясняет перевод ключа");
+    assert.ok(/check: false/.test(core), "writeFile не рассказывает про проверку");
+    // Роль «Менеджер»: прямая просьба про код — не самовольство.
+    assert.ok(/прямо попросил код/.test(core), "правило роли «Менеджер» осталось запрещающим");
   });
 }

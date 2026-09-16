@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld("api", {
   stopMessage: () => ipcRenderer.invoke("ai:stop"),
   testConnection: (ui) => ipcRenderer.invoke("ai:test", ui),
   listModels: (ui) => ipcRenderer.invoke("ai:models", ui),
+  probeLocalModel: (ui) => ipcRenderer.invoke("ai:probeLocal", ui),
   g4fTest: (opts) => ipcRenderer.invoke("g4f:test", opts),
   g4fProbe: (opts) => ipcRenderer.invoke("g4f:probe", opts),
   pickDirectory: () => ipcRenderer.invoke("dialog:pickDir"),

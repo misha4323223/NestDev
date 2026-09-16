@@ -709,6 +709,11 @@
                   <button id="btn-refresh-ollama-models" class="btn btn-ghost" title="Загрузить список моделей из Ollama">↻</button>
                 </div>
               </div>
+              <div class="field">
+                <label>Скорость модели</label>
+                <button id="btn-probe-ollama" class="btn btn-ghost" title="Замерить локальную модель: связь, загрузку, чтение промпта, генерацию и память (считает видеокарта или процессор)">📈 Замерить скорость</button>
+                <pre id="ollama-probe-result" class="probe-result hidden"></pre>
+              </div>
             </div>
           </div>
 
@@ -1072,6 +1077,8 @@
             <div class="field mobile-fields hidden" id="mobile-fields">
               <label>Порт моста</label>
               <input id="s-mobile-port" type="number" min="1024" max="65535" placeholder="9090" spellcheck="false" autocomplete="off" />
+              <label>Адрес для телефона <span class="hint">(какой адрес ПК показывать в QR-коде)</span></label>
+              <input id="s-mobile-host" placeholder="авто — по сети ПК" spellcheck="false" autocomplete="off" />
               <label>PIN-код для подключения <span class="hint">(показывается при подключении с телефона)</span></label>
               <div class="input-row">
                 <input id="s-mobile-pin" readonly class="mobile-pin-input" spellcheck="false" autocomplete="off" />

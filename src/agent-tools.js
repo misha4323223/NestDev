@@ -18,6 +18,66 @@
    Зависимости приходят снаружи (та же конвенция, что у createYcService и
    createDeployEngine): модуль чистый и проверяется в plain-node. */
 
+// ── Проверка записанного файла ────────────────────────────────────────────
+// Проверяем то, что действительно проверяется на этой машине: синтаксис JS (тем
+// же Node, что запущен) и разбор JSON. Картинки и архивы проверять нечем —
+// честно молчим, а не делаем вид, что проверили.
+const CHECK_CODE_EXT = { ".js": 1, ".mjs": 1, ".cjs": 1, ".jsx": 1 };
+
+function checkWrittenFile(file, content) {
+  const pathMod = require("path");
+  const ext = pathMod.extname(String(file || "")).toLowerCase();
+  if (ext === ".json") {
+    try {
+      JSON.parse(String(content == null ? "" : content));
+      return { checked: true, problem: "" };
+    } catch (e) {
+      return { checked: true, problem: "JSON не разбирается: " + String((e && e.message) || e).slice(0, 200) };
+    }
+  }
+  if (!CHECK_CODE_EXT[ext]) return { checked: false, problem: "" };
+  try {
+    const { spawnSync } = require("child_process");
+    const r = spawnSync(process.execPath, ["--check", file], {
+      env: Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: "1" }),
+      encoding: "utf8",
+      timeout: 15000,
+      windowsHide: true,
+    });
+    if (r.status === 0) return { checked: true, problem: "" };
+    const msg = String(r.stderr || r.stdout || "").trim().split("\n").slice(0, 4).join(" ");
+    return { checked: true, problem: "синтаксис не проходит (node --check): " + msg.slice(0, 300) };
+  } catch (e) {
+    return { checked: false, problem: "" }; // проверка не запустилась — не выдумываем ошибку
+  }
+}
+
+// Что нужно, чтобы файл вообще запустился: без этой строки агент считает работу
+// законченной, а скрипт падает на машине без нужного окружения.
+function envNoteFor(file) {
+  const pathMod = require("path");
+  const fsMod = require("fs");
+  const ext = pathMod.extname(String(file || "")).toLowerCase();
+  if (!CHECK_CODE_EXT[ext] && ext !== ".py" && ext !== ".sh") return "";
+  if (ext === ".py") {
+    return "\nДля запуска нужен Python 3; библиотеки ставить через pip, список — в requirements.txt. Секреты и ключи — в Настройки → Секреты (не в код). Запуск: runCommand.";
+  }
+  if (ext === ".sh") {
+    return "\nДля запуска нужен bash/sh (на Windows — Git Bash или WSL). Запуск: runCommand.";
+  }
+  let hasDeps = false;
+  try {
+    hasDeps = fsMod.existsSync(pathMod.join(pathMod.dirname(file), "node_modules"));
+  } catch (e) {}
+  return (
+    "\nДля запуска нужен Node.js (или bun)." +
+    (hasDeps
+      ? " Зависимости рядом есть (node_modules)."
+      : " Зависимостей рядом нет (node_modules): если скрипту нужны библиотеки — сначала installPackage; ключи и токены — в Настройки → Секреты, а не в код.") +
+    (/\.jsx$/.test(ext) ? " Файл .jsx без сборки Node не запустит — нужен инструмент сборки." : " Запуск: runCommand.")
+  );
+}
+
 function createAgentTools(deps) {
   // Панель «Миссия» обновляется сразу: шаг агента видно без ожидания опроса.
   const notifyMission = () => {
@@ -746,7 +806,18 @@ function createAgentTools(deps) {
         fs.writeFileSync(p, content, "utf8");
         const lines = content ? content.split("\n").length : 0;
         const sizeNote = content ? ", " + content.length + " символов" : "";
-        return "OK — файл " + (existed ? "перезаписан" : "создан") + ": " + p + " (" + lines + " строк" + sizeNote + ")";
+        // Проверка сразу после записи: «успешно сохранённый» сломанный файл агент
+        // находит через десять шагов, когда что-то не запускается.
+        const check = args.check === false ? { checked: false, problem: "" } : checkWrittenFile(p, content);
+        const checkNote =
+          args.check === false
+            ? ""
+            : check.problem
+              ? "\n⚠ Проверка после записи: " + check.problem + "\nФайл записан, но он сломан — почини его следующим writeFile и только потом запускай."
+              : check.checked
+                ? "\nПроверка после записи: ок."
+                : "";
+        return "OK — файл " + (existed ? "перезаписан" : "создан") + ": " + p + " (" + lines + " строк" + sizeNote + ")" + checkNote + envNoteFor(p);
     },
     "webSearch": async (args, settings) => {
         const q = String(args.query || args.q || "").trim();
@@ -2114,7 +2185,8 @@ function createAgentTools(deps) {
           "\nЦель: " + msR.mission.goal +
           "\nПлан (" + msP.total + "): " + msPlanText +
           "\nЛимит: " + msR.mission.limits.rounds + " раундов, " + Math.round(msR.mission.limits.minutes / 60) + " ч" +
-          "\nРаботай по шагам и после КАЖДОГО шага вызывай missionStep(done, next, note) — журнал читает человек." +
+          "\nПЕРВЫМ ДЕЛОМ вызови todoWrite с планом миссии (3–7 пунктов): план видно человеку в панели, и он не теряется при перезапуске." +
+          "\nДальше работай по шагам и после КАЖДОГО шага вызывай missionStep(done, next, note) — журнал читает человек." +
           " Когда закончишь — missionFinish(report).";
     },
     "missionStep": async (args, settings) => {
@@ -2154,7 +2226,24 @@ function createAgentTools(deps) {
     "missionFinish": async (args, settings) => {
         const msDir4 = agentWorkDir(settings);
         const msRec4 = missionStore.missionActive(msDir4);
-        if (!msRec4) return "Ошибка: незакрытой миссии нет — закрывать нечего.";
+        if (!msRec4) {
+          // Это не ошибка: чаще всего миссию закрыли в прошлом раунде. Ответ
+          // должен сказать, что закрыто, когда и с каким итогом, — иначе агент
+          // считает, что «закрывать нечего», и повторяет вызов.
+          const msDone = missionStore.missionList(msDir4, { limit: 1 })[0];
+          if (!msDone) {
+            return "Незакрытой миссии нет и закрытых тоже: эта работа не начиналась. Для длинной работы сначала missionStart(goal, steps).";
+          }
+          const msDP = missionStore.missionProgress(msDone);
+          return (
+            "Миссия «" + msDone.title + "» (" + msDone.id + ") уже закрыта" +
+            (msDone.finishedAt ? " " + new Date(msDone.finishedAt).toLocaleString() : "") +
+            " — состояние: " + msDone.status + ", шагов: " + msDP.done + "/" + msDP.total + "." +
+            "\nОтчёт: .agent/missions/" + msDone.id + "/report.md" +
+            (msDone.reason ? "\nИтог: " + String(msDone.reason).slice(0, 300) : "") +
+            "\nЕсли нужна новая работа — missionStart(goal, steps)."
+          );
+        }
         const msR4 = missionStore.missionFinish(msDir4, msRec4.id, {
           report: args.report, status: args.status, next: args.next,
         });

@@ -121,7 +121,11 @@ const SEND_BUTTON = ".ConvoComposer__sendButton--submit";
     assert.ok(/browserText/.test(guide), "проверка сессии описана без browserText");
     assert.ok(/vaultList/.test(guide) && /vaultFill/.test(guide), "вход не описан через менеджер паролей");
     assert.ok(/попроси человека|ввести.{0,20}сам/i.test(guide), "не сказано, что пароль вне менеджера просит человек");
-    assert.ok(/IIFE/.test(guide), "нет обхода для browserEval с IIFE (не возвращает значение)");
+    // browserEval: код-операторы без return честно отвечает «ничего не вернул»,
+    // значение берётся из window.__x, а DOM-узел надо просить как текст.
+    assert.ok(/оператор/i.test(guide) && /ничего не вернул/.test(guide), "нет объяснения про код-операторы в browserEval");
+    assert.ok(/window\.__x/.test(guide), "не сказано, что значение берётся из window.__x");
+    assert.ok(/outerHTML/.test(guide), "нет подсказки про DOM-узел в ответе browserEval");
     assert.ok(/filter|clear/.test(guide) && /browserNetwork/.test(guide), "нет обхода поллинга в журнале сети");
     assert.ok(/перезагружается|перезагрузка вкладки/.test(guide), "не сказано, что вкладка перезагружается и window теряется");
   });
