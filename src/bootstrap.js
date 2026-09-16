@@ -44,6 +44,17 @@ function otaVersion() {
   }
 }
 
+// Версия КОДА внутри применённого бандла: номер набора и версия кода — разные вещи
+// (набор 1.5.132 собран из кода 1.5.121). Её пишет ota.js при применении набора;
+// у старых наборов её нет — тогда остаётся прежнее поведение по номеру набора.
+function otaCodeVersion() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(OTA_CURRENT(), "version.json"), "utf8")).codeVersion || null;
+  } catch {
+    return null;
+  }
+}
+
 function versionGt(a, b) {
   const A = String(a || "0.0.0").match(/^(\d+)\.(\d+)\.(\d+)/);
   const B = String(b || "0.0.0").match(/^(\d+)\.(\d+)\.(\d+)/);
@@ -60,9 +71,17 @@ function versionGt(a, b) {
 // установленной версии приложения. Если пользователь скачал/собрал свежий код
 // (1.5.7 и выше), а в userData/ota/current остался старый бандл (1.3.x / 1.5.x) —
 // старый бандл больше никогда не «перекрывает» установленный код.
+//
+// Сравниваем ВЕРСИЮ КОДА внутри бандла, а не номер набора. Номера наборов идут своим
+// счётом (набор 1.5.125 собран из кода 1.5.114), поэтому по номеру набора старый
+// бандл выглядел «новее» свежего кода в папке, которую человек только что обновил из
+// репозитория, и приложение запускало старый код — ровно жалоба «обновил проект в
+// папке, а версия всё та же».
 function otaNewerThanInstalled() {
   const inst = installedVersion();
   if (!inst) return true; // версию установленного не прочитать — legacy-поведение
+  const code = otaCodeVersion();
+  if (code) return versionGt(code, inst);
   return !!otaVersion() && versionGt(otaVersion(), inst);
 }
 
@@ -89,6 +108,11 @@ Module._resolveFilename = function (request, parent, isMain, options) {
 function loadMain(fromDir) {
   require(path.join(fromDir, "src", "main.js"));
 }
+
+// Наружу — только решения о том, какой код грузить: их проверяют тесты без запуска
+// приложения (поддельные electron и fs). Экспорт ставится ДО загрузки основного кода:
+// когда выбран OTA-набор, до конца файла дело не доходит (процесс уходит в main.js).
+module.exports = { versionGt, installedVersion, otaVersion, otaCodeVersion, otaNewerThanInstalled };
 
 // Если пользователь выключил OTA в настройках (Настройки → Self-update →
 // «Разрешить локальные обновления на ходу») — грузим код ТОЛЬКО из установки,

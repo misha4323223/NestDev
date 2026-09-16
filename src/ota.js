@@ -50,10 +50,13 @@ function versionGt(a, b) {
   return false;
 }
 
-// Установленная сейчас версия (применённый OTA)
+// Установленная сейчас версия (применённый OTA). Держим ДВЕ версии: номер набора
+// (по нему видно, какой бандл применён) и версию КОДА внутри него. По номеру набора
+// решать, какой код грузить, нельзя: номера наборов идут своим счётом, и старый бандл
+// «перекрывал» свежий код, скачанный человеком из репозитория (см. bootstrap.js).
 function installedInfo() {
   const v = readJson(path.join(CURRENT(), "version.json"));
-  return v && v.version ? { version: v.version, source: "ota" } : null;
+  return v && v.version ? { version: v.version, codeVersion: v.codeVersion || null, source: "ota" } : null;
 }
 
 // Версия установленного приложения (package.json рядом с кодом).
@@ -92,8 +95,12 @@ function findCandidate(settings) {
     if (m.app && m.app !== "ai-agent") continue;
     if (installed && !versionGt(m.version, installed.version)) continue;
     // Не накатываем бандл, который не новее установленного приложения
-    // (например, свежескачанный код уже содержит эти правки).
-    if (appV && !versionGt(m.version, appV)) continue;
+    // (например, свежескачанный код уже содержит эти правки). Смотрим на версию
+    // КОДА внутри набора (manifest.codeVersion), а не на номер набора: у наборов
+    // свой счёт (набор 1.5.132 собран из кода 1.5.121), и по номеру набора проверка
+    // пропускала бы бандл, собранный из более старого кода. Старые наборы без
+    // codeVersion сравниваются по-прежнему — по номеру.
+    if (appV && !versionGt(m.codeVersion || m.version, appV)) continue;
     if (best && !versionGt(m.version, best.version)) continue;
     best = { dir, manifest: m };
   }
@@ -159,6 +166,9 @@ async function applyBundle(dir, manifest) {
 
   writeJson(path.join(tmpDir, "version.json"), {
     version: manifest.version,
+    // Версия кода внутри бандла: по ней bootstrap.js решает, перекрывать ли свежий
+    // код приложения (подробности — в bootstrap.js, otaNewerThanInstalled).
+    codeVersion: manifest.codeVersion || null,
     builtAt: manifest.builtAt || Date.now(),
     source: dir,
   });
@@ -201,11 +211,26 @@ function rollback() {
 
 function status(settings) {
   const inst = installedInfo();
+  // Что панель Self-update показывает человеку: версию КОДА (её и надо сверять с
+  // репозиторием), номер применённого набора отдельно, все найденные папки-источники
+  // с их версиями и самый свежий доступный набор. Без этого строка «Версия кода:
+  // 1.5.125» сбивала с толку: это был номер набора, а не версия кода.
+  const list = sources(settings).map((dir) => {
+    const m = readJson(path.join(dir, "manifest.json")) || {};
+    return { dir: dir, manifest: path.join(dir, "manifest.json"), version: m.version || "", codeVersion: m.codeVersion || "" };
+  });
+  const cand = findCandidate(settings);
   return {
     enabled: settings ? settings.otaEnabled !== false : true,
     dir: OTA_ROOT(),
     installed: inst ? inst.version : "base",
-    sources: sources(settings).map((d) => path.join(d, "manifest.json")),
+    bundle: inst ? inst.version : "",
+    codeVersion: (inst && inst.codeVersion) || appVersion() || "",
+    appliedCode: (inst && inst.codeVersion) || "",
+    appVersion: appVersion() || "",
+    sources: list.map((s) => s.manifest),
+    sourceList: list,
+    candidate: cand ? { version: cand.manifest.version || "", dir: cand.dir } : null,
   };
 }
 

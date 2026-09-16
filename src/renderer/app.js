@@ -2499,7 +2499,13 @@
     settings.model = settings[MODEL_KEY[settings.provider]] || "";
   }
 
-  // Статус локального self-update (OTA): версия, папка, источники
+  // Статус локального self-update (OTA): какой код работает, какой набор применён,
+  // куда приложение смотрит за обновлениями и что там доступно.
+  //
+  // Раньше здесь показывался номер НАБОРА как «версия кода» — и человек, обновив
+  // папку проекта из репозитория, видел ту же цифру и делал верный вывод «код
+  // старый». Теперь версия кода и номер набора показаны раздельно, а если источников
+  // обновлений нет — сказано и это, чтобы не оставалось места для догадок.
   async function renderOtaStatus() {
     const el = $("ota-status");
     if (!el) return;
@@ -2509,11 +2515,25 @@
     }
     try {
       const st = await api.otaStatus();
-      sbVersion = (st && st.installed) || "базовая";
+      const code = (st && (st.codeVersion || st.appVersion)) || "";
+      sbVersion = code || "базовая";
       updateStatusBar();
-      const parts = ["Версия кода: " + ((st && st.installed) || "базовая")];
-      if (st && st.dir) parts.push("Папка: " + st.dir);
-      if (st && st.sources && st.sources.length) parts.push("Обновлений найдено: " + st.sources.length);
+      const parts = ["Версия кода: " + (code || "не прочитана")];
+      if (st && st.bundle) parts.push("применён набор " + st.bundle);
+      if (st && st.dir) parts.push("Папка обновлений: " + st.dir);
+      const list = (st && st.sourceList) || [];
+      if (list.length) {
+        parts.push(
+          "Источников: " + list.length + " — " + list.map((s) => (s.codeVersion || s.version || "?") + " из " + s.dir).join(" | ")
+        );
+      } else {
+        parts.push("Источников обновлений нет — укажите папку ota проекта в поле ниже");
+      }
+      if (st && st.candidate) {
+        parts.push("Доступно: " + st.candidate.version + " из " + st.candidate.dir + " — нажмите «Проверить сейчас»");
+      } else {
+        parts.push("Ничего новее этого кода нет");
+      }
       el.textContent = parts.join(" · ");
     } catch {
       el.textContent = "—";

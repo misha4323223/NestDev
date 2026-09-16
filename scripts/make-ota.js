@@ -121,6 +121,10 @@ function main() {
   const manifest = {
     app: "ai-agent",
     version,
+    // Версия КОДА внутри набора — из package.json репозитория. Номер набора и версия
+    // кода живут своим счётом (набор 1.5.132 собран из кода 1.5.121), и приложение
+    // судит, перекрывать ли свежий код старым бандлом, именно по этой строке.
+    codeVersion: pkg.version || "1.0.0",
     builtAt: Date.now(),
     files: Object.keys(filesB64).length,
     sha256: crypto.createHash("sha256").update(bundleJson).digest("hex"),

@@ -7944,6 +7944,84 @@ async function testChatFeed() {
 // Дозор запуска окна (boot-guard.js): «пусто в чате» должно быть объяснено словами.
 // Проверяем и решения (чистые), и подписку на игрушечном DOM: настоящая плашка в
 // живом окне проверяется в сквозном прогоне десктопа (scripts/live-desktop.js).
+// Обновление кода (OTA): приложение судит, какой код грузить, по ВЕРСИИ КОДА в наборе,
+// а не по номеру набора. Жалоба, ради которой это заведено: человек обновил папку
+// проекта из репозитория, а приложение продолжало запускать старый код из набора
+// (номер набора 1.5.125 выглядел «новее» кода 1.5.121).
+async function testOtaCodeVersion() {
+  await test("обновление кода: решает версия кода, а не номер набора", () => {
+    // 1. Набор несёт версию кода внутри себя — иначе судить не по чему.
+    const makeOta = fs.readFileSync(path.join(ROOT, "scripts", "make-ota.js"), "utf8");
+    assert.ok(/codeVersion: pkg\.version/.test(makeOta), "сборщик набора не пишет версию кода в манифест");
+    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, "ota", "manifest.json"), "utf8"));
+    const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
+    assert.strictEqual(manifest.codeVersion, pkg.version, "версия кода в наборе не совпадает с package.json");
+
+    // 2. Применённый набор помнит и номер, и версию кода; поиск обновления смотрит на код.
+    const otaSrc = fs.readFileSync(path.join(ROOT, "src", "ota.js"), "utf8");
+    assert.ok(/codeVersion: manifest\.codeVersion/.test(otaSrc), "применённый набор не запоминает версию кода");
+    assert.ok(/m\.codeVersion \|\| m\.version/.test(otaSrc), "поиск обновления не смотрит на версию кода набора");
+    assert.ok(/codeVersion: \(inst && inst\.codeVersion\)/.test(otaSrc), "статус обновлений не отдаёт версию кода");
+
+    // 3. Панель показывает версию кода отдельно от номера набора и не молчит про пустые источники.
+    const panel = uiFind("  async function renderOtaStatus() {");
+    assert.ok(/sbVersion = code \|\| "базовая"/.test(panel.code), "строка состояния не показывает версию кода");
+    assert.ok(/применён набор/.test(panel.code), "панель не различает номер набора и версию кода");
+    assert.ok(/Источников обновлений нет/.test(panel.code), "панель молчит, когда папок-источников нет");
+    assert.ok(/st\.candidate/.test(panel.code), "панель не говорит, что за обновление доступно");
+
+    // 4. Правило загрузки кода: собираем bootstrap.js в песочнице с поддельными
+    //    electron и fs и спрашиваем его решение по четырём раскладам.
+    const vm = require("vm");
+    function bootDecision(files) {
+      const norm = (p) => String(p).replace(/\\/g, "/");
+      // fs подделываем ОДНИМ объектом и отдаём его же на require("fs"): bootstrap берёт
+      // файловую систему через require, и подделка иначе не попала бы в него вовсе.
+      const fakeFs = {
+        readFileSync: (p) => {
+          const key = norm(p);
+          if (key === "/userData/ota/current/version.json") return JSON.stringify(files.applied);
+          if (key === "/app/package.json") return JSON.stringify({ version: files.installed });
+          throw new Error("нет файла " + key);
+        },
+        existsSync: (p) => {
+          const key = norm(p);
+          if (!files.applied) return false;
+          return key.indexOf("/userData/ota/current") === 0;
+        },
+        rmSync() {},
+        renameSync() {},
+      };
+      const sandbox = {
+        module: { exports: {} },
+        __dirname: "/app/src",
+        console: { error() {}, warn() {}, log() {} },
+        path: path,
+        process: { env: {}, execPath: "/usr/bin/electron" },
+        require: (id) => {
+          if (id === "module") return { _resolveFilename: () => "", _nodeModulePaths: () => [] };
+          if (id === "electron") return { app: { getPath: () => "/userData" } };
+          if (id === "path") return require("path");
+          if (id === "fs") return fakeFs;
+          return {}; // src/main.js и прочее — заглушка: загрузку кода проверяет живой прогон
+        },
+        fs: fakeFs,
+      };
+      vm.runInNewContext(fs.readFileSync(path.join(ROOT, "src", "bootstrap.js"), "utf8"), sandbox, { filename: "bootstrap.js" });
+      return sandbox.module.exports;
+    }
+
+    // Жалоба дословно: обновил папку проекта (код 1.5.121), а грузился набор 1.5.125 с кодом 1.5.114.
+    const stuck = bootDecision({ installed: "1.5.121", applied: { version: "1.5.125", codeVersion: "1.5.114" } });
+    assert.strictEqual(stuck.otaNewerThanInstalled(), false, "старый набор перекрывает свежий код из папки проекта");
+    assert.strictEqual(bootDecision({ installed: "1.5.121", applied: { version: "1.5.133", codeVersion: "1.5.121" } }).otaNewerThanInstalled(), false, "набор из того же кода перекрывает код приложения");
+    assert.strictEqual(bootDecision({ installed: "1.5.99", applied: { version: "1.5.133", codeVersion: "1.5.121" } }).otaNewerThanInstalled(), true, "свежий набор не грузится на старом приложении");
+    // Старые наборы без версии кода ведут себя как раньше — по номеру набора.
+    assert.strictEqual(bootDecision({ installed: "1.5.114", applied: { version: "1.5.125" } }).otaNewerThanInstalled(), true, "набор без версии кода перестал грузиться");
+    assert.strictEqual(bootDecision({ installed: "1.5.125", applied: { version: "1.5.125" } }).otaNewerThanInstalled(), false, "набор той же версии перекрывает установленный код");
+  });
+}
+
 async function testBootGuard() {
   const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "boot-guard.js"), "utf8");
   // Модуль собирается той же фабрикой, что и в окне: `self` — игрушечное окно,
@@ -14408,6 +14486,7 @@ async function testMissions() {
   await testChatFeed();
   await testChatWork();
   await testBootGuard();
+  await testOtaCodeVersion();
   await testTasksMission();
   await testProviderConfig();
   await testProviderTransport();

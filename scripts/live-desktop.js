@@ -775,6 +775,43 @@ function startFakeProvider(seen, rounds, rate, script) {
     });
     check("плашку можно закрыть", !closedBanner.есть, "кнопки: " + closedBanner.кнопки.join(" / "));
 
+
+    console.log("\n[15] Обновления: панель говорит, какой код работает");
+    // Человек сверяет с репозиторием ВЕРСИЮ КОДА. Раньше панель показывала номер набора,
+    // и это выглядело как «код старый» даже после обновления папки проекта.
+    const pkgVersion = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
+    const otaStatus = await page.evaluate(async () => await window.api.otaStatus());
+    check(
+      "статус обновлений отдаёт версию кода отдельно от номера набора",
+      otaStatus.codeVersion === pkgVersion && typeof otaStatus.bundle === "string",
+      JSON.stringify({ codeVersion: otaStatus.codeVersion, bundle: otaStatus.bundle, appVersion: otaStatus.appVersion })
+    );
+    check(
+      "статус обновлений перечисляет найденные папки-источники",
+      Array.isArray(otaStatus.sourceList),
+      "источников: " + ((otaStatus.sourceList || []).length)
+    );
+    const panelText = await page.evaluate(async () => {
+      document.getElementById("btn-settings").click();
+      await new Promise((r) => setTimeout(r, 500));
+      const el = document.getElementById("ota-status");
+      return el ? el.textContent : "";
+    });
+    check(
+      "панель называет версию кода (а не номер набора)",
+      panelText.indexOf("Версия кода: " + pkgVersion) !== -1,
+      panelText.slice(0, 220)
+    );
+    check(
+      "панель объясняет, откуда берётся обновление",
+      /Источников|Источников обновлений нет/.test(panelText) && /Доступно:|Ничего новее/.test(panelText),
+      panelText.slice(0, 220)
+    );
+    await page.evaluate(async () => {
+      const close = document.getElementById("btn-close-settings");
+      if (close) close.click();
+      await new Promise((r) => setTimeout(r, 200));
+    });
   } catch (e) {
     check("сквозной прогон без исключений", false, e.message);
   } finally {
