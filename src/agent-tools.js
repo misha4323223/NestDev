@@ -86,6 +86,17 @@ function createAgentTools(deps) {
       if (em) em({ type: "mission", phase: "changed" });
     } catch {}
   };
+  // «Своя» миссия прогона: если прогон ведёт миссию, инструмент без id работает
+  // с ней, а не с самой свежей незакрытой (их могло остаться несколько — тогда
+  // агент закрывал чужую работу, а его настоящая миссия снова его «дёргала»).
+  const missionOfRun = (dir) => {
+    const id = String((live && live.activeRunMissionId) || "");
+    if (id) {
+      const rec = missionStore.missionLoad(dir, id);
+      if (rec && rec.status !== "done" && rec.status !== "failed" && rec.status !== "stopped") return rec;
+    }
+    return missionStore.missionActive(dir);
+  };
   const {
     shell,
     path,
@@ -255,6 +266,10 @@ function createAgentTools(deps) {
     },
     get activeRunChatId() {
       return deps.live.activeRunChatId ? deps.live.activeRunChatId() : "";
+    },
+    // Миссия текущего прогона: инструменты без id работают именно с ней.
+    get activeRunMissionId() {
+      return deps.live.activeRunMissionId ? deps.live.activeRunMissionId() : "";
     },
     get activeToolRouter() {
       return deps.live.activeToolRouter();
@@ -2191,7 +2206,7 @@ function createAgentTools(deps) {
     },
     "missionStep": async (args, settings) => {
         const msDir2 = agentWorkDir(settings);
-        const msCur = missionStore.missionActive(msDir2);
+        const msCur = missionOfRun(msDir2);
         if (!msCur) return "Ошибка: незакрытой миссии нет. Для длинной работы сначала missionStart(goal, steps).";
         const msR2 = missionStore.missionStep(msDir2, msCur.id, {
           done: args.done, fail: args.fail, next: args.next, note: args.note,
@@ -2207,7 +2222,7 @@ function createAgentTools(deps) {
     "missionStatus": async (args, settings) => {
         const msDir3 = agentWorkDir(settings);
         const msWanted = String(args.id || "").trim();
-        const msRec = msWanted ? missionStore.missionLoad(msDir3, msWanted) : missionStore.missionActive(msDir3);
+        const msRec = msWanted ? missionStore.missionLoad(msDir3, msWanted) : missionOfRun(msDir3);
         if (!msRec) return msWanted ? "Ошибка: миссия " + msWanted + " не найдена." : "Незакрытых миссий нет.";
         const msP3 = missionStore.missionProgress(msRec);
         const msElapsed = Math.round((Date.now() - (msRec.startedAt || msRec.createdAt || Date.now())) / 60000);
@@ -2225,7 +2240,7 @@ function createAgentTools(deps) {
     },
     "missionFinish": async (args, settings) => {
         const msDir4 = agentWorkDir(settings);
-        const msRec4 = missionStore.missionActive(msDir4);
+        const msRec4 = missionOfRun(msDir4);
         if (!msRec4) {
           // Это не ошибка: чаще всего миссию закрыли в прошлом раунде. Ответ
           // должен сказать, что закрыто, когда и с каким итогом, — иначе агент

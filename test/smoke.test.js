@@ -443,6 +443,465 @@ async function testWebChat() {
   });
 }
 
+// ── Блок размышлений модели (src/renderer/chat-thinking.js, этап 3.7) ───────
+// Модуль вынесен из app.js. Проверяем ПОВЕДЕНИЕ плашки «Размышление», а не наличие
+// функций: сборку из заголовка и тела, рост текста с автопрокруткой, честную
+// реакцию на ручную прокрутку (человек читает выше — не выдёргиваем), ручное
+// сворачивание кликом, автосворачивание по завершении ответа и возврат
+// сохранённых размышлений после перезагрузки.
+async function testChatThinking() {
+  const vm = require("vm");
+  const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "chat-thinking.js"), "utf8");
+
+  await test("размышления: плашка живёт в своём модуле и ведёт себя как раньше", () => {
+    // 1. Разметка, мост и оболочка: модуль подключён до app.js и собирается без зависимостей.
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const iTag = html.indexOf('src="chat-thinking.js"');
+    assert.ok(iTag > 0, "разметка не грузит chat-thinking.js");
+    assert.ok(iTag < html.indexOf('src="app.js"'), "chat-thinking.js подключён после app.js");
+    const bridge = fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8");
+    assert.ok(/"chat-thinking\.js"/.test(bridge), "мобильный мост не отдаёт chat-thinking.js телефону");
+    const appSrc = uiFile("app.js");
+    assert.ok(appSrc.indexOf("function thinkAutoScroll") === -1, "код блока размышлений остался в app.js");
+    assert.ok(appSrc.indexOf('querySelector(".think")') === -1, "в app.js остались знания о разметке блока размышлений");
+    assert.ok(/const ChatThinking = window\.ChatThinking\(\);/.test(appSrc), "оболочка не собирает модуль размышлений");
+    // Возврат сохранённой плашки зовёт модуль отрисовки сообщения (этап 3.7),
+
+    // поэтому спрашиваем интерфейс целиком, а не только оболочку.
+    const uiSrc = uiAll();
+    for (const call of ["ChatThinking.ensureThinkBox", "ChatThinking.collapseThinkBox", "ChatThinking.restoreThinkBox"]) {
+      assert.ok(uiSrc.indexOf(call) !== -1, "никто не зовёт " + call);
+    }
+
+    // 2. Заглушка DOM: ищем по классу, как настоящий браузер (querySelector).
+    const findByClass = (node, sel) => {
+      const cls = String(sel || "").replace(/^\./, "");
+      for (const child of node.children || []) {
+        if (String(child.className).split(/\s+/).indexOf(cls) !== -1) return child;
+        const deep = findByClass(child, sel);
+        if (deep) return deep;
+      }
+      return null;
+    };
+    const el = () => {
+      const classes = new Set();
+      let text = "";
+      const node = {
+        className: "", children: [], dataset: {}, onclick: null, listeners: {},
+        scrollTop: 0, scrollHeight: 900, clientHeight: 200, parentNode: null,
+        get textContent() { return text; },
+        set textContent(v) { text = String(v); },
+        classList: {
+          add: (...c) => c.forEach((x) => classes.add(x)),
+          remove: (...c) => c.forEach((x) => classes.delete(x)),
+          contains: (c) => classes.has(c),
+          toggle: (c, on) => {
+            const want = on === undefined ? !classes.has(c) : !!on;
+            if (want) classes.add(c); else classes.delete(c);
+            return want;
+          },
+        },
+        addEventListener: (type, fn) => { node.listeners[type] = fn; },
+        appendChild: (child) => { node.children.push(child); child.parentNode = node; return child; },
+        insertBefore: (child, ref) => {
+          const at = node.children.indexOf(ref);
+          node.children.splice(at < 0 ? node.children.length : at, 0, child);
+          child.parentNode = node;
+          return child;
+        },
+        querySelector: (sel) => findByClass(node, sel),
+      };
+      return node;
+    };
+    const sandbox = { module: { exports: {} }, self: {}, console: { warn() {}, log() {}, error() {} }, document: { createElement: () => el() } };
+    vm.runInNewContext(src, sandbox, { filename: "chat-thinking.js" });
+    assert.strictEqual(typeof sandbox.module.exports, "function", "модуль не отдал фабрику");
+    const think = sandbox.module.exports();
+    assert.deepStrictEqual(Object.keys(think).sort(), ["collapseThinkBox", "ensureThinkBox", "restoreThinkBox"],
+      "наружу торчит лишнее или чего-то не хватает");
+
+    // 3. Сборка плашки: заголовок, значок, стрелка, тело — и она встаёт НАД пузырём ответа.
+    const wrap = el();
+    const bubble = el();
+    bubble.className = "bubble";
+    wrap.appendChild(bubble);
+    const box = think.ensureThinkBox(wrap, "думаю над задачей");
+    assert.strictEqual(box.className, "think", "плашка собрана не тем классом");
+    assert.strictEqual(wrap.children[0], box, "плашка не встала над пузырём ответа");
+    assert.ok(box.children[0].className === "think-head", "нет заголовка плашки");
+    assert.strictEqual(box.children[1].className, "think-body", "нет тела плашки");
+    assert.strictEqual(box.children[1].textContent, "думаю над задачей", "текст размышлений не попал в тело");
+    const head = box.children[0];
+    assert.strictEqual(head.querySelector(".think-t").textContent, "Размышление", "заголовок плашки не тот");
+    assert.strictEqual(head.querySelector(".think-chev").textContent, "▾", "стрелка не раскрыта");
+    assert.strictEqual(box.children[1].scrollTop, box.children[1].scrollHeight, "новый блок не показал конец размышлений");
+
+    // 4. Текст вырос — тот же блок, текст обновился и снова поехал вниз.
+    box.children[1].scrollTop = 0;
+    const again = think.ensureThinkBox(wrap, "думаю дальше");
+    assert.strictEqual(again, box, "выросший текст создал второй блок вместо обновления");
+    assert.strictEqual(box.children[1].textContent, "думаю дальше", "текст в блоке не обновился");
+    assert.strictEqual(box.children[1].scrollTop, box.children[1].scrollHeight, "текст вырос, а блок не поехал вниз");
+
+    // 5. Человек отлистал вверх читать: не выдёргиваем, но вернёмся, когда он у конца.
+    const body = box.children[1];
+    body.scrollTop = 120;
+    body.dataset.pinned = "0";
+    think.ensureThinkBox(wrap, "думаю ещё немного");
+    assert.strictEqual(body.scrollTop, 120, "человека выдернули из чтения");
+    body.scrollHeight = 1000;
+    body.scrollTop = 950;
+    body.listeners.scroll();
+    assert.strictEqual(body.dataset.pinned, "1", "не заметили, что человек снова у конца");
+    think.ensureThinkBox(wrap, "и ещё");
+    assert.strictEqual(body.scrollTop, body.scrollHeight, "у конца текста автопрокрутка не вернулась");
+
+    // 6. Клик по заголовку: сворачивает, помечает ручное управление и разворачивает обратно.
+    let stopped = false;
+    head.onclick({ stopPropagation: () => { stopped = true; } });
+    assert.ok(stopped, "клик по заголовку не остановлен — уйдёт в обработчик пузыря");
+    assert.ok(box.classList.contains("user"), "ручное управление не помечено");
+    assert.ok(box.classList.contains("collapsed"), "клик по заголовку не свернул блок");
+    assert.strictEqual(head.querySelector(".think-chev").textContent, "▸", "стрелка не свернулась");
+    body.scrollTop = 0;
+    head.onclick({ stopPropagation: () => {} });
+    assert.ok(!box.classList.contains("collapsed"), "повторный клик не развернул блок");
+    assert.strictEqual(head.querySelector(".think-chev").textContent, "▾", "стрелка не развернулась");
+    assert.strictEqual(body.scrollTop, body.scrollHeight, "разворот не показал конец размышлений");
+
+    // 7. Завершение ответа сворачивает блок — но не тот, который человек открыл сам.
+    const fresh = el(); // пузыря ответа ещё нет: плашка обязана встать в конец
+    const auto = think.ensureThinkBox(fresh, "размышления до конца");
+    assert.strictEqual(fresh.children[0], auto, "без пузыря плашка не встала в сообщение");
+    think.collapseThinkBox(fresh);
+    assert.ok(auto.classList.contains("collapsed"), "завершение ответа не свернуло размышления");
+    assert.strictEqual(auto.querySelector(".think-chev").textContent, "▸", "стрелка не свернулась при автосворачивании");
+    auto.classList.add("user");
+    auto.classList.remove("collapsed");
+    think.collapseThinkBox(fresh);
+    assert.ok(!auto.classList.contains("collapsed"), "автосворачивание залезло в блок, открытый человеком");
+    think.collapseThinkBox(null);
+    think.collapseThinkBox(el());
+
+    // 8. Возврат сохранённых размышлений: свёрнуто, а у незакрытого ответа — раскрыто.
+    const saved = el();
+    think.restoreThinkBox(saved, "старые размышления", false);
+    const savedBox = saved.querySelector(".think");
+    assert.ok(savedBox && savedBox.classList.contains("collapsed"), "сохранённые размышления показаны развёрнутыми");
+    assert.strictEqual(savedBox.querySelector(".think-chev").textContent, "▸", "стрелка сохранённых размышлений не свёрнута");
+    assert.strictEqual(savedBox.querySelector(".think-body").textContent, "старые размышления", "текст сохранённых размышлений потерян");
+    const pending = el();
+    think.restoreThinkBox(pending, "ответ ещё идёт", true);
+    assert.ok(!pending.querySelector(".think").classList.contains("collapsed"), "у идущего ответа размышления свернули");
+
+    // 9. Негативный контроль: тело плашки пропало — модуль не падает, а живёт дальше.
+    const broken = el();
+    const brokenBox = el();
+    brokenBox.className = "think";
+    broken.appendChild(brokenBox);
+    assert.doesNotThrow(() => think.ensureThinkBox(broken, "новый текст"), "пропавшее тело плашки уронило модуль");
+  });
+}
+
+// ── Сегменты ответа: лог «текст → действия → текст» (этап 3.7, часть 2) ─────
+// Модуль вынесен из app.js. Проверяем ПОВЕДЕНИЕ: после действия текст идёт НОВЫМ
+// сообщением ниже блока действий, а не дописывается в пузырь сверху; пустой
+// сегмент убирается из данных, из DOM и из сессии; сегменты запуска собираются по
+// порядку. Сессия приходит ЖИВОЙ функцией — проверяем и это.
+async function testChatSegments() {
+  const vm = require("vm");
+  const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "chat-segments.js"), "utf8");
+
+  await test("сегменты ответа: текст после действия открывает новое сообщение", () => {
+    // 1. Модуль на месте, подключён до app.js, отдаётся телефону, собран в оболочке.
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const iTag = html.indexOf('src="chat-segments.js"');
+    assert.ok(iTag > 0, "разметка не грузит chat-segments.js");
+    assert.ok(iTag < html.indexOf('src="app.js"'), "chat-segments.js подключён после app.js");
+    const bridge = fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8");
+    assert.ok(/"chat-segments\.js"/.test(bridge), "мобильный мост не отдаёт chat-segments.js телефону");
+    const appSrc = uiFile("app.js");
+    for (const gone of ["function ensureSegmentForText", "function removeSegment", "function runSegments"]) {
+      assert.ok(appSrc.indexOf(gone) === -1, "код сегментов остался в app.js: " + gone);
+    }
+    const wiring = appSrc.slice(appSrc.indexOf("window.ChatSegments({"));
+    const wiringCall = wiring.slice(0, wiring.indexOf("});"));
+    for (const dep of ["$: $", "uid: uid", "getSession: () => session", "msgEls: msgEls", "buildMessageEl: buildMessageEl", "scrollBottom: ChatFeed.scrollBottom", "persistChatsSoon: persistChatsSoon", "planRoundStarted: planRoundStarted"]) {
+      assert.ok(wiringCall.includes(dep), "в проводку сегментов не передан " + dep);
+    }
+    // Границы модуля: сессия только живой функцией, в чужие глобалы не лезем.
+    assert.ok(!/(^|[^\w$."])session\b/.test(src), "модуль читает session напрямую вместо getSession()");
+    assert.ok(!/AgentCore|window\.api\b|localStorage/.test(src), "модуль лезет в чужие глобалы");
+
+    // 2. Среда: живые настройки-сессия снаружи, карта элементов, счётчик вызовов.
+    const makeEl = () => {
+      const node = {
+        children: [], parentNode: null,
+        appendChild(child) { node.children.push(child); child.parentNode = node; return child; },
+        removeChild(child) { node.children = node.children.filter((c) => c !== child); child.parentNode = null; },
+      };
+      return node;
+    };
+    let session = { chatId: "c1", segmentIds: [] };
+    let seq = 0;
+    const calls = { plan: [], scroll: 0, persist: 0, built: [] };
+    const msgEls = new Map();
+    const messages = makeEl();
+    const build = (deps) => {
+      const sandbox = { module: { exports: {} }, self: {}, console: { warn() {}, log() {}, error() {} } };
+      vm.runInNewContext(src, sandbox, { filename: "chat-segments.js" });
+      assert.strictEqual(typeof sandbox.module.exports, "function", "модуль не отдал фабрику");
+      return sandbox.module.exports(deps);
+    };
+    const deps = {
+      $: () => messages,
+      uid: () => "seg" + ++seq,
+      getSession: () => session,
+      msgEls: msgEls,
+      buildMessageEl: (m) => { calls.built.push(m.id); return makeEl(); },
+      scrollBottom: () => { calls.scroll++; },
+      persistChatsSoon: () => { calls.persist++; },
+      planRoundStarted: (chat, id) => calls.plan.push(id),
+    };
+    const seg = build(deps);
+    assert.deepStrictEqual(Object.keys(seg).sort(), ["ensureSegmentForText", "removeSegment", "runSegments"],
+      "наружу торчит лишнее или чего-то не хватает");
+
+    // 3. Текст БЕЗ действия дописывается в текущий сегмент запуска.
+    const first = { id: "s1", role: "assistant", content: "", pending: true };
+    const chat = { id: "c1", messages: [first] };
+    session = { chatId: "c1", segmentIds: ["s1"] };
+    assert.strictEqual(seg.ensureSegmentForText(chat, first), first, "текст без действия открыл лишнее сообщение");
+    assert.strictEqual(chat.messages.length, 1, "лишнее сообщение всё-таки появилось");
+
+    // 4. Текст ПОСЛЕ действия — новое сообщение в конец (ниже блока действий).
+    chat.messages.push({ id: "t1", role: "tool", toolName: "runCommand" });
+    const created = seg.ensureSegmentForText(chat, first);
+    assert.ok(created && created !== first, "текст после действия дописан в пузырь сверху");
+    assert.strictEqual(chat.messages[chat.messages.length - 1], created, "новое сообщение не встало в конец");
+    assert.strictEqual(created.role, "assistant", "новое сообщение не от ассистента");
+    assert.strictEqual(created.content, "", "новое сообщение не пустое для стрима");
+    assert.strictEqual(created.pending, true, "новое сообщение не помечено как незавершённое");
+    assert.deepStrictEqual(session.segmentIds, ["s1", created.id], "сегмент не попал в сессию запуска");
+    assert.deepStrictEqual(calls.plan, [created.id], "новый раунд не отметился для текстового плана");
+    assert.deepStrictEqual(calls.built, [created.id], "элемент сообщения не собран");
+    assert.strictEqual(messages.children.length, 1, "элемент не добавлен в ленту сообщений");
+    assert.ok(calls.scroll > 0, "лента не прокрутилась к новому сообщению");
+
+    // 5. Сессия читается ЖИВОЙ: подменили объект снаружи — модуль видит новый.
+    const second = { id: "s2", role: "assistant", content: "", pending: true };
+    const chat2 = { id: "c2", messages: [second] };
+    session = { chatId: "c2", segmentIds: ["s2"] };
+    assert.strictEqual(seg.ensureSegmentForText(chat2, second), second, "модуль работал с копией сессии");
+    // Чужой сегмент (не из текущего запуска) не трогаем: возвращаем запасной.
+    const other = { id: "s9", role: "assistant", content: "старое" };
+    const chat3 = { id: "c3", messages: [other] };
+    assert.strictEqual(seg.ensureSegmentForText(chat3, second), second, "модуль дописал в чужой сегмент");
+    // Пустой чат и совсем без сессии — без падений.
+    assert.strictEqual(seg.ensureSegmentForText(null, second), second, "без чата не вернулся запасной сегмент");
+    session = null;
+    const chat4 = { id: "c4", messages: [{ id: "t2", role: "tool", toolName: "readFile" }] };
+    const soloSeg = seg.ensureSegmentForText(chat4, null);
+    assert.ok(soloSeg && soloSeg.role === "assistant", "без сессии новый сегмент не создался");
+
+    // 6. Пустой сегмент убирается отовсюду: из данных, из DOM и из сессии.
+    session = { chatId: "c1", segmentIds: [created.id] };
+    const emptyChat = { id: "c1", messages: [first, { id: "t1", role: "tool" }, created] };
+    const el = makeEl();
+    messages.appendChild(el);
+    msgEls.set(created.id, el);
+    seg.removeSegment(emptyChat, created);
+    assert.strictEqual(emptyChat.messages.indexOf(created), -1, "пустой сегмент остался в истории");
+    assert.strictEqual(msgEls.has(created.id), false, "пустой сегмент остался в карте элементов");
+    assert.strictEqual(el.parentNode, null, "элемент пустого сегмента остался в ленте");
+    assert.deepStrictEqual(session.segmentIds, [], "пустой сегмент остался в сессии запуска");
+    assert.ok(calls.persist > 0, "история не сохранена после удаления");
+    seg.removeSegment(emptyChat, { id: "нет такого" }); // тихо, без исключений
+
+    // 7. Сегменты запуска — по порядку id, с запасным вариантом.
+    const a = { id: "a1", role: "assistant", content: "раз" };
+    const b = { id: "b1", role: "assistant", content: "два" };
+    const runChat = { id: "c5", messages: [b, a] }; // в истории лежат вразнобой
+    session = { chatId: "c5", segmentIds: ["a1", "b1"] };
+    // Модуль живёт в своём окружении (vm): его массив приводим к своему, иначе
+    // строгое сравнение ругается на разные прототипы, а не на порядок.
+    assert.deepStrictEqual(Array.from(seg.runSegments(runChat, a), (s) => s.id), ["a1", "b1"], "порядок сегментов поехал");
+    session = { chatId: "c5", segmentIds: [] };
+    assert.deepStrictEqual(Array.from(seg.runSegments(runChat, a)), [a], "без сегментов не вернулся запасной");
+    session = null;
+    assert.deepStrictEqual(Array.from(seg.runSegments(runChat, a)), [a], "без сессии не вернулся запасной");
+    assert.deepStrictEqual(Array.from(seg.runSegments(runChat, null)), [], "пустой запасной не отфильтрован");
+
+    // 8. Негативный контроль зависимостей: без getSession модуль падает понятно.
+    const noSession = build({
+      $: deps.$, uid: deps.uid, msgEls: msgEls, buildMessageEl: deps.buildMessageEl,
+      scrollBottom: deps.scrollBottom, persistChatsSoon: deps.persistChatsSoon, planRoundStarted: deps.planRoundStarted,
+    });
+    assert.throws(() => noSession.ensureSegmentForText({ messages: [] }, null), /getSession/, "забытая зависимость не привела к понятной ошибке");
+  });
+}
+
+// ── Отрисовка сообщения: текст, вложения, кнопки (этап 3.7, часть 3) ────────
+// Модуль вынесен из app.js. Проверяем ПОВЕДЕНИЕ: как содержимое превращается в
+// текст и в разметку (в том числе картинки-вложения), какие классы получает пузырь,
+// какие кнопки появляются под сообщением и что они на самом деле делают.
+// Отдельно — прерванный ответ: кнопка обязана уйти в главный процесс с ЖИВЫМИ
+// данными чатов (именно здесь вынос оставил «голое» имя chatsData, и это падало
+// бы у человека, а не в тестах).
+async function testChatRender() {
+  const vm = require("vm");
+  const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "chat-render.js"), "utf8");
+
+  await test("отрисовка сообщения: содержимое, классы и кнопки работают, как раньше", () => {
+    // 1. Разметка, мост, оболочка.
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const iTag = html.indexOf('src="chat-render.js"');
+    assert.ok(iTag > 0, "разметка не грузит chat-render.js");
+    assert.ok(iTag < html.indexOf('src="app.js"'), "chat-render.js подключён после app.js");
+    const bridge = fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8");
+    assert.ok(/"chat-render\.js"/.test(bridge), "мобильный мост не отдаёт chat-render.js телефону");
+    const appSrc = uiFile("app.js");
+    for (const gone of ["function msgText", "function msgHtml", "function buildBubbleEl"]) {
+      assert.ok(appSrc.indexOf(gone) === -1, "код отрисовки остался в app.js: " + gone);
+    }
+    // Проводка: собрана ПОСЛЕ действий чата — иначе ChatActions в этот момент пуст.
+    const wiringAt = appSrc.indexOf("window.ChatRender({");
+    const actionsAt = appSrc.indexOf("window.ChatActions({");
+    assert.ok(wiringAt > 0 && wiringAt > actionsAt, "отрисовка собрана раньше действий чата");
+    const wiringCall = appSrc.slice(wiringAt, appSrc.indexOf("});", wiringAt));
+    for (const dep of ["MdRender: MdRender", "fmtClock: fmtClock", "ChatThinking: ChatThinking", "ChatActions: ChatActions", "continueInterruptedAnswer: continueInterruptedAnswer", "getChatsData: () => chatsData"]) {
+      assert.ok(wiringCall.includes(dep), "в проводке отрисовки нет " + dep);
+    }
+    // Границы модуля: чужие имена берём только из deps. Это дешёвая родня
+    // бэкенд-стража «ни одного имени из main.js без внедрения».
+    for (const name of ["chatsData", "session", "streaming", "msgEls", "pinnedToBottom"]) {
+      assert.ok(!new RegExp("(^|[^\\w$.])" + name + "\\b").test(src), "модуль ссылается на " + name + " без внедрения");
+    }
+    const calls = (appSrc.match(/ChatRender\.\w+/g) || []).sort();
+    assert.deepStrictEqual(calls, ["ChatRender.buildBubbleEl", "ChatRender.msgHtml", "ChatRender.msgHtml", "ChatRender.msgText", "ChatRender.msgText"],
+      "вызовов модуля не пять ожидаемых: " + calls.join(", "));
+
+    // 2. Среда: заглушка DOM и живые зависимости.
+    const el = () => {
+      const classes = new Set();
+      const node = {
+        type: "", className: "", title: "", textContent: "", innerHTML: "", onclick: null,
+        children: [], parentNode: null,
+        classList: {
+          add: (...c) => c.forEach((x) => classes.add(x)),
+          remove: (...c) => c.forEach((x) => classes.delete(x)),
+          contains: (c) => classes.has(c),
+          toggle: (c, on) => {
+            const want = on === undefined ? !classes.has(c) : !!on;
+            if (want) classes.add(c); else classes.delete(c);
+            return want;
+          },
+        },
+        appendChild(child) { node.children.push(child); child.parentNode = node; return child; },
+        removeChild(child) { node.children = node.children.filter((c) => c !== child); child.parentNode = null; },
+      };
+      return node;
+    };
+    const spy = { rendered: [], restored: [], copied: [], regenerated: 0, edited: 0, continued: [] };
+    const chats = { activeId: "chat-1" };
+    const MdRender = { render: (t) => { spy.rendered.push(t); return "<md>" + t + "</md>"; }, esc: (s) => String(s).replace(/</g, "&lt;") };
+    const sandbox = { module: { exports: {} }, self: {}, console: { warn() {}, log() {}, error() {} }, document: { createElement: () => el() } };
+    vm.runInNewContext(src, sandbox, { filename: "chat-render.js" });
+    assert.strictEqual(typeof sandbox.module.exports, "function", "модуль не отдал фабрику");
+    const render = sandbox.module.exports({
+      MdRender: MdRender,
+      fmtClock: (ts) => "в " + ts,
+      ChatThinking: { restoreThinkBox: (node, text, pending) => { spy.restored.push([text, pending]); return node; } },
+      ChatActions: {
+        copyText: (t) => spy.copied.push(t),
+        isLastAssistant: (m) => m.last === true,
+        regenerate: () => { spy.regenerated++; },
+        editUserMessage: () => { spy.edited++; },
+      },
+      continueInterruptedAnswer: (id, m) => spy.continued.push([id, m]),
+      getChatsData: () => chats,
+    });
+    assert.deepStrictEqual(Object.keys(render).sort(), ["buildBubbleEl", "msgHtml", "msgText"], "наружу торчит лишнее или чего-то не хватает");
+    const byClass = (node, cls) => (node.children || []).filter((c) => String(c.className).split(/\s+/).indexOf(cls) !== -1);
+    const first = (node, cls) => byClass(node, cls)[0];
+
+    // 3. Содержимое: строка, части с картинками, пустое и мусор.
+    assert.strictEqual(render.msgText("привет"), "привет", "строка не отдана как есть");
+    assert.strictEqual(render.msgText([{ type: "text", text: "раз" }, { type: "image_url", image_url: { url: "x" } }, { type: "text", text: "два" }]), "раз\nдва", "текстовые части не склеены");
+    assert.strictEqual(render.msgText(null), "", "пустое содержимое не отдано пустой строкой");
+    assert.strictEqual(render.msgText([{ type: "image_url", image_url: { url: "x" } }]), "", "картинка без текста дала текст");
+    assert.ok(render.msgHtml("жирный").indexOf("<md>жирный</md>") === 0, "markdown не отрисован");
+    const withImage = render.msgHtml([{ type: "image_url", image_url: { url: "http://x/1.png?a=<b>" } }, { type: "text", text: "подпись" }]);
+    assert.ok(withImage.indexOf('class="md-attach"') > 0, "картинка не встроена в разметку");
+    assert.ok(withImage.indexOf("&lt;b>") > 0, "адрес картинки не экранирован");
+    assert.ok(withImage.indexOf("<md>подпись</md>") > 0, "подпись под картинкой потерялась");
+    assert.strictEqual(render.msgHtml(null), "", "пустое содержимое дало разметку");
+
+    // 4. Ошибка и незавершённый ответ: классы и содержимое.
+    const failed = render.buildBubbleEl({ id: "e1", role: "assistant", error: "Не вышло" });
+    assert.strictEqual(failed.className, "msg error", "у ошибки не тот класс сообщения");
+    const failedBubble = first(failed, "bubble");
+    assert.strictEqual(failedBubble.textContent, "Не вышло", "текст ошибки не показан");
+    assert.ok(!failedBubble.classList.contains("md"), "ошибку отрисовали как markdown");
+    assert.strictEqual(byClass(failed, "msg-actions").length, 0, "под ошибкой появились кнопки действий");
+    const pending = render.buildBubbleEl({ id: "p1", role: "assistant", content: "пишу", pending: true });
+    assert.strictEqual(first(pending, "bubble").className, "bubble pending", "незавершённый ответ потерял пометку");
+    assert.strictEqual(byClass(pending, "msg-actions").length, 0, "у незавершённого ответа появились кнопки");
+
+    // 5. Обычный ответ: markdown, метка времени, плашка размышлений, кнопки.
+    const answer = render.buildBubbleEl({ id: "a1", role: "assistant", content: "готово", createdAt: 12345, thinking: "думал", last: true });
+    assert.ok(first(answer, "bubble").classList.contains("md"), "ответ не помечен как markdown");
+    assert.strictEqual(first(answer, "bubble").innerHTML, "<md>готово</md>", "текст ответа отрисован неверно");
+    assert.strictEqual(first(answer, "meta").textContent, "в 12345", "метка времени не показана");
+    assert.deepStrictEqual(spy.restored, [["думал", undefined]], "плашка размышлений не восстановлена");
+    const answerButtons = byClass(first(answer, "msg-actions"), "ma-btn");
+    assert.strictEqual(answerButtons.length, 2, "у последнего ответа должны быть «скопировать» и «перегенерировать»");
+    answerButtons[0].onclick();
+    assert.deepStrictEqual(spy.copied, ["готово"], "кнопка «скопировать» не отдала текст ответа");
+    answerButtons[1].onclick();
+    assert.strictEqual(spy.regenerated, 1, "кнопка «перегенерировать» не сработала");
+    const older = render.buildBubbleEl({ id: "a2", role: "assistant", content: "раньше", last: false });
+    assert.strictEqual(byClass(first(older, "msg-actions"), "ma-btn").length, 1, "у старого ответа осталась кнопка перегенерации");
+
+    // 6. Своё сообщение: скопировать и вернуть в поле ввода.
+    const mine = render.buildBubbleEl({ id: "u1", role: "user", content: "вопрос" });
+    assert.ok(String(mine.className).indexOf("msg user") === 0, "у своего сообщения не тот класс");
+    const mineButtons = byClass(first(mine, "msg-actions"), "ma-btn");
+    assert.strictEqual(mineButtons.length, 2, "у своего сообщения не две кнопки");
+    assert.ok(mineButtons[1].title.indexOf("Редактировать") === 0, "нет кнопки правки сообщения");
+    mineButtons[1].onclick();
+    assert.strictEqual(spy.edited, 1, "кнопка правки не сработала");
+
+    // 7. Прерванный ответ: кнопка уходит в главный процесс с ЖИВЫМИ данными чатов.
+    const interrupted = render.buildBubbleEl({ id: "s1", role: "system", interrupted: true, content: "прервано" });
+    const continueRow = first(interrupted, "msg-actions");
+    const continueBtn = continueRow && byClass(continueRow, "ma-btn")[0];
+    assert.ok(continueBtn, "нет кнопки «Дописать ответ» у прерванного хода");
+    assert.strictEqual(continueBtn.textContent, "↻ Дописать ответ", "кнопка продолжения подписана иначе");
+    continueBtn.onclick({ stopPropagation: () => {} });
+    assert.strictEqual(continueRow.parentNode, null, "кнопка не убрана после нажатия");
+    assert.deepStrictEqual(spy.continued.map((c) => c[0]), ["chat-1"], "продолжение ушло без данных чатов");
+    assert.strictEqual(spy.continued[0][1].id, "s1", "продолжение ушло не с тем сообщением");
+    // Данные чатов читаются ЖИВОЙ функцией: подменили объект — модуль видит новый.
+    chats.activeId = "chat-2";
+    const again = render.buildBubbleEl({ id: "s2", role: "system", interrupted: true });
+    byClass(first(again, "msg-actions"), "ma-btn")[0].onclick({ stopPropagation: () => {} });
+    assert.strictEqual(spy.continued[1][0], "chat-2", "модуль работал с копией данных чатов");
+    // Свой чат у сообщения важнее активного.
+    const own = render.buildBubbleEl({ id: "s3", role: "system", interrupted: true, chatId: "chat-9" });
+    byClass(first(own, "msg-actions"), "ma-btn")[0].onclick({ stopPropagation: () => {} });
+    assert.strictEqual(spy.continued[2][0], "chat-9", "чат сообщения не учтён");
+
+    // 8. Негативный контроль зависимостей: без часов панель падает понятной ошибкой.
+    const noClock = sandbox.module.exports({
+      MdRender: MdRender, ChatThinking: { restoreThinkBox: () => ({}) }, ChatActions: {},
+      continueInterruptedAnswer: () => {}, getChatsData: () => chats,
+    });
+    assert.throws(() => noClock.buildBubbleEl({ role: "assistant", content: "текст", createdAt: 1 }), /fmtClock/,
+      "забытая зависимость не привела к понятной ошибке");
+  });
+}
+
 // ── Роли, дела и миссия (src/renderer/tasks-mission.js) ────────────────────
 // Модуль вынесен из app.js: проверяется ПОВЕДЕНИЕ панелей на заглушках настоящей
 // разметки и живом обработчике событий — список дел, фильтры, добавление, роли и
@@ -508,7 +967,7 @@ async function testTasksMission() {
       running: true, rounds: 3, batches: 1, tokens: 42, compactions: 1, startedAt: Date.now() - hour,
       journal: [{ ts: Date.now(), kind: "step", text: "Прочитал заявки" }],
     };
-    const calls = { board: 0, add: [], update: [], done: [], toasts: [], opened: [], closed: 0, sent: 0, sidebar: 0, persisted: 0, subscribed: 0, resumed: 0 };
+    const calls = { board: 0, add: [], update: [], done: [], toasts: [], opened: [], closed: 0, sent: 0, sidebar: 0, persisted: 0, subscribed: 0, resumed: 0, finished: null };
     const api = {
       tasksBoard: async () => { calls.board++; return board; },
       tasksAdd: async (t) => { calls.add.push(t); return { ok: true }; },
@@ -522,6 +981,7 @@ async function testTasksMission() {
       missionPause: async () => ({ ok: true }),
       missionStop: async () => ({ ok: true }),
       missionResume: async () => { calls.resumed++; return { ok: true, text: "продолжай работу" }; },
+      missionFinish: async (id) => { calls.finished = id; return { ok: true, status: "stopped" }; },
     };
     const settings = { tasksEnabled: true, defaultRole: "dev" };
     const chat = { id: "c1", role: "manager", messages: [] };
@@ -665,6 +1125,21 @@ async function testTasksMission() {
     assert.strictEqual(calls.resumed, 1, "миссия не продолжилась, когда генерации нет");
     assert.strictEqual($("input").value, "продолжай работу", "текст продолжения не попал в поле ввода");
     assert.strictEqual(calls.sent, 1, "продолжение миссии не отправлено агенту");
+    // Закрытие руками: раньше незакрытую миссию можно было только продолжить или
+    // увести в паузу — работа висела в панели, и агент «продолжал» её кругами.
+    calls.toasts.length = 0;
+    await $("btn-mission-finish").onclick();
+    assert.strictEqual(calls.finished, "m1", "закрылась не та миссия: " + calls.finished);
+    assert.ok(calls.toasts.some((t) => /закрыта/.test(t)), "человеку не сказали, что миссия закрыта: " + calls.toasts.join(" | "));
+    streaming = true;
+    calls.finished = null;
+    calls.toasts.length = 0;
+    await $("btn-mission-finish").onclick();
+    assert.strictEqual(calls.finished, null, "миссия закрылась во время идущего прогона");
+    assert.ok(calls.toasts.some((t) => /Дождись/.test(t)), "отказ закрыть миссию прозвучал молча: " + calls.toasts.join(" | "));
+    streaming = false;
+    await M.refreshMission();
+    assert.strictEqual($("btn-mission-finish").disabled, false, "кнопка закрытия осталась недоступной без прогона");
 
     // 6. Событие прогона: карточка обновляется из него, НЕ дожидаясь опроса.
     M.missionFromEvent({ id: "m2", title: "Свести заявки", status: "active", steps: [{ title: "Шаг из события", state: "doing" }], tokens: 7 });
@@ -740,6 +1215,24 @@ function uiFind(startMarker, endMarker) {
   const end = src.indexOf(endMarker, start);
   assert.ok(end > start, "не найден конец куска (" + JSON.stringify(endMarker) + ") в " + file);
   return { file, start, end, code: src.slice(start, end) };
+}
+
+// Сборка вынесенного модуля ленты (chat-feed.js) в песочнице: та же фабрика, что и
+// в приложении, поэтому проверяется НАСТОЯЩИЙ код, а не копия из теста.
+function buildChatFeed(deps) {
+  const vm = require("vm");
+  const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "chat-feed.js"), "utf8");
+  const sandbox = {
+    module: { exports: {} },
+    self: {},
+    console: { warn() {}, log() {}, error() {} },
+    // Очередь кадра зовёт requestAnimationFrame: в песочнице его нет, поэтому
+    // пробрасываем наружу — так тест сам распоряжается кадрами.
+    requestAnimationFrame: (fn) => requestAnimationFrame(fn),
+  };
+  vm.runInNewContext(src, sandbox, { filename: "chat-feed.js" });
+  assert.strictEqual(typeof sandbox.module.exports, "function", "модуль ленты не отдал фабрику");
+  return sandbox.module.exports(deps);
 }
 
 // Помощник обязан понимать и модули, и app.js: иначе он бесполезен на середине
@@ -3011,6 +3504,212 @@ async function testSecretsPanel() {
   });
 }
 
+// ── Мобильный доступ: панель подключения телефона (этап 3.6) ────────────────
+// Панель вынесена из app.js в src/renderer/mobile-panel.js. Проверяем ПОВЕДЕНИЕ,
+// а не наличие функций: заполнение полей из настроек, запись обратно, QR-код,
+// список адресов, два предупреждения (адрес недостижим, мост не запустился),
+// отказ статуса, смена PIN и включение галочкой. Заглушка DOM строгая: id, которого
+// нет в настоящей разметке, — ошибка теста (так находились опечатки в разметке).
+async function testMobilePanel() {
+  const vm = require("vm");
+  const modPath = path.join(ROOT, "src", "renderer", "mobile-panel.js");
+  const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+  const appSrc = uiFile("app.js");
+
+  await test("мобильный доступ: панель подключения телефона работает и живёт в своём модуле", async () => {
+    // 1. Модуль на месте, подключён до app.js и отдаётся телефону.
+    assert.ok(fs.existsSync(modPath), "нет файла src/renderer/mobile-panel.js");
+    const src = fs.readFileSync(modPath, "utf8");
+    const iTag = html.indexOf('src="mobile-panel.js"');
+    assert.ok(iTag > 0, "разметка не грузит mobile-panel.js");
+    assert.ok(iTag < html.indexOf('src="app.js"'), "mobile-panel.js подключён после app.js");
+    const bridge = fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8");
+    assert.ok(/"mobile-panel\.js"/.test(bridge), "мобильный мост не отдаёт mobile-panel.js телефону");
+
+    // 2. В app.js кода панели не осталось — только сборка модуля с зависимостями.
+    for (const gone of ["renderMobileQr", "renderMobileStatus", "regenerateMobilePin"]) {
+      assert.ok(appSrc.indexOf(gone) === -1, "код панели остался в app.js: " + gone);
+    }
+    const wiring = appSrc.slice(appSrc.indexOf("window.MobilePanel({"));
+    const wiringCall = wiring.slice(0, wiring.indexOf("});"));
+    for (const dep of ["$: $", "api: api", "isElectron: isElectron", "getSettings: () => settings", "setSettingsMsg: setSettingsMsg"]) {
+      assert.ok(wiringCall.includes(dep), "в проводку панели не передан " + dep);
+    }
+    // Границы модуля: настройки только через getSettings(), в чужие глобалы не лезем.
+    assert.ok(!/(^|[^\w.])settings\./.test(src), "модуль ходит в settings напрямую вместо getSettings()");
+    assert.ok(!/AgentCore|window\.api\b|localStorage/.test(src), "модуль лезет в чужие глобалы");
+
+    // 3. Настоящая сборка в песочнице на заглушках РЕАЛЬНОЙ разметки.
+    const known = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
+    const els = new Map();
+    const el = () => {
+      const classes = new Set();
+      let markup = "";
+      const node = {
+        value: "", textContent: "", checked: false, className: "", href: "", target: "", rel: "",
+        children: [], listeners: {},
+        classList: {
+          add: (...c) => c.forEach((x) => classes.add(x)),
+          remove: (...c) => c.forEach((x) => classes.delete(x)),
+          contains: (c) => classes.has(c),
+          toggle: (c, on) => (on ? classes.add(c) : classes.delete(c)),
+        },
+        addEventListener: (type, fn) => { node.listeners[type] = fn; },
+        appendChild: (child) => { node.children.push(child); return child; },
+      };
+      // Как в браузере: запись innerHTML заменяет содержимое (иначе адреса копились бы).
+      Object.defineProperty(node, "innerHTML", {
+        get: () => markup,
+        set: (v) => { markup = String(v); node.children.length = 0; },
+      });
+      return node;
+    };
+    const $ = (id) => {
+      assert.ok(known.has(id), "модуль ищет элемент, которого нет в разметке: " + id);
+      if (!els.has(id)) els.set(id, el());
+      return els.get(id);
+    };
+    const status = {
+      enabled: true, running: true, pin: "135790", host: "", hostActive: true,
+      url: "http://192.168.1.72:9090", urls: [{ url: "http://192.168.1.72:9090" }],
+    };
+    const settings = { mobileEnabled: true, mobilePort: 9090, mobileHost: "" };
+    const calls = { status: 0, regen: 0 };
+    const messages = [];
+    const qr = [];
+    let statusFails = false;
+    const api = {
+      mobileStatus: async () => { calls.status++; if (statusFails) throw new Error("мост молчит"); return status; },
+      mobilePinRegen: async () => { calls.regen++; return { pin: "246810" }; },
+    };
+    const build = (deps) => {
+      const sandbox = {
+        module: { exports: {} },
+        window: { QR: { toSvg: (text, opts) => { qr.push([text, opts]); return "<svg>" + text + "</svg>"; } } },
+        self: {},
+        console: { log() {}, warn() {}, error() {} },
+        document: { createElement: () => el() },
+      };
+      vm.runInNewContext(src, sandbox, { filename: "mobile-panel.js" });
+      assert.strictEqual(typeof sandbox.module.exports, "function", "модуль не отдал фабрику");
+      return sandbox.module.exports(deps);
+    };
+    const panel = build({
+      $, api, isElectron: true,
+      getSettings: () => settings,
+      setSettingsMsg: (text, isErr) => messages.push([text, !!isErr]),
+    });
+    assert.deepStrictEqual(Object.keys(panel).sort(), ["applyMobileFields", "initMobilePanel", "readMobileFields"],
+      "наружу торчит лишнее или чего-то не хватает");
+
+    // 4. Заполнение полей из настроек: галочка, порт, адрес, PIN, QR и адрес для телефона.
+    $("s-mobile-enabled").checked = false;
+    await panel.applyMobileFields();
+    assert.strictEqual($("s-mobile-enabled").checked, true, "галочка не поднялась из настроек");
+    assert.strictEqual($("s-mobile-port").value, 9090, "порт моста не подставился");
+    assert.strictEqual($("s-mobile-host").value, "", "поле «Адрес для телефона» не заполнено");
+    assert.strictEqual($("s-mobile-pin").value, "135790", "PIN моста не показан");
+    assert.strictEqual(calls.status, 1, "статус моста не запрошен");
+    assert.strictEqual(qr.length, 1, "QR-код не построен");
+    assert.ok(qr[0][0].indexOf("/#pin=135790") > 0, "в QR-код не попал адрес с PIN: " + qr[0][0]);
+    assert.strictEqual(qr[0][1].ecc, "M", "у QR-кода не та коррекция ошибок");
+    assert.ok(!$("mobile-qr-block").classList.contains("hidden"), "блок QR остался скрытым при работающем мосте");
+    assert.strictEqual($("mobile-urls").children.length, 1, "адрес для телефона не показан");
+    assert.strictEqual($("mobile-urls").children[0].textContent, "http://192.168.1.72:9090", "показан не тот адрес");
+    assert.strictEqual($("mobile-urls").children[0].href, "http://192.168.1.72:9090", "адрес не открывается ссылкой");
+
+    // 5. Предупреждение: адрес задан вручную, но такого IP на ПК нет.
+    status.host = "192.168.99.99";
+    status.hostActive = false;
+    await panel.applyMobileFields();
+    let texts = $("mobile-urls").children.map((c) => c.textContent);
+    assert.ok(texts.some((t) => t.indexOf("192.168.99.99") >= 0 && t.indexOf("не найден") >= 0),
+      "нет предупреждения о недостижимом адресе: " + texts.join(" | "));
+
+    // 6. Предупреждение: мост включён, но не запустился (порт занят).
+    status.host = "";
+    status.hostActive = true;
+    status.running = false;
+    await panel.applyMobileFields();
+    texts = $("mobile-urls").children.map((c) => c.textContent);
+    assert.ok(texts.some((t) => String(t).indexOf("Мост не запустился") >= 0), "нет предупреждения о незапустившемся мосте");
+    assert.ok($("mobile-qr-block").classList.contains("hidden"), "QR-код показан при неработающем мосте");
+
+    // 7. Статус недоступен: панель не молчит и ничего не роняет.
+    statusFails = true;
+    await panel.applyMobileFields();
+    const failed = $("mobile-urls").children;
+    assert.strictEqual(failed.length, 1, "отказ статуса оставил мусор в списке адресов");
+    assert.ok(String(failed[0].textContent).indexOf("Статус недоступен") >= 0, "нет честного сообщения об отказе статуса");
+    statusFails = false;
+    status.running = true;
+
+    // 8. Сохранение настроек: поля уходят в ЖИВЫЕ настройки.
+    $("s-mobile-enabled").checked = false;
+    $("s-mobile-port").value = "9191";
+    $("s-mobile-host").value = " 192.168.1.72 ";
+    panel.readMobileFields();
+    assert.strictEqual(settings.mobileEnabled, false, "галочка не сохранилась");
+    assert.strictEqual(settings.mobilePort, 9191, "порт не сохранился");
+    assert.strictEqual(settings.mobileHost, "192.168.1.72", "адрес не сохранился без пробелов");
+    $("s-mobile-port").value = "";
+    panel.readMobileFields();
+    assert.strictEqual(settings.mobilePort, 9090, "пустой порт не вернулся к 9090");
+
+    // 9. Галочка включает поля и обновляет статус, кнопка меняет PIN.
+    panel.initMobilePanel();
+    assert.strictEqual(typeof $("s-mobile-enabled").listeners.change, "function", "галочка не получила обработчик");
+    $("s-mobile-enabled").checked = false;
+    $("mobile-fields").classList.remove("hidden");
+    $("s-mobile-enabled").listeners.change();
+    assert.ok($("mobile-fields").classList.contains("hidden"), "выключенная галочка не спрятала поля");
+    $("s-mobile-enabled").checked = true;
+    const before = calls.status;
+    $("s-mobile-enabled").listeners.change();
+    await Promise.resolve();
+    assert.ok(!$("mobile-fields").classList.contains("hidden"), "включённая галочка не показала поля");
+    assert.ok(calls.status > before, "при включении галочки статус не перечитан");
+    assert.strictEqual(typeof $("btn-mobile-pin-regen").onclick, "function", "кнопка смены PIN без обработчика");
+    await $("btn-mobile-pin-regen").onclick();
+    assert.strictEqual(calls.regen, 1, "смена PIN не дошла до главного процесса");
+    assert.strictEqual(settings.mobilePin, "246810", "новый PIN не сохранён");
+    assert.strictEqual($("s-mobile-pin").value, "246810", "новый PIN не показан в поле");
+    assert.ok(messages.some((m) => m[0].indexOf("246810") >= 0 && m[1] === false), "человеку не сказали новый PIN");
+
+    // 10. Ошибка смены PIN называется вслух, а не глотается.
+    const errs = [];
+    const broken = build({
+      $, isElectron: true, getSettings: () => settings,
+      setSettingsMsg: (text, isErr) => errs.push([text, !!isErr]),
+      api: { mobileStatus: api.mobileStatus, mobilePinRegen: async () => { throw new Error("мост занят"); } },
+    });
+    broken.initMobilePanel();
+    await $("btn-mobile-pin-regen").onclick();
+    assert.ok(errs.some((m) => m[0].indexOf("Не удалось сменить PIN") >= 0 && m[1] === true), "ошибка смены PIN не показана человеку");
+
+    // 11. Веб-режим: панель прячется и в главный процесс не ходит вовсе.
+    const webCalls = { status: 0, regen: 0 };
+    const web = build({
+      $, isElectron: false, getSettings: () => settings, setSettingsMsg: () => {},
+      api: {
+        mobileStatus: async () => { webCalls.status++; return status; },
+        mobilePinRegen: async () => { webCalls.regen++; return { pin: "1" }; },
+      },
+    });
+    $("mobile-fields").classList.remove("hidden");
+    await web.applyMobileFields();
+    assert.ok($("mobile-fields").classList.contains("hidden"), "в веб-режиме поля подключения телефона остались видны");
+    assert.strictEqual(webCalls.status, 0, "в веб-режиме статус всё равно запрошен");
+    web.initMobilePanel();
+    await $("btn-mobile-pin-regen").onclick();
+    assert.strictEqual(webCalls.regen, 0, "в веб-режиме смена PIN всё равно ушла в IPC");
+
+    // 12. Негативный контроль зависимостей: без getSettings панель падает понятно.
+    const noSettings = build({ $, api, isElectron: true, setSettingsMsg: () => {} });
+    assert.throws(() => noSettings.readMobileFields(), /getSettings/, "забытая зависимость не привела к понятной ошибке");
+  });
+}
+
 // ── 4c. Сессия и контекст: индикатор, профиль браузера, «Дописать ответ» ───
 async function testSessionExtras() {
   const mainSrc = backendSrc();
@@ -3078,10 +3777,14 @@ async function testSessionExtras() {
     assert.ok(/top: 0/.test(headRule), "нет привязки к верху панели");
     assert.ok(/z-index/.test(headRule), "заголовок не поднят над строками действий");
     assert.ok(/background/.test(headRule), "нет плотного фона — строки будут просвечивать сквозь заголовок");
-    assert.ok(appSrc.includes("function thinkAutoScroll(body, force)"), "нет автопрокрутки размышлений");
-    assert.ok(/thinkAutoScroll\(body\); \/\/ текст вырос/.test(appSrc), "автопрокрутка не вызывается при стриминге");
-    assert.ok(/thinkAutoScroll\(body, true\)/.test(appSrc), "разворот блока не показывает конец размышлений");
-    assert.ok(appSrc.includes("body.dataset.pinned"), "нет учёта ручной прокрутки пользователя");
+    // Блок размышлений вынесен из app.js в src/renderer/chat-thinking.js (этап 3.7):
+    // сам код спрашиваем в модуле, а оболочку — на факт сборки модуля.
+    const thinkSrc = uiFile("chat-thinking.js");
+    assert.ok(thinkSrc.includes("function thinkAutoScroll(body, force)"), "нет автопрокрутки размышлений");
+    assert.ok(/thinkAutoScroll\(body\); \/\/ текст вырос/.test(thinkSrc), "автопрокрутка не вызывается при стриминге");
+    assert.ok(/thinkAutoScroll\(body, true\)/.test(thinkSrc), "разворот блока не показывает конец размышлений");
+    assert.ok(thinkSrc.includes("body.dataset.pinned"), "нет учёта ручной прокрутки пользователя");
+    assert.ok(appSrc.includes("window.ChatThinking()"), "оболочка не собирает модуль размышлений");
 
     // Поведенчески — на настоящем коде app.js: тянем вниз, но не выдёргиваем
     // пользователя, который сам читает выше.
@@ -3123,8 +3826,11 @@ async function testSessionExtras() {
   await test("прерванный ответ: пометка и кнопка «Дописать ответ» на месте", () => {
     assert.ok(/interrupted: true/.test(appSrc), "пометка прерванного ответа не ставится");
     assert.ok(/function continueInterruptedAnswer\(chatId, m\)/.test(appSrc), "нет функции продолжения");
-    assert.ok(/Дописать ответ/.test(appSrc), "нет кнопки «Дописать ответ»");
-    assert.ok(/continueInterruptedAnswer\(m\.chatId \|\| chatsData\.activeId, m\)/.test(appSrc), "кнопка не привязана");
+    // Кнопка живёт в модуле отрисовки сообщения (этап 3.7) — спрашиваем интерфейс целиком.
+    assert.ok(/Дописать ответ/.test(uiAll()), "нет кнопки «Дописать ответ»");
+    // Привязка живёт в модуле отрисовки сообщения (этап 3.7): там живые данные чатов
+    // берутся через getChatsData(), а не копией объекта.
+    assert.ok(/continueInterruptedAnswer\(m\.chatId \|\| getChatsData\(\)\.activeId, m\)/.test(uiAll()), "кнопка не привязана");
   });
 }
 
@@ -3211,9 +3917,11 @@ async function testMobileBridge() {
   await test("mobile-bridge: поле «Адрес для телефона» есть в настройках и сохраняется", () => {
     const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     assert.ok(/id="s-mobile-host"/.test(htmlSrc), "нет поля «Адрес для телефона»");
-    const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
-    assert.ok(/settings\.mobileHost = \$\("s-mobile-host"\)\.value\.trim\(\)/.test(appSrc), "поле не сохраняется");
-    assert.ok(/st\.host && !st\.hostActive/.test(appSrc), "нет предупреждения о недостижимом адресе");
+    // Панель подключения телефона вынесена в src/renderer/mobile-panel.js (этап 3.6):
+    // спрашиваем интерфейс целиком, а не адрес кода, — вынос не должен ронять проверку.
+    const uiSrc = uiAll();
+    assert.ok(/getSettings\(\)\.mobileHost = \$\("s-mobile-host"\)\.value\.trim\(\)/.test(uiSrc), "поле не сохраняется");
+    assert.ok(/st\.host && !st\.hostActive/.test(uiSrc), "нет предупреждения о недостижимом адресе");
     const mainS = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
     assert.ok(/mobileHost: "192\.168\.1\.72"/.test(mainS), "адрес по умолчанию не задан");
   });
@@ -5646,8 +6354,13 @@ async function testPlanPanel() {
     getActiveChat: () => activeChat,
     streaming: false,
     session: null,
-    // runSegments живёт выше блока плана — в игрушечной среде отдаём его сами.
-    runSegments: (chat, aMsg) => [aMsg].filter(Boolean),
+    // Сегменты ответа вынесены в src/renderer/chat-segments.js (этап 3.7, часть 2):
+    // в игрушечной среде плана их нет вовсе, поэтому отдаём тот же контракт заглушкой.
+    ChatSegments: {
+      ensureSegmentForText: (chat, aMsg) => aMsg || null,
+      removeSegment: () => {},
+      runSegments: (chat, aMsg) => [aMsg].filter(Boolean),
+    },
     sendMessage: () => {},
     autoResize: () => {},
     persistChatsSoon: () => {},
@@ -6015,7 +6728,9 @@ async function testPlanPanel() {
   });
 
   await test("план: текст ответа связан с панелью (chunk → раунд, tool_start, done)", () => {
-    assert.ok(/if \(planFromText\(chat, runTextOf\(chat, aMsg\)\)\)/.test(appSrc), "интерфейс не разбирает план, написанный текстом");    assert.ok(/planRoundStarted\(chat, seg\.id\);/.test(appSrc), "новый раунд ответа не двигает галочки текстового плана");
+    assert.ok(/if \(planFromText\(chat, runTextOf\(chat, aMsg\)\)\)/.test(appSrc), "интерфейс не разбирает план, написанный текстом");    // Строка «planRoundStarted(chat, seg.id)» живёт в src/renderer/chat-segments.js
+        // (этап 3.7): спрашиваем интерфейс целиком, а не адрес кода.
+        assert.ok(/planRoundStarted\(chat, seg\.id\);/.test(uiAll()), "новый раунд ответа не двигает галочки текстового плана");
     assert.ok(/if \(planTextFinish\(chat\)\)/.test(appSrc), "финиш запуска не закрывает шаг текстового плана");
     // Веб-версия: в План-режиме список инструментов больше не пуст — todoWrite доходит до модели.
     assert.ok(/tools: planMode \? AgentCore\.PLAN_MODE_TOOL_DEFINITIONS : AgentCore\.TOOL_DEFINITIONS,/.test(uiAll()), "в веб-версии План-режим без todoWrite");
@@ -7022,37 +7737,60 @@ async function testAgentSpeedups() {
 }
 
 
-// ── Стрим и печать: работа не чаще одного кадра ────────────────────────────
-async function testStreamThrottle() {
-  const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
-  const cssSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "styles.css"), "utf8");
+// ── Лента: умная прокрутка и очередь кадра (этап 3.7, часть 4) ──────────────
+// Модуль вынесен из app.js. Проверяем ПОВЕДЕНИЕ: пока человек читает выше — вниз
+// не дёргаем и показываем кнопку «↓»; по клику и по новому сообщению возвращаемся
+// в конец; очередь кадра копит текст и рисует последнее состояние ровно один раз
+// за кадр. Отдельно — забытые зависимости: они обязаны падать понятной ошибкой,
+// а не тихо оставлять человека с неперерисованным пузырём.
+async function testChatFeed() {
+  const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "chat-feed.js"), "utf8");
 
-  await test("стрим: обработчик chunk рисует через очередь кадра, а не на каждый чанк", () => {
+  await test("лента: прокрутка и очередь кадра работают, как раньше", () => {
+    // 1. Модуль на месте, подключён до app.js, отдаётся телефону, собран в оболочке.
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const iTag = html.indexOf('src="chat-feed.js"');
+    assert.ok(iTag > 0, "разметка не грузит chat-feed.js");
+    assert.ok(iTag < html.indexOf('src="app.js"'), "chat-feed.js подключён после app.js");
+    const bridge = fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8");
+    assert.ok(/"chat-feed\.js"/.test(bridge), "мобильный мост не отдаёт chat-feed.js телефону");
+    const appSrc = uiFile("app.js");
+    for (const gone of ["function scrollBottom", "function updatePinState", "function jumpToBottom", "function queueBubbleRender", "function scrollBottomSoon", "let pinnedToBottom"]) {
+      assert.ok(appSrc.indexOf(gone) === -1, "код ленты остался в app.js: " + gone);
+    }
+    const wiring = appSrc.slice(appSrc.indexOf("window.ChatFeed({"));
+    const wiringCall = wiring.slice(0, wiring.indexOf("});"));
+    for (const dep of ["$: $", "msgEls: msgEls", "msgHtml: (c) => ChatRender.msgHtml(c)"]) {
+      assert.ok(wiringCall.includes(dep), "в проводку ленты не передан " + dep);
+    }
+    // Отрисовка сообщения (chat-render.js) собирается НИЖЕ ленты, поэтому msgHtml — стрелка:
+    // копия функции на этом месте была бы пустой и упала бы при первом же чанке.
     assert.ok(
-      /case "chunk":[\s\S]{0,420}?queueBubbleRender\(chat, seg\)/.test(appSrc),
-      "обработчик chunk не использует очередь кадра"
+      appSrc.indexOf("window.ChatFeed({") < appSrc.indexOf("window.ChatRender({"),
+      "лента собрана после отрисовки — стрелка msgHtml больше не нужна, проверь порядок"
     );
-    assert.ok(
-      !/case "chunk":[\s\S]{0,420}?b\.innerHTML = msgHtml\(seg\.content\)/.test(appSrc),
-      "chunk всё ещё перерисовывает innerHTML на каждый чанк"
-    );
-    assert.ok(
-      /case "thinking":[\s\S]{0,420}?scrollBottomSoon\(\)/.test(appSrc),
-      "размышления всё ещё дёргают прокрутку на каждый токен"
-    );
-  });
+    // Границы модуля: ничего чужого из оболочки, только внедрённое.
+    for (const name of ["chatsData", "session", "streaming", "ChatRender", "localStorage", "document"]) {
+      assert.ok(!new RegExp("(^|[^\\w$.])" + name + "\\b").test(src), "модуль ссылается на " + name + " без внедрения");
+    }
 
-  await test("стрим: очередь копит текст и рисует последнее состояние за один кадр", () => {
-    const streamSlice = uiFind("  let pinnedToBottom = true;", "  // ─────────────── Отправка ───────────────");
-    assert.ok(streamSlice.start > 0, "не нашёл блок прокрутки/стрима в интерфейсе");
-
-    const dom = {
-      messages: { scrollTop: 0, scrollHeight: 500 },
-      "btn-scroll-bottom": { classList: { add() {}, remove() {}, toggle() {} } },
+    // 2. Среда: заглушка ленты (окно прокрутки + кнопка «↓») и карта элементов сообщений.
+    const classes = new Set();
+    const btn = {
+      classList: {
+        add: (c) => classes.add(c),
+        remove: (c) => classes.delete(c),
+        toggle: (c, on) => {
+          const want = on === undefined ? !classes.has(c) : !!on;
+          if (want) classes.add(c); else classes.delete(c);
+          return want;
+        },
+      },
     };
+    const win = { scrollTop: 0, scrollHeight: 900, clientHeight: 300 };
+    const dom = { messages: win, "btn-scroll-bottom": btn };
     const $ = (id) => dom[id];
     const msgEls = new Map();
-    const msgHtml = (c) => "<p>" + c + "</p>";
     const bubble = { innerHTML: "", classList: { add() {}, remove() {} } };
     msgEls.set("a1", { querySelector: (sel) => (sel === ".bubble" ? bubble : null) });
 
@@ -7060,13 +7798,142 @@ async function testStreamThrottle() {
     const origRaf = globalThis.requestAnimationFrame;
     globalThis.requestAnimationFrame = (fn) => { rafQ.push(fn); return rafQ.length; };
     try {
-      const api = new Function(
-        "$",
-        "msgEls",
-        "msgHtml",
-        streamSlice.code +
-          "\nreturn { queueBubbleRender: queueBubbleRender, scrollBottom: scrollBottom, scrollBottomSoon: scrollBottomSoon };"
-      )($, msgEls, msgHtml);
+      const feed = buildChatFeed({ $: $, msgEls: msgEls, msgHtml: (c) => "<p>" + c + "</p>" });
+      assert.deepStrictEqual(
+        Object.keys(feed).sort(),
+        ["jumpToBottom", "queueBubbleRender", "scrollBottom", "scrollBottomSoon", "updatePinState"],
+        "наружу торчит лишнее или чего-то не хватает"
+      );
+
+      // 3. У конца ленты — держимся внизу, кнопка «↓» скрыта.
+      win.scrollTop = 900;
+      feed.updatePinState();
+      assert.strictEqual(classes.has("hidden"), true, "у конца ленты кнопка «↓» осталась видимой");
+      win.scrollHeight = 1200;
+      feed.scrollBottom();
+      assert.strictEqual(win.scrollTop, 1200, "у конца ленты прокрутка не поехала вниз");
+
+      // 4. Человек читает выше — не выдёргиваем и показываем кнопку.
+      win.scrollTop = 120;
+      feed.updatePinState();
+      assert.strictEqual(classes.has("hidden"), false, "при чтении выше кнопка «↓» не показалась");
+      win.scrollHeight = 1400;
+      feed.scrollBottom();
+      assert.strictEqual(win.scrollTop, 120, "человека выдернули из чтения");
+
+      // 5. Ручной возврат в конец: без «умной» логики, сразу вниз.
+      feed.jumpToBottom();
+      assert.strictEqual(win.scrollTop, 1400, "кнопка «↓» не вернула в конец");
+      assert.strictEqual(classes.has("hidden"), true, "после возврата кнопка «↓» осталась");
+      win.scrollHeight = 1500;
+      feed.scrollBottom();
+      assert.strictEqual(win.scrollTop, 1500, "после возврата автопрокрутка не возобновилась");
+
+      // 6. Очередь кадра: два чанка — один кадр и последнее состояние.
+      const seg = { id: "a1", content: "прив" };
+      const chat = { messages: [seg] };
+      feed.queueBubbleRender(chat, seg);
+      seg.content = "привет";
+      feed.queueBubbleRender(chat, seg);
+      assert.strictEqual(rafQ.length, 1, "кадр запланирован не один раз: " + rafQ.length);
+      assert.strictEqual(bubble.innerHTML, "", "пузырь перерисован до кадра");
+      assert.strictEqual(win.scrollTop, 1500, "прокрутка дёрнулась до кадра");
+      rafQ.splice(0).forEach((fn) => fn());
+      assert.strictEqual(bubble.innerHTML, "<p>привет</p>", "не отрисовано последнее состояние");
+      assert.strictEqual(win.scrollTop, win.scrollHeight, "нет автопрокрутки в кадре");
+      assert.strictEqual(rafQ.length, 0, "очередь кадров не очищена");
+
+      // 7. Следующий поток чанков снова планирует ровно один кадр.
+      seg.content = "привет!";
+      feed.queueBubbleRender(chat, seg);
+      assert.strictEqual(rafQ.length, 1, "новый кадр не запланирован");
+      rafQ.splice(0).forEach((fn) => fn());
+      assert.strictEqual(bubble.innerHTML, "<p>привет!</p>");
+
+      // 8. Чанк без сообщения (сегмент уже убран) — молча: без падений и без лишней работы.
+      feed.queueBubbleRender(chat, null);
+      feed.queueBubbleRender(chat, { id: "нет такого", content: "x" });
+      rafQ.splice(0).forEach((fn) => fn());
+      assert.strictEqual(bubble.innerHTML, "<p>привет!</p>", "чужой сегмент перерисовал пузырь");
+      assert.strictEqual(rafQ.length, 0, "пустой чанк оставил висячий кадр");
+
+      // 9. Отложенная прокрутка (размышления) тоже схлопывается в один кадр и тоже
+      //    уважает «человек читает выше».
+      win.scrollHeight = 2000;
+      win.scrollTop = 100;
+      feed.updatePinState();
+      feed.scrollBottomSoon();
+      feed.scrollBottomSoon();
+      assert.strictEqual(rafQ.length, 1, "прокрутка планирует больше одного кадра");
+      rafQ.splice(0).forEach((fn) => fn());
+      assert.strictEqual(win.scrollTop, 100, "отложенная прокрутка выдернула человека из чтения");
+      feed.jumpToBottom();
+      win.scrollHeight = 2100;
+      feed.scrollBottomSoon();
+      assert.strictEqual(rafQ.length, 1, "отложенная прокрутка не запланирована");
+      rafQ.splice(0).forEach((fn) => fn());
+      assert.strictEqual(win.scrollTop, 2100, "отложенная прокрутка не сработала");
+
+      // 10. Негативный контроль зависимостей: без DOM модуль падает понятной ошибкой.
+      const noDollar = buildChatFeed({ msgEls: msgEls, msgHtml: (c) => c });
+      assert.throws(() => noDollar.updatePinState(), /is not a function/, "без $ модуль не упал");
+      try {
+        noDollar.updatePinState();
+        assert.fail("без $ ошибка не называет забытую зависимость");
+      } catch (e) {
+        assert.ok(/\$/.test(String(e && e.message)), "ошибка не называет забытую зависимость: " + (e && e.message));
+      }
+      // Без рендера содержимого кадр обязан упасть, а не молча оставить пузырь пустым.
+      const noHtml = buildChatFeed({ $: $, msgEls: msgEls });
+      noHtml.queueBubbleRender(chat, seg);
+      assert.throws(
+        () => rafQ.splice(0).forEach((fn) => fn()),
+        /msgHtml is not a function/,
+        "забытый рендер содержимого не привёл к понятной ошибке"
+      );
+    } finally {
+      globalThis.requestAnimationFrame = origRaf;
+    }
+  });
+}
+
+// ── Стрим и печать: работа не чаще одного кадра ────────────────────────────
+async function testStreamThrottle() {
+  const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+  const cssSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "styles.css"), "utf8");
+
+  await test("стрим: обработчик chunk рисует через очередь кадра, а не на каждый чанк", () => {
+    assert.ok(
+      /case "chunk":[\s\S]{0,420}?ChatFeed\.queueBubbleRender\(chat, seg\)/.test(appSrc),
+      "обработчик chunk не использует очередь кадра"
+    );
+    assert.ok(
+      !/case "chunk":[\s\S]{0,420}?b\.innerHTML = msgHtml\(seg\.content\)/.test(appSrc),
+      "chunk всё ещё перерисовывает innerHTML на каждый чанк"
+    );
+    assert.ok(
+      /case "thinking":[\s\S]{0,420}?ChatFeed\.scrollBottomSoon\(\)/.test(appSrc),
+      "размышления всё ещё дёргают прокрутку на каждый токен"
+    );
+  });
+
+  await test("стрим: очередь копит текст и рисует последнее состояние за один кадр", () => {
+    const dom = {
+      messages: { scrollTop: 0, scrollHeight: 500 },
+      "btn-scroll-bottom": { classList: { add() {}, remove() {}, toggle() {} } },
+    };
+    const $ = (id) => dom[id];
+    const msgEls = new Map();
+    // Лента (прокрутка и очередь кадра) вынесена в src/renderer/chat-feed.js (этап 3.7):
+    // очереди нужен только рендер содержимого — отдаём его заглушкой.
+    const bubble = { innerHTML: "", classList: { add() {}, remove() {} } };
+    msgEls.set("a1", { querySelector: (sel) => (sel === ".bubble" ? bubble : null) });
+
+    const rafQ = [];
+    const origRaf = globalThis.requestAnimationFrame;
+    globalThis.requestAnimationFrame = (fn) => { rafQ.push(fn); return rafQ.length; };
+    try {
+      const api = buildChatFeed({ $: $, msgEls: msgEls, msgHtml: (c) => "<p>" + c + "</p>" });
 
       const seg = { id: "a1", content: "прив" };
       const chat = { messages: [seg] };
@@ -12476,6 +13343,182 @@ async function testCoreSplit() {
 }
 
 // ── 1.67 миссии: долгая работа, файлы рядом с проектом и панель ──────────────
+// ── Сторож миссий: петля «продолжай — нет, ты продолжай» (1.5.114) ──────────
+// Миссия, которую прогон «продолжал» сам, заводила круг: модель отвечает текстом,
+// приложение призывает «продолжай делом», модель повторяет тот же отчёт — и так
+// трижды, а потом миссия встаёт на ПАУЗУ, которую следующий прогон снова
+// подхватывает. Человек видел три-четыре одинаковых «Готово». Проверяем правила
+// сторожа и то, что main.js действительно их спрашивает, а не решает по-своему.
+async function testMissionGuard() {
+  const mg = require(path.join(ROOT, "src", "mission-guard.js"));
+  const ms = require(path.join(ROOT, "src", "mission-store.js"));
+  const mainSrc = backendSrc();
+
+  await test("сторож миссий: сам продолжается только ЖИВАЯ миссия своего чата", () => {
+    const live = { id: "m1", status: "active", chatId: "c1" };
+    assert.strictEqual(mg.adoptable(live, { chatId: "c1" }), true, "живая миссия своего чата не подхвачена");
+    assert.strictEqual(mg.adoptable(live, { chatId: "c2" }), false, "миссия чужого чата подхвачена");
+    assert.strictEqual(
+      mg.adoptable({ id: "m1", status: "active", chatId: "" }, { chatId: "c2" }),
+      true,
+      "старая миссия без чата перестала подхватываться"
+    );
+    for (const status of ["paused", "done", "failed", "stopped", ""]) {
+      assert.strictEqual(
+        mg.adoptable({ id: "m1", status: status, chatId: "c1" }, { chatId: "c1" }),
+        false,
+        "подхватилась миссия в состоянии «" + status + "»"
+      );
+    }
+    assert.strictEqual(mg.adoptable({ status: "active" }, {}), false, "миссия без id подхвачена");
+    // Свежая пауза лежит выше живой миссии — берём именно живую.
+    const list = [{ id: "p", status: "paused", chatId: "c1" }, live];
+    assert.strictEqual(mg.pickAdopted(list, { chatId: "c1" }), live, "выбрана пауза вместо живой миссии");
+    assert.strictEqual(mg.pickAdopted([{ id: "p", status: "paused", chatId: "c1" }], { chatId: "c1" }), null, "пауза подхватилась сама");
+    assert.strictEqual(mg.pickAdopted(null, {}), null, "пустой список сломал выбор");
+  });
+
+  await test("сторож миссий: повтор ответа и стояние на месте прекращают призывы", () => {
+    assert.deepStrictEqual(
+      mg.nudgeStep({ status: "active", max: 3, progress: 1 }),
+      { action: "nudge", nudge: 1, reason: "модель ответила текстом, не закрыв миссию" },
+      "первый текстовый ответ не получил призыва"
+    );
+    // Случай человека: работа сдана, модель повторяет тот же отчёт (пробелы не в счёт).
+    const repeat = mg.nudgeStep({
+      status: "active",
+      max: 3,
+      nudges: 1,
+      progress: 2,
+      lastProgress: 2,
+      text: "Готово —   отчёт по 10 клиентам",
+      lastText: "Готово — отчёт по 10 клиентам\n",
+    });
+    assert.strictEqual(repeat.action, "pause", "повтор того же отчёта снова получил призыв");
+    assert.ok(/повторила/.test(repeat.reason), "причина паузы не объясняет повтор: " + repeat.reason);
+    // Отчёт переписан другими словами, но работа не сдвинулась — тоже стоп.
+    const idle = mg.nudgeStep({
+      status: "active",
+      max: 3,
+      nudges: 1,
+      progress: 2,
+      lastProgress: 2,
+      text: "Работа завершена, всё на месте",
+      lastText: "Готово — отчёт по 10 клиентам",
+    });
+    assert.strictEqual(idle.action, "pause", "стояние на месте снова получило призыв");
+    // Работа сдвинулась — призываем дальше, пока не исчерпали потолок.
+    const moved = mg.nudgeStep({ status: "active", max: 3, nudges: 1, progress: 4, lastProgress: 2, text: "Сделал шаг", lastText: "начал" });
+    assert.strictEqual(moved.action, "nudge", "после сдвига работа не получила призыва");
+    assert.strictEqual(moved.nudge, 2, "номер призыва не вырос");
+    assert.strictEqual(
+      mg.nudgeStep({ status: "active", max: 3, nudges: 3, progress: 9, lastProgress: 8 }).action,
+      "pause",
+      "призывы не ограничены потолком"
+    );
+    for (const status of ["paused", "done", ""]) {
+      assert.strictEqual(mg.nudgeStep({ status: status, nudges: 0, progress: 0 }).action, "stop", "призыв к миссии в состоянии «" + status + "»");
+    }
+    // Петля целиком: сколько бы раз модель ни повторяла отчёт, призывов больше потолка
+    // не будет — второй ход уже уводит миссию на паузу.
+    const REPORT = "Готово — отчёт по 10 клиентам";
+    let nudges = 0;
+    let lastText = "";
+    let lastProgress = null;
+    const actions = [];
+    for (let i = 0; i < 8; i++) {
+      const st = mg.nudgeStep({ status: "active", max: 3, nudges: nudges, progress: 0, lastProgress: lastProgress, text: REPORT, lastText: lastText });
+      actions.push(st.action);
+      if (st.action !== "nudge") break;
+      nudges = st.nudge;
+      lastText = REPORT;
+      lastProgress = 0;
+    }
+    assert.deepStrictEqual(actions, ["nudge", "pause"], "повтор отчёта не остановил петлю: " + actions.join(", "));
+  });
+
+  await test("сторож миссий: призыв называет миссию и запрещает пересказ отчёта", () => {
+    const t = mg.nudgeText({ title: "Разбор входящих", id: "20260916-1431", progress: { done: 0, total: 0 }, nudge: 2, max: 3 });
+    assert.ok(t.indexOf("20260916-1431") >= 0, "в призыве нет id миссии — непонятно, какую работу закрывать");
+    assert.ok(/не пересказывай отчёт/i.test(t), "в призыве нет запрета пересказывать отчёт");
+    assert.ok(t.indexOf("missionFinish(report") >= 0, "в призыве не сказано, чем закрывать работу");
+    assert.ok(t.indexOf("призыв 2 из 3") >= 0, "в призыве не видно, сколько напоминаний осталось");
+    assert.ok(t.indexOf("готово 0 из 0") >= 0, "в призыве нет прогресса миссии (в том числе «0 из 0»)");
+    assert.strictEqual(
+      mg.normalizeReport("Готово — отчёт\nпо клиентам"),
+      mg.normalizeReport("  Готово — отчёт   по клиентам "),
+      "различия в пробелах считаются другим ответом"
+    );
+    assert.strictEqual(mg.sameReport("", ""), false, "пустые ответы считаются повтором одного и того же");
+    assert.strictEqual(mg.sameReport("одно", "другое"), false, "разные ответы считаются повтором");
+  });
+
+  await test("сторож миссий: пауза на диске больше не подхватывается сама", () => {
+    const wd = tmpdir("mission-guard-");
+    const c = ms.missionCreate(wd, { goal: "Разбор входящих", title: "Разбор входящих", chatId: "c1" });
+    assert.ok(c.ok, "missionCreate: " + (c.error || ""));
+    // Живую миссию своего чата прогон продолжает сам...
+    assert.ok(mg.pickAdopted(ms.missionList(wd, { limit: 20 }), { chatId: "c1" }), "живая миссия своего чата не подхвачена с диска");
+    assert.strictEqual(mg.pickAdopted(ms.missionList(wd, { limit: 20 }), { chatId: "другой" }), null, "миссия чужого чата подхвачена с диска");
+    // ...а поставленную на паузу — нет: её продолжает человек кнопкой «▶ Продолжить».
+    ms.missionFinish(wd, c.mission.id, { status: "paused", reason: "агент остановился, не закрыв миссию" });
+    assert.strictEqual(
+      mg.pickAdopted(ms.missionList(wd, { limit: 20 }), { chatId: "c1" }),
+      null,
+      "пауза подхватилась следующим прогоном — петля вернулась"
+    );
+    assert.ok(ms.missionActive(wd), "пауза пропала из панели «Миссия» — человек не сможет её продолжить");
+    // Закрытая миссия не подхватывается ни в каком виде.
+    ms.missionFinish(wd, c.mission.id, { status: "done", report: "Итог готов." });
+    assert.strictEqual(mg.pickAdopted(ms.missionList(wd, { limit: 20 }), { chatId: "c1" }), null, "закрытая миссия подхватилась");
+  });
+
+  await test("сторож миссий: оболочка спрашивает сторожа, а не решает сама", () => {
+    assert.ok(/require\("\.\/mission-guard\.js"\)/.test(mainSrc), "main.js не подключил сторожа миссий");
+    const readStart = mainSrc.indexOf("const missionRead = () => {");
+    assert.ok(readStart > 0, "не нашёл выбор миссии прогона в main.js");
+    const readBody = mainSrc.slice(readStart, mainSrc.indexOf("\n  };", readStart));
+    assert.ok(readBody.indexOf("missionGuard.pickAdopted") > 0, "выбор миссии идёт мимо сторожа");
+    assert.ok(readBody.indexOf("missionStore.missionActive") === -1, "прогон по-прежнему подхватывает любую незакрытую миссию (включая паузы)");
+    assert.ok(readBody.indexOf("missionClaim") > 0, "просьба человека «Продолжить» не учитывается при выборе миссии");
+    assert.ok(mainSrc.indexOf("missionGuard.nudgeStep(") > 0, "решение о призыве принимается мимо сторожа");
+    assert.ok(mainSrc.indexOf("missionGuard.nudgeText(") > 0, "текст призыва собирается мимо сторожа");
+    assert.ok(
+      mainSrc.indexOf('(mission.status === "active" || mission.status === "paused")') === -1,
+      "призывы по-прежнему бьют по миссии на паузе"
+    );
+    assert.ok(/activeRunMissionId: \(\) => runMissionId/.test(mainSrc), "миссия прогона не отдана агентским инструментам");
+    const toolsSrc = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
+    assert.ok(toolsSrc.indexOf("const missionOfRun = (dir)") > 0, "нет помощника «миссия прогона» в реестре инструментов");
+    for (const call of ["missionOfRun(msDir2)", "missionOfRun(msDir3)", "missionOfRun(msDir4)"]) {
+      assert.ok(toolsSrc.indexOf(call) > 0, "инструмент без id работает не со своей миссией: " + call);
+    }
+    assert.ok(/Отчёт по ОДНОЙ И ТОЙ ЖЕ работе/.test(coreData()), "в промпте нет правила «отчёт присылается один раз»");
+    // Человеческий путь «▶ Продолжить»: миссия возвращается в работу, запоминается
+    // как просьба человека (пауза сама не подхватывается) и продолжается в СВОЁМ чате.
+    const resumeAt = mainSrc.indexOf('ipcMain.handle("mission:resume"');
+    assert.ok(resumeAt > 0, "main.js не умеет продолжать миссию по кнопке");
+    const resumeBlock = mainSrc.slice(resumeAt, mainSrc.indexOf("mission:open", resumeAt));
+    assert.ok(resumeBlock.indexOf('rec.status = "active"') > 0, "кнопка «Продолжить» не возвращает миссию в работу");
+    assert.ok(/missionClaim = rec\.id/.test(resumeBlock), "просьба человека не запоминается для следующего прогона");
+    const missionUi = fs.readFileSync(path.join(ROOT, "src", "renderer", "tasks-mission.js"), "utf8");
+    assert.ok(/c\.id === r\.chatId/.test(missionUi), "продолжение уходит не в тот чат, где живёт миссия");
+    assert.ok(/getChatsData: \(\) => chatsData/.test(uiFile("app.js")), "панели миссии не отданы живые данные чатов");
+    // Человек может закрыть миссию руками — и закрытая больше не подхватывается.
+    assert.ok(uiFile("index.html").indexOf('id="btn-mission-finish"') > 0, "в панели миссии нет кнопки закрытия");
+    assert.ok(/missionFinish: \(id\) => ipcRenderer\.invoke\("mission:finish"/.test(fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8")), "закрытие миссии не отдано окну");
+    const finishAt = mainSrc.indexOf('ipcMain.handle("mission:finish"');
+    assert.ok(finishAt > 0, "в главном процессе нет закрытия миссии");
+    const finishBlock = mainSrc.slice(finishAt, mainSrc.indexOf("ipcMain.handle(\"mission:open\"", finishAt));
+    assert.ok(/status: "stopped"/.test(finishBlock) && /закрыто человеком/.test(finishBlock), "человеческое закрытие не отличается от провала работы");
+    const closedWd = tmpdir("mission-human-close-");
+    const closedRec = ms.missionCreate(closedWd, { goal: "Закрыть руками", chatId: "c1" });
+    ms.missionFinish(closedWd, closedRec.mission.id, { status: "stopped", reason: "закрыто человеком" });
+    assert.strictEqual(ms.missionActive(closedWd), null, "закрытая человеком миссия снова считается незакрытой");
+    assert.strictEqual(mg.pickAdopted(ms.missionList(closedWd, { limit: 20 }), { chatId: "c1" }), null, "закрытая человеком миссия подхватилась прогоном");
+  });
+}
+
 async function testMissions() {
   const ms = require(path.join(ROOT, "src", "mission-store.js"));
   // Фиксированное «сейчас»: 15 сентября 2026, 10:30 — тесты не зависят от дня запуска.
@@ -12654,7 +13697,7 @@ async function testMissions() {
     assert.ok(/мисси/.test(core), "в промпте нет правил про миссии");
     for (const id of [
       "sp-mission", "ms-steps", "ms-journal", "ms-list", "ms-card", "ms-meta",
-      "btn-mission-pause", "btn-mission-resume", "btn-mission-stop", "btn-mission-folder", "btn-mission-refresh",
+      "btn-mission-pause", "btn-mission-resume", "btn-mission-stop", "btn-mission-finish", "btn-mission-folder", "btn-mission-refresh",
       "rail-mission", "sp-mission-dot", "s-long-work", "s-long-hours", "s-long-rounds", "s-long-continue",
       "s-agent-files", "btn-agent-files-open", "btn-agent-files-clear", "agent-files-status",
     ]) {
@@ -12695,6 +13738,7 @@ async function testMissions() {
   await testVault();
   await testVaultUi();
   await testSecretsPanel();
+  await testMobilePanel();
   await testMail();
   await testYandexCloud();
   await testYcDiagnosis();
@@ -12721,6 +13765,7 @@ async function testMissions() {
   await testLongChatRecovery();
   await testTasks();
   await testMissions();
+  await testMissionGuard();
   await testYcConsole();
   await testDeploy();
   await testToolPolicy();
@@ -12737,6 +13782,10 @@ async function testMissions() {
   await testDevRun();
   await testChatActions();
   await testWebChat();
+  await testChatThinking();
+  await testChatSegments();
+  await testChatRender();
+  await testChatFeed();
   await testTasksMission();
   await testProviderConfig();
   await testProviderTransport();

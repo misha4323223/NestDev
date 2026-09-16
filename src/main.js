@@ -81,6 +81,7 @@ const appUi = require("./app-ui-tools.js"); // инструменты управ
 const secrets = require("./secrets.js"); // секреты: ключи, токены, PIN, agentEnv (safeStorage)
 const agentStore = require("./agent-store.js"); // память проекта (заметки) и точки отката (чекпоинты)
 const missionStore = require("./mission-store.js"); // миссии: цель, план, журнал и отчёт файлами в .agent/
+const missionGuard = require("./mission-guard.js"); // сторож миссий: кого продолжать и когда перестать приставать
 const unifiedPatch = require("./unified-patch.js"); // применение unified diff (applyPatch)
 const codeIndex = require("./code-index.js"); // семантический индекс кода (BM25 + стемминг)
 const yandexCloud = require("./yandex-cloud.js"); // Yandex Cloud REST API: авторизация, дашборд, создание ресурсов
@@ -116,6 +117,8 @@ let activeRunOrigin = "desktop";
 // некуда показать. Значения приходят из интерфейса вместе с сообщением.
 let activeRunRole = "";
 let activeRunChatId = "";
+let runMissionId = ""; // миссия текущего прогона: по ней инструменты находят «свою» миссию
+let missionClaim = ""; // id миссии, которую человек вернул в работу кнопкой «▶ Продолжить»
 const ota = require("./ota.js"); // локальный self-update (OTA)
 const selfDev = require("./self-dev.js"); // защита критичной инфраструктуры самообновления
 
@@ -2154,6 +2157,8 @@ async function runAi(settings, messages, win, opts) {
   let missionTokens = 0;
   let missionCompactions = 0;
   let missionNudges = 0; // «миссия не закрыта, а модель замолчала»
+  let missionNudgeProgress = null; // сколько шагов было готово в момент прошлого призыва
+  let missionNudgeText = ""; // ответ модели в момент прошлого призыва (ловит повторы)
   let missionJournalLeft = MISSION_JOURNAL_PER_BATCH;
   let missionStopReason = "";
   let missionErrorContinues = 0; // авто-продолжений после сбоя (лимит из настроек)
@@ -2172,16 +2177,35 @@ async function runAi(settings, messages, win, opts) {
     return "";
   })();
 
+  // Миссия прогона живёт и на диске, и здесь: агентские инструменты без id должны
+  // отмечать шаги и закрывать ИМЕННО её, а не самую свежую незакрытую миссию.
+  const setRunMission = (rec) => {
+    mission = rec || null;
+    runMissionId = (mission && mission.id) || "";
+    return mission;
+  };
+  // Какую миссию продолжает этот прогон. Подхватываем только ЖИВУЮ миссию этого чата:
+  // пауза означает «жду человека» (её продолжает кнопка «▶ Продолжить»), а миссия
+  // другого чата к этой работе не относится. Раньше сюда попадали и паузы, и чужие
+  // миссии — прогон «продолжал» давно сданную работу, подталкивал модель и получал
+  // один и тот же отчёт по кругу (три «Готово» подряд — отсюда).
   const missionRead = () => {
     if (!longWork) return null;
     try {
-      return missionStore.missionActive(missionDir);
+      // Просьба человека (кнопка «Продолжить») сильнее любых правил: он вернул
+      // миссию в работу своими руками.
+      if (missionClaim) {
+        const claimed = missionStore.missionLoad(missionDir, missionClaim);
+        missionClaim = "";
+        if (claimed && claimed.status === "active") return claimed;
+      }
+      return missionGuard.pickAdopted(missionStore.missionList(missionDir, { limit: 20 }), { chatId: activeRunChatId });
     } catch {
       return null;
     }
   };
   const missionRefresh = () => {
-    if (longWork) mission = missionRead();
+    if (longWork) setRunMission(missionRead());
     return mission;
   };
   // Состояние в интерфейс и на телефон: панель «Миссия» рисует по этому событию.
@@ -2221,7 +2245,7 @@ async function runAi(settings, messages, win, opts) {
         limits: { minutes: missionLimits.minutes, rounds: missionLimits.rounds },
       });
       if (!r.ok) return null;
-      mission = r.mission;
+      setRunMission(r.mission);
       missionAutoCreated = true;
       missionStore.missionNote(missionDir, mission.id, "note", "📄 Миссию завело приложение (" + why + "): цель взята из последней просьбы.");
       emit({
@@ -2543,7 +2567,9 @@ async function runAi(settings, messages, win, opts) {
     if (!longWork) return { continue: false };
     const rec = missionRefresh();
     if (!rec) return { continue: false };
-    if (rec.status !== "active" && rec.status !== "paused") return { continue: false, closed: true };
+    // Прогон ведёт только живую миссию (паузы сторож не подхватывает): «не active»
+    // здесь означает, что миссия закрыта или её продолжает человек.
+    if (rec.status !== "active") return { continue: false, closed: true };
     const title = "«" + rec.title + "»";
     const elapsedMin = (Date.now() - missionStartedAt) / 60000;
     const hardStop = (reason, message) => {
@@ -3042,49 +3068,61 @@ async function runAi(settings, messages, win, opts) {
       continue;
     }
 
-    // Миссия не закрыта, а модель ответила текстом — это обрыв, а не финал: длинная
-    // работа не должна заканчиваться словами «осталось сделать то и то».
-    if (
-      toolCalls.length === 0 &&
-      !planMode &&
-      longWork &&
-      mission &&
-      !abort.signal.aborted &&
-      (mission.status === "active" || mission.status === "paused") &&
-      missionNudges < 3
-    ) {
-      missionNudges++;
+    // Миссия не закрыта, а модель ответила текстом. Призывать ли дальше — решает
+    // сторож (src/mission-guard.js): один призыв на первый текстовый ответ, дальше —
+    // только если работа сдвинулась. Повтор того же ответа или стояние на месте
+    // прекращает призывы и уводит миссию в паузу: раньше приложение подталкивало
+    // модель трижды подряд, и человек получал три одинаковых отчёта по кругу.
+    if (toolCalls.length === 0 && !planMode && longWork && mission && !abort.signal.aborted) {
       const prN = missionStore.missionProgress(mission);
-      emit({
-        type: "notice",
-        text: "📋 Миссия «" + mission.title + "» не закрыта (" + prN.done + "/" + prN.total + ") — прошу продолжить делом (попытка " + missionNudges + "/3).",
+      const nudge = missionGuard.nudgeStep({
+        status: mission.status,
+        nudges: missionNudges,
+        max: missionGuard.NUDGE_MAX,
+        progress: prN.done + prN.failed,
+        lastProgress: missionNudgeProgress,
+        text: finalText,
+        lastText: missionNudgeText,
       });
-      canonical.push({
-        role: "user",
-        content:
-          "Ты ответил текстом, но миссия «" + mission.title + "» не закрыта: готово " + prN.done + " из " + prN.total +
-          ". Не описывай, что осталось, а ВЫПОЛНЯЙ: вызови следующий инструмент. " +
-          "Если пункт сделать нельзя — отметь его fail через missionStep(fail, note) и переходи к следующему. " +
-          "Когда работа действительно закончена — missionFinish(report).",
-      });
-      continue;
-    }
-    // Модель несколько раз закончила ответ, не закрыв миссию: ставим её на паузу,
-    // чтобы она не висела «активной» и человек видел, что работа ждёт его.
-    if (toolCalls.length === 0 && !planMode && longWork && mission && mission.status === "active" && !abort.signal.aborted) {
-      try {
-        missionStore.missionFinish(missionDir, mission.id, {
-          status: "paused",
-          reason: "агент остановился, не закрыв миссию",
-          next: mission.next,
+      if (nudge.action === "nudge") {
+        missionNudges++;
+        missionNudgeProgress = prN.done + prN.failed;
+        missionNudgeText = finalText;
+        emit({
+          type: "notice",
+          text: "📋 Миссия «" + mission.title + "» (" + mission.id + ") не закрыта (" + prN.done + "/" + prN.total + ") — прошу продолжить делом (попытка " + missionNudges + "/" + missionGuard.NUDGE_MAX + ").",
         });
-        missionStore.missionNote(missionDir, mission.id, "note", "⏸ Агент закончил ответ, не закрыв миссию — поставил её на паузу.");
-      } catch {}
-      emit({
-        type: "notice",
-        text: "⏸ Миссия «" + mission.title + "» на паузе: агент закончил ответ, но не закрыл её. Продолжить — панель «Миссия» → «▶ Продолжить».",
-      });
-      missionEmit("paused");
+        canonical.push({
+          role: "user",
+          content: missionGuard.nudgeText({
+            title: mission.title,
+            id: mission.id,
+            progress: prN,
+            nudge: missionNudges,
+            max: missionGuard.NUDGE_MAX,
+          }),
+        });
+        continue;
+      }
+      if (nudge.action === "pause") {
+        // Призывы прекращены: миссия встаёт на паузу и ждёт человека. Пауза сама
+        // не подхватывается следующим прогоном — на этом петля и кончается.
+        try {
+          const r = missionStore.missionFinish(missionDir, mission.id, {
+            status: "paused",
+            reason: nudge.reason,
+            next: mission.next,
+          });
+          if (r && r.ok) setRunMission(r.mission);
+          missionStore.missionNote(missionDir, mission.id, "note", "⏸ Призывы к продолжению остановлены: " + nudge.reason + ".");
+        } catch {}
+        emit({
+          type: "notice",
+          text: "⏸ Миссия «" + mission.title + "» (" + mission.id + ") на паузе: " + nudge.reason + ". Продолжить — панель «Миссия» → «▶ Продолжить».",
+        });
+        missionEmit("paused");
+        missionRefresh(); // пауза не подхватывается сама: дальше работа идёт как обычная
+      }
     }
 
     // Пустой финальный ответ — не молчим. Один раз просим итоговый отчёт.
@@ -3285,7 +3323,7 @@ async function runAi(settings, messages, win, opts) {
     const fatal = (e && e.name === "AbortError") || (e && e.fatal) || global.__agentStopRequested || (e && e.message && /Не выбрана модель/.test(e.message));
     // Миссия и сбой: обычные ошибки (сеть, 5xx, обрыв) не повод бросать долгую работу.
     // Ждём и продолжаем, пока миссия жива и не исчерпан запас авто-продолжений.
-    const mAlive = longWork && !fatal && !!missionRefresh() && (mission.status === "active" || mission.status === "paused");
+    const mAlive = longWork && !fatal && !!missionRefresh() && mission.status === "active";
     const mContinues = mAlive && missionErrorContinues < missionLimits.autoContinues;
     if (fatal || (attemptNum > AUTO_RETRY_LIMIT && !mContinues)) throw e;
     if (mContinues) {
@@ -3703,11 +3741,47 @@ ipcMain.handle("mission:resume", () => {
     rec = missionStore.missionActive(dir);
   } catch {}
   if (!rec) return { ok: false, error: "Незакрытых миссий нет." };
+  // Человек нажал «▶ Продолжить» — это единственный путь для миссии с паузы:
+  // сама пауза не подхватывается (иначе прогон бесконечно «продолжал» бы сданную
+  // работу). Возвращаем миссию в работу и запоминаем просьбу: следующий прогон
+  // возьмёт именно её — пауза без этой просьбы не подхватывается.
+  try {
+    rec.status = "active";
+    rec.finishedAt = 0;
+    rec.reason = "";
+    missionStore.missionSave(dir, rec);
+    missionStore.missionNote(dir, rec.id, "note", "▶ Человек вернул миссию в работу (кнопка «Продолжить»).");
+  } catch {}
+  missionClaim = rec.id;
   return {
     ok: true,
     id: rec.id,
+    chatId: rec.chatId || "",
     text: missionStore.missionResumeText(rec, missionStore.missionJournalText(dir, rec.id, { limit: 12 })),
   };
+});
+// Закрытие миссии человеком. Раньше незакрытую миссию можно было только
+// продолжить или увести в паузу — работы без конца висели в панели, и агент
+// снова и снова «продолжал» их. Теперь человек закрывает её одним нажатием.
+ipcMain.handle("mission:finish", (_e, id) => {
+  const s = loadSettings();
+  const dir = agentWorkDir(s);
+  let rec = null;
+  try {
+    rec = String(id || "").trim() ? missionStore.missionLoad(dir, String(id).trim()) : missionStore.missionActive(dir);
+  } catch {}
+  if (!rec) return { ok: false, error: "Незакрытых миссий нет." };
+  if (rec.status === "done" || rec.status === "failed" || rec.status === "stopped") {
+    return { ok: true, id: rec.id, status: rec.status, already: true };
+  }
+  let r = null;
+  try {
+    r = missionStore.missionFinish(dir, rec.id, { status: "stopped", reason: "закрыто человеком", next: rec.next });
+    missionStore.missionNote(dir, rec.id, "note", "🏁 Миссию закрыл человек — работа считается законченной.");
+  } catch {}
+  if (!r || !r.ok) return { ok: false, error: (r && r.error) || "Не удалось закрыть миссию." };
+  if (missionClaim === rec.id) missionClaim = "";
+  return { ok: true, id: rec.id, status: r.mission.status };
 });
 ipcMain.handle("mission:open", (_e, id) => {
   const dir = agentWorkDir(loadSettings());
@@ -4041,6 +4115,7 @@ ipcMain.handle("ai:send", async (e, messages, opts) => {
   activeRunOrigin = e && e.sender && e.sender.id ? "desktop" : "mobile";
   activeRunRole = String((opts && opts.role) || "") || activeRunRole;
   activeRunChatId = String((opts && opts.chatId) || "");
+  runMissionId = ""; // прогон начинается с чистого листа: миссию выберет missionRead
   global.__agentStopRequested = false;
   global.__agentRunning = true;
   try {
@@ -5278,6 +5353,8 @@ const agentToolHandlers = createAgentTools({
     // чтобы панель «Миссия» знала, к какой работе относится журнал.
     activeRunRole: () => activeRunRole,
     activeRunChatId: () => activeRunChatId,
+    // Миссия текущего прогона: инструменты без id отмечают и закрывают именно её.
+    activeRunMissionId: () => runMissionId,
     mainWindow: () => mainWindow,
     // Откат правок и сводка плана: инструменты их не только читают, но и меняют —
     // поэтому запись идёт через сеттер, а не копией значения.

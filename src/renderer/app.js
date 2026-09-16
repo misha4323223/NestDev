@@ -547,7 +547,7 @@
     if (c && c.auto) return "Автозадачи"; // чат автозадач всегда зовётся одинаково
     const firstUser = c.messages.find((m) => m.role === "user");
     if (firstUser) {
-      const t = msgText(firstUser.content) || "📷 Изображение";
+      const t = ChatRender.msgText(firstUser.content) || "📷 Изображение";
       return t.slice(0, 42) + (t.length > 42 ? "…" : "");
     }
     // Чат, привязанный к проекту, без сообщений — показываем имя проекта.
@@ -779,7 +779,7 @@
   // поэтому панель и оставалась пустой, хотя модель «составила план».
   function runTextOf(chat, aMsg) {
     const parts = [];
-    for (const s of runSegments(chat, aMsg)) {
+    for (const s of ChatSegments.runSegments(chat, aMsg)) {
       if (!s) continue;
       if (s.thinking) parts.push(String(s.thinking));
       if (s.content) parts.push(String(s.content));
@@ -1054,176 +1054,22 @@
     welcome.classList.add("hidden");
     $("chat-title").textContent = chatTitle(chat);
     for (const m of chat.messages) wrap.appendChild(buildMessageEl(m));
-    pinnedToBottom = true; // при переключении чата всегда прыгаем вниз
-    scrollBottom();
+    ChatFeed.jumpToBottom(); // при переключении чата всегда прыгаем вниз
   }
 
   function buildMessageEl(m) {
     let el;
     if (m.role === "tool") el = buildToolEl(m);
-    else el = buildBubbleEl(m);
+    else el = ChatRender.buildBubbleEl(m);
     msgEls.set(m.id, el);
     return el;
   }
 
-  // content сообщения может быть строкой или массивом частей
-  // [{type:"text",text},{type:"image_url",image_url:{url}}] — вложения-скриншоты.
-  function msgText(content) {
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-      return content.filter((p) => p && p.type === "text").map((p) => p.text || "").join("\n");
-    }
-    return "";
-  }
-  function msgHtml(content) {
-    if (typeof content === "string") return MdRender.render(content);
-    if (Array.isArray(content)) {
-      let h = "";
-      for (const p of content) {
-        if (!p) continue;
-        if (p.type === "image_url" && p.image_url && p.image_url.url) {
-          h += '<div class="md-attach"><img src="' + MdRender.esc(p.image_url.url) + '" alt="изображение" /></div>';
-        }
-      }
-      const txt = msgText(content);
-      if (txt) h += MdRender.render(txt);
-      return h;
-    }
-    return "";
-  }
+  // ─── Отрисовка сообщения (текст, вложения, кнопки) — код в src/renderer/chat-render.js ───
 
-  // ─── Размышления модели (как в Replit) — блок над ответом, свёртывается по клику ───
-  // При стриминге раскрыт и обновляется вживую; по завершении автоматически
-  // сворачивается в одну строку (если пользователь сам не открыл его кликом).
-  // Автопрокрутка размышлений: текст растёт — блок сам едет вниз, читать
-  // конец вручную не нужно. Если пользователь отлистал вверх (читает ранее
-  // написанное) — не выдёргиваем его и возвращаемся к автопрокрутке, когда он
-  // снова окажется у конца.
-  function thinkAutoScroll(body, force) {
-    if (!body) return;
-    if (!force && body.dataset && body.dataset.pinned === "0") return;
-    if (body.dataset) body.dataset.pinned = "1";
-    body.scrollTop = body.scrollHeight;
-  }
-
-  function ensureThinkBox(el, text) {
-    let box = el.querySelector(".think");
-    if (!box) {
-      box = document.createElement("div");
-      box.className = "think";
-      const head = document.createElement("div");
-      head.className = "think-head";
-      const ic = document.createElement("span");
-      ic.className = "think-ic";
-      ic.textContent = "💭";
-      const tt = document.createElement("span");
-      tt.className = "think-t";
-      tt.textContent = "Размышление";
-      const chev = document.createElement("span");
-      chev.className = "think-chev";
-      chev.textContent = "▾";
-      head.appendChild(ic);
-      head.appendChild(tt);
-      head.appendChild(chev);
-      const body = document.createElement("div");
-      body.className = "think-body";
-      body.textContent = text || "";
-      // Следим, у конца ли пользователь: ушёл вверх — автопрокрутку не навязываем.
-      body.addEventListener("scroll", () => {
-        const nearEnd = body.scrollHeight - body.scrollTop - body.clientHeight < 40;
-        body.dataset.pinned = nearEnd ? "1" : "0";
-      });
-      head.onclick = (e) => {
-        e.stopPropagation();
-        box.classList.add("user"); // управление вручную — автосворачивание больше не трогает блок
-        const collapsed = box.classList.toggle("collapsed");
-        chev.textContent = collapsed ? "▸" : "▾";
-        if (!collapsed) thinkAutoScroll(body, true); // развернули — сразу показываем конец
-      };
-      thinkAutoScroll(body, true);
-      box.appendChild(head);
-      box.appendChild(body);
-      const bubble = el.querySelector(".bubble");
-      if (bubble) el.insertBefore(box, bubble);
-      else el.appendChild(box);
-    } else {
-      const body = box.querySelector(".think-body");
-      if (body && body.textContent !== (text || "")) {
-        body.textContent = text || "";
-        thinkAutoScroll(body); // текст вырос — едем вниз вместе с ним
-      }
-    }
-    return box;
-  }
-
-  function buildBubbleEl(m) {
-    const wrap = document.createElement("div");
-    wrap.className = "msg " + (m.error ? "error" : m.role);
-    const bubble = document.createElement("div");
-    bubble.className = "bubble" + (m.pending ? " pending" : "");
-    if (m.error) {
-      bubble.textContent = m.error;
-    } else {
-      bubble.classList.add("md");
-      bubble.innerHTML = msgHtml(m.content);
-    }
-    wrap.appendChild(bubble);
-    if (m.createdAt) {
-      const meta = document.createElement("div");
-      meta.className = "meta";
-      meta.textContent = fmtClock(m.createdAt);
-      wrap.appendChild(meta);
-    }
-    // Прерванный ответ (приложение закрыли посреди хода): кнопка «Дописать ответ»
-    if (m.role === "system" && m.interrupted) {
-      const row = document.createElement("div");
-      row.className = "msg-actions";
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "ma-btn";
-      b.textContent = "↻ Дописать ответ";
-      b.title = "Продолжить прерванный ответ с того места, где он остановился";
-      b.onclick = (e) => {
-        e.stopPropagation();
-        if (row.parentNode) row.parentNode.removeChild(row);
-        continueInterruptedAnswer(m.chatId || chatsData.activeId, m);
-      };
-      row.appendChild(b);
-      wrap.appendChild(row);
-    }
-    // Сохранённые размышления (после перезагрузки/переключения чата) — свёрнуты
-    if (m.role === "assistant" && m.thinking) {
-      const box = ensureThinkBox(wrap, m.thinking);
-      if (!m.pending) {
-        box.classList.add("collapsed");
-        const ch = box.querySelector(".think-chev");
-        if (ch) ch.textContent = "▸";
-      }
-    }
-    // Кнопки действий под сообщением: копировать, перегенерировать, редактировать
-    if (!m.pending && (m.role === "user" || (m.role === "assistant" && !m.error))) {
-      const actions = document.createElement("div");
-      actions.className = "msg-actions";
-      const addBtn = (label, title, fn) => {
-        const b = document.createElement("button");
-        b.type = "button";
-        b.className = "ma-btn";
-        b.textContent = label;
-        b.title = title;
-        b.onclick = fn;
-        actions.appendChild(b);
-      };
-      if (m.role === "assistant") {
-        addBtn("⧉", "Скопировать ответ", () => ChatActions.copyText(msgText(m.content)));
-        if (ChatActions.isLastAssistant(m)) addBtn("↻", "Сгенерировать ответ заново", () => ChatActions.regenerate(m));
-      } else if (m.role === "user") {
-        addBtn("⧉", "Скопировать сообщение", () => ChatActions.copyText(msgText(m.content)));
-        addBtn("✏️", "Редактировать — вставить в поле ввода и переотправить", () => ChatActions.editUserMessage(m));
-      }
-      wrap.appendChild(actions);
-    }
-    return wrap;
-  }
+  // ─── Размышления модели: блок над ответом — код в src/renderer/chat-thinking.js ───
+  // Своих зависимостей у модуля нет: он работает с элементом сообщения, который ему дали.
+  const ChatThinking = window.ChatThinking();
 
   const TOOL_ICON = {
     createFolder: "📁",
@@ -1624,68 +1470,16 @@
     if (old.classList && old.classList.contains("in-work")) rebuilt.classList.add("in-work");
     old.parentNode.insertBefore(rebuilt, old);
     old.parentNode.removeChild(old);
-    scrollBottom();
+    ChatFeed.scrollBottom();
   }
 
-  // Умная прокрутка: пока пользователь читает выше — не дёргаем вниз,
-  // показываем плавающую кнопку «↓»; по клику/новому сообщению — обратно вниз.
-  let pinnedToBottom = true;
-  function scrollBottom() {
-    const w = $("messages");
-    if (!pinnedToBottom) return;
-    w.scrollTop = w.scrollHeight;
-  }
-  function updatePinState() {
-    const w = $("messages");
-    const nearBottom = w.scrollHeight - w.scrollTop - w.clientHeight < 90;
-    pinnedToBottom = nearBottom;
-    $("btn-scroll-bottom").classList.toggle("hidden", nearBottom);
-  }
-  function jumpToBottom() {
-    pinnedToBottom = true;
-    $("btn-scroll-bottom").classList.add("hidden");
-    const w = $("messages");
-    w.scrollTop = w.scrollHeight;
-  }
-
-  // ─── Экономия кадров при стриме ───
-  // Раньше КАЖДЫЙ чанк модели заменял innerHTML всего пузыря: на длинном ответе
-  // браузер десятки раз в секунду пересобирал сотни узлов и заново растеризовал
-  // «стеклянную» подложку — интерфейс начинал «жевать» при печати. Теперь текст
-  // копится в данных, а DOM обновляется не чаще одного раза за кадр (финальный
-  // рендер всё равно делает finishStream).
-  let streamRenderRaf = 0;
-  let streamDirty = [];
-  function queueBubbleRender(chat, seg) {
-    if (!seg) return;
-    if (streamDirty.indexOf(seg.id) < 0) streamDirty.push(seg.id);
-    if (streamRenderRaf) return;
-    streamRenderRaf = requestAnimationFrame(() => {
-      streamRenderRaf = 0;
-      const ids = streamDirty;
-      streamDirty = [];
-      for (const id of ids) {
-        const m = chat && chat.messages.find((x) => x.id === id);
-        const el = msgEls.get(id);
-        const b = el && el.querySelector ? el.querySelector(".bubble") : null;
-        if (!m || !b) continue;
-        b.classList.add("md");
-        b.innerHTML = msgHtml(m.content);
-      }
-      scrollBottom();
-    });
-  }
-
-  // Автопрокрутка — тоже не чаще кадра: scrollTop = scrollHeight заставляет браузер
-  // синхронно пересчитать раскладку, и на каждый чанк это лишняя работа.
-  let streamScrollRaf = 0;
-  function scrollBottomSoon() {
-    if (streamScrollRaf) return;
-    streamScrollRaf = requestAnimationFrame(() => {
-      streamScrollRaf = 0;
-      scrollBottom();
-    });
-  }
+  // ─── Лента: прокрутка и очередь кадра при стриме — код в src/renderer/chat-feed.js ───
+  // msgHtml — стрелкой: отрисовка сообщения (chat-render.js) собирается НИЖЕ.
+  const ChatFeed = window.ChatFeed({
+    $: $,
+    msgEls: msgEls,
+    msgHtml: (c) => ChatRender.msgHtml(c),
+  });
 
   // ─────────────── Отправка ───────────────
   // Продолжить ответ, прерванный закрытием приложения. Идём тем же путём, что и
@@ -1720,7 +1514,7 @@
     $("welcome").classList.add("hidden");
     $("messages").appendChild(buildMessageEl(chat.messages[chat.messages.length - 2]));
     $("messages").appendChild(buildMessageEl(assistantMsg));
-    scrollBottom();
+    ChatFeed.scrollBottom();
     persistChats();
     setStreaming(true);
 
@@ -1900,50 +1694,17 @@
     }
   }
 
-  // ─── Сегменты ответа: хронологический лог «текст → действия → текст → …» ───
-  // Текст, пришедший сразу после действия (tool-сообщения), открывается НОВЫМ
-  // сообщением ниже блока действий, а не дописывается в пузырь сверху.
-  function ensureSegmentForText(chat, aMsg) {
-    if (!chat) return aMsg || null;
-    const msgs = chat.messages;
-    const last = msgs[msgs.length - 1];
-    const segIds = session && Array.isArray(session.segmentIds) ? session.segmentIds : null;
-    if (last && last.role === "tool") {
-      // Текст после действия — новый сегмент ответа в конец (ниже блока действий).
-      const seg = { id: uid(), role: "assistant", content: "", pending: true, createdAt: Date.now() };
-      msgs.push(seg);
-      if (segIds) segIds.push(seg.id);
-      planRoundStarted(chat, seg.id); // новый раунд работы закрывает шаг текстового плана
-      $("messages").appendChild(buildMessageEl(seg));
-      scrollBottom();
-      return seg;
-    }
-    // Дописываем в последний сегмент текущего запуска, если он ещё последний.
-    if (last && last.role === "assistant" && (!segIds || segIds.includes(last.id))) return last;
-    return aMsg || null;
-  }
-
-  // Убрать пустой сегмент (промежуточный текст так и не появился) из данных и из DOM.
-  function removeSegment(chat, s) {
-    const idx = chat.messages.indexOf(s);
-    if (idx >= 0) chat.messages.splice(idx, 1);
-    const el = msgEls.get(s.id);
-    if (el && el.parentNode) el.parentNode.removeChild(el);
-    msgEls.delete(s.id);
-    if (session && Array.isArray(session.segmentIds)) {
-      const i = session.segmentIds.indexOf(s.id);
-      if (i >= 0) session.segmentIds.splice(i, 1);
-    }
-    persistChatsSoon();
-  }
-
-  // Все assistant-сегменты текущего запуска (по порядку).
-  function runSegments(chat, aMsg) {
-    const ids = session && Array.isArray(session.segmentIds) ? session.segmentIds : null;
-    if (!ids || !chat) return [aMsg].filter(Boolean);
-    const segs = ids.map((id) => chat.messages.find((m) => m.id === id)).filter(Boolean);
-    return segs.length ? segs : [aMsg].filter(Boolean);
-  }
+  // ─── Сегменты ответа: лог «текст → действия → текст» — код в src/renderer/chat-segments.js ───
+  const ChatSegments = window.ChatSegments({
+    $: $,
+    uid: uid,
+    getSession: () => session,
+    msgEls: msgEls,
+    buildMessageEl: buildMessageEl,
+    scrollBottom: ChatFeed.scrollBottom,
+    persistChatsSoon: persistChatsSoon,
+    planRoundStarted: planRoundStarted,
+  });
 
   function onAiEvent(ev) {
     // Служебная заметка прогона (например, ожидание лимита провайдера). Показываем тостом:
@@ -2004,25 +1765,25 @@
     const aMsg = chat ? chat.messages.find((m) => m.id === session.assistantId) : null;
     switch (ev.type) {
       case "chunk": {
-        const seg = ensureSegmentForText(chat, aMsg);
+        const seg = ChatSegments.ensureSegmentForText(chat, aMsg);
         if (seg) {
           seg.content += ev.text;
           persistChatsSoon();
-          queueBubbleRender(chat, seg);
+          ChatFeed.queueBubbleRender(chat, seg);
         }
         // План, написанный в ответе, показываем сразу, как только он сложился.
         tryPlanFromRunText(chat, aMsg);
         break;
       }
       case "thinking": {
-        const seg = ensureSegmentForText(chat, aMsg);
+        const seg = ChatSegments.ensureSegmentForText(chat, aMsg);
         if (seg) {
           seg.thinking = (seg.thinking || "") + ev.text;
           persistChatsSoon();
           const el = msgEls.get(seg.id);
           if (el) {
-            ensureThinkBox(el, seg.thinking);
-            scrollBottomSoon();
+            ChatThinking.ensureThinkBox(el, seg.thinking);
+            ChatFeed.scrollBottomSoon();
           }
         }
         // План в размышлениях: локальные модели формулируют его именно там.
@@ -2060,7 +1821,7 @@
         ) {
           if (planTextAdvance(chat, true)) renderPlanPanel();
         }
-        scrollBottom();
+        ChatFeed.scrollBottom();
         persistChatsSoon();
         break;
       case "tool_result":
@@ -2086,11 +1847,11 @@
         }
         break;
       case "text_override": {
-        const seg = ensureSegmentForText(chat, aMsg);
+        const seg = ChatSegments.ensureSegmentForText(chat, aMsg);
         if (seg) {
           seg.content = ev.text;
           persistChatsSoon();
-          queueBubbleRender(chat, seg);
+          ChatFeed.queueBubbleRender(chat, seg);
         }
         break;
       }
@@ -2107,7 +1868,7 @@
           note.className = "vision-note";
           note.textContent = ev.text;
           $("messages").appendChild(note);
-          scrollBottom();
+          ChatFeed.scrollBottom();
         }
         break;
       }
@@ -2122,7 +1883,7 @@
           mnote.className = "vision-note";
           mnote.textContent = ev.text;
           $("messages").appendChild(mnote);
-          scrollBottom();
+          ChatFeed.scrollBottom();
         }
         break;
       }
@@ -2133,7 +1894,7 @@
           note.className = "vision-note";
           note.textContent = ev.text;
           $("messages").appendChild(note);
-          scrollBottom();
+          ChatFeed.scrollBottom();
         }
         break;
       }
@@ -2184,7 +1945,7 @@
           const el = buildMessageEl(ch.messages[ch.messages.length - 1]);
           const w = ensureWorkGroup();
           w.body.appendChild(el);
-          scrollBottom();
+          ChatFeed.scrollBottom();
           persistChatsSoon();
         }
         // Синхронизируем локальную копию настроек с main (активный профиль сменился)
@@ -2208,7 +1969,7 @@
         break;
       case "error": {
         closeAskModal();
-        const segs = runSegments(chat, aMsg);
+        const segs = ChatSegments.runSegments(chat, aMsg);
         for (const s of segs) s.pending = false;
         const lastSeg = segs[segs.length - 1] || aMsg;
         if (lastSeg) {
@@ -2441,6 +2202,9 @@
     AgentCore: AgentCore,
     toast: toast,
     getActiveChat: getActiveChat,
+    // Живые данные чатов: по ним «▶ Продолжить» находит чат самой миссии —
+    // продолжать работу надо там, где она шла, а не где открыта панель.
+    getChatsData: () => chatsData,
     selectChat: selectChat,
     sendMessage: sendMessage,
     autoResize: autoResize,
@@ -2576,9 +2340,19 @@
     renderMessages: renderMessages,
     sendMessage: sendMessage,
     autoResize: autoResize,
-    msgText: msgText,
+    msgText: (c) => ChatRender.msgText(c),
     chatTitle: chatTitle,
     isStreaming: () => streaming,
+  });
+
+  // ─── Отрисовка сообщения: текст, вложения, кнопки — код в src/renderer/chat-render.js ───
+  const ChatRender = window.ChatRender({
+    MdRender: MdRender,
+    fmtClock: fmtClock,
+    ChatThinking: ChatThinking,
+    ChatActions: ChatActions,
+    continueInterruptedAnswer: continueInterruptedAnswer,
+    getChatsData: () => chatsData,
   });
 
   // ─────────────── Быстрое переключение модели (попап в шапке) ───────────────
@@ -2731,7 +2505,7 @@
 
   async function finishStream(chat, aMsg) {
     // Все сегменты текущего запуска: помечаем готовыми, пустые промежуточные убираем.
-    const segs = runSegments(chat, aMsg);
+    const segs = ChatSegments.runSegments(chat, aMsg);
     const anyText = segs.some((s) => s.content && !s.error);
     const kept = [];
     for (const s of segs) {
@@ -2739,7 +2513,7 @@
       if (!s.content && !s.error) {
         if (!anyText && segs.indexOf(s) === segs.length - 1) s.content = "…";
         else {
-          removeSegment(chat, s);
+          ChatSegments.removeSegment(chat, s);
           continue;
         }
       }
@@ -2757,7 +2531,7 @@
           b.textContent = lastSeg.error;
         } else {
           b.classList.add("md");
-          b.innerHTML = msgHtml(lastSeg.content) || "…";
+          b.innerHTML = ChatRender.msgHtml(lastSeg.content) || "…";
         }
         b.classList.remove("pending");
       }
@@ -2771,12 +2545,7 @@
     for (const s of kept) {
       const sEl = msgEls.get(s.id);
       if (!sEl) continue;
-      const th = sEl.querySelector(".think");
-      if (th && !th.classList.contains("user")) {
-        th.classList.add("collapsed");
-        const ch = th.querySelector(".think-chev");
-        if (ch) ch.textContent = "▸";
-      }
+      ChatThinking.collapseThinkBox(sEl);
     }
     // Кнопки действий под ответом: выполнить план / отменить изменения агента
     if (el && !lastSeg.error) {
@@ -3082,10 +2851,7 @@
       $("s-browser-connect-port").value = settings.browserConnectPort || 9222;
       renderBrowserConnectInfo();
     }
-    $("s-mobile-enabled").checked = !!settings.mobileEnabled;
-    $("s-mobile-port").value = settings.mobilePort || 9090;
-    $("s-mobile-host").value = settings.mobileHost || "";
-    renderMobileStatus();
+    MobilePanel.applyMobileFields();
     $("s-vision-enabled").checked = !!settings.visionEnabled;
     $("s-vision-auto").checked = settings.visionAuto !== false;
     $("s-vision-url").value = settings.visionUrl || "";
@@ -3148,9 +2914,7 @@
       settings.browserConnect = !!$("s-browser-connect").checked;
       settings.browserConnectPort = parseInt($("s-browser-connect-port").value, 10) || 9222;
     }
-    settings.mobileEnabled = !!$("s-mobile-enabled").checked;
-    settings.mobilePort = parseInt($("s-mobile-port").value, 10) || 9090;
-    settings.mobileHost = $("s-mobile-host").value.trim();
+    MobilePanel.readMobileFields();
     settings.visionEnabled = !!$("s-vision-enabled").checked;
     settings.visionAuto = !!$("s-vision-auto").checked;
     settings.visionUrl = $("s-vision-url").value.trim();
@@ -3508,98 +3272,14 @@
     }
   }
 
-  // ── Мобильный доступ: QR-код «наведи камеру телефона» ──
-  // В коде — адрес моста и PIN: телефон подключается одним наведением камеры,
-  // без ручного ввода адреса и шести цифр. Код остаётся светлым даже в тёмной
-  // теме (QR.toSvg рисует белое поле): на тёмном фоне камера его не видит.
-  function renderMobileQr(st) {
-    const block = $("mobile-qr-block");
-    const host = $("mobile-qr");
-    if (!block || !host) return;
-    const urls = (st && st.urls) || [];
-    const pin = String((st && st.pin) || "");
-    if (!(st && st.enabled && st.running) || !urls.length || !pin || !window.QR) {
-      block.classList.add("hidden");
-      host.innerHTML = "";
-      return;
-    }
-    try {
-      host.innerHTML = window.QR.toSvg(urls[0].url + "/#pin=" + pin, { ecc: "M" });
-      block.classList.remove("hidden");
-    } catch (e) {
-      // Лучше показать адреса и PIN текстом, чем пустое место с чужой ошибкой.
-      block.classList.add("hidden");
-      host.innerHTML = "";
-      console.warn("QR-код не построен:", (e && e.message) || e);
-    }
-  }
-
-  // ── Мобильный доступ: статус моста, PIN, адреса для телефона ──
-  async function renderMobileStatus() {
-    const box = $("mobile-fields");
-    const urls = $("mobile-urls");
-    if (!isElectron || !api.mobileStatus) {
-      if (box) box.classList.add("hidden");
-      return;
-    }
-    box.classList.toggle("hidden", !$("s-mobile-enabled").checked);
-    try {
-      const st = await api.mobileStatus();
-      if (!st) return;
-      if ($("s-mobile-pin")) $("s-mobile-pin").value = st.pin || "";
-      renderMobileQr(st);
-      urls.innerHTML = "";
-      const list = (st.urls && st.urls.length) ? st.urls : [{ url: st.url || "—" }];
-      for (const u of list) {
-        const a = document.createElement("a");
-        a.className = "mobile-url-chip";
-        a.href = u.url;
-        a.target = "_blank";
-        a.rel = "noopener";
-        a.textContent = u.url;
-        urls.appendChild(a);
-      }
-      if (!st.urls || !st.urls.length) {
-        const span = document.createElement("span");
-        span.className = "mobile-url-none";
-        span.textContent = "Нет доступных адресов — проверь подключение ПК к сети.";
-        urls.appendChild(span);
-      }
-      // Адрес задан вручную, но такого IP на этом ПК нет: телефон по нему не дойдёт.
-      if (st.host && !st.hostActive) {
-        const warn = document.createElement("div");
-        warn.className = "mobile-url-none";
-        warn.textContent = "⚠ Адрес " + st.host + " на этом ПК не найден — показываю реальные. Поправь «Адрес для телефона».";
-        urls.appendChild(warn);
-      }
-      if (st.enabled && !st.running) {
-        const err = document.createElement("div");
-        err.className = "mobile-url-none";
-        err.textContent = "⚠ Мост не запустился (порт занят?). Попробуй другой порт.";
-        urls.appendChild(err);
-      }
-    } catch (e) {
-      urls.innerHTML = "";
-      const span = document.createElement("span");
-      span.className = "mobile-url-none";
-      span.textContent = "Статус недоступен: " + (e.message || "");
-      urls.appendChild(span);
-    }
-  }
-
-  async function regenerateMobilePin() {
-    if (!isElectron || !api.mobilePinRegen) return;
-    try {
-      const st = await api.mobilePinRegen();
-      if (st && st.pin) {
-        settings.mobilePin = st.pin;
-        $("s-mobile-pin").value = st.pin;
-        setSettingsMsg("Новый PIN: " + st.pin + " — покажи его на телефоне.", false);
-      }
-    } catch (e) {
-      setSettingsMsg("Не удалось сменить PIN: " + (e.message || ""), true);
-    }
-  }
+  // ── Мобильный доступ: QR-код, статус моста, PIN и адреса — код в src/renderer/mobile-panel.js ──
+  const MobilePanel = window.MobilePanel({
+    $: $,
+    api: api,
+    isElectron: isElectron,
+    getSettings: () => settings,
+    setSettingsMsg: setSettingsMsg,
+  });
 
   // Тип подключения вспомогательной модели выбирать не нужно — приложение определяет
   // провайдера по адресу. Но человек должен видеть, что понято правильно: «Gemini
@@ -6169,8 +5849,8 @@
 
   // ── Удобство: копирование чата, умная прокрутка, горячие клавиши, ресайзер панели ──
   $("btn-copy-chat").onclick = ChatActions.copyChat;
-  $("btn-scroll-bottom").onclick = jumpToBottom;
-  $("messages").addEventListener("scroll", updatePinState, { passive: true });
+  $("btn-scroll-bottom").onclick = ChatFeed.jumpToBottom;
+  $("messages").addEventListener("scroll", ChatFeed.updatePinState, { passive: true });
 
   // Горячие клавиши (дополнение к Ctrl/Cmd+N — новый чат)
   document.addEventListener("keydown", (e) => {
@@ -6742,12 +6422,8 @@
     if (isElectron) api.openExternal("https://github.com/login/device");
   };
 
-  // ── Мобильный доступ ──
-  $("s-mobile-enabled").addEventListener("change", () => {
-    $("mobile-fields").classList.toggle("hidden", !$("s-mobile-enabled").checked);
-    if ($("s-mobile-enabled").checked) renderMobileStatus();
-  });
-  $("btn-mobile-pin-regen").onclick = regenerateMobilePin;
+  // ── Мобильный доступ: панель в настройках — код в src/renderer/mobile-panel.js ──
+  MobilePanel.initMobilePanel();
   // ── Зрение и генерация изображений (вспомогательная модель) ──
   $("s-vision-enabled").addEventListener("change", () => {
     $("vision-fields").classList.toggle("hidden", !$("s-vision-enabled").checked);

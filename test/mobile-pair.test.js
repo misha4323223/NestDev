@@ -264,8 +264,10 @@ function authPayloads(env) {
   });
 
   await test("ссылка с ПК и разбор на телефоне — один формат", () => {
-    // Что строит ПК в Настройках (app.js): адрес моста + «/#pin=» + PIN.
-    const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    // Что строит ПК в Настройках: адрес моста + «/#pin=» + PIN. Панель подключения
+    // телефона вынесена из app.js в src/renderer/mobile-panel.js (этап 3.6) —
+    // спрашиваем модуль, а не адрес кода: формат ссылки от переезда не меняется.
+    const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "mobile-panel.js"), "utf8");
     assert.ok(
       /urls\[0\]\.url\s*\+\s*"\/#pin="\s*\+\s*pin/.test(app),
       "ПК должен строить ссылку вида <адрес>/#pin=<PIN>"

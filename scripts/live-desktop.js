@@ -231,8 +231,18 @@ function startFakeProvider(seen, rounds, rate, script) {
   try {
     // Проверка свежести: если порт отладки занял старый экземпляр (прошлый прогон
     // не убил процессы), тест молча проверял бы старый код — это уже случалось.
-    const fresh = await page.evaluate(() => typeof window.AgentCore.imageAttempts === "function");
-    check("запущен свежий код (imageAttempts на месте)", fresh, fresh ? "" : "похоже, порт занят старым экземпляром");
+    // Сначала ждём, пока окно поднимет ядро: на «холодном» профиле страница ещё
+    // разбирает скрипты, и window.AgentCore появляется не сразу. Без этого ожидания
+    // проверка давала ложное падение «к отладке подключился старый экземпляр».
+    const tCore = Date.now();
+    let coreUp = false;
+    while (Date.now() - tCore < 15000) {
+      coreUp = await page.evaluate(() => typeof window.AgentCore === "object" && window.AgentCore !== null).catch(() => false);
+      if (coreUp) break;
+      await sleep(250);
+    }
+    const fresh = coreUp && (await page.evaluate(() => typeof window.AgentCore.imageAttempts === "function"));
+    check("запущен свежий код (imageAttempts на месте)", fresh, fresh ? "" : "окно не подняло ядро за 15 с (или порт занят старым экземпляром)");
     if (!fresh) throw new Error("к отладке подключился старый экземпляр приложения");
 
     console.log("\n[2] Настройки: вспомогательная модель смотрит на фейковый провайдер");
@@ -595,6 +605,54 @@ function startFakeProvider(seen, rounds, rate, script) {
     check("действия средней опасности тоже в журнале", rows.some((r) => r.tool === "generateImage") && rows.some((r) => r.tool === "runCommand"), "инструменты: " + Array.from(new Set(rows.map((r) => r.tool))).join(", ").slice(0, 140));
     check("в журнале нет значения секрета агента", auditText.indexOf("live-secret-value-42") === -1, "проверено по файлу журнала");
     check("в журнале нет аргументов-секретов целиком", auditText.indexOf("agentEnv") === -1, "");
+    console.log("\n[12] Миссия: повтор отчёта больше не заводит петлю");
+    const missionStore = require(path.join(ROOT, "src", "mission-store.js"));
+    // Рабочая папка агента та же, что у приложения: её показывает панель «Миссия».
+    const mState = await page.evaluate(async () => await window.api.missionState());
+    const mDir = mState.dir;
+    for (const m of mState.list || []) {
+      if (m.status === "active" || m.status === "paused") {
+        missionStore.missionFinish(mDir, m.id, { status: "stopped", reason: "подготовка живой проверки" });
+      }
+    }
+    const mChat = await page.evaluate(async () => (await window.api.loadChats()).activeId);
+    const mNew = missionStore.missionCreate(mDir, {
+      goal: "Разбор входящих писем",
+      title: "Разбор входящих писем",
+      steps: ["Прочитать письма", "Разложить по делам"],
+      chatId: mChat,
+    });
+    check("миссия заведена для живой проверки", !!(mNew && mNew.ok), (mNew && mNew.error) || mDir);
+    // Модель отвечает текстом и миссию не закрывает — на всех раундах одно «Готово.».
+    const missionRun = await page.evaluate(async () => {
+      window.__ev.length = 0;
+      try { await window.api.sendMessage([{ role: "user", content: "разбери входящие" }], {}); } catch (e) { window.__ev.push({ type: "throw", message: String((e && e.message) || e) }); }
+      const st = await window.api.missionState();
+      return {
+        notices: window.__ev.filter((e) => e.type === "notice").map((e) => String(e.text)),
+        active: st.active ? st.active.id : "",
+        status: st.active ? st.active.status : "",
+      };
+    });
+    const scold = missionRun.notices.filter((t) => /не закрыта/.test(t));
+    const pausedNotices = missionRun.notices.filter((t) => /на паузе/.test(t));
+    check("призыв прозвучал один раз, а не трижды", scold.length === 1, "призывов: " + scold.length + " — " + scold.join(" | ").slice(0, 170));
+    check("повтор того же отчёта остановил призывы", pausedNotices.length === 1 && /повторила/.test(pausedNotices[0] || ""), pausedNotices.join(" | ").slice(0, 170));
+    check("миссия ждёт человека (пауза), а не крутится", missionRun.status === "paused", "состояние: " + missionRun.status + ", миссия: " + missionRun.active);
+    // Главное: следующий прогон паузу НЕ подхватывает. Это и было «миссия снова дёргает».
+    const afterPause = await page.evaluate(async () => {
+      window.__ev.length = 0;
+      try { await window.api.sendMessage([{ role: "user", content: "ответь одним словом: ок" }], {}); } catch (e) {}
+      const st = await window.api.missionState();
+      return { notices: window.__ev.filter((e) => e.type === "notice").map((e) => String(e.text)), status: st.active ? st.active.status : "нет", resumed: window.__ev.some((e) => e.type === "mission" && e.phase === "resume") };
+    });
+    check("пауза не подхватилась следующим прогоном", afterPause.notices.every((t) => !/не закрыта/.test(t)), afterPause.notices.join(" | ").slice(0, 170));
+    check("прогон не «продолжил» паузу сам", afterPause.resumed === false && afterPause.status === "paused", "состояние: " + afterPause.status + ", продолжал: " + afterPause.resumed);
+    // И миссия закрывается человеком/агентом как раньше: закрытая больше не всплывает.
+    const closed = missionStore.missionFinish(mDir, missionRun.active, { status: "done", report: "Разобрал 10 писем." });
+    check("миссию можно закрыть после паузы", !!(closed && closed.ok), (closed && closed.error) || "");
+    check("закрытая миссия больше не подхватывается", !missionStore.missionActive(mDir), "в панели снова висит незакрытая миссия");
+
   } catch (e) {
     check("сквозной прогон без исключений", false, e.message);
   } finally {

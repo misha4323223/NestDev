@@ -70,6 +70,11 @@ const STATIC_FILES = new Set([
   "web-chat.js",
   "tasks-mission.js",
   "secrets-panel.js",
+  "mobile-panel.js",
+  "chat-thinking.js",
+  "chat-segments.js",
+  "chat-render.js",
+  "chat-feed.js",
   "deploy-panel.css",
 ]);
 

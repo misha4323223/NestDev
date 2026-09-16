@@ -246,8 +246,11 @@ async function startServer(port) {
     await page.goto(BASE, { waitUntil: "load" });
     await page.waitForSelector("#rail", { state: "visible", timeout: 10000 });
     await sleep(600);
-    check("рельса: 9 иконок (добавился «Деплой»)", (await page.locator("#rail .rail-btn").count()) === 9);
+    // Иконок ровно столько, сколько быстрых панелей в разметке: «Чаты», «Консоль»,
+    // «Превью», «Файлы», «Облако», «Деплой», «Миссия», «Дела», новый чат, настройки.
+    check("рельса: 10 иконок (включая «Миссию» и «Деплой»)", (await page.locator("#rail .rail-btn").count()) === 10);
     check("на рельсе есть кнопка «Дела»", await page.locator("#rail-tasks").isVisible());
+    check("на рельсе есть кнопка «Миссия»", await page.locator("#rail-mission").isVisible());
     check("на рельсе есть кнопка «Деплой»", await page.locator("#rail-deploy").isVisible());
     check("список чатов виден", await page.locator("#sidebar").isVisible());
     check("на рельсе подсвечены «Чаты»", ((await page.locator("#rail-chats").getAttribute("class")) || "").includes("active"));

@@ -95,7 +95,10 @@ function bootWindow() {
       insertBefore(c) { this.children.push(c); return c; }, replaceChildren() {},
       remove() {}, focus() {}, blur() {}, click() {}, select() {}, scrollIntoView() {}, scrollTo() {},
       closest(sel) { return closestByHtml(this.id, sel); }, querySelector: () => null, querySelectorAll: () => [],
-      addEventListener() {}, removeEventListener() {}, dispatchEvent: () => true,
+      // Запоминаем подписку на click/change — иначе честная панель, которая вешает
+      // обработчик через addEventListener, выглядит в прогоне «без обработчика».
+      addEventListener(type, fn) { if (type === "click" || type === "change") this["on" + type] = fn; },
+      removeEventListener() {}, dispatchEvent: () => true,
       getBoundingClientRect: () => ({ top: 0, left: 0, width: 100, height: 20 }),
       clientHeight: 100, scrollHeight: 100, offsetHeight: 100, clientWidth: 100, scrollWidth: 100, offsetWidth: 100,
       firstChild: null, lastChild: null, parentNode: null, files: [], childNodes: [],
@@ -167,6 +170,11 @@ function bootWindow() {
     ["ProviderConfig", "object"], ["ProviderTransport", "function"], ["WebTools", "object"], ["ImageTools", "function"],
     ["MdRender", "object"], ["Highlight", "object"], ["QR", "object"], ["YcConsole", "object"],
     ["YcPanel", "function"], ["DeployPanel", "object"], ["DevRun", "function"],
+    ["MobilePanel", "function"],
+    ["ChatThinking", "function"],
+    ["ChatSegments", "function"],
+    ["ChatRender", "function"],
+    ["ChatFeed", "function"],
   ];
   for (const [name, kind] of globals) ok(typeof win[name] === kind, "модуль в окне: " + name + " (" + kind + ")");
   return win;
@@ -181,10 +189,12 @@ function checkWiring(win) {
     "btn-preview-start", "btn-preview-stop", "btn-probe-ollama", "btn-probe-model",
     // Панель дел и миссии (задачи со сроками): строки добавляются, фильтры кликаются.
     "btn-task-add", "btn-role", "btn-tasks-refresh", "btn-tasks-done-toggle",
-    "btn-mission-pause", "btn-mission-resume", "btn-mission-stop", "btn-mission-refresh",
+    "btn-mission-pause", "btn-mission-resume", "btn-mission-stop", "btn-mission-finish", "btn-mission-refresh",
     // Секреты: переменные агента, пароли сайтов и почта.
     "btn-env-add", "btn-env-import", "btn-vault-add", "btn-vault-clear", "btn-vault-eye",
     "btn-mail-detect", "btn-mail-test", "btn-mail-test-send", "btn-mail-recent",
+    // Мобильный доступ: галочка включает поля и читает статус, кнопка меняет PIN.
+    "s-mobile-enabled", "btn-mobile-pin-regen",
   ];
   for (const id of wired) {
     const el = stubs && stubs.get(id);

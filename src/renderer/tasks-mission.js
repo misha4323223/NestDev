@@ -21,7 +21,7 @@
   }
 })(typeof self !== "undefined" ? self : this, function (TasksMissionDeps) {
   const {
-    $, api, isElectron, AgentCore, toast, getActiveChat, selectChat, sendMessage, autoResize,
+    $, api, isElectron, AgentCore, toast, getActiveChat, getChatsData, selectChat, sendMessage, autoResize,
     persistChatsNow, renderSidebar, openSidePanel, closeSidePanel, sidePanelVisible,
     startAutoRunNow, getSettings, isStreaming, getSideTab,
   } = TasksMissionDeps || {};
@@ -451,6 +451,8 @@
       if (resumeBtn) resumeBtn.disabled = running || !!isStreaming();
       const stopBtn = $("btn-mission-stop");
       if (stopBtn) stopBtn.disabled = !st.running;
+      const finishBtn = $("btn-mission-finish");
+      if (finishBtn) finishBtn.disabled = !!isStreaming();
     }
 
     const list = (st.list || []).filter((x) => !m || x.id !== m.id);
@@ -515,11 +517,37 @@
           toast((r && r.error) || "Незакрытых миссий нет");
           return;
         }
-        const chat = getActiveChat();
+        // Продолжаем миссию в ЕЁ чате (там история работы и отчёты); если чата уже
+        // нет — работаем в открытом. Чат приходит из mission:resume вместе с текстом.
+        const chats = getChatsData ? getChatsData() : null;
+        const home = r.chatId && chats && Array.isArray(chats.chats) ? chats.chats.find((c) => c.id === r.chatId) : null;
+        const chat = home || getActiveChat();
         if (chat) selectChat(chat.id);
         $("input").value = r.text;
         autoResize();
         sendMessage();
+      };
+    }
+    if ($("btn-mission-finish")) {
+      $("btn-mission-finish").onclick = async () => {
+        // Во время прогона не закрываем: агент держит миссию в памяти и продолжит
+        // её писать. Скажем вслух — молчаливая кнопка хуже отказа.
+        if (isStreaming()) {
+          toast("Дождись окончания текущего прогона");
+          return;
+        }
+        // Закрываем ту миссию, которую видит человек в карточке.
+        const id = missionCache && missionCache.active ? missionCache.active.id : "";
+        let r = null;
+        try {
+          r = await api.missionFinish(id);
+        } catch {}
+        if (!r || !r.ok) {
+          toast((r && r.error) || "Не удалось закрыть миссию");
+          return;
+        }
+        toast("🏁 Миссия закрыта — напоминать о ней больше не будут");
+        refreshMission();
       };
     }
     if ($("btn-mission-folder")) {

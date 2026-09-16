@@ -38,7 +38,7 @@
 | src/renderer/prompts.js | системный промпт агента и правила ролей | agent-core.js: root.Prompts |
 | src/renderer/tool-schemas.js | таблица схем инструментов (159 штук) | agent-core.js: root.ToolSchemas |
 | src/renderer/agent-core.js | ядро агента: запросы, инструменты, план, память | app.js: window.AgentCore |
-| src/renderer/markdown.js | рендер markdown и диаграмм без библиотек | app.js: MdRender.render( |
+| src/renderer/markdown.js | рендер markdown и диаграмм без библиотек | chat-render.js: MdRender.render( |
 | src/renderer/bootstrap.js | заглушка для телефона + страховочная загрузка field-guard | — |
 | src/renderer/mobile-api.js | работа окна на телефоне: IPC через WebSocket | app.js: window.mobileApi |
 | src/renderer/yc-console.js | консоль Yandex Cloud в правой панели | yc-panel.js: window.YcConsole |
@@ -52,7 +52,12 @@
 | src/renderer/tasks-mission.js | роли чата, дела и миссия: панели и их состояние | app.js: window.TasksMission({ |
 | src/renderer/secrets-panel.js | секреты: пароли сайтов, почта, переменные агента | app.js: window.SecretsPanel({ |
 | src/renderer/highlight.js | подсветка кода для читалки файлов | app.js: window.Highlight |
-| src/renderer/qr.js | QR-код подключения телефона | app.js: window.QR |
+| src/renderer/qr.js | QR-код подключения телефона | mobile-panel.js: window.QR |
+| src/renderer/mobile-panel.js | мобильный доступ: QR, статус моста, PIN, адреса для телефона | app.js: window.MobilePanel({ |
+| src/renderer/chat-thinking.js | блок размышлений модели: сборка, автопрокрутка, свёртывание | app.js: window.ChatThinking() |
+| src/renderer/chat-segments.js | сегменты ответа: лог «текст → действия → текст» | app.js: window.ChatSegments({ |
+| src/renderer/chat-render.js | отрисовка сообщения: текст, вложения, метка времени, кнопки | app.js: window.ChatRender({ |
+| src/renderer/chat-feed.js | лента: умная прокрутка и очередь кадра при стриме | app.js: window.ChatFeed({ |
 | src/renderer/field-guard.js | страховка полей ввода (фокус не теряется) | — сам навешивает защиту |
 | src/renderer/app.js | оболочка окна: чат, панели, настройки, события | — собирает всё в окне |
 <!-- UI-MAP:END -->

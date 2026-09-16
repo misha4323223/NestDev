@@ -143,6 +143,7 @@
     missionStop: invoke("mission:stop"),
     missionResume: invoke("mission:resume"),
     missionOpen: invoke("mission:open"),
+    missionFinish: invoke("mission:finish"),
     agentFilesStatus: invoke("agentfiles:status"),
     tasksList: invoke("tasks:list"),
     tasksAdd: invoke("tasks:add"),
