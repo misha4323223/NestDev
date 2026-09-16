@@ -32,6 +32,7 @@ const STAGE_LABELS = {
   build: "Сборка образа",
   push: "Загрузка образа",
   container: "Контейнер и доступ",
+  secrets: "Секреты (Lockbox)",
   revision: "Деплой ревизии",
   health: "Проверка после деплоя",
   browse: "Проверка в браузере",
@@ -50,6 +51,7 @@ const STAGE_ORDER = [
   "build",
   "push",
   "container",
+  "secrets",
   "revision",
   "health",
   "browse",
@@ -68,6 +70,40 @@ const TIMEOUTS = {
   dockerPush: 900000,
   login: 90000,
 };
+
+// ── Правила «production не принимает сломанное» ──────────────────────────────
+// Тесты проекта и проверка страницы браузером раньше были советами: падение
+// тестов давало замечание, а недоступный браузер — молчание. Для development это
+// удобно, для production опасно: в прод уезжало заведомо сломанное состояние.
+// Здесь только решение — что считать остановкой, а что замечанием.
+function isProduction(o) {
+  return String((o && o.environment) || "production") === "production";
+}
+
+// Тесты: в production падение останавливает выкат. Продолжить можно только
+// явным «да, я понимаю» (allowFailingTests) — тогда правда остаётся в замечаниях.
+function testsAreFatal(o, recipe) {
+  if (!recipe || !recipe.testCmd) return false;
+  if (o.allowFailingTests === true) return false;
+  const gate = String(o.testsGate || "").trim().toLowerCase();
+  if (gate === "warn") return false;
+  if (gate === "block") return true;
+  return isProduction(o);
+}
+
+// Браузерная проверка — настраиваемая. Сломанная страница (белый экран, 5xx,
+// ошибка в консоли) останавливает выкат в ЛЮБОМ режиме, кроме «off».
+//   off       — проверять не надо (и делать вид, что проверили, тоже не надо);
+//   auto      — проверяем; браузер не поднялся — замечание, а не провал (это
+//               ограничение машины, а не поломка приложения);
+//   required  — без проверки выкат не принимается: и сломанная страница, и
+//               несостоявшаяся проверка — остановка. Это осознанный выбор
+//               пользователя, поэтому навязать его по умолчанию нельзя.
+function browserModeOf(o) {
+  const explicit = String((o && o.browserCheck) || "").trim().toLowerCase();
+  if (explicit === "off" || explicit === "required" || explicit === "auto") return explicit;
+  return "auto";
+}
 
 // ─────────────────────────────── помощники ───────────────────────────────
 
@@ -154,7 +190,10 @@ function createDeployEngine(deps) {
               status,
               path: p,
               url: target,
-              reason: "контейнер отвечает " + status + " — публичный доступ не настроен (деплой без public или не хватило прав на роль invoker)",
+              reason:
+                "контейнер отвечает " +
+                status +
+                " — публичного доступа нет: нужна привязка «все пользователи → serverless.containers.invoker» на контейнер (деплой с public: false её не ставит)",
               ms: Date.now() - started,
             };
           } else {
@@ -241,10 +280,15 @@ function createDeployEngine(deps) {
     let recipe = null;
     let image = "";
     let containerId = "";
+    let secretId = "";
+    let secretVersionId = "";
+    let secretKeys = [];
     let revisionId = "";
     let url = "";
     let health = null;
     let browserCheck = null;
+    let browserMode = "";
+    let testsFailed = false;
     let rollbackCheck = null;
     let screenshotPath = "";
     let fatal = "";
@@ -321,9 +365,21 @@ function createDeployEngine(deps) {
           }
           if (recipe.testCmd && o.runTests !== false) {
             const r = await cmd(recipe.testCmd, dir, TIMEOUTS.test);
-            // Тесты не блокируют деплой, но о падении докладываем честно.
-            if (r.code !== 0) warnings.push("Тесты проекта упали (" + recipe.testCmd + ") — деплой продолжен, проверь:\n" + tail(r.out, 800));
-            else done.push("тесты");
+            if (r.code !== 0) {
+              const text = "Тесты проекта упали (" + recipe.testCmd + "):\n" + tail(r.out, 800);
+              // production не принимает заведомо сломанное: остановка до сборки
+              // образа. Разработке можно продолжать — там цена ошибки ниже.
+              if (testsAreFatal(o, recipe)) {
+                testsFailed = true;
+                throw new Error(
+                  text +
+                    "\nДеплой в production остановлен: сломанные тесты в прод не уезжают. Если это осознанно — продолжай явно (allowFailingTests)."
+                );
+              }
+              warnings.push(text + " — деплой продолжен (не production или явное разрешение): проверь.");
+            } else {
+              done.push("тесты");
+            }
           }
           return done.join(", ") || "проверок не требовалось";
         });
@@ -399,11 +455,32 @@ function createDeployEngine(deps) {
           const c = await yandex.ensureContainer(oauth, folderId, slug);
           containerId = c.id;
           const done = ["контейнер " + c.id];
+          // Публичный доступ — это привязка роли invoker субъекту «все
+          // пользователи» на сам контейнер. Раньше роль выдавалась сервисному
+          // аккаунту на каталог: в облаке это не открывало контейнер из
+          // интернета, и выкат разваливался на проверке адреса (403), хотя все
+          // предыдущие стадии проходили.
           if (o.public !== false) {
+            if (typeof yandex.setContainerPublicAccess !== "function") {
+              throw new Error(
+                "Модуль Yandex Cloud без поддержки публичного доступа (setContainerPublicAccess) — модуль деплоя и модуль облака должны обновляться вместе."
+              );
+            }
+            const pub = await yandex.setContainerPublicAccess(oauth, c.id);
+            done.push(
+              pub && pub.already
+                ? "публичный доступ уже был (все пользователи → invoker)"
+                : "публичный доступ (все пользователи → serverless.containers.invoker)"
+            );
+          }
+          // Сервисный аккаунт ревизии — отдельная история: он нужен приложению
+          // для доступа к его ресурсам (секреты, бакеты), а не для публичности.
+          // Создаём только когда его явно просят: это лишнее право и лишний
+          // ресурс в каталоге пользователя.
+          if (o.serviceAccount) {
             const sa = await yandex.ensureServiceAccount(oauth, folderId, "sa-" + slug);
             serviceAccountId = sa.id;
-            await yandex.addRoleOnFolder(oauth, folderId, sa.id, "serverless.containers.invoker");
-            done.push("публичный доступ (SA " + sa.id + " + роль invoker)");
+            done.push("сервисный аккаунт " + sa.id);
           }
           if (writeState) {
             state.writeInfrastructure(dir, {
@@ -418,14 +495,101 @@ function createDeployEngine(deps) {
           fatal =
             cont.error +
             (o.public !== false
-              ? " Проверь, что у аккаунта есть роль editor на каталог, или задеплой без публичного доступа."
+              ? " Публичный доступ выдаётся привязкой роли invoker на контейнер — для неё нужна роль с правом serverless-containers.containers.setAccessBindings (её даёт editor на каталог). Можно задеплоить и без публичного доступа."
               : "");
         }
+      }
+
+      // 9б. Секреты: значения уезжают в Lockbox, а в ревизию попадает ССЫЛКА
+      // { id, key, environmentVariable } — значение подставляет облако. Так
+      // значение не проходит ни через модель, ни через состояние проекта, ни
+      // через imageSpec.environment открытым текстом.
+      const secretValues = o.secrets && typeof o.secrets === "object" ? o.secrets : {};
+      const wantedSecretId = String(o.secretId || "").trim();
+      const wantedSecretKeys = Array.isArray(o.secretKeys) ? o.secretKeys.map((k) => String(k)) : [];
+      if (!fatal && (Object.keys(secretValues).length || wantedSecretId)) {
+        const sec = await stage("secrets", async () => {
+          if (typeof yandex.ensureLockboxSecret !== "function" || typeof yandex.putSecretVersion !== "function") {
+            throw new Error(
+              "Модуль Yandex Cloud без поддержки Lockbox — модуль деплоя и модуль облака должны обновляться вместе."
+            );
+          }
+          // Значения секретов читает сервисный аккаунт ревизии: без него облако
+          // просто не отдаст значение приложению.
+          if (!serviceAccountId) {
+            if (o.serviceAccount === false) {
+              throw new Error(
+                "Секреты требуют сервисного аккаунта с ролью lockbox.payloadViewer, а он выключён (serviceAccount: false)."
+              );
+            }
+            const sa = await yandex.ensureServiceAccount(oauth, folderId, "sa-" + slug);
+            serviceAccountId = sa.id;
+          }
+          const done = ["сервисный аккаунт " + serviceAccountId];
+          const names = Object.keys(secretValues);
+          if (names.length) {
+            const secret = await yandex.ensureLockboxSecret(oauth, folderId, "app-" + slug + "-env");
+            secretId = (secret && secret.id) || "";
+            const version = await yandex.putSecretVersion(
+              oauth,
+              secretId,
+              names.map((k) => ({ key: k, value: secretValues[k] }))
+            );
+            secretVersionId = (version && version.versionId) || "";
+            secretKeys = (version && version.keys) || names;
+            done.push("секрет " + secretId + ", версия " + (secretVersionId || "новая") + ", ключей " + secretKeys.length);
+          } else {
+            if (!wantedSecretKeys.length) {
+              throw new Error(
+                "Указан готовый секрет Lockbox без ключей: перечисли их в secretKeys (это только имена, не значения) — иначе неизвестно, какие переменные ждёт приложение."
+              );
+            }
+            const secret = await yandex.getSecret(oauth, wantedSecretId);
+            secretId = wantedSecretId;
+            secretKeys = wantedSecretKeys;
+            done.push("секрет " + secretId + " («" + ((secret && secret.name) || "?") + "»), ключей " + secretKeys.length);
+          }
+          // Права только на этот секрет и только сервисному аккаунту ревизии.
+          // Значения при этом не запрашиваем: getPayload не вызывается.
+          await yandex.grantSecretAccess(oauth, secretId, serviceAccountId, "lockbox.payloadViewer");
+          done.push("доступ: сервисный аккаунт → lockbox.payloadViewer");
+          // Одна и та же переменная в двух полях — это ошибка человека, и её надо
+          // назвать: иначе непонятно, какое значение уехало в контейнер.
+          const plainEnvNow = o.env || {};
+          const twice = secretKeys.filter((k) => Object.prototype.hasOwnProperty.call(plainEnvNow, k));
+          if (twice.length) {
+            warnings.push(
+              "Переменные " + twice.join(", ") + " заданы дважды — как обычные и как секреты. В контейнер уйдёт только секретная версия."
+            );
+          }
+          if (writeState) {
+            state.updateDeployment(dir, rec.id, {
+              secretId,
+              secretVersionId,
+              secretKeys: secretKeys.slice(),
+            });
+            state.writeInfrastructure(dir, {
+              lockbox: { id: secretId, name: "app-" + slug + "-env" },
+              secretKeys: secretKeys.slice(),
+              serviceAccount: serviceAccountId ? { id: serviceAccountId, name: "sa-" + slug } : null,
+            });
+          }
+          return done.join(", ");
+        });
+        if (!sec.ok) fatal = sec.error;
       }
 
       // 10. Ревизия
       if (!fatal) {
         const rev = await stage("revision", async () => {
+          // Переменные, ставшие секретами, в открытое окружение не дублируем.
+          const plainEnv = Object.assign({}, o.env || {});
+          for (const k of secretKeys) delete plainEnv[k];
+          const revisionSecrets = secretKeys.map((k) => {
+            const s = { id: secretId, key: k, environmentVariable: k };
+            if (secretVersionId) s.versionId = secretVersionId;
+            return s;
+          });
           const r = await yandex.deployContainerRevision(oauth, {
             containerId,
             folderId,
@@ -434,7 +598,8 @@ function createDeployEngine(deps) {
             memoryMb: o.memoryMb || REVISION_DEFAULTS.memoryMb,
             cores: o.cores || REVISION_DEFAULTS.cores,
             timeoutSec: o.timeoutSec || REVISION_DEFAULTS.timeoutSec,
-            env: o.env || {},
+            env: plainEnv,
+            secrets: revisionSecrets,
           });
           revisionId = (r && r.revisionId) || (await latestRevisionId(oauth, containerId)) || (r && r.id) || "";
           const info = await yandex.containerInfo(oauth, containerId);
@@ -463,15 +628,26 @@ function createDeployEngine(deps) {
 
       // 12. Проверка страницы браузером: HTTP 200 ещё не значит, что всё нарисовалось
       if (!fatal) {
-        if (!browserAudit) {
-          warnings.push("Проверка страницы браузером пропущена: браузер недоступен — посмотри адрес глазами.");
+        browserMode = browserModeOf(o);
+        if (browserMode === "off") {
+          // Выключено осознанно: не пугаем замечанием, но и не делаем вид, что проверили.
+          browserCheck = { ok: true, level: "off", reason: "", warnings: [], metrics: null };
+        } else if (!browserAudit) {
+          const why = "Проверка страницы браузером невозможна: браузер недоступен.";
+          if (browserMode === "required") fatal = why + " Проверка объявлена обязательной (browserCheck: required).";
+          else warnings.push(why + " Посмотри адрес глазами.");
         } else {
           const b = await stage("browse", async () => {
             const audit = await browserAudit(url, { settleMs: o.browserSettleMs });
             // Не поднялся сам браузер — это ограничение проверки, а не поломка
-            // выката: откатывать работающий сайт из-за этого нельзя.
+            // выката: откатывать работающий сайт из-за этого нельзя. Но когда
+            // проверка объявлена обязательной — без неё выкат не принимается.
             if (!audit || !audit.ok) {
-              warnings.push("браузер: проверка страницы не состоялась — " + ((audit && audit.error) || "нет данных"));
+              const why = "браузер: проверка страницы не состоялась — " + ((audit && audit.error) || "нет данных");
+              if (browserMode === "required") {
+                throw new Error(why + " Проверка объявлена обязательной (browserCheck: required): без неё выкат не принимается.");
+              }
+              warnings.push(why);
               return "пропущено: " + ((audit && audit.error) || "браузер недоступен");
             }
             browserCheck = deployCheck.evaluate(audit);
@@ -499,6 +675,9 @@ function createDeployEngine(deps) {
               image,
               revisionId,
               containerId,
+              secretId,
+              secretVersionId,
+              secretKeys: secretKeys.slice(),
               warnings,
               health,
               browserCheck,
@@ -576,8 +755,13 @@ function createDeployEngine(deps) {
         url,
         image,
         revisionId,
+        secretId,
+        secretVersionId,
+        secretKeys: secretKeys.slice(),
         health,
         browserCheck,
+        browserMode,
+        testsFailed,
         browserCheckAfterRollback: rollbackCheck,
         browserShot: screenshotPath,
         deploymentId: rec && rec.id,
@@ -595,10 +779,15 @@ function createDeployEngine(deps) {
       image,
       revisionId,
       containerId,
+      secretId,
+      secretVersionId,
+      secretKeys: secretKeys.slice(),
       deploymentId: rec && rec.id,
       number: rec && rec.number,
       health,
       browserCheck,
+      browserMode,
+      testsFailed,
       browserShot: screenshotPath,
       stages,
       warnings,
@@ -676,4 +865,12 @@ function createDeployEngine(deps) {
   return { deploy, rollback, healthCheck, STAGE_ORDER, STAGE_LABELS, _normalizeRun: normalizeRun };
 }
 
-module.exports = { createDeployEngine, STAGE_ORDER, STAGE_LABELS, REVISION_DEFAULTS };
+module.exports = {
+  createDeployEngine,
+  STAGE_ORDER,
+  STAGE_LABELS,
+  REVISION_DEFAULTS,
+  // Правила приёмки production — чистые решения, поэтому проверяются напрямую.
+  testsAreFatal,
+  browserModeOf,
+};

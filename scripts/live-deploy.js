@@ -36,8 +36,16 @@ function freePort() {
 
 // ── Подменённый Yandex Cloud API + сайт для проверки после деплоя ───────────
 const seen = [];
-const calls = { rollback: 0, deploys: 0, images: [] };
+const calls = { rollback: 0, deploys: 0, images: [], publicAccess: 0, saCreated: 0 };
 const revisions = [];
+// Права на контейнер. Публичным его делает только привязка «все пользователи →
+// invoker» — до неё адрес отвечает 403. Так подменённое облако повторяет
+// настоящее: если движок забудет выдать права, выкат упадёт на проверке адреса.
+let containerBindings = [];
+const isPublic = () =>
+  containerBindings.some(
+    (b) => /containers\.?invoker$/i.test(String(b.roleId).replace(/[_.-]/g, ".")) && b.subject && b.subject.id === "allUsers"
+  );
 // Что отдаёт выкаченный сайт: ok — рабочая страница, http500 — приложение падает,
 // blank — отвечает 200, но страница пустая (такое видит только браузер).
 let mode = "ok";
@@ -64,7 +72,12 @@ function startFake() {
       const p = u.pathname;
 
       // Сайт проекта: сюда попадают проверка адреса и аудит страницы браузером.
+      // Закрытый контейнер отвечает 403 — как настоящее облако.
       if (p.startsWith("/app")) {
+        if (!isPublic()) {
+          res.writeHead(403, { "Content-Type": "text/plain" });
+          return res.end("forbidden: container is not public");
+        }
         if (mode === "http500") {
           res.writeHead(500, { "Content-Type": "text/plain" });
           return res.end("internal error");
@@ -102,6 +115,20 @@ function startFake() {
           return json(200, { id: "op-cont", done: true });
         }
         return json(200, { containers: calls.containerCreated ? [{ id: "cont1", name: "shop", status: "ACTIVE" }] : [] });
+      }
+      if (p === "/containers/v1/containers/cont1:listAccessBindings") {
+        return json(200, { accessBindings: containerBindings });
+      }
+      if (p === "/containers/v1/containers/cont1:updateAccessBindings" && req.method === "POST") {
+        calls.publicAccess++;
+        try {
+          const deltas = (JSON.parse(body || "{}").accessBindingDeltas) || [];
+          for (const d of deltas) {
+            const ab = d && d.accessBinding;
+            if (ab) containerBindings.push({ roleId: ab.roleId, subject: ab.subject });
+          }
+        } catch {}
+        return json(200, { id: "op-ab", done: true });
       }
       if (p === "/containers/v1/containers/cont1") {
         // Адрес контейнера: после «сломанного» выката сайт отдаёт 500 — движок
@@ -378,6 +405,17 @@ function makeFakeDocker(dir) {
     check("прогон дошёл до Production", /Production/.test(first.status), first.status);
     check("адрес сайта показан", /^http:\/\/127\.0\.0\.1:\d+\/app$/.test(first.url), first.url);
     check("стадий ровно 13 и все успешны", first.stages.length === 13 && first.stages.every((s) => s.status === "ok"), first.stages.map((s) => s.status).join(","));
+    // Контейнер закрыт, пока не выдана привязка «все пользователи → invoker»:
+    // подменённое облако отдаёт по адресу 403, как настоящее. Если стадия прав
+    // пропадёт, эти же проверки уронят выкат целиком.
+    const contStage = first.stages.find((s) => /Контейнер/.test(s.name)) || {};
+    check(
+      "публичный доступ выдан привязкой «все пользователи → invoker»",
+      calls.publicAccess >= 1 && isPublic(),
+      "запросов прав: " + calls.publicAccess + ", привязок: " + containerBindings.length
+    );
+    check("стадия контейнера называет, чем открыт доступ", /все пользователи/.test(contStage.detail || ""), contStage.detail || "нет стадии");
+    check("сервисный аккаунт ради публичности не создаётся", calls.saCreated === 0, "создано SA: " + calls.saCreated);
     const browseStage = first.stages.find((s) => s.name === "Проверка в браузере") || {};
     check("страница проверена браузером (адрес, текст, заголовок)", /HTTP 200/.test(browseStage.detail || "") && /текста \d+/.test(browseStage.detail || "") && /Витрина магазина/.test(browseStage.detail || ""), browseStage.detail || "нет стадии");
     check("локальная сборка и тесты прошли до образа", first.stages.some((s) => s.name === "Проверки проекта" && /сборка/.test(s.detail)), (first.stages.find((s) => s.name === "Проверки проекта") || {}).detail || "");

@@ -469,8 +469,11 @@ async function createResource(oauthToken, folderId, serviceKey, name) {
     headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
     body: JSON.stringify(maker.body(folderId, nm)),
   }, 30000);
-  await waitOperation(oauthToken, j && j.id, 180000);
-  return { ok: true, resourceId: (j && j.id) || "", name: nm, message: "Ресурс «" + nm + "» создан (операция завершена)." };
+  const op = await waitOperation(oauthToken, j && j.id, 180000);
+  // id созданного ресурса, а не операции: в облаке это разные вещи, и откат
+  // с удалением по id операции не находит ничего.
+  const resourceId = (op && op.response && op.response.id) || (j && j.id) || "";
+  return { ok: true, resourceId, name: nm, message: "Ресурс «" + nm + "» создан (операция завершена)." };
 }
 
 // Удалить ресурс по id. DELETE <base><listPath>/<id>.
@@ -512,7 +515,9 @@ async function waitOperation(oauthToken, operationId, timeoutMs) {
           e.status = 400;
           throw e;
         }
-        return;
+        // Возвращаем тело операции: у части сервисов (Lockbox, создание
+        // ресурсов) id готового объекта приходит только в response.
+        return j;
       }
       lastMsg = "операция ещё выполняется";
     } catch (e) {
@@ -538,9 +543,9 @@ async function testAuth(oauthToken, folderId) {
 }
 
 // ── Деплой-конвейер: папка проекта → Serverless Containers ───────────────────
-// Шаги (выполняются в main.js, здесь — только REST-части):
+// Шаги (порядок задаёт src/deploy-engine.js, здесь — только REST-части):
 //   ensureRegistry → docker build/push (CLI) → ensureContainer →
-//   ensureServiceAccount + роль на каталог → deployContainerRevision → url.
+//   setContainerPublicAccess (allUsers → invoker) → deployContainerRevision → url.
 
 function slugify(name) {
   return String(name || "").toLowerCase().replace(/[^a-z0-9-_]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "app";
@@ -632,6 +637,83 @@ async function containerInfo(oauthToken, containerId) {
     folderId: c.folderId || "",
     createdAt: c.createdAt || "",
   };
+}
+
+// ── Публичный доступ к контейнеру ──────────────────────────────────────────
+// Публичным контейнер делает привязка роли invoker субъекту «все пользователи»
+// ({ id: "allUsers", type: "system" }) НА САМ КОНТЕЙНЕР. Роль, выданная
+// сервисному аккаунту или на каталог, доступа из интернета не даёт: адрес
+// контейнера отвечает 403, и деплой справедливо падает на проверке после
+// выката, хотя все предыдущие стадии прошли. Сверено с документацией
+// (serverless-containers/operations/container-public).
+const PUBLIC_INVOKER_SUBJECT = { id: "allUsers", type: "system" };
+const CONTAINER_INVOKER_ROLE = "serverless.containers.invoker";
+
+// id роли в ответах встречается в двух формах: serverless.containers.invoker и
+// serverless-containers.containerInvoker. Сравниваем по «скелету», иначе
+// готовая привязка не распознаётся и мы добавили бы её второй раз.
+function isInvokerRole(roleId) {
+  const s = String(roleId || "")
+    .toLowerCase()
+    .replace(/[\s._-]/g, "");
+  return s === "serverlesscontainersinvoker" || s === "serverlesscontainerscontainerinvoker";
+}
+
+// Права контейнера в читаемом виде.
+async function listContainerAccessBindings(oauthToken, containerId) {
+  const id = String(containerId || "").trim();
+  if (!id) throw new Error("Не указан id контейнера.");
+  const token = await getIamToken(oauthToken);
+  const base = await scBase(oauthToken);
+  const j = await fetchJson(base + "/containers/v1/containers/" + encodeURIComponent(id) + ":listAccessBindings", {
+    headers: { Authorization: "Bearer " + token },
+  }, 20000);
+  const list = Array.isArray(j && j.accessBindings) ? j.accessBindings : [];
+  return list.map((b) => {
+    const subj = (b && b.subject) || {};
+    return { roleId: (b && b.roleId) || "", subjectId: subj.id || "", subjectType: subj.type || "" };
+  });
+}
+
+function hasPublicInvoker(bindings) {
+  return (bindings || []).some(
+    (b) => isInvokerRole(b.roleId) && b.subjectId === PUBLIC_INVOKER_SUBJECT.id && b.subjectType === PUBLIC_INVOKER_SUBJECT.type
+  );
+}
+
+// Сделать контейнер вызываемым из интернета. Добавляем одну привязку (delta ADD),
+// а не заменяем весь список: чужие роли на контейнере остаются на месте. Если
+// привязка уже есть — ничего не делаем, и это не ошибка.
+async function setContainerPublicAccess(oauthToken, containerId) {
+  const id = String(containerId || "").trim();
+  if (!id) throw new Error("Не указан id контейнера.");
+  const before = await listContainerAccessBindings(oauthToken, id);
+  if (hasPublicInvoker(before)) return { ok: true, already: true, bindings: before };
+  const token = await getIamToken(oauthToken);
+  const base = await scBase(oauthToken);
+  const j = await fetchJson(base + "/containers/v1/containers/" + encodeURIComponent(id) + ":updateAccessBindings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+    body: JSON.stringify({
+      accessBindingDeltas: [
+        { action: "ADD", accessBinding: { roleId: CONTAINER_INVOKER_ROLE, subject: PUBLIC_INVOKER_SUBJECT } },
+      ],
+    }),
+  }, 30000);
+  await waitOperation(oauthToken, j && j.id, 120000);
+  // Проверяем результат, а не факт отправки запроса: без привязки контейнер
+  // останется закрытым, и узнать об этом лучше здесь, а не на проверке адреса.
+  const after = await listContainerAccessBindings(oauthToken, id);
+  if (!hasPublicInvoker(after)) {
+    const e = new Error(
+      "Права контейнера не изменились: привязка «все пользователи → " +
+        CONTAINER_INVOKER_ROLE +
+        "» не появилась. Нужна роль с правом serverless-containers.containers.setAccessBindings (её даёт editor на каталог)."
+    );
+    e.status = 403;
+    throw e;
+  }
+  return { ok: true, already: false, bindings: after };
 }
 
 // Редактор контейнера: имя, описание, метки. updateMask перечисляет ТОЛЬКО те
@@ -925,6 +1007,144 @@ async function addRoleOnFolder(oauthToken, folderId, saId, roleId) {
   return true;
 }
 
+// ── Lockbox: секреты приложения ─────────────────────────────────────────────
+// Зачем: значения секретов не должны ехать через модель и не должны лежать
+// в образе открытым текстом (imageSpec.environment). Секрет живёт в Lockbox, а
+// ревизия получает только ссылку { id, key, environmentVariable } — значение
+// подставляет само облако. Ревизии для этого нужен сервисный аккаунт с ролью
+// lockbox.payloadViewer НА СЕКРЕТ (не на каталог — так меньше прав).
+// Сверено с документацией: serverless-containers/operations/lockbox-secret-transmit,
+// lockbox/api-ref/Secret/addVersion.
+
+async function lockboxBase(oauthToken) {
+  return (await endpoint("lockbox")) || KNOWN_ENDPOINTS.lockbox;
+}
+
+async function listSecrets(oauthToken, folderId) {
+  const token = await getIamToken(oauthToken);
+  const base = await lockboxBase(oauthToken);
+  const j = await fetchJson(base + "/lockbox/v1/secrets?folderId=" + encodeURIComponent(folderId) + "&pageSize=1000", {
+    headers: { Authorization: "Bearer " + token },
+  }, 25000);
+  return Array.isArray(j && j.secrets) ? j.secrets : [];
+}
+
+async function findSecret(oauthToken, folderId, name) {
+  const list = await listSecrets(oauthToken, folderId);
+  return list.find((s) => s && s.name === name) || null;
+}
+
+// Секрет приложения: есть — отдаём его, нет — создаём. Повторные деплои не
+// плодят новые секреты, а добавляют в тот же новую версию.
+async function ensureLockboxSecret(oauthToken, folderId, name) {
+  const nm = String(name || "").trim();
+  if (!nm) throw new Error("Не указано имя секрета Lockbox.");
+  const existing = await findSecret(oauthToken, folderId, nm);
+  if (existing) return existing;
+  await createResource(oauthToken, folderId, "lockbox", nm);
+  const after = await findSecret(oauthToken, folderId, nm);
+  if (!after) throw new Error("Секрет «" + nm + "» создан, но не найден в каталоге — проверь права на Lockbox.");
+  return after;
+}
+
+async function getSecret(oauthToken, secretId) {
+  const id = String(secretId || "").trim();
+  if (!id) throw new Error("Не указан id секрета Lockbox.");
+  const token = await getIamToken(oauthToken);
+  const base = await lockboxBase(oauthToken);
+  const j = await fetchJson(base + "/lockbox/v1/secrets/" + encodeURIComponent(id), {
+    headers: { Authorization: "Bearer " + token },
+  }, 20000);
+  return j || {};
+}
+
+async function listSecretVersions(oauthToken, secretId) {
+  const id = String(secretId || "").trim();
+  if (!id) throw new Error("Не указан id секрета Lockbox.");
+  const token = await getIamToken(oauthToken);
+  const base = await lockboxBase(oauthToken);
+  const j = await fetchJson(base + "/lockbox/v1/secrets/" + encodeURIComponent(id) + "/versions?pageSize=100", {
+    headers: { Authorization: "Bearer " + token },
+  }, 20000);
+  const list = Array.isArray(j && j.versions) ? j.versions : [];
+  return list
+    .slice()
+    .sort((a, b) => String((b && b.createdAt) || "").localeCompare(String((a && a.createdAt) || "")));
+}
+
+// Новая версия секрета со значениями. Значения НЕ возвращаются и НЕ попадают
+// ни в отчёт, ни в состояние: наружу уходят только ключи и id версии.
+async function putSecretVersion(oauthToken, secretId, entries) {
+  const id = String(secretId || "").trim();
+  if (!id) throw new Error("Не указан id секрета Lockbox.");
+  const list = (entries || []).map((e) => ({ key: String(e && e.key), textValue: String(e && e.value == null ? "" : e.value) })).filter((e) => e.key);
+  if (!list.length) throw new Error("Нет ни одной пары «ключ → значение» для версии секрета.");
+  const bad = list.find((e) => !/^[-_./\\@0-9a-zA-Z]+$/.test(e.key));
+  if (bad) throw new Error("Ключ «" + bad.key + "» не годится для Lockbox: допустимы латиница, цифры и знаки - _ . / \\ @.");
+  const token = await getIamToken(oauthToken);
+  const base = await lockboxBase(oauthToken);
+  const j = await fetchJson(base + "/lockbox/v1/secrets/" + encodeURIComponent(id) + ":addVersion", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+    body: JSON.stringify({ description: "deploy " + new Date().toISOString(), payloadEntries: list }),
+  }, 30000);
+  const op = await waitOperation(oauthToken, j && j.id, 120000);
+  let versionId = (op && op.response && op.response.id) || "";
+  if (!versionId) {
+    const versions = await listSecretVersions(oauthToken, id);
+    versionId = (versions[0] && versions[0].id) || "";
+  }
+  return { versionId, keys: list.map((e) => e.key) };
+}
+
+// Права на секрет — сервисному аккаунту ревизии и только на этот секрет.
+async function grantSecretAccess(oauthToken, secretId, serviceAccountId, roleId) {
+  const id = String(secretId || "").trim();
+  const saId = String(serviceAccountId || "").trim();
+  if (!id) throw new Error("Не указан id секрета Lockbox.");
+  if (!saId) throw new Error("Не указан сервисный аккаунт, которому выдаём доступ к секрету.");
+  const token = await getIamToken(oauthToken);
+  const base = await lockboxBase(oauthToken);
+  const j = await fetchJson(base + "/lockbox/v1/secrets/" + encodeURIComponent(id) + ":updateAccessBindings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+    body: JSON.stringify({
+      accessBindingDeltas: [
+        { action: "ADD", accessBinding: { roleId: roleId || "lockbox.payloadViewer", subject: { id: saId, type: "serviceAccount" } } },
+      ],
+    }),
+  }, 30000);
+  await waitOperation(oauthToken, j && j.id, 120000);
+  return true;
+}
+
+// ── Образы реестра: нужны уборке ────────────────────────────────────────────
+// Реестр в облаке не удаляется, пока в нём есть образы, а тестовый прогон
+// обязан убрать за собой всё.
+async function listRegistryImages(oauthToken, registryId) {
+  const id = String(registryId || "").trim();
+  if (!id) throw new Error("Не указан id реестра.");
+  const token = await getIamToken(oauthToken);
+  const base = await endpoint("container-registry") || KNOWN_ENDPOINTS["container-registry"];
+  const j = await fetchJson(base + "/container-registry/v1/images?registryId=" + encodeURIComponent(id) + "&pageSize=1000", {
+    headers: { Authorization: "Bearer " + token },
+  }, 25000);
+  return Array.isArray(j && j.images) ? j.images : [];
+}
+
+async function deleteRegistryImage(oauthToken, imageId) {
+  const id = String(imageId || "").trim();
+  if (!id) throw new Error("Не указан id образа.");
+  const token = await getIamToken(oauthToken);
+  const base = await endpoint("container-registry") || KNOWN_ENDPOINTS["container-registry"];
+  const j = await fetchJson(base + "/container-registry/v1/images/" + encodeURIComponent(id), {
+    method: "DELETE",
+    headers: { Authorization: "Bearer " + token },
+  }, 30000);
+  await waitOperation(oauthToken, j && j.id, 120000);
+  return true;
+}
+
 module.exports = {
   SERVICES,
   _fetchJson: fetchJson,
@@ -959,6 +1179,17 @@ module.exports = {
   findContainer,
   ensureContainer,
   containerInfo,
+  listContainerAccessBindings,
+  setContainerPublicAccess,
+  listSecrets,
+  findSecret,
+  ensureLockboxSecret,
+  getSecret,
+  listSecretVersions,
+  putSecretVersion,
+  grantSecretAccess,
+  listRegistryImages,
+  deleteRegistryImage,
   getContainer,
   updateContainer,
   listRevisions,

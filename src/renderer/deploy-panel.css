@@ -125,6 +125,29 @@
 
 .dp-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
 
+/* Переменные и секреты: многострочные поля — по строке KEY=значение. */
+.dp-ta {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-input, rgba(255, 255, 255, 0.03));
+  color: var(--text);
+  font-family: var(--mono, monospace);
+  font-size: 11.5px;
+  line-height: 1.5;
+  resize: vertical;
+}
+.dp-ta:focus { outline: none; border-color: var(--accent); }
+.dp-hint { margin-top: 6px; font-size: 11px; color: var(--text-faint); line-height: 1.5; }
+
+/* Продолжить выкат после упавших тестов: видно, но не как основное действие. */
+.dp-override { width: 100%; justify-content: center; border-color: var(--warn); color: var(--warn); }
+.dp-override:hover { box-shadow: 0 0 14px rgba(255, 176, 32, 0.18); }
+
 /* Узкая панель: кнопки в строку не влезают — переносим, ничего не обрезаем. */
 @media (max-width: 520px) {
   .dp-top { align-items: flex-start; }

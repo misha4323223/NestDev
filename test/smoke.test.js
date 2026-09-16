@@ -9013,11 +9013,41 @@ async function testDeploy() {
       getIamToken: async () => "t1.IAMTOKEN",
       ensureRegistry: async () => ({ id: "crp1" }),
       ensureContainer: async () => ({ id: "cont1" }),
-      ensureServiceAccount: async () => ({ id: "sa1" }),
+      ensureServiceAccount: async () => {
+        calls.yandex.push("sa");
+        return { id: "sa1" };
+      },
       addRoleOnFolder: async () => ({}),
+      // Публичный доступ — отдельный вызов на контейнер (привязка allUsers → invoker).
+      setContainerPublicAccess: async (_a, containerId) => {
+        if (o.publicAccessFails) {
+          throw new Error("Права контейнера не изменились: привязка «все пользователи → serverless.containers.invoker» не появилась.");
+        }
+        calls.yandex.push("public:" + containerId + (o.publicAccessAlready ? ":already" : ""));
+        return { ok: true, already: !!o.publicAccessAlready, bindings: [] };
+      },
       deployContainerRevision: async (_a, args) => {
         calls.yandex.push("revision:" + args.imageUrl);
+        calls.revisionArgs = args;
         return { revisionId: "rev-" + calls.yandex.length };
+      },
+      // Lockbox: секрет, его версия (значения), чтение по ссылке и права на секрет.
+      ensureLockboxSecret: async (_a, _folderId, name) => {
+        calls.yandex.push("secret:" + name);
+        return { id: "sec1", name };
+      },
+      putSecretVersion: async (_a, id, entries) => {
+        calls.secretValues = entries.slice();
+        calls.yandex.push("secretVersion:" + id + ":" + entries.map((e) => e.key).join("+"));
+        return { versionId: "ver1", keys: entries.map((e) => e.key) };
+      },
+      getSecret: async (_a, id) => {
+        calls.yandex.push("getSecret:" + id);
+        return { id, name: "готовый" };
+      },
+      grantSecretAccess: async (_a, id, saId) => {
+        calls.yandex.push("grant:" + id + ":" + saId);
+        return true;
       },
       containerInfo: async () => ({ url: "https://app.test" }),
       rollbackContainer: async (_a, cid, rev) => {
@@ -9141,6 +9171,336 @@ async function testDeploy() {
     const r2 = await priv.engine.deploy(d, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 1, healthDelayMs: 1, autoRollback: false });
     assert.strictEqual(r2.ok, false);
     assert.ok(/публичн/i.test(r2.error), "403 нужно объяснять словами про публичный доступ");
+    assert.ok(/все пользователи/.test(r2.error), "в объяснении 403 должно быть сказано, чем именно открывается контейнер");
+
+  });
+
+  await test("секреты деплоя: значения уезжают в Lockbox, а в ревизию — только ссылка", async () => {
+    const d = mkproj("e-secrets", projFiles);
+    const { engine, calls } = makeEngine({});
+    const r = await engine.deploy(d, {
+      cloud: { oauth: "o", folderId: "b1g" },
+      name: "app",
+      runTests: false,
+      healthTries: 1,
+      healthDelayMs: 1,
+      env: { NODE_ENV: "production", DATABASE_URL: "postgres://secret" },
+      secrets: { DATABASE_URL: "postgres://user:pw@host/db", API_KEY: "s3cret" },
+    });
+    assert.strictEqual(r.ok, true, r.error);
+    const ids = r.stages.map((s) => s.id);
+    assert.ok(
+      ids.indexOf("secrets") > ids.indexOf("container") && ids.indexOf("secrets") < ids.indexOf("revision"),
+      "стадия секретов идёт между контейнером и ревизией: " + ids.join(",")
+    );
+    // Значения ушли в версию секрета, а не в образ.
+    assert.deepStrictEqual(calls.secretValues, [
+      { key: "DATABASE_URL", value: "postgres://user:pw@host/db" },
+      { key: "API_KEY", value: "s3cret" },
+    ]);
+    const args = calls.revisionArgs;
+    assert.ok(
+      !JSON.stringify(args.env).includes("s3cret") && !JSON.stringify(args.env).includes("postgres://user:pw"),
+      "значения секретов не дублируются в открытом окружении: " + JSON.stringify(args.env)
+    );
+    assert.strictEqual(args.env.NODE_ENV, "production", "обычные переменные остаются открытыми");
+    // Проверять надо ИМЕНА переменных: значение обычной переменной может совпасть
+    // случайно, а вот дубль «одно и то же в двух полях» — это утечка открытым текстом.
+    assert.deepStrictEqual(Object.keys(args.env).sort(), ["NODE_ENV"], "переменные, ставшие секретами, не дублируются открытым текстом");
+    assert.ok(
+      r.warnings.some((w) => /заданы дважды/.test(w)),
+      "про одну и ту же переменную в двух полях человек должен узнать: " + JSON.stringify(r.warnings)
+    );
+    assert.ok(
+      r.stages.find((s) => s.id === "secrets").detail.includes("lockbox.payloadViewer"),
+      "стадия секретов говорит, какие права выданы"
+    );
+    assert.deepStrictEqual(args.secrets.map((s) => s.environmentVariable), ["DATABASE_URL", "API_KEY"]);
+    assert.ok(args.secrets.every((s) => s.id === "sec1" && s.key === s.environmentVariable), "ревизия ссылается на секрет, а не на значение");
+    assert.ok(args.secrets.every((s) => s.versionId === "ver1"), "версия секрета указана явно: иначе подставится другая");
+    assert.ok(calls.yandex.includes("grant:sec1:sa1"), "права выдаются НА СЕКРЕТ и сервисному аккаунту ревизии");
+    assert.ok(calls.yandex.includes("sa"), "для секретов сервисный аккаунт создаётся сам");
+    // В состоянии — только id секрета и имена ключей.
+    const stateText =
+      fs.readFileSync(path.join(d, ".cloud", "deployments.json"), "utf8") + fs.readFileSync(path.join(d, ".cloud", "infrastructure.json"), "utf8");
+    assert.ok(!stateText.includes("s3cret") && !stateText.includes("postgres://user:pw"), "значения секретов не пишем в состояние");
+    assert.ok(stateText.includes("API_KEY") && stateText.includes("sec1"), "id секрета и имена ключей храним");
+
+    // Готовый секрет по ссылке: значения не нужны и не читаются.
+    const d2 = mkproj("e-secrets-ref", projFiles);
+    const ref = makeEngine({});
+    const r2 = await ref.engine.deploy(d2, {
+      cloud: { oauth: "o", folderId: "b1g" },
+      name: "app",
+      runTests: false,
+      healthTries: 1,
+      healthDelayMs: 1,
+      secretId: "sec9",
+      secretKeys: ["DATABASE_URL"],
+    });
+    assert.strictEqual(r2.ok, true, r2.error);
+    assert.ok(ref.calls.yandex.includes("getSecret:sec9"), "готовый секрет читается по ссылке");
+    assert.ok(!ref.calls.secretValues, "значения секрета не запрашиваются и не пишутся");
+    assert.deepStrictEqual(ref.calls.revisionArgs.secrets, [{ id: "sec9", key: "DATABASE_URL", environmentVariable: "DATABASE_URL" }]);
+
+    // Готовый секрет без ключей — понятная ошибка, а не молчаливый выкат.
+    const d3 = mkproj("e-secrets-nokeys", projFiles);
+    const bad = makeEngine({});
+    const r3 = await bad.engine.deploy(d3, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 1, healthDelayMs: 1, secretId: "sec9" });
+    assert.strictEqual(r3.ok, false);
+    assert.ok(/secretKeys/.test(r3.error), "в ошибке сказано, чего не хватает: " + r3.error);
+  });
+
+  await test("Lockbox: версия секрета кладётся нужным запросом, права — на секрет, значения наружу не идут", async () => {
+    const yc = require(path.join(ROOT, "src", "yandex-cloud.js"));
+    const realFetch = global.fetch;
+    const reqs = [];
+    let returnVersion = true;
+    const mkJson = (obj) => ({ ok: true, status: 200, async text() { return JSON.stringify(obj); }, async json() { return obj; } });
+    global.fetch = async (url, init) => {
+      const p = String(url).split("?")[0];
+      reqs.push({ method: (init && init.method) || "GET", path: p, body: init && init.body ? JSON.parse(init.body) : null });
+      if (p.endsWith("/iam/v1/tokens")) return mkJson({ iamToken: "t1.T", expiresAt: new Date(Date.now() + 3600e3).toISOString() });
+      // Опрос операции: id готовой версии приходит именно здесь, а не в ответе
+      // на :addVersion (тот отдаёт операцию, а не результат).
+      if (p.includes("/operations/")) return mkJson({ id: "op", done: true, response: returnVersion ? { id: "ver7" } : undefined });
+      if (p.endsWith(":addVersion")) return mkJson({ id: "opi", done: true });
+      if (p.endsWith("/versions")) return mkJson({ versions: [{ id: "ver8", createdAt: "2026-09-16T10:00:00Z" }, { id: "ver7", createdAt: "2026-09-15T10:00:00Z" }] });
+      if (p.endsWith(":updateAccessBindings")) return mkJson({ id: "opb", done: true });
+      return mkJson({});
+    };
+    try {
+      const v = await yc.putSecretVersion("oauth", "sec1", [{ key: "DATABASE_URL", value: "postgres://user:pw@host/db" }]);
+      const add = reqs.find((r) => r.path.endsWith(":addVersion"));
+      assert.ok(add && add.method === "POST", "версия добавляется запросом :addVersion");
+      assert.deepStrictEqual(add.body.payloadEntries, [{ key: "DATABASE_URL", textValue: "postgres://user:pw@host/db" }]);
+      assert.strictEqual(v.versionId, "ver7", "id версии берётся из ответа операции");
+      assert.deepStrictEqual(v.keys, ["DATABASE_URL"]);
+      assert.ok(!JSON.stringify(v).includes("postgres://user:pw"), "значения не возвращаются наружу");
+      assert.ok(!JSON.stringify(v).includes("host/db"), "значения не возвращаются наружу");
+
+      // Операция без response: id версии добираем списком, а не выдумываем.
+      returnVersion = false;
+      const v2 = await yc.putSecretVersion("oauth", "sec1", [{ key: "API_KEY", value: "x" }]);
+      assert.strictEqual(v2.versionId, "ver8");
+
+      await assert.rejects(
+        () => yc.putSecretVersion("oauth", "sec1", [{ key: "плохой ключ", value: "x" }]),
+        /не годится/,
+        "ключ, который Lockbox не примет, отсекаем сами — с понятным текстом"
+      );
+      await assert.rejects(() => yc.putSecretVersion("oauth", "sec1", []), /ключ → значение/);
+
+      await yc.grantSecretAccess("oauth", "sec1", "sa1", "lockbox.payloadViewer");
+      const grant = reqs.filter((r) => r.path.endsWith(":updateAccessBindings")).pop();
+      assert.strictEqual(grant.path, "https://lockbox.api.cloud.yandex.net/lockbox/v1/secrets/sec1:updateAccessBindings");
+      assert.deepStrictEqual(grant.body.accessBindingDeltas[0].accessBinding, {
+        roleId: "lockbox.payloadViewer",
+        subject: { id: "sa1", type: "serviceAccount" },
+      });
+    } finally {
+      global.fetch = realFetch;
+    }
+  });
+
+  await test("движок деплоя: контейнер открывается привязкой «все пользователи» на контейнер", async () => {
+    const d = mkproj("e-public", projFiles);
+    const first = makeEngine({});
+    const r = await first.engine.deploy(d, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 1, healthDelayMs: 1 });
+    assert.strictEqual(r.ok, true);
+    const cont = r.stages.find((s) => s.id === "container") || {};
+    assert.ok(/все пользователи/.test(cont.detail || ""), "публичность выдаётся привязкой на контейнер: " + cont.detail);
+    assert.ok(first.calls.yandex.includes("public:cont1"), "движок обязан выдать публичный доступ");
+    assert.ok(!first.calls.yandex.includes("sa"), "сервисный аккаунт для публичности не нужен: лишнее право и лишний ресурс в каталоге");
+
+    const second = makeEngine({ publicAccessAlready: true });
+    const r2 = await second.engine.deploy(d, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 1, healthDelayMs: 1 });
+    assert.strictEqual(r2.ok, true);
+    const again = r2.stages.find((s) => s.id === "container") || {};
+    assert.ok(/уже был/.test(again.detail || ""), "повторную выдачу прав надо назвать словами, а не молчать: " + again.detail);
+
+    const d3 = mkproj("e-public-fail", projFiles);
+    const third = makeEngine({ publicAccessFails: true });
+    const r3 = await third.engine.deploy(d3, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", runTests: false, healthTries: 1, healthDelayMs: 1 });
+    assert.strictEqual(r3.ok, false);
+    assert.ok(/setAccessBindings/.test(r3.error), "в ошибке должно быть названо право, которого не хватило: " + r3.error);
+    assert.ok(!third.calls.yandex.some((c) => c.startsWith("revision:")), "ревизию без публичного доступа не создаём");
+
+    const d4 = mkproj("e-private", projFiles);
+    const fourth = makeEngine({});
+    const r4 = await fourth.engine.deploy(d4, { cloud: { oauth: "o", folderId: "b1g" }, name: "app", public: false, runTests: false, healthTries: 1, healthDelayMs: 1 });
+    assert.strictEqual(r4.ok, true);
+    assert.ok(!fourth.calls.yandex.some((c) => c.startsWith("public:")), "при public: false права не трогаем");
+  });
+
+  await test("публичный доступ: привязка allUsers → invoker, повтор и отказ распознаются", async () => {
+    const yc = require(path.join(ROOT, "src", "yandex-cloud.js"));
+    const realFetch = global.fetch;
+    const mkJson = (obj, status) => ({
+      ok: (status || 200) < 400,
+      status: status || 200,
+      async text() { return JSON.stringify(obj); },
+      async json() { return obj; },
+    });
+    let bindings = [];
+    let updates = 0;
+    let failUpdate = false;
+    global.fetch = async (url, init) => {
+      const p = String(url).split("?")[0];
+      const method = (init && init.method) || "GET";
+      if (p.endsWith("/iam/v1/tokens")) return mkJson({ iamToken: "t1.TEST", expiresAt: new Date(Date.now() + 3600e3).toISOString() });
+      if (p.endsWith(":listAccessBindings")) return mkJson({ accessBindings: bindings.slice() });
+      if (p.endsWith(":updateAccessBindings") && method === "POST") {
+        updates++;
+        const delta = JSON.parse(init.body).accessBindingDeltas[0];
+        if (failUpdate) return mkJson({ id: "op1", done: true });
+        // В ответе облако отдаёт id роли в другой форме: готовая привязка всё
+        // равно должна распознаваться, иначе мы добавим её второй раз.
+        bindings.push({ roleId: "serverless-containers.containerInvoker", subject: delta.accessBinding.subject });
+        return mkJson({ id: "op1", done: true });
+      }
+      if (p.includes("/operations/")) return mkJson({ id: "op1", done: true });
+      return mkJson({});
+    };
+    try {
+      const first = await yc.setContainerPublicAccess("oauth", "cont1");
+      assert.strictEqual(first.ok, true);
+      assert.strictEqual(first.already, false);
+      assert.strictEqual(updates, 1, "привязка добавляется одним запросом");
+
+      const second = await yc.setContainerPublicAccess("oauth", "cont1");
+      assert.strictEqual(second.already, true, "готовую привязку надо распознать, а не добавлять второй раз");
+      assert.strictEqual(updates, 1, "повторный вызов не должен слать второй запрос");
+
+      const list = await yc.listContainerAccessBindings("oauth", "cont1");
+      assert.deepStrictEqual(list[0], { roleId: "serverless-containers.containerInvoker", subjectId: "allUsers", subjectType: "system" });
+
+      failUpdate = true;
+      bindings = [];
+      await assert.rejects(
+        () => yc.setContainerPublicAccess("oauth", "cont2"),
+        /setAccessBindings/,
+        "если права не изменились — это ошибка с названным правом, а не тихий успех"
+      );
+    } finally {
+      global.fetch = realFetch;
+    }
+  });
+
+  await test("публичный доступ сквозь настоящий модуль облака: закрытый контейнер отвечает 403, права открывают", async () => {
+    const yc = require(path.join(ROOT, "src", "yandex-cloud.js"));
+    const realFetch = global.fetch;
+    // Облако как в жизни: адрес контейнера отвечает 403, пока нет привязки
+    // «все пользователи → invoker». Прежняя подмена этого не воспроизводила —
+    // и ошибка выдачи прав жила незамеченной: все стадии проходили, а выкат
+    // умирал на проверке адреса (403), потому что роль выдали сервисному
+    // аккаунту на каталог, а не всеобщей привязкой на контейнер.
+    let bindings = [];
+    let updates = 0;
+    let ignoreUpdate = false;
+    let revisions = 0;
+    const projDir = mkproj("e-real-yc", projFiles);
+    const PAGE = '<!doctype html><html><head><title>Магазин</title></head><body><div id=root><h1>Магазин работает</h1><p>Товары загружены: 12 позиций</p></div></body></html>';
+    const resp = (status, body, type) => ({
+      ok: status < 400,
+      status,
+      async text() { return typeof body === "string" ? body : JSON.stringify(body); },
+      async json() { return typeof body === "string" ? {} : body; },
+      headers: { get: () => type || "application/json" },
+    });
+    global.fetch = async (url, init) => {
+      const p = String(url).split("?")[0];
+      const method = (init && init.method) || "GET";
+      // Адрес контейнера: закрыт, пока прав нет.
+      if (p.startsWith("http://app.test")) {
+        if (!bindings.length) return resp(403, "forbidden: container is not public", "text/plain");
+        return resp(200, PAGE, "text/html");
+      }
+      if (p.endsWith("/iam/v1/tokens")) return resp(200, { iamToken: "t1.REAL", expiresAt: new Date(Date.now() + 3600e3).toISOString() });
+      if (p.endsWith("/container-registry/v1/registries")) {
+        return method === "POST" ? resp(200, { id: "op", done: true }) : resp(200, { registries: [{ id: "crp9", name: "app-registry" }] });
+      }
+      if (p.endsWith("/containers/v1/containers")) {
+        return method === "POST" ? resp(200, { id: "op", done: true }) : resp(200, { containers: [{ id: "cont9", name: "app" }] });
+      }
+      if (p.endsWith("/containers/v1/containers/cont9")) {
+        return resp(200, { id: "cont9", name: "app", folderId: "f1", status: "ACTIVE", url: "http://app.test" });
+      }
+      if (p.endsWith("/containers/v1/containers/cont9:listAccessBindings")) return resp(200, { accessBindings: bindings });
+      if (p.endsWith("/containers/v1/containers/cont9:updateAccessBindings") && method === "POST") {
+        updates++;
+        if (!ignoreUpdate) {
+          try {
+            for (const d of JSON.parse(init.body || "{}").accessBindingDeltas || []) {
+              bindings.push({ roleId: d.accessBinding.roleId, subject: d.accessBinding.subject });
+            }
+          } catch {}
+        }
+        return resp(200, { id: "op", done: true });
+      }
+      if (p.endsWith("/containers/v1/revisions:deploy") && method === "POST") {
+        revisions++;
+        return resp(200, { id: "op", done: true });
+      }
+      if (p.endsWith("/containers/v1/revisions")) return resp(200, { revisions: [] });
+      if (p.includes("/operations/")) return resp(200, { id: "op", done: true });
+      return resp(200, {});
+    };
+    const mkEngine = () =>
+      createDeployEngine({
+        run: (command) => {
+          if (command === "docker --version") return { code: 0, out: "Docker version 25.0.3" };
+          if (command.includes("docker push")) return { code: 0, out: "digest: sha256:abcd" };
+          return { code: 0, out: "ok" };
+        },
+        yandex: yc,
+        emit: () => {},
+        findProgram: () => ({ found: true }),
+      });
+    try {
+      const ok = await mkEngine().deploy(projDir, {
+        cloud: { oauth: "oauth-token", folderId: "f1" },
+        name: "app",
+        runTests: false,
+        healthTries: 1,
+        healthDelayMs: 1,
+      });
+      assert.strictEqual(ok.ok, true, "сквозной выкат через настоящий модуль облака: " + ok.error);
+      assert.ok(updates >= 1, "права на контейнер выдаются запросом к облаку");
+      assert.ok(
+        bindings.some((b) => b.subject && b.subject.id === "allUsers" && b.subject.type === "system"),
+        "публичность — это привязка «все пользователи», а не роль сервисному аккаунту"
+      );
+      assert.strictEqual(ok.health.status, 200, "адрес открылся только после выдачи прав");
+
+      const updBefore = updates;
+      const again = await mkEngine().deploy(projDir, {
+        cloud: { oauth: "oauth-token", folderId: "f1" },
+        name: "app",
+        runTests: false,
+        healthTries: 1,
+        healthDelayMs: 1,
+      });
+      assert.strictEqual(again.ok, true);
+      assert.strictEqual(updates, updBefore, "готовые права не добавляем повторно");
+
+      const dFail = mkproj("e-real-yc-fail", projFiles);
+      ignoreUpdate = true;
+      bindings = [];
+      const revBefore = revisions;
+      const bad = await mkEngine().deploy(dFail, {
+        cloud: { oauth: "oauth-token", folderId: "f1" },
+        name: "app",
+        runTests: false,
+        healthTries: 1,
+        healthDelayMs: 1,
+      });
+      assert.strictEqual(bad.ok, false, "без публичного доступа выкат не должен считаться успешным");
+      assert.ok(/setAccessBindings/.test(bad.error), "в ошибке названо право, которого не хватило: " + bad.error);
+      assert.strictEqual(revisions, revBefore, "ревизию без публичного доступа не создаём");
+    } finally {
+      global.fetch = realFetch;
+    }
   });
 
   await test("движок деплоя: ручной откат проверяет результат, а не только команду", async () => {
@@ -11029,6 +11389,8 @@ async function testMissions() {
   await testContextWindow();
   await testSecretScopes();
   await testOneNavigation();
+  await testRealE2E();
+  await testProductionGate();
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");
   process.exit(failed ? 1 : 0);
 })();
@@ -11363,5 +11725,358 @@ async function testOneNavigation() {
     assert.ok(html.indexOf("📋 План</button>") !== -1, "подпись режима плана не укорочена");
     assert.ok(m900 && /\.input-hint \{ display: none; \}/.test(m900[1]), "на телефоне осталась подсказка про Enter");
     assert.ok(m900 && /\.composer-btns \{ gap: 5px; \}/.test(m900[1]), "на телефоне кнопки композера не сжаты");
+  });
+}
+// ── E2E настоящего облака (scripts/live-yc-real.js, 1.5.97) ──────────────────
+// Подменённое облако проверяет ЛОГИКУ движка, но не реальность: права IAM,
+// статус операции, схема ответа и формат параметра ревизии ломаются только на
+// настоящем API. Прогон против настоящего каталога в песочнице не сделать (нужен
+// токен и деньги), поэтому проверяется ровно то, что проверяется кодом: права на
+// запуск, совпадение имён с движком, уборка и то, что «страница отвечает»
+// подтверждается МАРКЕРОМ версии, а не просто кодом 200.
+async function testRealE2E() {
+  const live = require(path.join(ROOT, "scripts", "live-yc-real.js"));
+
+  await test("E2E облака: запуск только по явному разрешению, план называет ресурсы", () => {
+    assert.strictEqual(live.wantsRealRun([], {}), false, "без флага прогон начинается — это трата денег без спроса");
+    assert.strictEqual(live.wantsRealRun([], { AI_AGENT_YC_REAL: "0" }), false, "«0» принято за согласие");
+    assert.strictEqual(live.wantsRealRun(["--yes"], {}), true, "--yes не считается согласием");
+    assert.strictEqual(live.wantsRealRun([], { AI_AGENT_YC_REAL: "1" }), true, "AI_AGENT_YC_REAL=1 не считается согласием");
+    assert.strictEqual(live.keepResources({ YC_REAL_KEEP: "1" }), true, "YC_REAL_KEEP не читается — уборку не отключить");
+    const plan = live.planText("e2e-20260916-101530", "b1g2");
+    for (const what of ["контейнер", "реестр", "Lockbox", "сервисный аккаунт", "удаляет"]) {
+      assert.ok(plan.includes(what), "в плане не сказано про «" + what + "»:\n" + plan);
+    }
+    assert.ok(plan.includes("b1g2"), "в плане не назван каталог");
+  });
+
+  await test("E2E облака: имена ресурсов совпадают с именами движка деплоя", () => {
+    const engineSrc = fs.readFileSync(path.join(ROOT, "src", "deploy-engine.js"), "utf8");
+    const n = live.namesFor("E2E-20260916-101530");
+    assert.strictEqual(n.slug, "e2e-20260916-101530", "slug приводится не так, как движок: " + n.slug);
+    assert.strictEqual(n.container, n.slug, "контейнер назван иначе, чем slug: " + n.container);
+    assert.strictEqual(n.registry, n.slug + "-registry", "реестр назван не так: " + n.registry);
+    assert.strictEqual(n.secret, "app-" + n.slug + "-env", "секрет назван не так: " + n.secret);
+    assert.strictEqual(n.serviceAccount, "sa-" + n.slug, "сервисный аккаунт назван не так: " + n.serviceAccount);
+    // Сверка с движком по тексту кода: если он переименует ресурсы, уборка E2E
+    // искала бы не то имя и оставила бы ресурсы в каталоге пользователя.
+    assert.ok(engineSrc.includes('ensureRegistry(oauth, folderId, slug + "-registry")'), "движок называет реестр иначе — поправь namesFor в live-yc-real.js");
+    assert.ok(engineSrc.includes('"app-" + slug + "-env"'), "движок называет секрет иначе — поправь namesFor в live-yc-real.js");
+    assert.ok(engineSrc.includes('"sa-" + slug'), "движок называет сервисный аккаунт иначе — поправь namesFor в live-yc-real.js");
+    assert.ok(engineSrc.includes("ensureContainer(oauth, folderId, slug)"), "движок называет контейнер иначе — поправь namesFor в live-yc-real.js");
+  });
+
+  await test("E2E облака: уборка удаляет всё, образы раньше реестра, провал не мешает остальным", async () => {
+    const calls = [];
+    const yc = {
+      deleteResource: async (_t, key, id) => {
+        calls.push("delete:" + key + ":" + id);
+        if (key === "lockbox") throw new Error("нет прав на удаление секрета");
+      },
+      listRegistryImages: async () => {
+        calls.push("listImages");
+        return [{ id: "img1" }, { id: "img2" }];
+      },
+      deleteRegistryImage: async (_t, id) => calls.push("deleteImage:" + id),
+    };
+    const left = await live.cleanup(yc, "tok", { containerId: "cont1", registryId: "cr1", secretId: "sec1", serviceAccountId: "sa1" });
+    const at = (s) => calls.findIndex((c) => c.startsWith(s));
+    assert.ok(at("delete:serverlessContainers") >= 0, "контейнер не удалён: " + calls.join(" "));
+    assert.ok(at("deleteImage:img1") >= 0 && at("deleteImage:img2") >= 0, "образы не удалены: " + calls.join(" "));
+    assert.ok(at("delete:containerRegistry") > at("deleteImage:img2"), "реестр удалён раньше образов — облако так не даст: " + calls.join(" "));
+    assert.ok(at("delete:iam") >= 0, "сервисный аккаунт не удалён: " + calls.join(" "));
+    assert.strictEqual(left.length, 1, "провал одного шага уборки посчитан неверно: " + JSON.stringify(left));
+    assert.ok(/секрет|lockbox/i.test(left[0]), "в остатках не назван неудалённый секрет: " + left[0]);
+    // Ничего не создано — убирать нечего: ни вызовов, ни жалоб.
+    const empty = [];
+    const yc2 = { deleteResource: async () => empty.push("x"), listRegistryImages: async () => [], deleteRegistryImage: async () => {} };
+    const left2 = await live.cleanup(yc2, "tok", {});
+    assert.deepStrictEqual(left2, [], "пустая уборка пожаловалась: " + JSON.stringify(left2));
+    assert.deepStrictEqual(empty, [], "пустая уборка что-то удаляла");
+  });
+
+  await test("E2E облака: адрес подтверждается маркером версии, а не просто «200»", async () => {
+    let n = 0;
+    const late = async () => {
+      n++;
+      return { status: 200, text: async () => (n >= 3 ? "наша страница E2E-MARK-1-1" : "страница без маркера") };
+    };
+    const r1 = await live.httpCheck("http://x/", "E2E-MARK-1-1", { fetch: late, tries: 5, delayMs: 0 });
+    assert.ok(r1.ok && r1.marker, "маркер не найден: " + JSON.stringify(r1));
+    assert.strictEqual(n, 3, "проверка не подождала готовности страницы: попыток " + n);
+
+    let m = 0;
+    const noMarker = async () => {
+      m++;
+      return { status: 200, text: async () => "чужая версия" };
+    };
+    const r2 = await live.httpCheck("http://x/", "E2E-MARK-1-1", { fetch: noMarker, tries: 4, delayMs: 0 });
+    assert.strictEqual(r2.ok, true, "200 должен считаться ответом");
+    assert.strictEqual(r2.marker, false, "чужой маркер принят за свой — откат выглядел бы успешным");
+    assert.strictEqual(m, 4, "попытки исчерпаны не полностью: " + m);
+
+    let k = 0;
+    const err = async () => {
+      k++;
+      return { status: 500, text: async () => "boom" };
+    };
+    const r3 = await live.httpCheck("http://x/", "E2E-MARK-1-1", { fetch: err, tries: 2, delayMs: 0 });
+    assert.strictEqual(r3.ok, false, "500 принят за живую страницу");
+    assert.strictEqual(k, 2, "проверка не повторилась: " + k);
+  });
+
+  await test("E2E облака: прогон контейнер → ревизия → откат и требует настоящей смены версии", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-flow-"));
+    const calls = [];
+    let current = 0; // какая версия сейчас отвечает по адресу
+    const engine = {
+      deploy: async (_dir, opts) => {
+        calls.push({ m: "deploy", secrets: opts.secrets });
+        current = calls.filter((c) => c.m === "deploy").length;
+        return {
+          ok: true,
+          url: "https://e2e.test/app",
+          revisionId: "rev" + current,
+          containerId: "cont1",
+          secretId: "sec1",
+          secretVersionId: "ver" + current,
+          secretKeys: ["E2E_SECRET"],
+          warnings: current === 1 ? ["первое замечание"] : [],
+          stages: [{ id: "check", status: "ok" }, { id: "revision", status: "ok" }],
+        };
+      },
+      rollback: async (_dir, opts) => {
+        calls.push({ m: "rollback", toRevision: opts.toRevision });
+        current = 1;
+        return { ok: true, revisionId: opts.toRevision, url: "https://e2e.test/app", stages: [] };
+      },
+    };
+    const fetchImpl = async () => ({
+      status: 200,
+      text: async () => (current === 1 ? "страница E2E-MARK-1-1" : "страница E2E-MARK-1-2"),
+    });
+    const yc = { findRegistry: async () => ({ id: "cr1" }), findServiceAccount: async () => ({ id: "sa1" }) };
+    const r = await live.runFlow({ engine, yandex: yc, oauth: "tok", folderId: "f1", dir, appName: "e2e-1", stamp: "1", fetch: fetchImpl });
+
+    assert.strictEqual(calls.filter((c) => c.m === "deploy").length, 2, "должно быть два выката — иначе откатывать некуда");
+    assert.strictEqual(calls[2] && calls[2].m, "rollback", "откат не идёт последним шагом: " + calls.map((c) => c.m).join(","));
+    assert.strictEqual(calls[2].toRevision, "rev1", "откат не на первую ревизию, а на " + calls[2].toRevision);
+    assert.ok(r.deploy1.ok && r.deploy2.ok, "выкаты не прошли: " + JSON.stringify([r.deploy1 && r.deploy1.error, r.deploy2 && r.deploy2.error]));
+    assert.ok(r.http1.marker && r.http2.marker, "адрес не подтвердил версии: " + JSON.stringify([r.http1, r.http2]));
+    assert.ok(r.rollback.ok && r.httpAfterRollback && r.httpAfterRollback.marker, "после отката версия не вернулась: " + JSON.stringify(r.httpAfterRollback));
+    assert.strictEqual(r.resources.containerId, "cont1", "контейнер не запомнен для уборки");
+    assert.strictEqual(r.resources.registryId, "cr1", "реестр не найден по имени движка — уборка его пропустит");
+    assert.strictEqual(r.resources.serviceAccountId, "sa1", "сервисный аккаунт не найден — уборка его пропустит");
+    assert.ok(r.warnings.some((w) => /первое замечание/.test(w)), "замечания движка потеряны: " + r.warnings.join(" | "));
+    assert.ok(calls[0].secrets && calls[0].secrets.E2E_SECRET, "секрет не уехал в выкат — стадия Lockbox не проверяется");
+
+    // Провал первого выката: вторую ревизию не выкатываем и не притворяемся, что всё хорошо.
+    const bad = [];
+    const engine2 = {
+      deploy: async () => {
+        bad.push("deploy");
+        return { ok: false, error: "нет прав на каталог", stages: [] };
+      },
+      rollback: async () => {
+        bad.push("rollback");
+        return { ok: true };
+      },
+    };
+    const r2 = await live.runFlow({ engine: engine2, yandex: yc, oauth: "tok", folderId: "f1", dir, appName: "e2e-1", stamp: "1", fetch: fetchImpl });
+    assert.strictEqual(bad.length, 1, "после провала выката прогон продолжился: " + bad.join(","));
+    assert.strictEqual(r2.deploy2, null, "вторая ревизия выкатывалась после провала первой");
+    assert.ok(!r2.deploy1.ok && /нет прав/.test(r2.deploy1.error), "ошибка первого выката потеряна");
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {}
+  });
+}
+// ── Приёмка production: сломанное не уезжает в прод (1.5.97) ─────────────────
+// Раньше падение тестов проекта было замечанием, а проверка страницы браузером —
+// необязательной. Для прода это неверно: туда уезжало заведомо сломанное
+// состояние. Теперь решение принимает движок — и оно проверяется здесь ЖИВЫМ
+// прогоном конвейера на подставных Docker и облаке: до настоящего облака дело не
+// доходит, потому что проверяем именно решение остановиться.
+async function testProductionGate() {
+  const engineMod = require(path.join(ROOT, "src", "deploy-engine.js"));
+
+  function makeProject() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prod-gate-"));
+    fs.mkdirSync(path.join(dir, "node_modules"), { recursive: true }); // зависимости «уже стоят»
+    fs.writeFileSync(
+      path.join(dir, "package.json"),
+      JSON.stringify({ name: "gate", scripts: { test: "node -e \"process.exit(1)\"" } }, null, 2)
+    );
+    fs.writeFileSync(path.join(dir, "server.js"), "require('http').createServer().listen(8080);\n");
+    return dir;
+  }
+
+  // Подставной Docker: команды записываются, тесты «падают» (если просили).
+  function makeRun(log, failTests) {
+    return async (command) => {
+      log.push(command);
+      if (failTests !== false && /^\s*(npm|yarn|pnpm|bun)\s+(run\s+)?test\b/.test(command)) {
+        return { code: 1, out: "тест упал: ожидалось 2, получено 1" };
+      }
+      if (/docker --version/.test(command)) return { code: 0, out: "Docker version 27.0.0" };
+      if (/^\s*docker login/.test(command)) return { code: 0, out: "Login Succeeded" };
+      if (/^\s*docker build/.test(command)) return { code: 0, out: "Successfully built abc123" };
+      if (/^\s*docker push/.test(command)) return { code: 0, out: "digest: sha256:deadbeef" };
+      return { code: 0, out: "ok" };
+    };
+  }
+
+  function makeYc() {
+    return {
+      slugify: (s) => String(s || "").toLowerCase().replace(/[^a-z0-9-_]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "app",
+      ensureRegistry: async () => ({ id: "cr1" }),
+      ensureContainer: async () => ({ id: "cont1" }),
+      setContainerPublicAccess: async () => ({ already: false }),
+      deployContainerRevision: async () => ({ revisionId: "rev1" }),
+      containerInfo: async () => ({ id: "cont1", url: "https://app.test", status: "ACTIVE" }),
+      getIamToken: async () => "iam",
+    };
+  }
+
+  function makeEngine(opts) {
+    const o = opts || {};
+    return engineMod.createDeployEngine({
+      yandex: makeYc(),
+      run: o.run,
+      findProgram: () => ({ found: true }),
+      fetch: async () => ({ status: 200 }),
+      browserAudit: o.browserAudit || null,
+      emit: () => {},
+    });
+  }
+
+  const cloud = { oauth: "t", folderId: "f" };
+
+  await test("приёмка production: правила остановки — чистые решения, а не догадки", () => {
+    const { testsAreFatal, browserModeOf } = engineMod;
+    const recipe = { testCmd: "npm test" };
+    assert.strictEqual(testsAreFatal({}, recipe), true, "production по умолчанию обязан останавливать выкат");
+    assert.strictEqual(testsAreFatal({ environment: "production" }, recipe), true, "production не останавливает");
+    assert.strictEqual(testsAreFatal({ environment: "development" }, recipe), false, "development обязан продолжать");
+    assert.strictEqual(testsAreFatal({ allowFailingTests: true }, recipe), false, "явное разрешение не действует — обхода нет");
+    assert.strictEqual(testsAreFatal({ testsGate: "warn" }, recipe), false, "testsGate: warn не действует");
+    assert.strictEqual(testsAreFatal({ testsGate: "block", environment: "development" }, recipe), true, "testsGate: block не действует");
+    assert.strictEqual(testsAreFatal({}, { testCmd: "" }), false, "без тестов останавливать нечего");
+    assert.strictEqual(browserModeOf(), "auto", "по умолчанию должен быть auto");
+    assert.strictEqual(browserModeOf({ browserCheck: "OFF" }), "off", "регистр в browserCheck не учитывается");
+    assert.strictEqual(browserModeOf({ browserCheck: "required" }), "required", "required не распознан");
+    assert.strictEqual(browserModeOf({ browserCheck: "что-то" }), "auto", "мусор в browserCheck принят за режим");
+  });
+
+  await test("приёмка production: выкат встаёт ДО сборки образа, обход работает явно", async () => {
+    const dir = makeProject();
+    const log = [];
+    const r = await makeEngine({ run: makeRun(log, true) }).deploy(dir, { cloud, name: "gate", saveState: false });
+    assert.strictEqual(r.ok, false, "сломанные тесты не остановили выкат в production");
+    assert.strictEqual(r.testsFailed, true, "остановка на тестах не помечена — панель не предложит выбор");
+    assert.ok(!log.some((c) => /^\s*docker build/.test(c)), "образ всё-таки собирался: " + log.join(" | "));
+    const verify = (r.stages || []).find((s) => s.id === "verify") || {};
+    assert.strictEqual(verify.status, "fail", "стадия проверок не помечена провалом: " + JSON.stringify(verify));
+    assert.ok(/production остановлен/.test(verify.detail || ""), "в объяснении нет причины: " + verify.detail);
+
+    // Тот же сломанный проект, но с явным «да, я понимаю»: выкат идёт дальше сборки.
+    const log2 = [];
+    const r2 = await makeEngine({ run: makeRun(log2, true) }).deploy(dir, {
+      cloud,
+      name: "gate",
+      saveState: false,
+      allowFailingTests: true,
+    });
+    assert.ok(log2.some((c) => /^\s*docker build/.test(c)), "явное разрешение не пропустило выкат к сборке: " + log2.join(" | "));
+    assert.strictEqual(r2.testsFailed, false, "testsFailed выставлен, хотя остановки не было");
+    assert.ok((r2.warnings || []).some((w) => /упали/.test(w)), "правда о тестах потерялась: " + JSON.stringify(r2.warnings));
+
+    // Разработка: то же падение — только замечание, выкат продолжается.
+    const log3 = [];
+    const r3 = await makeEngine({ run: makeRun(log3, true) }).deploy(dir, {
+      cloud,
+      name: "gate",
+      saveState: false,
+      environment: "development",
+    });
+    assert.ok(log3.some((c) => /^\s*docker build/.test(c)), "в development выкат остановился: " + log3.join(" | "));
+    assert.strictEqual(r3.testsFailed, false, "в development выставлен признак остановки");
+    assert.ok((r3.warnings || []).some((w) => /упали/.test(w)), "в development не сказано про упавшие тесты");
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {}
+  });
+
+  await test("проверка страницы: auto / off / required ведут себя по-разному", async () => {
+    const dir = makeProject();
+    const run = makeRun([], false);
+    const okAudit = async () => ({
+      ok: true,
+      status: 200,
+      info: { textLen: 120, title: "Гейт", rootChildren: 3, h1: ["Гейт"] },
+      consoleErrors: [],
+      pageErrors: [],
+      failedRequests: [],
+      url: "https://app.test",
+    });
+    const brokenAudit = async () => ({
+      ok: true,
+      status: 200,
+      info: { textLen: 0, title: "", rootChildren: 0, h1: [] },
+      consoleErrors: [],
+      pageErrors: [],
+      failedRequests: [],
+      url: "https://app.test",
+    });
+    const deadBrowser = async () => ({ ok: false, error: "браузер не запустился" });
+
+    // auto, браузера нет: выкат проходит, но с замечанием.
+    const auto = await makeEngine({ run }).deploy(dir, { cloud, name: "gate", saveState: false });
+    assert.strictEqual(auto.ok, true, "auto без браузера не должен валить выкат: " + auto.error);
+    assert.ok((auto.warnings || []).some((w) => /браузер/.test(w)), "о непроверенной странице не сказано: " + JSON.stringify(auto.warnings));
+
+    // off: проверки нет — и замечания нет (не делаем вид, что проверили).
+    const off = await makeEngine({ run }).deploy(dir, { cloud, name: "gate", saveState: false, browserCheck: "off" });
+    assert.strictEqual(off.ok, true, "off сломал выкат: " + off.error);
+    assert.strictEqual(off.browserCheck && off.browserCheck.level, "off", "режим off не отмечен в результате: " + JSON.stringify(off.browserCheck));
+    assert.ok(!(off.warnings || []).some((w) => /браузер/i.test(w)), "off всё равно ругается на браузер: " + JSON.stringify(off.warnings));
+
+    // required, браузера нет: выкат не принимается.
+    const req = await makeEngine({ run }).deploy(dir, { cloud, name: "gate", saveState: false, browserCheck: "required" });
+    assert.strictEqual(req.ok, false, "required пропустил выкат без проверки страницы");
+    assert.ok(/обязательн/i.test(req.error || ""), "причина отказа не названа: " + req.error);
+
+    // auto + браузер не поднялся: замечание, а не провал — это ограничение машины.
+    const soft = await makeEngine({ run, browserAudit: deadBrowser }).deploy(dir, { cloud, name: "gate", saveState: false });
+    assert.strictEqual(soft.ok, true, "недоступный браузер в auto сломал выкат: " + soft.error);
+    assert.ok((soft.warnings || []).some((w) => /не состоялась/.test(w)), "о несостоявшейся проверке не сказано: " + JSON.stringify(soft.warnings));
+
+    // Белый экран останавливает выкат в любом режиме, кроме off — это и есть цель.
+    const bad = await makeEngine({ run, browserAudit: brokenAudit }).deploy(dir, { cloud, name: "gate", saveState: false });
+    assert.strictEqual(bad.ok, false, "белый экран не остановил выкат");
+    assert.ok(/пуст|белый экран/i.test(bad.error || ""), "про белый экран не сказано: " + bad.error);
+
+    // Здоровая страница: проверка проходит и её результат сохранён.
+    const good = await makeEngine({ run, browserAudit: okAudit }).deploy(dir, { cloud, name: "gate", saveState: false });
+    assert.strictEqual(good.ok, true, "здоровая страница не прошла: " + good.error);
+    assert.strictEqual(good.browserCheck && good.browserCheck.ok, true, "результат проверки не сохранён: " + JSON.stringify(good.browserCheck));
+    assert.strictEqual(good.browserMode, "auto", "режим проверки не отдан наружу: " + good.browserMode);
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {}
+  });
+
+  await test("приёмка production: панель предлагает выбор, а мост его пропускает", () => {
+    const panel = fs.readFileSync(path.join(ROOT, "src", "renderer", "deploy-panel.js"), "utf8");
+    const css = fs.readFileSync(path.join(ROOT, "src", "renderer", "deploy-panel.css"), "utf8");
+    const ipc = fs.readFileSync(path.join(ROOT, "src", "deploy-ipc.js"), "utf8");
+    assert.ok(panel.includes("canOverrideTests"), "панель не знает про остановку на тестах");
+    assert.ok(panel.includes("allowFailingTests: true"), "нет явного продолжения после упавших тестов");
+    assert.ok(/тесты упали/i.test(panel), "в кнопке не сказано, почему спрашивают");
+    assert.ok(/dp-override/.test(css), "кнопка выбора не оформлена");
+    assert.ok(ipc.includes("testsFailed: !!res.testsFailed"), "мост не передаёт признак остановки в окно");
+    assert.ok(ipc.includes("allowFailingTests: o.allowFailingTests"), "мост не пропускает явное разрешение");
+    assert.ok(ipc.includes("browserCheck: o.browserCheck"), "мост не пропускает режим проверки страницы");
+    assert.ok(ipc.includes("environment: o.environment"), "мост не пропускает окружение выката");
   });
 }

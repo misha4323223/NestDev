@@ -2499,6 +2499,11 @@ function createAgentTools(deps) {
           timeoutSec: args.timeoutSec,
           public: args.public,
           runTests: args.runTests,
+          // Значения секретов через агента не проходят: он передаёт готовый
+          // секрет ссылкой (secretId + secretKeys — только имена ключей), а
+          // значения человек вводит в панели деплоя, и они сразу уходят в Lockbox.
+          secretId: args.secretId,
+          secretKeys: args.secretKeys,
           triggeredBy: "agent",
         });
         const head = r.ok
@@ -2516,6 +2521,10 @@ function createAgentTools(deps) {
             body.push("Страница в браузере: HTTP " + r.browserCheck.metrics.status + ", текста " + r.browserCheck.metrics.textLen + " символов" + (r.browserCheck.metrics.title ? ", заголовок «" + r.browserCheck.metrics.title + "»" : "") + ".");
           }
           body.push("Образ: " + r.image + (r.revisionId ? ", ревизия " + r.revisionId : ""));
+          if (r.secretKeys && r.secretKeys.length) {
+            // Наружу — только имена ключей: значения секретов не отдаём.
+            body.push("Секреты (Lockbox " + r.secretId + "): " + r.secretKeys.join(", "));
+          }
           body.push('Логи: ycLogs(service: "serverlessContainers", id: "' + (r.containerId || "") + '").');
         }
         body.push("", "История и текущее состояние — в панели «☁️ Cloud» → Деплой.");

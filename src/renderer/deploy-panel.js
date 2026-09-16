@@ -27,6 +27,8 @@
     shotError: "",
     message: "",
     messageKind: "",
+    // Выкат остановлен на упавших тестах: предлагаем продолжить явным выбором.
+    canOverrideTests: false,
   };
 
   function $(id) {
@@ -169,6 +171,55 @@
       host.appendChild(box);
     }
 
+    // Переменные и секреты. Значения вводит ЧЕЛОВЕК здесь, а не модель в чате:
+    // обычные переменные уезжают в контейнер как есть, секреты — в Lockbox, и в
+    // ревизию попадает только ссылка на секрет (значения не возвращаются).
+    {
+      const box = el("div", "dp-block");
+      box.appendChild(el("div", "dp-block-title", "Переменные и секреты"));
+
+      const envTa = el("textarea", "dp-ta");
+      envTa.id = "dp-env";
+      envTa.rows = 3;
+      envTa.placeholder = "NODE_ENV=production\nPORT=8080";
+      envTa.value = state.envText || "";
+      envTa.oninput = () => {
+        state.envText = envTa.value;
+      };
+      box.appendChild(el("div", "dp-hint", "Настройки без секретов — уезжают в контейнер как есть, по строке KEY=value."));
+      box.appendChild(envTa);
+
+      const secTa = el("textarea", "dp-ta");
+      secTa.id = "dp-secrets";
+      secTa.rows = 3;
+      secTa.placeholder = "DATABASE_URL=postgres://...\nAPI_KEY=...";
+      secTa.value = state.secretsText || "";
+      secTa.oninput = () => {
+        state.secretsText = secTa.value;
+      };
+      box.appendChild(
+        el("div", "dp-hint", "Секреты — уходят в Yandex Lockbox, в ревизию попадает только ссылка. Значения не показываются ни в чате, ни в истории деплоев.")
+      );
+      box.appendChild(secTa);
+
+      const lockbox = (d.infrastructure || {}).lockbox;
+      if (lockbox && lockbox.id) {
+        const keys = ((d.infrastructure || {}).secretKeys || []).join(", ");
+        box.appendChild(el("div", "dp-note", "Lockbox проекта: " + lockbox.id + (keys ? " · ключи: " + keys : "")));
+        box.appendChild(
+          btn("↺ Использовать тот же секрет", "btn-ghost", () => {
+            state.secretsText = "";
+            state.useSecretId = lockbox.id;
+            state.useSecretKeys = (d.infrastructure || {}).secretKeys || [];
+            state.message = "Секрет " + lockbox.id + " будет использован как есть — значения остаются в Lockbox.";
+            state.messageKind = "";
+            render();
+          })
+        );
+      }
+      host.appendChild(box);
+    }
+
     // Текущий выкат
     const cur = d.current;
     const curBox = el("div", "dp-current");
@@ -191,6 +242,7 @@
       if (cur.revisionId) meta.push("ревизия " + cur.revisionId);
       if (cur.startedAt) meta.push(ago(cur.startedAt));
       if (cur.health && cur.health.ok) meta.push("HTTP " + cur.health.status + " по " + cur.health.path);
+      if (cur.secretKeys && cur.secretKeys.length) meta.push("секретов: " + cur.secretKeys.length + " (Lockbox)");
       if (meta.length) curBox.appendChild(el("div", "dp-current-meta", meta.join(" · ")));
       if (cur.rolledBackTo) curBox.appendChild(el("div", "dp-note", "Откатились на рабочую версию #" + cur.rolledBackTo + " — она сейчас в проде."));
       if (cur.error) curBox.appendChild(el("div", "dp-error", String(cur.error).split("\n")[0]));
@@ -283,6 +335,39 @@
     if (state.message) {
       host.appendChild(el("div", "dp-msg " + (state.messageKind || ""), state.message));
     }
+
+    // Продолжить после упавших тестов — только осознанным нажатием: молча
+    // выкатывать сломанное нельзя, но и решать за человека тоже нельзя.
+    if (state.canOverrideTests) {
+      host.appendChild(
+        btn("⚠ Всё равно задеплоить: тесты упали", "dp-override", () => {
+          state.canOverrideTests = false;
+          render();
+          doDeploy({ allowFailingTests: true });
+        })
+      );
+    }
+  }
+
+  // Разбор «KEY=value» по строкам. Строка без «=» — это ошибка, а не повод молча
+  // её выбросить: иначе человек будет думать, что переменная уехала.
+  function parseKv(text) {
+    const out = {};
+    const bad = [];
+    for (const raw of String(text || "").split("\n")) {
+      const line = raw.trim();
+      if (!line || line.startsWith("#")) continue;
+      const i = line.indexOf("=");
+      if (i <= 0) {
+        bad.push(line);
+        continue;
+      }
+      const key = line.slice(0, i).trim();
+      const value = line.slice(i + 1).trim();
+      if (!key) bad.push(line);
+      else out[key] = value;
+    }
+    return { values: out, bad };
   }
 
   // Пользователю важно не только «откатили», но и почему — иначе непонятно, что чинить.
@@ -370,7 +455,8 @@
 
 
   // ── действия ──
-  async function doDeploy() {
+  async function doDeploy(over) {
+    const ov = over && typeof over === "object" ? over : {};
     if (state.running) return;
     const dir = (await resolveDir()) || state.dirHint || "";
     if (!dir) {
@@ -382,21 +468,68 @@
     state.dir = dir;
     const nameInput = $("dp-name");
     const name = (nameInput && nameInput.value.trim()) || "";
+
+    // Переменные и секреты берём из полей панели: секреты не проходят через чат.
+    const envField = $("dp-env");
+    const secField = $("dp-secrets");
+    const envParsed = parseKv(envField ? envField.value : state.envText);
+    const secParsed = parseKv(secField ? secField.value : state.secretsText);
+    state.envText = envField ? envField.value : state.envText || "";
+    state.secretsText = secField ? secField.value : state.secretsText || "";
+    const broken = envParsed.bad.concat(secParsed.bad);
+    if (broken.length) {
+      state.message = "Строка без «=»: " + broken.slice(0, 3).join(", ") + " — напиши как KEY=значение.";
+      state.messageKind = "bad";
+      render();
+      return;
+    }
+    const deployOpts = { name, env: envParsed.values, secrets: secParsed.values };
+    // «Тесты упали, но выкладывай» — явное нажатие кнопки, не тихий обход: движок
+    // запишет это замечанием и в историю деплоя.
+    if (ov.allowFailingTests) deployOpts.allowFailingTests = true;
+    // Повторный выкат без повторного ввода: берём готовый секрет Lockbox по ссылке.
+    if (state.useSecretId && !Object.keys(secParsed.values).length) {
+      deployOpts.secretId = state.useSecretId;
+      deployOpts.secretKeys = state.useSecretKeys || [];
+    }
+
     state.running = true;
     state.inFlight = true;
     state.stages = [];
-    state.message = "Собираю и выкладываю. Это несколько минут: сборка образа и первый холодный старт.";
-    state.messageKind = "";
+    state.canOverrideTests = false;
+    state.message = ov.allowFailingTests
+      ? "⚠ Тесты упали — выкладываю по твоему выбору. Это несколько минут: сборка образа и первый холодный старт."
+      : "Собираю и выкладываю. Это несколько минут: сборка образа и первый холодный старт.";
+    state.messageKind = ov.allowFailingTests ? "warn" : "";
     render();
     try {
-      const r = await window.api.deployRun(dir, { name });
+      const r = await window.api.deployRun(dir, deployOpts);
       state.running = false;
       state.inFlight = false;
       state.stages = (r && r.stages) || [];
       state.message = r && r.ok
-        ? "✅ Задеплоено. Адрес: " + (r.url || "—")
+        ? "✅ Задеплоено. Адрес: " + (r.url || "—") + (r.secretKeys && r.secretKeys.length ? " · секретов в Lockbox: " + r.secretKeys.length : "")
         : "❌ " + ((r && r.error) || "деплой не завершился");
+      // Значения в Lockbox: в поле им делать нечего, а повторный выкат
+      // воспользуется ссылкой на секрет.
+      if (r && r.ok && r.secretId) {
+        state.secretsText = "";
+        state.useSecretId = r.secretId;
+        state.useSecretKeys = r.secretKeys || [];
+      }
       state.messageKind = r && r.ok ? "ok" : "bad";
+      // Остановка на тестах — не тупик: в engine это отдельный признак, поэтому
+      // предлагаем выбор, а не заставляем читать многострочную ошибку сборки.
+      state.canOverrideTests = !!(r && !r.ok && r.testsFailed);
+      if (state.canOverrideTests) {
+        state.message =
+          "🛑 Тесты проекта упали — выкат в production остановлен. " +
+          String((r && r.error) || "")
+            .split("\n")
+            .slice(0, 3)
+            .join(" ");
+        state.messageKind = "bad";
+      }
       if (r && r.rolledBack) {
         state.message = rolledBackText(r);
         state.messageKind = "warn";
@@ -528,7 +661,7 @@
 
   function bind() {
     const pairs = [
-      ["btn-dp-deploy", doDeploy],
+      ["btn-dp-deploy", () => doDeploy()],
       ["btn-dp-rollback", () => doRollback(null)],
       ["btn-dp-health", doHealth],
       ["btn-dp-refresh", refresh],

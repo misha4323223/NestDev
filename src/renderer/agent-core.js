@@ -2349,7 +2349,7 @@
       type: "function",
       function: {
         name: "ycDeploy",
-        description: "Yandex Cloud: задеплоить папку проекта в Serverless Containers (лёгкий хостинг). Собирает Docker-образ (или генерирует Dockerfile по типу проекта), загружает в Container Registry, создаёт/обновляет Serverless Container и при public=true настраивает публичный доступ. directory — папка проекта (по умолчанию рабочая директория), name — имя приложения, public — публичный URL (по умолчанию true). Требует Docker на ПК и разрешение «Разрешить агенту создавать ресурсы». Деплой платный — только по явной просьбе пользователя.",
+        description: "Yandex Cloud: задеплоить папку проекта в Serverless Containers (лёгкий хостинг). Собирает Docker-образ (или генерирует Dockerfile по типу проекта), загружает в Container Registry, создаёт/обновляет Serverless Container и при public=true настраивает публичный доступ. directory — папка проекта (по умолчанию рабочая директория), name — имя приложения, public — публичный URL (по умолчанию true). Требует Docker на ПК и разрешение «Разрешить агенту создавать ресурсы». Деплой платный — только по явной просьбе пользователя. Секреты передаются ССЫЛКОЙ: secretId — готовый секрет Lockbox, secretKeys — имена его ключей (это не секрет). Значения секретов агенту передавать НЕЛЬЗЯ: их человек вводит в панели деплоя, и они уходят в Lockbox, а не в чат.",
         parameters: {
           type: "object",
           properties: {
@@ -2358,6 +2358,8 @@
             public: { type: "boolean", description: "Публичный URL без авторизации (по умолчанию true)" },
             memoryMb: { type: "integer", description: "Память ревизии в МБ (по умолчанию 256)" },
             cores: { type: "integer", description: "Число ядер (по умолчанию 1)" },
+            secretId: { type: "string", description: "id готового секрета Lockbox: значения подставит облако, в чат они не попадают" },
+            secretKeys: { type: "array", items: { type: "string" }, description: "Имена ключей секрета (не значения) — станут переменными окружения ревизии" },
           },
         },
       },

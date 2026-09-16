@@ -86,7 +86,10 @@ function readInfrastructure(projectDir) {
   const r = readJsonSafe(fileOf(projectDir, "infrastructure.json"), null);
   const data = r.data && typeof r.data === "object" ? r.data : {};
   return {
-    infrastructure: Object.assign({ registry: null, container: null, serviceAccount: null, domain: "", envKeys: [], updatedAt: 0 }, data),
+    infrastructure: Object.assign(
+      { registry: null, container: null, serviceAccount: null, lockbox: null, domain: "", envKeys: [], secretKeys: [], updatedAt: 0 },
+      data
+    ),
     issue: r.issue,
   };
 }
@@ -214,9 +217,12 @@ function toCloudConfig(projectDir) {
       registry: inf.registry ? inf.registry.id : "",
       container: inf.container ? inf.container.id : "",
       serviceAccount: inf.serviceAccount ? inf.serviceAccount.id : "",
+      lockbox: inf.lockbox ? inf.lockbox.id : "",
       domain: inf.domain || "",
     },
     envKeys: inf.envKeys || [],
+    // Только имена ключей секретов: значений в состоянии проекта нет и не будет.
+    secretKeys: inf.secretKeys || [],
     deployment: st.current
       ? {
           number: st.current.number,
