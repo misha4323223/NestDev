@@ -180,6 +180,35 @@ function walk(rel, out) {
       assert.ok(fs.existsSync(target), row[0] + ": в карте указан несуществующий " + m[1]);
       assert.ok(fs.readFileSync(target, "utf8").includes(m[2]), row[0] + ": в " + m[1] + " нет " + JSON.stringify(m[2]));
     }
+
+    // 5. Каждый вызов модуля существует в самом модуле: «Модуль.имя(» в окне обязан
+    //    иметь «имя» среди того, что модуль отдаёт наружу. Это ловит опечатки и вызовы
+    //    по памяти — ровно тот класс, из которого выросло падение ленты 1.5.118.
+    const rendererFiles = onDisk.filter((f) => f.endsWith(".js")).map((f) => path.join(ROOT, "src", "renderer", f));
+    const callersText = rendererFiles.map((f) => fs.readFileSync(f, "utf8")).join("\n");
+    let checkedCalls = 0;
+    for (const row of rows) {
+      const where = row[2] || "";
+      const wm = where.match(/window\.([\w$]+)\(/);
+      if (!wm) continue;
+      const modName = wm[1];
+      const modSrc = fs.readFileSync(path.join(ROOT, row[0]), "utf8");
+      const retIdx = modSrc.lastIndexOf("return {");
+      assert.ok(retIdx > 0, row[0] + ": не нашёл, что модуль отдаёт наружу");
+      const retBlock = modSrc.slice(retIdx + "return {".length, modSrc.indexOf("};", retIdx));
+      const exported = new Set((retBlock.match(/^\s*([\w$]+)\s*[:,]/gm) || []).map((x) => x.trim().replace(/[:,]$/, "")));
+      assert.ok(exported.size > 0, row[0] + ": наружу не отдаётся ничего");
+      const calls = callersText.match(new RegExp(modName + "\\.([\\w$]+)\\(", "g")) || [];
+      for (const call of calls) {
+        const fn = call.slice(modName.length + 1, -1);
+        checkedCalls++;
+        assert.ok(
+          exported.has(fn) || fn === "then" || fn === "catch",
+          modName + "." + fn + " вызывается в окне, но " + row[0] + " его не отдаёт"
+        );
+      }
+    }
+    assert.ok(checkedCalls > 50, "вызовов модулей проверено подозрительно мало: " + checkedCalls);
   });
 
   await test("бюджет прямых чтений app.js в тестах не растёт", () => {

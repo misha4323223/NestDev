@@ -714,6 +714,67 @@ function startFakeProvider(seen, rounds, rate, script) {
     check("ответ агента дошёл до окна", !!answered, answered || "за 30 с в ленте не появилось ответа");
     check("ошибок страницы после прогона нет", pageErrs.length === errsBefore, pageErrs.slice(errsBefore).join(" | ").slice(0, 200));
 
+    console.log("\n[14] Дозор запуска: поломка окна показывает себя сама");
+    // Ровно то, из-за чего человек видел «в чате пусто»: падение при загрузке уходило
+    // в консоль, которой в собранном приложении никто не видит. Теперь окно само
+    // называет причину, файл, строку и версию исполняемого кода — и этот разбор
+    // можно скопировать одной кнопкой.
+    const guard = await page.evaluate(() => ({
+      есть: typeof window.BootGuard === "object" && window.BootGuard !== null,
+      // Подписку ставит сам модуль при загрузке: ждать инициализацию окна не нужно.
+      подписался: window.__bootGuardInstalled === true,
+      разбор: typeof window.bootReport === "function" ? window.bootReport() : "",
+      плашка: !!document.getElementById("boot-banner"),
+    }));
+    check("дозор запуска стоит в окне", guard.есть, "");
+    check("дозор подписался сам при загрузке", guard.подписался, "");
+    check("на здоровом окне дозор молчит", !guard.плашка && /поломок не записано/.test(guard.разбор), guard.разбор.slice(0, 120));
+    // 1. Файл не доехал (неполный набор обновления) — человек должен увидеть ИМЯ файла.
+    await page.evaluate(() => {
+      const s = document.createElement("script");
+      s.src = "net-takogo-fajla-iz-nabora.js";
+      document.body.appendChild(s);
+    });
+    await sleep(600);
+    const byFile = await page.evaluate(() => {
+      const b = document.getElementById("boot-banner");
+      return { плашка: !!b, текст: b ? b.textContent.replace(/\s+/g, " ").trim() : "" };
+    });
+    check("пропавший файл назван в окне", byFile.плашка && /net-takogo-fajla-iz-nabora\.js/.test(byFile.текст), byFile.текст.slice(0, 170));
+    // 2. Падение при загрузке: причина, место и версия кода.
+    await page.evaluate(() => {
+      setTimeout(() => {
+        throw new Error("живая проверка дозора: лента чата сломана");
+      }, 0);
+    });
+    await sleep(600);
+    const byCrash = await page.evaluate(() => {
+      const b = document.getElementById("boot-banner");
+      return {
+        текст: b ? b.textContent.replace(/\s+/g, " ").trim() : "",
+        разбор: typeof window.bootReport === "function" ? window.bootReport() : "",
+      };
+    });
+    check("падение показано человеку словами", /лента чата сломана/.test(byCrash.текст), byCrash.текст.slice(0, 170));
+    check("в плашке есть место падения", /Где:/.test(byCrash.текст), byCrash.текст.slice(0, 200));
+    check("в плашке есть версия кода", /Версия кода:/.test(byCrash.текст), byCrash.текст.slice(0, 200));
+    check("разбор отдаётся целиком для пересылки", /лента чата сломана/.test(byCrash.разбор), byCrash.разбор.slice(0, 170));
+    // 3. «Закрыть» убирает плашку — и она не возвращается на следующую поломку:
+    //    человек уже прочитал причину, мешать ему нечем.
+    const closedBanner = await page.evaluate(async () => {
+      const b = document.getElementById("boot-banner");
+      const btns = Array.from(b.querySelectorAll("button"));
+      const close = btns.filter((x) => /Закрыть/.test(x.textContent))[0];
+      close.click();
+      await new Promise((r) => setTimeout(r, 100));
+      setTimeout(() => {
+        throw new Error("после закрытия дозор не должен мешать");
+      }, 0);
+      await new Promise((r) => setTimeout(r, 300));
+      return { есть: !!document.getElementById("boot-banner"), кнопки: btns.map((x) => x.textContent) };
+    });
+    check("плашку можно закрыть", !closedBanner.есть, "кнопки: " + closedBanner.кнопки.join(" / "));
+
   } catch (e) {
     check("сквозной прогон без исключений", false, e.message);
   } finally {

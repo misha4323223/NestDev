@@ -1354,6 +1354,10 @@
       </div>
     </div>
   </div>
+  <!-- Дозор запуска — ПЕРВЫМ: он подписывается на ошибки раньше остальных
+       скриптов. Иначе падение при их загрузке пройдёт мимо него, и человек
+       снова увидит пустое окно без объяснений. -->
+  <script src="boot-guard.js"></script>
   <script src="provider-config.js"></script>
   <script src="provider-transport.js"></script>
   <script src="context-window.js"></script>

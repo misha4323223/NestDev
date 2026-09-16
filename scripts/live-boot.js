@@ -171,6 +171,7 @@ function bootWindow() {
     ["MdRender", "object"], ["Highlight", "object"], ["QR", "object"], ["YcConsole", "object"],
     ["YcPanel", "function"], ["DeployPanel", "object"], ["DevRun", "function"],
     ["MobilePanel", "function"],
+    ["BootGuard", "object"],
     ["ChatThinking", "function"],
     ["ChatSegments", "function"],
     ["ChatRender", "function"],

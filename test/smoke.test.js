@@ -7941,6 +7941,214 @@ async function testChatFeed() {
 // компактная строка (значок, подпись, цель, состояние, подробности), когда путь
 // становится ссылкой на файл, и как строки складываются в группу «Выполняю
 // действия · N», которая закрывается по концу ответа и начинается заново.
+// Дозор запуска окна (boot-guard.js): «пусто в чате» должно быть объяснено словами.
+// Проверяем и решения (чистые), и подписку на игрушечном DOM: настоящая плашка в
+// живом окне проверяется в сквозном прогоне десктопа (scripts/live-desktop.js).
+async function testBootGuard() {
+  const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "boot-guard.js"), "utf8");
+  // Модуль собирается той же фабрикой, что и в окне: `self` — игрушечное окно,
+  // поэтому проверяется и запись разбора наружу (`self.bootReport`), как её видит
+  // человек, а не служебное поле экспорта.
+  const vm = require("vm");
+  const sandbox = { module: { exports: {} }, self: {}, console: { error() {}, warn() {}, log() {} } };
+  vm.runInNewContext(src, sandbox, { filename: "boot-guard.js" });
+  const mod = sandbox.module.exports;
+  const winRoot = sandbox.self;
+  assert.strictEqual(typeof mod.install, "function", "модуль дозора не отдал себя");
+
+  // Игрушечное окно: ровно те возможности, которые дозору нужны, и счётчики, по
+  // которым видно, что он действительно подписался и действительно нарисовал.
+  function toyDom(opts) {
+    opts = opts || {};
+    const docListeners = {};
+    const winListeners = {};
+    const mkEl = (tag) => {
+      const el = {
+        tagName: String(tag).toUpperCase(),
+        id: "",
+        children: [],
+        parentNode: null,
+        textContent: "",
+        style: { cssText: "" },
+        attrs: {},
+        listeners: {},
+        setAttribute(k, v) {
+          this.attrs[k] = v;
+        },
+        appendChild(c) {
+          c.parentNode = this;
+          this.children.push(c);
+          return c;
+        },
+        remove() {
+          if (this.parentNode) this.parentNode.children = this.parentNode.children.filter((x) => x !== this);
+          this.parentNode = null;
+        },
+        addEventListener(type, fn) {
+          (this.listeners[type] = this.listeners[type] || []).push(fn);
+        },
+        click() {
+          for (const fn of this.listeners.click || []) fn({});
+        },
+        find(id, out) {
+          out = out || [];
+          if (this.id === id) out.push(this);
+          for (const c of this.children) c.find(id, out);
+          return out;
+        },
+      };
+      return el;
+    };
+    const body = mkEl("body");
+    const doc = {
+      readyState: opts.readyState || "complete",
+      body: body,
+      defaultView: null,
+      createElement: mkEl,
+      getElementById: (id) => ((opts.ids || []).indexOf(id) !== -1 ? { id: id } : null),
+      addEventListener(type, fn) {
+        (docListeners[type] = docListeners[type] || []).push(fn);
+      },
+      removeEventListener(type, fn) {
+        docListeners[type] = (docListeners[type] || []).filter((x) => x !== fn);
+      },
+      hasFocus: () => true,
+    };
+    const win = {
+      addEventListener(type, fn) {
+        (winListeners[type] = winListeners[type] || []).push(fn);
+      },
+      removeEventListener(type, fn) {
+        winListeners[type] = (winListeners[type] || []).filter((x) => x !== fn);
+      },
+      navigator: {},
+    };
+    doc.defaultView = win;
+    return {
+      doc: doc,
+      win: win,
+      fireDoc(type, e) {
+        for (const fn of docListeners[type] || []) fn(e);
+      },
+      fireWin(type, e) {
+        for (const fn of winListeners[type] || []) fn(e);
+      },
+      banner() {
+        const found = body.find("boot-banner", []);
+        return found.length ? found[0] : null;
+      },
+      mkEl: mkEl,
+    };
+  }
+
+  await test("дозор запуска: решения — имя файла, место падения, чего не хватает", () => {
+    // 1. Модуль на месте, встаёт ПЕРВЫМ скриптом и отдаётся телефону.
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const iBoot = html.indexOf('src="boot-guard.js"');
+    assert.ok(iBoot > 0, "разметка не грузит boot-guard.js");
+    assert.ok(iBoot < html.indexOf('src="provider-config.js"'), "boot-guard.js не первый скрипт — падение при загрузке пройдёт мимо него");
+    const bridge = fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8");
+    assert.ok(/"boot-guard\.js"/.test(bridge), "мобильный мост не отдаёт boot-guard.js телефону");
+    assert.ok(/root\.BootGuard = factory/.test(src), "модуль не выставляет себя в окно");
+
+    // 2. Файл не загрузился: человек видит ИМЯ файла, а не «ошибка на странице».
+    const res = mod.scriptFailure({ tagName: "SCRIPT", src: "file:///C:/app/src/renderer/chat-feed.js" });
+    assert.ok(res && res.title.indexOf("chat-feed.js") !== -1, "дозор не назвал файл: " + JSON.stringify(res));
+    assert.ok(res.kind === "resource", "поломка файла не отнесена к загрузке ресурса");
+    const css = mod.scriptFailure({ tagName: "LINK", href: "https://x/styles.css" });
+    assert.ok(css && /стиль/.test(css.hint), "стиль не отличается от скрипта: " + JSON.stringify(css));
+    assert.strictEqual(mod.scriptFailure({ tagName: null, src: "" }), null, "дозор принял не-ресурс за ресурс");
+    assert.strictEqual(mod.scriptFailure(null), null, "дозор падает на пустом событии");
+
+    // 3. Падение: место берётся из filename/строки, свои кадры из стека не тащим.
+    const err = mod.scriptError({
+      message: "Cannot read properties of null (reading 'classList')",
+      filename: "src/renderer/chat-feed.js",
+      lineno: 42,
+      colno: 7,
+      stack: "Error: x\n  at jumpToBottom (chat-feed.js:42:7)\n  at renderMessages (app.js:100:2)\n  at boot-guard.js:1:1",
+    });
+    assert.ok(err.where.indexOf("chat-feed.js") !== -1 && err.where.indexOf("строка 42:7") !== -1, "место падения названо неточно: " + err.where);
+    assert.strictEqual(err.stack.length, 2, "свои кадры остались в стеке: " + JSON.stringify(err.stack));
+    assert.ok(/classList/.test(err.title), "текст ошибки потерялся");
+    const dumb = mod.scriptError(undefined, "окно");
+    assert.ok(dumb.title && dumb.title.length > 0, "пустая ошибка не описана словами");
+
+    // 4. Неполная сборка окна: и модули, и узлы названы по-русски, с пояснением.
+    const miss = mod.missingFrom([["ChatFeed", "лента чата"], ["ChatWork", "строки действий"]], (n) => n === "ChatFeed");
+    // Сравнение через JSON: модуль собран в песочнице, и его массив — не массив этого процесса.
+    assert.strictEqual(JSON.stringify(miss), JSON.stringify(["ChatWork (строки действий)"]), "список пропавшего собран неверно: " + JSON.stringify(miss));
+    const model = mod.missingModel(["ChatFeed (лента чата)"], ["messages", "input"]);
+    assert.ok(model.hint.indexOf("ChatFeed") !== -1 && model.hint.indexOf("messages") !== -1, "разбор неполон: " + model.hint);
+    assert.ok(/чат работать не может/.test(model.title), "нет человеческого заголовка: " + model.title);
+
+    // 5. Текст разбора: причина, место, версия кода и стек одной строкой для пересылки.
+    const text = mod.problemsText([err, model], { version: () => "1.5.120 (C:\\app\\ota)" });
+    assert.ok(/^⚠ Окно не работает/.test(text), "разбор не начинается с причины: " + text.slice(0, 80));
+    assert.ok(text.indexOf("Версия кода: 1.5.120 (C:\\app\\ota)") !== -1, "в разборе нет версии кода");
+    assert.ok(text.indexOf("Дальше:") !== -1, "в разборе нет остальных поломок");
+    assert.ok(/поломок не записано/.test(mod.problemsText([])), "пустой разбор говорит неправду");
+  });
+
+  await test("дозор запуска: плашка показывает поломку и её можно закрыть", () => {
+    // Окно, в котором нет НИ узлов, НИ модулей: дозор обязан сказать это сразу.
+    const dom = toyDom({ ids: [] });
+    const off = mod.install(dom.doc, {});
+    const banner = dom.banner();
+    assert.ok(banner, "дозор не показал плашку на пустом окне");
+    const textOf = (b) => b.find("boot-banner", [])[0].children[0].textContent + "\n" + b.find("boot-banner", [])[0].children[1].textContent;
+    assert.ok(/чат работать не может/.test(textOf(dom.doc.body)), "плашка не объясняет, что окно собрано неполно");
+    assert.ok(/ChatFeed/.test(textOf(dom.doc.body)) && /#?messages/.test(textOf(dom.doc.body)), "плашка не называет пропавшее: " + textOf(dom.doc.body).slice(0, 200));
+    assert.ok(typeof winRoot.bootReport === "function" && /чат работать не может/.test(winRoot.bootReport()), "разбор наружу не отдаётся человеку");
+    off();
+    assert.ok(!dom.doc.body.find("boot-banner", []).length, "отключение дозора не убрало плашку");
+
+    // Полное окно: молчит. И наоборот — падение файла и падение кода показываются,
+    // повтор того же падения не размножается.
+    const good = toyDom({ ids: mod.REQUIRED_IDS.slice() });
+    for (const [name] of mod.REQUIRED_MODULES) winRoot[name] = {};
+    let offGood = null;
+    try {
+      offGood = mod.install(good.doc, {});
+      assert.strictEqual(good.banner(), null, "дозор ругается на полностью собранное окно");
+      const script = good.mkEl("script");
+      script.src = "http://127.0.0.1/x/chat-feed.js";
+      good.fireDoc("error", { target: script });
+      const b1 = good.banner();
+      assert.ok(b1, "падение загрузки файла не показано");
+      assert.ok(b1.children[1].textContent.indexOf("chat-feed.js") !== -1, "плашка не назвала файл: " + b1.children[1].textContent.slice(0, 160));
+      good.fireDoc("error", { target: script });
+      const again = good.banner().children[1].textContent;
+      assert.strictEqual(again.split("chat-feed.js").length - 1, 1, "одно и то же падение повторилось в плашке");
+      good.fireWin("unhandledrejection", { reason: new Error("обещание сорвалось в чате") });
+      assert.ok(/обещание сорвалось/.test(good.banner().children[1].textContent), "сорванное обещание не показано");
+      // «Закрыть» убирает плашку и больше не мешает: новая поломка её не поднимает.
+      const actions = good.banner().children[2];
+      const closeBtn = actions.children[actions.children.length - 1];
+      assert.ok(/Закрыть/.test(closeBtn.textContent), "в плашке нет кнопки «Закрыть»");
+      closeBtn.click();
+      assert.strictEqual(good.banner(), null, "плашка не закрылась");
+      good.fireWin("unhandledrejection", { reason: new Error("ещё одна поломка") });
+      assert.strictEqual(good.banner(), null, "закрытая плашка вернулась сама");
+    } finally {
+      if (offGood) offGood();
+      for (const [name] of mod.REQUIRED_MODULES) delete winRoot[name];
+    }
+
+    // Разбор доступен человеку и без моста: `bootReport` пишет версию словами.
+    const solo = toyDom({ ids: mod.REQUIRED_IDS.slice() });
+    const offSolo = mod.install(solo.doc, {});
+    const script2 = solo.mkEl("script");
+    script2.src = "/y/chat-work.js";
+    solo.fireDoc("error", { target: script2 });
+    const report = winRoot.bootReport();
+    assert.ok(report.indexOf("chat-work.js") !== -1, "разбор наружу не назвал файл: " + report.slice(0, 160));
+    assert.ok(report.indexOf("Версия кода") !== -1, "в разборе наружу нет версии кода: " + report.slice(0, 200));
+    offSolo();
+    assert.strictEqual(typeof mod.install(null), "function", "дозор не переживает окно без документа");
+  });
+}
+
 async function testChatWork() {
   const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "chat-work.js"), "utf8");
 
@@ -14199,6 +14407,7 @@ async function testMissions() {
   await testChatRender();
   await testChatFeed();
   await testChatWork();
+  await testBootGuard();
   await testTasksMission();
   await testProviderConfig();
   await testProviderTransport();

@@ -37,6 +37,7 @@ const APP_VERSION = (() => {
 // монохромной, а подсветка кода молча отключалась.
 const STATIC_FILES = new Set([
   "index.html",
+  "boot-guard.js",
   "styles.css",
   "monochrome.css",
   "app.js",
