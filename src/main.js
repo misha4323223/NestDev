@@ -3783,6 +3783,21 @@ ipcMain.handle("mission:finish", (_e, id) => {
   if (missionClaim === rec.id) missionClaim = "";
   return { ok: true, id: rec.id, status: r.mission.status };
 });
+// Удаление миссии человеком: папка миссии (журнал, отчёт, план) уходит целиком.
+// Во время прогона по этой же миссии не удаляем: агент держит её в памяти и продолжит
+// писать — сначала «⏹ Стоп» или «🏁 Закрыть». Закрытые и прошлые миссии удаляются свободно.
+ipcMain.handle("mission:delete", (_e, id) => {
+  const dir = agentWorkDir(loadSettings());
+  const wanted = String(id || "").trim() || missionClaim;
+  if (!wanted) return { ok: false, error: "Не понял, какую миссию удалять." };
+  if (missionClaim === wanted && global.__agentRunning) {
+    return { ok: false, error: "Идёт прогон по этой миссии — сначала «⏹ Стоп» или «🏁 Закрыть»." };
+  }
+  const r = missionStore.missionDelete(dir, wanted);
+  if (!r || !r.ok) return { ok: false, error: (r && r.error) || "Не удалось удалить миссию." };
+  if (missionClaim === wanted) missionClaim = "";
+  return { ok: true, id: r.id };
+});
 ipcMain.handle("mission:open", (_e, id) => {
   const dir = agentWorkDir(loadSettings());
   const target = id ? missionStore.missionDirOf(dir, id) : missionStore.agentRoot(dir);

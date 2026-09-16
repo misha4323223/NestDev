@@ -30,15 +30,31 @@
     if (!pinnedToBottom) return;
     w.scrollTop = w.scrollHeight;
   }
+  // Кнопка «↓» — необязательный спутник ленты: если её нет в разметке, прокрутка
+  // обязана работать и молча. Раньше обращения к ней падали с «Cannot read
+  // properties of null», и падение обрывало перерисовку ленты (1.5.118).
+  function pinButton() {
+    return $("btn-scroll-bottom") || null;
+  }
   function updatePinState() {
     const w = $("messages");
     const nearBottom = w.scrollHeight - w.scrollTop - w.clientHeight < 90;
     pinnedToBottom = nearBottom;
-    $("btn-scroll-bottom").classList.toggle("hidden", nearBottom);
+    const btn = pinButton();
+    if (btn) btn.classList.toggle("hidden", nearBottom);
   }
   function jumpToBottom() {
     pinnedToBottom = true;
-    $("btn-scroll-bottom").classList.add("hidden");
+    const btn = pinButton();
+    if (btn) btn.classList.add("hidden");
+    const w = $("messages");
+    w.scrollTop = w.scrollHeight;
+  }
+  // Прыжок в конец БЕЗ кнопки: так перерисовка ленты гасит прокрутку вниз. Здесь
+  // важно не трогать элементы вне ленты: лента очищает себя целиком, и любой её
+  // спутник, попавший внутрь, будет удалён вместе с содержимым.
+  function pinBottom() {
+    pinnedToBottom = true;
     const w = $("messages");
     w.scrollTop = w.scrollHeight;
   }
@@ -88,6 +104,7 @@
     scrollBottomSoon: scrollBottomSoon,
     updatePinState: updatePinState,
     jumpToBottom: jumpToBottom,
+    pinBottom: pinBottom,
     queueBubbleRender: queueBubbleRender,
   };
 });

@@ -389,7 +389,11 @@ async function testWebChat() {
     const wiring = uiFind("  const WebChat = window.WebChat({", "  // ─────────────── Настройки ───────────────").code;
     assert.ok(/onEvent: onAiEvent/.test(wiring), "в модуль не передан обработчик событий: авто-переключение профилей снова упадёт");
     assert.ok(/getSettings: \(\) => settings/.test(wiring), "настройки переданы копией — смена профиля не дойдёт до модуля");
-    assert.ok(/openaiProfilesArr: openaiProfilesArr/.test(wiring), "модуль не видит сохранённые подключения");
+    assert.ok(/openaiProfilesArr: OpenaiProfiles.arr/.test(wiring), "модуль не видит сохранённые подключения");
+    // Сборка подключений стоит РАНЬШЕ веб-режима: тот берёт их своим входом.
+    const profLine = uiAll().split("\n").findIndex((l) => /const OpenaiProfiles = window.OpenaiProfiles\(/.test(l));
+    const webLine = uiAll().split("\n").findIndex((l) => /const WebChat = window.WebChat\(/.test(l));
+    assert.ok(profLine > 0 && webLine > profLine, "подключения собираются после веб-режима — он получит пустую ссылку");
 
     const sse = (parts) => new Response(parts.map((p) => "data: " + JSON.stringify(p) + "\n\n").join(""), { status: 200, headers: { "Content-Type": "text/event-stream" } });
     const realFetch = global.fetch;
@@ -7769,6 +7773,22 @@ async function testChatFeed() {
       appSrc.indexOf("window.ChatFeed({") < appSrc.indexOf("window.ChatRender({"),
       "лента собрана после отрисовки — стрелка msgHtml больше не нужна, проверь порядок"
     );
+    // Кнопка «↓» обязана жить СНАРУЖИ ленты: перерисовка очищает ленту целиком
+    // (innerHTML = ""), и вложенную кнопку удаляло вместе с содержимым. Именно на
+    // этом падала перерисовка (1.5.118), а падение обрывало запуск окна.
+    const flat = html.replace(/\s+/g, " ");
+    assert.ok(flat.includes('<div id="messages"></div>'), "внутри ленты есть узлы — первая же перерисовка их удалит");
+    assert.ok(
+      html.indexOf('id="btn-scroll-bottom"') > html.indexOf('id="messages"'),
+      "кнопка «↓» стоит внутри ленты — перерисовка её удалит"
+    );
+    assert.ok(flat.includes('<div id="messages-wrap">'), "нет обёртки ленты: кнопке негде жить снаружи");
+    // Лента не имеет права трогать элементы вне себя: перерисовка зовёт pinBottom,
+    // а не jumpToBottom (тот дёргает кнопку).
+    const renderBody = appSrc.slice(appSrc.indexOf("function renderMessages"), appSrc.indexOf("function buildMessageEl"));
+    assert.ok(/ChatFeed\.pinBottom\(\)/.test(renderBody), "перерисовка не прыгает в конец через pinBottom");
+    assert.ok(!/ChatFeed\.jumpToBottom\(/.test(renderBody), "перерисовка дёргает кнопку «↓» — она может быть удалена");
+
     // Границы модуля: ничего чужого из оболочки, только внедрённое.
     for (const name of ["chatsData", "session", "streaming", "ChatRender", "localStorage", "document"]) {
       assert.ok(!new RegExp("(^|[^\\w$.])" + name + "\\b").test(src), "модуль ссылается на " + name + " без внедрения");
@@ -7801,7 +7821,7 @@ async function testChatFeed() {
       const feed = buildChatFeed({ $: $, msgEls: msgEls, msgHtml: (c) => "<p>" + c + "</p>" });
       assert.deepStrictEqual(
         Object.keys(feed).sort(),
-        ["jumpToBottom", "queueBubbleRender", "scrollBottom", "scrollBottomSoon", "updatePinState"],
+        ["jumpToBottom", "pinBottom", "queueBubbleRender", "scrollBottom", "scrollBottomSoon", "updatePinState"],
         "наружу торчит лишнее или чего-то не хватает"
       );
 
@@ -7828,6 +7848,7 @@ async function testChatFeed() {
       win.scrollHeight = 1500;
       feed.scrollBottom();
       assert.strictEqual(win.scrollTop, 1500, "после возврата автопрокрутка не возобновилась");
+
 
       // 6. Очередь кадра: два чанка — один кадр и последнее состояние.
       const seg = { id: "a1", content: "прив" };
@@ -7874,6 +7895,24 @@ async function testChatFeed() {
       rafQ.splice(0).forEach((fn) => fn());
       assert.strictEqual(win.scrollTop, 2100, "отложенная прокрутка не сработала");
 
+      // 11. Перерисовка ленты прыгает в конец через pinBottom: он не трогает кнопку
+      //     «↓» и потому не может упасть на удалённом элементе.
+      win.scrollTop = 300;
+      feed.updatePinState();
+      assert.strictEqual(classes.has("hidden"), false, "при чтении выше кнопка «↓» не показалась");
+      win.scrollHeight = 1700;
+      feed.pinBottom();
+      assert.strictEqual(win.scrollTop, 1700, "pinBottom не прыгнул в конец");
+      assert.strictEqual(classes.has("hidden"), false, "pinBottom сам управляет кнопкой — не должен");
+
+      // 12. Кнопки может не быть вовсе (старая разметка, окно телефона): прокрутка
+      //     обязана работать молча, а не падать с «Cannot read properties of null».
+      const btnBackup = dom["btn-scroll-bottom"];
+      delete dom["btn-scroll-bottom"];
+      assert.doesNotThrow(() => feed.updatePinState(), "updatePinState падает без кнопки «↓»");
+      assert.doesNotThrow(() => feed.jumpToBottom(), "jumpToBottom падает без кнопки «↓»");
+      assert.doesNotThrow(() => feed.pinBottom(), "pinBottom падает без кнопки «↓»");
+      dom["btn-scroll-bottom"] = btnBackup;
       // 10. Негативный контроль зависимостей: без DOM модуль падает понятной ошибкой.
       const noDollar = buildChatFeed({ msgEls: msgEls, msgHtml: (c) => c });
       assert.throws(() => noDollar.updatePinState(), /is not a function/, "без $ модуль не упал");
@@ -9980,14 +10019,21 @@ async function testSettingsRedesign() {
   await test("настройки: поиск по всем вкладкам и понятная пустота", () => {
     assert.ok(htmlSrc.includes('id="settings-search"'), "нет поля поиска");
     assert.ok(htmlSrc.includes('id="settings-empty"'), "нет сообщения «ничего не найдено»");
-    assert.ok(appSrc.includes("function settingsSearchApply"), "поиск не реализован");
-    assert.ok(appSrc.includes('$("settings-search").addEventListener("input"'), "поиск не слушает ввод");
-    assert.ok(appSrc.includes('classList.toggle("sfilter-hide"'), "поле прячется не своим классом");
-    assert.ok(appSrc.includes('"sfilter-open"'), "найденное в свёрнутой карточке не раскрывается");
+    // Поиск живёт в своём модуле (этап 3.8, часть 1): проверяется и сама логика,
+    // и то, что оболочка ведёт ввод в неё, а кода поиска в app.js больше нет.
+    const searchSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "settings-search.js"), "utf8");
+    assert.ok(/function settingsSearchApply/.test(searchSrc), "поиск не реализован");
+    assert.ok(!appSrc.includes("function settingsSearchApply"), "поиск остался в оболочке");
+    assert.ok(
+      appSrc.includes('$("settings-search").addEventListener("input", (e) => SettingsSearch.apply(e.target.value))'),
+      "поиск не слушает ввод"
+    );
+    assert.ok(searchSrc.includes('classList.toggle("sfilter-hide"'), "поле прячется не своим классом");
+    assert.ok(searchSrc.includes('"sfilter-open"'), "найденное в свёрнутой карточке не раскрывается");
     assert.ok(cssSrc.includes(".sfilter-hide { display: none !important; }"), "нет стиля скрытия в поиске");
-    assert.ok(appSrc.includes("el.placeholder"), "поиск не видит placeholder полей");
-    assert.ok(appSrc.includes('classList.contains("acc")'), "карточки провайдеров выпадают из поиска (ключ и модель в «Модели» лежат в .acc)");
-    assert.ok(appSrc.includes("data-search-label"), "результаты не подписаны категорией");
+    assert.ok(searchSrc.includes("el.placeholder"), "поиск не видит placeholder полей");
+    assert.ok(searchSrc.includes('classList.contains("acc")'), "карточки провайдеров выпадают из поиска (ключ и модель в «Модели» лежат в .acc)");
+    assert.ok(searchSrc.includes("data-search-label"), "результаты не подписаны категорией");
   });
 
   await test("настройки: вкладка запоминается, клик по кнопке не передаёт событие", () => {
@@ -10197,11 +10243,22 @@ function miniDom() {
 async function testSettingsSearchLogic() {
 
   await test("поиск настроек: фильтрует по всем вкладкам, включая карточки провайдеров", () => {
-    const searchSlice = uiFind("  // ── Поиск по настройкам ──", "\n  function setPreset(p) {");
-    assert.ok(searchSlice.start > 0, "не нашёл функции поиска в интерфейсе");
-    const code = 'let lastSettingsTab = "model";\n' + searchSlice.code + "\nreturn settingsSearchApply;";
+    // Модуль берём с диска целиком и собираем ТОЙ ЖЕ фабрикой, что и приложение:
+    // проверяется настоящий код, а не вырезка из app.js.
+    const searchSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "settings-search.js"), "utf8");
     const d = miniDom();
-    const apply = new Function("document", "$", code)(d.document, d.$);
+    const sandbox = {
+      module: { exports: {} },
+      window: {},
+      self: {},
+      document: d.document,
+      console: { log() {}, warn() {}, error() {} },
+    };
+    const vm = require("vm"); // в этом файле vm подключается локально в каждой функции
+    vm.runInNewContext(searchSrc, sandbox, { filename: "settings-search.js" });
+    const api = sandbox.module.exports({ $: d.$, getLastTab: () => "model" });
+    const apply = api.apply;
+    assert.ok(api.active && api.reset && api.input && api.fieldText, "модуль поиска отдаёт не все входы");
 
     // 1. Поиск ключа: карточка OpenAI-совместимых должна быть видна, Ollama — нет.
     d.input.value = "ключ";
@@ -10247,6 +10304,17 @@ async function testSettingsSearchLogic() {
     assert.ok(d.accOllama.classList.contains("sfilter-open"), "карточка с замером не раскрылась для показа");
     apply("чтение промпта");
     assert.ok(d.accOllama.classList.contains("sfilter-hide") === false, "подсказка кнопки замера не участвует в поиске");
+
+    // 6. Границы модуля: чужое состояние — только через deps.
+    for (const name of ["chatsData", "session", "streaming", "msgEls", "currentPreset", "PRESETS", "projectDir"]) {
+      assert.ok(
+        !new RegExp("(^|[^\\w$.])" + name + "\\b").test(searchSrc),
+        "модуль поиска ссылается на " + name + " без внедрения"
+      );
+    }
+    // 7. Негативный контроль зависимости: забытый DOM — понятная ошибка, а не тихий отказ.
+    const noDeps = sandbox.module.exports({ getLastTab: () => "model" });
+    assert.throws(() => noDeps.apply("ключ"), /\$|is not a function/, "без $ поиск не упал");
   });
 
   await test("замер локальной модели: отчёт рисуется в панели, кнопка видна только для местной модели", () => {
@@ -10293,6 +10361,145 @@ async function testSettingsSearchLogic() {
     const setProv = uiFind("  function setProviderUI(p) {", "  // Переключение вкладок настроек").code;
     assert.ok(/refreshProbeButton\(\);/.test(setProv), "видимость кнопки замера не обновляется при смене провайдера");
     assert.ok(/Замерить скорость локальной модели/.test(appSrc2), "в палитре команд нет замера");
+  });
+}
+
+// ── Сохранённые OpenAI-подключения (этап 3.8, часть 2) ─────────────────────
+// Модуль вынесен из app.js. Проверяем ПОВЕДЕНИЕ: имя подключения по адресу,
+// сохранение нового и обновление выбранного, удаление с подтверждением,
+// перерисовка списка и перенос значений в поля при выборе.
+async function testOpenaiProfiles() {
+  const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "openai-profiles.js"), "utf8");
+
+  await test("подключения: сохранение, выбор и удаление работают, как раньше", () => {
+    // 1. Модуль на месте, подключён до app.js, отдаётся телефону.
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const iTag = html.indexOf('src="openai-profiles.js"');
+    assert.ok(iTag > 0, "разметка не грузит openai-profiles.js");
+    assert.ok(iTag < html.indexOf('src="app.js"'), "openai-profiles.js подключён после app.js");
+    assert.ok(/"openai-profiles\.js"/.test(fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8")), "мост не отдаёт модуль телефону");
+    const appSrc = uiFile("app.js");
+    for (const gone of ["function renderOpenaiProfiles", "function applyOpenaiProfile", "function saveOpenaiProfileFromFields", "function deleteOpenaiProfile", "function profileNameFromUrl", "function openaiProfilesArr"]) {
+      assert.ok(appSrc.indexOf(gone) === -1, "код подключений остался в app.js: " + gone);
+    }
+    // Границы модуля: чужое состояние — только через deps.
+    for (const name of ["chatsData", "session", "streaming", "msgEls", "currentPreset", "cachedModels", "projectDir"]) {
+      assert.ok(!new RegExp("(^|[^\\w$.])" + name + "\\b").test(src), "модуль ссылается на " + name + " без внедрения");
+    }
+
+    // 2. Среда: поля настроек, сообщения, подтверждение удаления.
+    const fields = {
+      "s-openai-profile": { value: "__new__", innerHTML: "", children: [] },
+      "s-openai-url": { value: "" },
+      "s-openai-key": { value: "" },
+      "s-openai-model": { value: "" },
+      "s-openai-project": { value: "" },
+    };
+    const msgs = [];
+    let saved = 0;
+    let askAnswer = true;
+    const settings = { openaiProfiles: [], openaiActiveProfile: "" };
+    const options = () => fields["s-openai-profile"].children.filter((c) => /option/.test(c.tag || ""));
+    const sandbox = {
+      module: { exports: {} },
+      window: {},
+      self: {},
+      console: { log() {}, warn() {}, error() {} },
+      confirm: () => askAnswer,
+      document: {
+        createElement: (tag) => ({ tag, value: "", textContent: "" }),
+        querySelectorAll: () => [],
+      },
+    };
+    const vm = require("vm");
+    vm.runInNewContext(src, sandbox, { filename: "openai-profiles.js" });
+    // Заглушка списка: appendChild складывает опции, innerHTML = "" чистит.
+    const sel = fields["s-openai-profile"];
+    Object.defineProperty(sel, "innerHTML", { set() { sel.children.length = 0; }, get() { return ""; } });
+    sel.appendChild = (o) => sel.children.push(o);
+    const api = sandbox.module.exports({
+      $: (id) => fields[id] || null,
+      uid: (() => { let n = 0; return () => "id" + ++n; })(),
+      getSettings: () => settings,
+      PRESETS: { deepseek: { url: "https://api.deepseek.com" }, openai: { url: "https://api.openai.com/v1" } },
+      persistSettings: () => { saved++; },
+      setSettingsMsg: (t, isErr) => msgs.push({ t, isErr: !!isErr }),
+    });
+
+    // 3. Имя по адресу: обычный домен, без www, и честная замена при мусоре.
+    assert.strictEqual(api.profileNameFromUrl("https://api.deepseek.com/v1"), "api.deepseek.com");
+    assert.strictEqual(api.profileNameFromUrl("https://www.openai.com/v1"), "openai.com");
+    assert.strictEqual(api.profileNameFromUrl("не-адрес"), "OpenAI");
+
+    // 4. Сохранение нового подключения: имя по адресу, ключ и модель записаны.
+    fields["s-openai-url"].value = "https://api.deepseek.com/v1";
+    fields["s-openai-key"].value = "ключ-1";
+    fields["s-openai-model"].value = "deepseek-chat";
+    fields["s-openai-project"].value = "проект";
+    api.saveFromFields();
+    assert.strictEqual(settings.openaiProfiles.length, 1, "подключение не сохранено");
+    assert.strictEqual(settings.openaiProfiles[0].name, "api.deepseek.com", "имя взято не по адресу");
+    assert.strictEqual(settings.openaiProfiles[0].apiKey, "ключ-1", "ключ не записан");
+    assert.strictEqual(saved, 1, "настройки не сохранены на диск");
+    assert.ok(options().length === 2, "в списке должно быть «Новое подключение» и сохранённое");
+
+    // 5. Сохранение сразу после сохранения ОБНОВЛЯЕТ выбранное, а не плодит копии:
+    //    после записи подключение становится активным, и список показывает его же.
+    fields["s-openai-key"].value = "ключ-1-правка";
+    api.saveFromFields();
+    assert.strictEqual(settings.openaiProfiles.length, 1, "повторное сохранение создало лишнее подключение");
+    assert.strictEqual(settings.openaiProfiles[0].apiKey, "ключ-1-правка", "правка не дошла до подключения");
+
+    // 6. А вот выбранное «Новое подключение» с тем же адресом получает номер —
+    //    два ключа одного сервиса не сливаются в одну запись.
+    fields["s-openai-profile"].value = "__new__";
+    fields["s-openai-key"].value = "ключ-2";
+    api.saveFromFields();
+    assert.deepStrictEqual(settings.openaiProfiles.map((p) => p.name), ["api.deepseek.com", "api.deepseek.com #2"], "два ключа одного сервиса слились");
+    assert.strictEqual(settings.openaiActiveProfile, "id2", "активным не стало новое подключение");
+
+    // 7. Обновление ВЫБРАННОГО из списка подключения (а не создание нового).
+    fields["s-openai-profile"].value = "id1";
+    fields["s-openai-key"].value = "ключ-1-новый";
+    api.saveFromFields();
+    assert.strictEqual(settings.openaiProfiles.length, 2, "обновление создало лишнее подключение");
+    assert.strictEqual(settings.openaiProfiles[0].apiKey, "ключ-1-новый", "ключ не обновился");
+
+    // 8. Пустой адрес: отказ словами, без записи.
+    fields["s-openai-url"].value = "";
+    const before = msgs.length;
+    api.saveFromFields();
+    assert.ok(msgs.length > before && msgs[msgs.length - 1].isErr, "пустой адрес не объяснён");
+    assert.strictEqual(settings.openaiProfiles.length, 2, "подключение с пустым адресом всё равно сохранилось");
+
+    // 9. Выбор подключения переносит значения в поля и подсказывает пресет.
+    api.apply("id2");
+    assert.strictEqual(fields["s-openai-url"].value, "https://api.deepseek.com/v1", "адрес не перенесён");
+    assert.strictEqual(fields["s-openai-key"].value, "ключ-2", "ключ не перенесён");
+    assert.strictEqual(fields["s-openai-model"].value, "deepseek-chat", "модель не перенесена");
+    assert.strictEqual(settings.openaiActiveProfile, "id2", "активное подключение не переключилось");
+    assert.ok(/выбрано/.test(msgs[msgs.length - 1].t), "выбор никак не подтверждён");
+
+    // 10. Удаление спрашивает подтверждение и не удаляет по отказу.
+    askAnswer = false;
+    fields["s-openai-profile"].value = "id2";
+    api.remove();
+    assert.strictEqual(settings.openaiProfiles.length, 2, "отказ в подтверждении всё равно удалил");
+    askAnswer = true;
+    api.remove();
+    assert.deepStrictEqual(settings.openaiProfiles.map((p) => p.id), ["id1"], "подключение не удалено");
+    assert.strictEqual(settings.openaiActiveProfile, "", "активным осталось удалённое подключение");
+    assert.ok(options().length === 2, "список не перерисован после удаления");
+
+    // 11. «Новое подключение» удалять нельзя — это подсказка, а не запись.
+    fields["s-openai-profile"].value = "__new__";
+    const beforeMsg = msgs.length;
+    api.remove();
+    assert.ok(msgs.length > beforeMsg && msgs[msgs.length - 1].isErr, "удаление «Нового подключения» прошло молча");
+
+    // 12. Негативный контроль зависимости: забытый DOM падает понятной ошибкой.
+    const noDeps = sandbox.module.exports({ uid: () => "x", getSettings: () => settings });
+    assert.throws(() => noDeps.render(), /\$|is not a function/, "без $ модуль не упал");
   });
 }
 
@@ -13720,6 +13927,42 @@ async function testMissions() {
     assert.ok(ms.missionJournalText(wd, id).indexOf("Миссия начата") >= 0, "старт миссии не попал в журнал");
   });
 
+  await test("миссии: удаление подключено от панели до склада, но не во время прогона", () => {
+    const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    const preloadSrc = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
+    const panelSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "tasks-mission.js"), "utf8");
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    assert.ok(html.includes('id="btn-mission-delete"'), "нет кнопки удаления в карточке миссии");
+    assert.ok(/ipcMain\.handle\("mission:delete"/.test(mainSrc), "нет канала mission:delete");
+    assert.ok(/missionDelete: \(id\) => ipcRenderer\.invoke\("mission:delete"/.test(preloadSrc), "мост не отдаёт удаление в окно");
+    // Во время прогона удалять нельзя: агент держит миссию в памяти и продолжит писать.
+    assert.ok(/global\.__agentRunning/.test(mainSrc.split('ipcMain.handle("mission:delete"')[1].split("ipcMain.handle(")[0]), "канал не отказывает во время прогона");
+    assert.ok(/btn-mission-delete"\)\.onclick/.test(panelSrc), "кнопка в карточке ни к чему не подключена");
+    assert.ok(/isStreaming\(\)/.test(panelSrc.split('$("btn-mission-delete").onclick')[1].split("};")[0]), "кнопка удаления работает и во время прогона");
+    assert.ok(/ms-past-del/.test(panelSrc), "у прошлых миссий нет кнопки удаления");
+    assert.ok(/confirm\(/.test(panelSrc.split('querySelectorAll(".ms-past-del")')[1].slice(0, 800)), "удаление прошлой миссии идёт без подтверждения");
+    assert.ok(/confirm\(/.test(panelSrc.split('$("btn-mission-delete").onclick')[1].slice(0, 900)), "удаление из карточки идёт без подтверждения");
+  });
+
+  await test("миссии: удаление уносит папку целиком, а мусорный идентификатор — отказ", () => {
+    const wd = tmpdir("mission-delete-");
+    const r = ms.missionCreate(wd, { goal: "Черновик на удаление", steps: ["Шаг"], ts: DAY });
+    const id = r.mission.id;
+    const dir = path.join(wd, ".agent", "missions", id);
+    assert.ok(fs.existsSync(dir), "миссия не создалась");
+    // Идентификатор идёт в путь, поэтому проверяется до удаления: «..» увёл бы наружу.
+    assert.ok(!ms.missionDelete(wd, "..").ok, "идентификатор «..» принят");
+    assert.ok(!ms.missionDelete(wd, "../сосед").ok, "идентификатор с путём принят");
+    assert.ok(!ms.missionDelete(wd, "").ok, "пустой идентификатор принят");
+    assert.ok(!ms.missionDelete(wd, "20990101-0000-no-such").ok, "несуществующая миссия «удалена»");
+    const d = ms.missionDelete(wd, id);
+    assert.ok(d.ok, "missionDelete: " + (d.error || ""));
+    assert.ok(!fs.existsSync(dir), "папка миссии осталась на диске");
+    assert.ok(!ms.missionActive(wd), "удалённая миссия всё ещё считается незакрытой");
+    // Удаляем ровно миссию: рабочая папка агента остаётся на месте.
+    assert.ok(fs.existsSync(path.join(wd, ".agent")), "удаление миссии снесло всю папку .agent");
+  });
+
   await test("миссии: шаг отмечает план, незапланированное не теряется, журнал растёт", () => {
     const wd = tmpdir("mission-step-");
     const r = ms.missionCreate(wd, { goal: "Порядок в файлах", steps: ["Найти дубли", "Удалить дубли"], ts: DAY });
@@ -13927,6 +14170,7 @@ async function testMissions() {
   await testChatContextTransfer();
   await testSettingsRedesign();
   await testSettingsSearchLogic();
+  await testOpenaiProfiles();
   await testLeftRail();
   await testSandboxObstacles();
   await testVkFieldFixes();

@@ -176,6 +176,8 @@ function bootWindow() {
     ["ChatRender", "function"],
     ["ChatFeed", "function"],
     ["ChatWork", "function"],
+    ["SettingsSearch", "function"],
+    ["OpenaiProfiles", "function"],
   ];
   for (const [name, kind] of globals) ok(typeof win[name] === kind, "модуль в окне: " + name + " (" + kind + ")");
   return win;

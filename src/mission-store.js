@@ -461,6 +461,28 @@ function missionActive(workDir) {
   return list.find((m) => m.status === "active" || m.status === "paused") || null;
 }
 
+// Удаление миссии вместе с папкой: цель, план, журнал и отчёт уходят целиком.
+// Идентификатор обязательно проверяем: он приходит из интерфейса и попадает в путь,
+// а «../» в нём означал бы удаление чужой папки.
+function missionDelete(workDir, id) {
+  const mid = String(id || "").trim();
+  if (!mid) return { ok: false, error: "Не понял, какую миссию удалять" };
+  // Идентификатор — ровно ОДИН сегмент пути, и в нём бывают русские буквы
+  // (слаги миссий вида «20260915-1030-черновик-на-удаление»). Поэтому проверяем
+  // не алфавит, а путь: разделители, «.», «..» и выход наружу недопустимы.
+  if (mid === "." || mid === ".." || mid !== path.basename(mid) || /[\/\\]/.test(mid)) {
+    return { ok: false, error: "Неверный идентификатор миссии: " + mid };
+  }
+  const dir = missionDirOf(workDir, mid);
+  if (!fs.existsSync(dir)) return { ok: false, error: "Миссия не найдена: " + mid };
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+  return { ok: true, id: mid };
+}
+
 function missionPrune(workDir) {
   const all = missionList(workDir, { limit: 100 });
   const keep = all.slice(0, MISSION_MAX_KEEP);
@@ -623,6 +645,7 @@ module.exports = {
   missionFinish,
   missionList,
   missionActive,
+  missionDelete,
   missionPrune,
   missionJournal,
   missionJournalText,

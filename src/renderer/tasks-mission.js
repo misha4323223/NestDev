@@ -453,6 +453,8 @@
       if (stopBtn) stopBtn.disabled = !st.running;
       const finishBtn = $("btn-mission-finish");
       if (finishBtn) finishBtn.disabled = !!isStreaming();
+      const delBtn = $("btn-mission-delete");
+      if (delBtn) delBtn.disabled = !!isStreaming();
     }
 
     const list = (st.list || []).filter((x) => !m || x.id !== m.id);
@@ -465,6 +467,7 @@
             '<span class="ms-past-meta">' + (MISSION_STATUS_LABEL[x.status] || x.status) + " · " +
             (x.progress ? x.progress.done + "/" + x.progress.total : "0/0") + "</span>" +
             '<button class="btn btn-ghost btn-small ms-past-open" title="Открыть папку миссии">📂</button>' +
+            '<button class="btn btn-ghost btn-small ms-past-del" title="Удалить миссию вместе с журналом и отчётом">🗑</button>' +
             "</div>"
           ).join("")
         : '<div class="ms-muted">Прошлых миссий нет.</div>';
@@ -473,6 +476,27 @@
           e.stopPropagation();
           const box = row.closest(".ms-past");
           if (box && api.missionOpen) api.missionOpen(box.dataset.id);
+        };
+      }
+      // Удаление прошлой миссии: спрашиваем подтверждение и убираем папку целиком.
+      for (const row of lbox.querySelectorAll(".ms-past-del")) {
+        row.onclick = async (e) => {
+          e.stopPropagation();
+          const box = row.closest(".ms-past");
+          if (!box) return;
+          const tEl = box.querySelector(".ms-past-title");
+          const name = (tEl && tEl.textContent) || box.dataset.id;
+          if (!confirm("Удалить миссию «" + name + "» вместе с журналом и отчётом? Вернуть её будет нельзя.")) return;
+          let r = null;
+          try {
+            r = api.missionDelete ? await api.missionDelete(box.dataset.id) : null;
+          } catch {}
+          if (!r || !r.ok) {
+            toast((r && r.error) || "Не удалось удалить миссию");
+            return;
+          }
+          toast("🗑 Миссия удалена");
+          refreshMission();
         };
       }
     }
@@ -554,6 +578,32 @@
       $("btn-mission-folder").onclick = () => {
         const id = missionCache && missionCache.active ? missionCache.active.id : "";
         if (api.missionOpen) api.missionOpen(id);
+      };
+    }
+    if ($("btn-mission-delete")) {
+      $("btn-mission-delete").onclick = async () => {
+        // Во время прогона не удаляем: агент держит миссию в памяти. Скажем вслух.
+        if (isStreaming()) {
+          toast("Дождись окончания прогона — или закрой миссию кнопкой «🏁 Закрыть»");
+          return;
+        }
+        const rec = missionCache && missionCache.active;
+        const id = rec ? rec.id : "";
+        if (!id) {
+          toast("Нет миссии в карточке — удалять нечего");
+          return;
+        }
+        if (!confirm("Удалить миссию «" + (rec.title || id) + "» вместе с журналом и отчётом? Вернуть её будет нельзя.")) return;
+        let r = null;
+        try {
+          r = api.missionDelete ? await api.missionDelete(id) : null;
+        } catch {}
+        if (!r || !r.ok) {
+          toast((r && r.error) || "Не удалось удалить миссию");
+          return;
+        }
+        toast("🗑 Миссия удалена");
+        refreshMission();
       };
     }
     if (missionSupported()) {

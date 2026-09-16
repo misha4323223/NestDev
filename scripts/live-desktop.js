@@ -653,6 +653,67 @@ function startFakeProvider(seen, rounds, rate, script) {
     check("миссию можно закрыть после паузы", !!(closed && closed.ok), (closed && closed.error) || "");
     check("закрытая миссия больше не подхватывается", !missionStore.missionActive(mDir), "в панели снова висит незакрытая миссия");
 
+    // Удаление миссии: от кнопки в окне до папки на диске (канал mission:delete).
+    const doomed = missionStore.missionCreate(mDir, { goal: "Черновик на удаление", steps: ["Шаг"], chatId: mChat });
+    const doomedDir = missionStore.missionDirOf(mDir, doomed.mission.id);
+    await page.evaluate(async (id) => {
+      window.confirm = () => true; // подтверждение спрашивается в окне — здесь соглашаемся
+      await window.api.missionDelete(id);
+    }, doomed.mission.id);
+    await sleep(400);
+    const left = (await page.evaluate(async () => (await window.api.missionState()).list.map((m) => m.id)));
+    const doomedLeft = fs.existsSync(doomedDir);
+    check("миссия удалена каналом окна", !doomedLeft, doomedLeft ? "папка осталась: " + doomedDir : "папки миссии нет");
+    check("удалённой миссии нет в списке панели", left.indexOf(doomed.mission.id) === -1, "миссий в панели: " + left.length);
+    const badId = missionStore.missionDelete(mDir, "..");
+    check("склад отказывает на мусорном идентификаторе", !badId.ok, badId.ok ? "«..» прошёл в удаление" : "отказ: " + badId.error);
+
+    console.log("\n[13] Непустая история: окно открывается, кнопка «↓» жива, события доходят");
+    // Ровно тот случай, который ломал приложение: при загрузке с непустой историей
+    // перерисовка ленты падала на кнопке «↓» («Cannot read properties of null»),
+    // падение обрывало запуск окна — и события агента вообще не доходили до экрана
+    // (человек видел ответ только уведомлением).
+    const errsBefore = pageErrs.length;
+    await page.evaluate(async () => {
+      const now = Date.now();
+      await window.api.saveChats({ activeId: "hist", chats: [{ id: "hist", title: "История", createdAt: now, messages: [
+        { id: "h1", role: "user", content: "посмотри файлы", createdAt: now },
+        { id: "h2", role: "tool", toolName: "listFiles", toolArgs: { path: "." }, toolResult: "файлы", pending: false, toolOk: true, createdAt: now + 1 },
+        { id: "h3", role: "assistant", content: "Посмотрел файлы, всё на месте.", createdAt: now + 2 },
+      ] }] });
+    });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await sleep(1500);
+    await page.waitForFunction(() => typeof window.AgentCore === "object" && window.AgentCore !== null, null, { timeout: 20000 });
+    const hist = await page.evaluate(() => {
+      const box = document.getElementById("messages");
+      const btn = document.getElementById("btn-scroll-bottom");
+      return {
+        bubbles: box.querySelectorAll(".msg").length,
+        text: box.textContent.replace(/\s+/g, " ").trim().slice(0, 120),
+        hasBtn: !!btn,
+        btnOutside: !!btn && !box.contains(btn),
+      };
+    });
+    check("непустая история показана целиком", hist.bubbles >= 3, "пузырей " + hist.bubbles + " — " + hist.text);
+    check("кнопка «↓» пережила перерисовку", hist.hasBtn && hist.btnOutside, "есть: " + hist.hasBtn + ", снаружи ленты: " + hist.btnOutside);
+    check("ошибок страницы при загрузке с историей нет", pageErrs.length === errsBefore, pageErrs.slice(errsBefore).join(" | ").slice(0, 200));
+    // Главное: события агента доходят до ОКНА. Отправляем через окно, как человек.
+    await page.fill("#input", "ответь одним словом: ок");
+    await page.click("#btn-send");
+    let answered = "";
+    for (let i = 0; i < 30 && !answered; i++) {
+      await sleep(1000);
+      answered = await page.evaluate(() => {
+        const els = Array.from(document.getElementById("messages").querySelectorAll(".msg.assistant"));
+        const last = els[els.length - 1];
+        const t = last ? last.textContent.replace(/\s+/g, " ").trim() : "";
+        return /Готово/i.test(t) ? t.slice(0, 80) : "";
+      });
+    }
+    check("ответ агента дошёл до окна", !!answered, answered || "за 30 с в ленте не появилось ответа");
+    check("ошибок страницы после прогона нет", pageErrs.length === errsBefore, pageErrs.slice(errsBefore).join(" | ").slice(0, 200));
+
   } catch (e) {
     check("сквозной прогон без исключений", false, e.message);
   } finally {

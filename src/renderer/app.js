@@ -383,7 +383,7 @@
     if (!raw || !Array.isArray(raw.openaiProfiles)) {
       const profUrl = String(s.openaiUrl || "").trim();
       if (profUrl) {
-        s.openaiProfiles = [{ id: "p-main", name: profileNameFromUrl(profUrl), url: profUrl, apiKey: s.openaiApiKey || "", model: s.openaiModel || "", project: s.openaiProject || "" }];
+        s.openaiProfiles = [{ id: "p-main", name: OpenaiProfiles.profileNameFromUrl(profUrl), url: profUrl, apiKey: s.openaiApiKey || "", model: s.openaiModel || "", project: s.openaiProject || "" }];
         s.openaiActiveProfile = "p-main";
       } else {
         s.openaiProfiles = [];
@@ -1054,7 +1054,9 @@
     welcome.classList.add("hidden");
     $("chat-title").textContent = chatTitle(chat);
     for (const m of chat.messages) wrap.appendChild(buildMessageEl(m));
-    ChatFeed.jumpToBottom(); // при переключении чата всегда прыгаем вниз
+    // Именно pinBottom («вниз без кнопки»): перерисовка не имеет права трогать
+    // элементы вне ленты, а jumpToBottom дёргает кнопку «↓».
+    ChatFeed.pinBottom(); // при переключении чата всегда прыгаем вниз
   }
 
   function buildMessageEl(m) {
@@ -2272,13 +2274,25 @@
     else if (webAbort) webAbort.abort();
   }
 
+  // ─────────────── Сохранённые OpenAI-подключения ───────────────
+  // Код живёт в src/renderer/openai-profiles.js. Сборка стоит раньше веб-режима:
+  // тот берёт список подключений своим входом (OpenaiProfiles.arr).
+  const OpenaiProfiles = window.OpenaiProfiles({
+    $: $,
+    uid: uid,
+    getSettings: () => settings,
+    PRESETS: PRESETS,
+    persistSettings: persistSettings,
+    setSettingsMsg: setSettingsMsg,
+  });
+
   // ─────────────── Веб-режим: чат напрямую из браузера ───────────────
   // Код живёт в src/renderer/web-chat.js: тот же цикл чата на общем транспорте
   // AgentCore, когда окно открыто в браузере (веб-превью, телефон).
   const WebChat = window.WebChat({
     AgentCore: AgentCore,
     getSettings: () => settings,
-    openaiProfilesArr: openaiProfilesArr,
+    openaiProfilesArr: OpenaiProfiles.arr,
     persistSettings: persistSettings,
     onEvent: onAiEvent, // то же окно событий, что и у desktop-цикла
     openAskModal: openAskModal,
@@ -2330,101 +2344,18 @@
   // Переключение вкладок настроек. Последняя открытая вкладка запоминается на сессию:
   // кнопка «Настройки» возвращает туда, где ты остановился.
   let lastSettingsTab = "model";
+  // Поиск по настройкам собран до первого спрашивающего: о состоянии поиска
+  // спрашивает переключение вкладок, а оно может случиться раньше этого места.
+  const SettingsSearch = window.SettingsSearch({ $: $, getLastTab: () => lastSettingsTab });
   function showSettingsTab(name) {
     name = name || "model";
     lastSettingsTab = name;
-    if (settingsSearchActive()) settingsSearchReset();
+    if (SettingsSearch.active()) SettingsSearch.reset();
     document.querySelectorAll(".stab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
     document.querySelectorAll(".settings-tab-body").forEach((b) => {
       b.classList.remove("sfilter-hide");
       b.classList.toggle("hidden", b.dataset.tabBody !== name);
     });
-  }
-
-  // ── Поиск по настройкам ──
-  // Прячем поля ТОЛЬКО своим классом sfilter-hide: служебный .hidden приложение
-  // ставит само (например #mobile-fields или #yandex-project-field), снимать его нельзя.
-  function settingsSearchInput() {
-    return $("settings-search");
-  }
-  function settingsSearchActive() {
-    const el = settingsSearchInput();
-    return !!(el && el.value.trim());
-  }
-  function settingsSearchReset() {
-    const el = settingsSearchInput();
-    if (el) el.value = "";
-    settingsSearchApply("");
-  }
-  // Текст поля для поиска: подпись + подсказки + placeholder/title самих контролов,
-  // чтобы «sk-», «пароль», «токен» находились, даже если их нет в подписи.
-  function settingsFieldText(f) {
-    let t = f.textContent || "";
-    f.querySelectorAll("input, textarea, select").forEach((el) => {
-      t += " " + (el.placeholder || "") + " " + (el.title || "");
-    });
-    // Кнопка внутри поля тоже объясняет, что здесь делается: «Замерить скорость»
-    // находится поиском по слову «замерить», хотя в подписи поля его нет.
-    f.querySelectorAll("button").forEach((el) => {
-      t += " " + (el.textContent || "") + " " + (el.title || "");
-    });
-    return t.toLowerCase();
-  }
-  function settingsSearchApply(raw) {
-    const q = String(raw || "").trim().toLowerCase();
-    const clearBtn = $("settings-search-clear");
-    if (clearBtn) clearBtn.classList.toggle("hidden", !q);
-    const bodies = Array.prototype.slice.call(document.querySelectorAll(".settings-tab-body"));
-    const empty = $("settings-empty");
-    const content = document.querySelector(".settings-content");
-    if (content) content.classList.toggle("search-mode", !!q);
-    // Карточки, раскрытые поиском, при выходе из поиска снова сворачиваем.
-    document.querySelectorAll(".sfilter-open").forEach((acc) => acc.classList.remove("open", "sfilter-open"));
-    if (!q) {
-      document.querySelectorAll(".sfilter-hide").forEach((el) => el.classList.remove("sfilter-hide"));
-      bodies.forEach((b) => b.classList.toggle("hidden", b.dataset.tabBody !== lastSettingsTab));
-      if (empty) empty.classList.add("hidden");
-      return;
-    }
-    let hits = 0;
-    bodies.forEach((body) => {
-      let bodyHits = 0;
-      Array.prototype.forEach.call(body.children, (child) => {
-        if (!child.classList) return;
-        // Искать можно и в секциях, и в карточках провайдеров (.acc): в «Модели»
-        // ключ и модель живут именно в карточках, а не в секции.
-        const searchable = child.classList.contains("settings-section") || child.classList.contains("acc");
-        if (searchable) {
-          let blockHits = 0;
-          child.querySelectorAll(".field").forEach((f) => {
-            const on = settingsFieldText(f).indexOf(q) !== -1;
-            f.classList.toggle("sfilter-hide", !on);
-            if (on) blockHits++;
-          });
-          child.classList.toggle("sfilter-hide", blockHits === 0);
-          bodyHits += blockHits;
-        } else {
-          // Всё остальное (подсказки моделей, панель провайдеров G4F) в результатах скрыто.
-          child.classList.add("sfilter-hide");
-        }
-      });
-      body.classList.toggle("hidden", bodyHits === 0);
-      if (bodyHits) {
-        // Совпадение внутри свёрнутой карточки — раскрываем её, иначе результата не видно.
-        // Помечаем только те, что раскрыли мы: открытые до поиска не трогаем.
-        body.querySelectorAll(".acc").forEach((acc) => {
-          if (acc.querySelector(".field:not(.sfilter-hide)") && !acc.classList.contains("open")) {
-            acc.classList.add("open", "sfilter-open");
-          }
-        });
-        // Подписываем результаты категорией, иначе непонятно, из какой вкладки поле.
-        const navBtn = document.querySelector('.stab[data-tab="' + body.dataset.tabBody + '"]');
-        const labelEl = navBtn && navBtn.querySelector(".stab-text b");
-        body.setAttribute("data-search-label", (labelEl && labelEl.textContent) || "");
-      }
-      hits += bodyHits;
-    });
-    if (empty) empty.classList.toggle("hidden", hits > 0);
   }
 
   function setPreset(p) {
@@ -2493,7 +2424,7 @@
     if ($("s-audit-log")) $("s-audit-log").checked = settings.auditLog !== false;
     $("s-ota-enabled").checked = settings.otaEnabled !== false;
     $("s-ota-dir").value = settings.otaDir || "";
-    renderOpenaiProfiles();
+    OpenaiProfiles.render();
     $("s-auto-switch").checked = !!settings.autoSwitchProfiles;
     $("s-send-all-tools").checked = !!settings.sendAllTools;
     if ($("s-no-tools-model")) $("s-no-tools-model").checked = !!settings.noToolsModel;
@@ -2566,103 +2497,6 @@
     if ($("s-no-tools-model")) settings.noToolsModel = !!$("s-no-tools-model").checked;
     // Зеркало модели активного провайдера
     settings.model = settings[MODEL_KEY[settings.provider]] || "";
-  }
-
-  // ── Сохранённые OpenAI-подключения (несколько ключей) ──
-  function profileNameFromUrl(url) {
-    try {
-      const m = String(url || "").match(/^https?:\/\/([^\/:?#]+)/i);
-      return m ? m[1].replace(/^www\./, "") : "OpenAI";
-    } catch {
-      return "OpenAI";
-    }
-  }
-
-  function openaiProfilesArr() {
-    return Array.isArray(settings.openaiProfiles) ? settings.openaiProfiles : [];
-  }
-
-  // Перерисовывает выпадающий список сохранённых подключений
-  function renderOpenaiProfiles() {
-    const sel = $("s-openai-profile");
-    if (!sel) return;
-    const profs = openaiProfilesArr();
-    sel.innerHTML = "";
-    const optNew = document.createElement("option");
-    optNew.value = "__new__";
-    optNew.textContent = "➕ Новое подключение…";
-    sel.appendChild(optNew);
-    for (const p of profs) {
-      const o = document.createElement("option");
-      o.value = p.id;
-      o.textContent = p.name + (p.model ? " · " + p.model : "") + (String(p.apiKey || "").trim() ? "" : " (без ключа)");
-      sel.appendChild(o);
-    }
-    sel.value =
-      settings.openaiActiveProfile && profs.some((p) => p.id === settings.openaiActiveProfile)
-        ? settings.openaiActiveProfile
-        : "__new__";
-  }
-
-  // Применяет выбранное подключение к полям URL/ключ/модель/проект
-  function applyOpenaiProfile(id) {
-    const p = openaiProfilesArr().find((x) => x.id === id);
-    if (!p) return;
-    settings.openaiActiveProfile = p.id;
-    $("s-openai-url").value = p.url || "";
-    $("s-openai-key").value = p.apiKey || "";
-    $("s-openai-model").value = p.model || "";
-    $("s-openai-project").value = p.project || "";
-    // Подсвечиваем пресет-чип по URL (не трогая поля — у подключения свои значения)
-    const url = String(p.url || "").toLowerCase();
-    let found = "";
-    for (const [k, v] of Object.entries(PRESETS)) {
-      if (v && v.url && url.includes(String(v.url).replace(/\/+$/, "").toLowerCase())) { found = k; break; }
-    }
-    document.querySelectorAll(".chip[data-preset]").forEach((c) => c.classList.toggle("active", c.dataset.preset === (found || "custom")));
-    setSettingsMsg("Подключение «" + (p.name || p.id) + "» выбрано. Нажми «Сохранить настройки».", false);
-  }
-
-  // Сохраняет текущие URL/ключ/модель как новое подключение или обновляет выбранное
-  function saveOpenaiProfileFromFields() {
-    const sel = $("s-openai-profile");
-    const profs = openaiProfilesArr();
-    const url = $("s-openai-url").value.trim();
-    if (!url) { setSettingsMsg("Сначала заполни базовый URL — без него подключение не сохранить.", true); return; }
-    const key = $("s-openai-key").value.trim();
-    const model = $("s-openai-model").value.trim();
-    const project = $("s-openai-project").value.trim();
-    const editingId = sel.value !== "__new__" ? sel.value : "";
-    if (editingId) {
-      const p = profs.find((x) => x.id === editingId);
-      if (!p) return;
-      p.url = url; p.apiKey = key; p.model = model; p.project = project;
-      settings.openaiActiveProfile = p.id;
-      setSettingsMsg("Подключение «" + (p.name || p.id) + "» обновлено.", false);
-    } else {
-      let name = profileNameFromUrl(url);
-      const same = profs.filter((x) => x.name === name).length;
-      if (same) name = name + " #" + (same + 1);
-      profs.push({ id: uid(), name, url, apiKey: key, model, project });
-      settings.openaiActiveProfile = profs[profs.length - 1].id;
-      setSettingsMsg("Подключение «" + name + "» сохранено. Переключайся между ключами в один клик.", false);
-    }
-    persistSettings();
-    renderOpenaiProfiles();
-  }
-
-  function deleteOpenaiProfile() {
-    const sel = $("s-openai-profile");
-    if (sel.value === "__new__") { setSettingsMsg("Выбери подключение из списка, чтобы удалить его.", true); return; }
-    const profs = openaiProfilesArr();
-    const p = profs.find((x) => x.id === sel.value);
-    if (!p) return;
-    if (!confirm("Удалить подключение «" + (p.name || p.id) + "»?")) return;
-    settings.openaiProfiles = profs.filter((x) => x.id !== p.id);
-    if (settings.openaiActiveProfile === p.id) settings.openaiActiveProfile = "";
-    persistSettings();
-    renderOpenaiProfiles();
-    setSettingsMsg("Подключение удалено.", false);
   }
 
   // Статус локального self-update (OTA): версия, папка, источники
@@ -3339,19 +3173,19 @@
   });
   $("btn-close-settings").onclick = () => $("settings-overlay").classList.add("hidden");
   if ($("settings-search")) {
-    $("settings-search").addEventListener("input", (e) => settingsSearchApply(e.target.value));
+    $("settings-search").addEventListener("input", (e) => SettingsSearch.apply(e.target.value));
     // Esc в поле поиска очищает только поиск, а не закрывает всё окно настроек.
     $("settings-search").addEventListener("keydown", (e) => {
       if (e.key === "Escape" && $("settings-search").value) {
         e.preventDefault();
         e.stopPropagation();
-        settingsSearchReset();
+        SettingsSearch.reset();
       }
     });
   }
   if ($("settings-search-clear")) {
     $("settings-search-clear").onclick = () => {
-      settingsSearchReset();
+      SettingsSearch.reset();
       $("settings-search").focus();
     };
   }
@@ -3420,10 +3254,10 @@
   $("s-openai-profile").onchange = () => {
     const v = $("s-openai-profile").value;
     if (v === "__new__") { settings.openaiActiveProfile = ""; return; }
-    applyOpenaiProfile(v);
+    OpenaiProfiles.apply(v);
   };
-  $("btn-profile-save").onclick = saveOpenaiProfileFromFields;
-  $("btn-profile-delete").onclick = deleteOpenaiProfile;
+  $("btn-profile-save").onclick = OpenaiProfiles.saveFromFields;
+  $("btn-profile-delete").onclick = OpenaiProfiles.remove;
   $("btn-pick-dir").onclick = async () => {
     if (!isElectron) {
       toast("Выбор папки доступен только в приложении на ПК");

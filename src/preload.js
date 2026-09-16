@@ -68,6 +68,8 @@ contextBridge.exposeInMainWorld("api", {
   missionOpen: (id) => ipcRenderer.invoke("mission:open", id || ""),
   // Закрыть миссию руками: без этого незакрытая работа могла висеть в панели вечно.
   missionFinish: (id) => ipcRenderer.invoke("mission:finish", id || ""),
+  // Удалить миссию вместе с папкой: чистка списка прошлых работ.
+  missionDelete: (id) => ipcRenderer.invoke("mission:delete", id || ""),
   // Файлы работы агента (.agent/ рядом с проектом): задачи и контекст
   agentFilesStatus: () => ipcRenderer.invoke("agentfiles:status"),
   agentFilesOpen: (id) => ipcRenderer.invoke("agentfiles:openDir", id || ""),
