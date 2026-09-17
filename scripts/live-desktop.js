@@ -973,6 +973,94 @@ function startFakeProvider(seen, rounds, rate, script) {
     const savedOnDisk = fs.existsSync(livePanelFile) ? fs.readFileSync(livePanelFile, "utf8") : "";
     check("правка из окна доехала до файла на диске", /второй вариант/.test(savedOnDisk), JSON.stringify(savedOnDisk.slice(0, 60)));
     check("окно просмотра файла закрывается", livePanel.closed, "overlay hidden: " + livePanel.closed);
+    console.log("\n[18] Палитра команд: Ctrl+K, поиск и запуск живут своим модулем");
+    // Этап 8: палитра уехала в command-palette.js. Проверяем её НАСТОЯЩИМИ клавишами в
+    // настоящем окне: Ctrl+K открывает список, ввод фильтрует, Enter запускает строку —
+    // и последствие видно в окне (открылась консоль), а не по тексту кода.
+    await page.evaluate(async () => {
+      const sp = document.getElementById("side-panel");
+      if (sp && !sp.classList.contains("hidden")) document.getElementById("btn-sp-close").click();
+      await new Promise((r) => setTimeout(r, 200));
+    });
+    await page.keyboard.press("Control+k");
+    await sleep(500);
+    const pal = await page.evaluate(() => {
+      const $ = (id) => document.getElementById(id);
+      const rows = Array.from(document.querySelectorAll("#palette-list .palette-row"));
+      return {
+        open: !!$("palette-overlay") && !$("palette-overlay").classList.contains("hidden"),
+        placeholder: $("palette-input").placeholder,
+        focused: document.activeElement === $("palette-input"),
+        sections: Array.from(document.querySelectorAll("#palette-list .palette-sec")).map((s) => s.textContent),
+        titles: rows.map((r) => r.textContent),
+      };
+    });
+    check(
+      "Ctrl+K открывает палитру команд",
+      pal.open && /Действие/.test(pal.placeholder) && pal.focused,
+      JSON.stringify({ open: pal.open, ph: pal.placeholder, focus: pal.focused })
+    );
+    check(
+      "в списке есть разделы и действия окна",
+      pal.sections.length >= 3 && pal.titles.some((t) => /Консоль/.test(t)) && pal.titles.some((t) => /Открыть файл/.test(t)),
+      pal.sections.join(" / ")
+    );
+    // Фильтр: набор текста в поле сужает список.
+    await page.keyboard.type("консоль");
+    await sleep(300);
+    const palFiltered = await page.evaluate(() =>
+      Array.from(document.querySelectorAll("#palette-list .palette-row")).map((r) => r.textContent)
+    );
+    check(
+      "ввод сужает список до совпадений",
+      palFiltered.length > 0 && palFiltered.length < pal.titles.length && palFiltered.every((t) => /консоль/i.test(t)),
+      palFiltered.join(" / ")
+    );
+    // Enter запускает подсвеченную строку: человек видит открытую консоль и подсветку раздела.
+    await page.keyboard.press("Enter");
+    await sleep(800);
+    const palRan = await page.evaluate(() => {
+      const $ = (id) => document.getElementById(id);
+      return {
+        closed: $("palette-overlay").classList.contains("hidden"),
+        panelVisible: !$("side-panel").classList.contains("hidden"),
+        consoleTab: !$("sp-console").classList.contains("hidden"),
+        btnActive: $("btn-toggle-console").classList.contains("active"),
+      };
+    });
+    check(
+      "Enter запустил действие и закрыл палитру",
+      palRan.closed && palRan.panelVisible && palRan.consoleTab,
+      JSON.stringify(palRan)
+    );
+    check("раздел в рельсе подсвечен как активный", palRan.btnActive, "active: " + palRan.btnActive);
+    // Ctrl+P: палитра сама собирает список файлов рабочей папки.
+    await page.keyboard.press("Control+p");
+    await sleep(2000);
+    const palFiles = await page.evaluate(() => {
+      const $ = (id) => document.getElementById(id);
+      return {
+        open: !$("palette-overlay").classList.contains("hidden"),
+        placeholder: $("palette-input").placeholder,
+        icon: $("palette-ic").textContent,
+        titles: Array.from(document.querySelectorAll("#palette-list .palette-row")).map((r) => r.textContent),
+      };
+    });
+    check(
+      "Ctrl+P открывает режим файлов",
+      palFiles.open && /Имя файла/.test(palFiles.placeholder) && palFiles.icon === "📄",
+      JSON.stringify({ open: palFiles.open, ph: palFiles.placeholder, ic: palFiles.icon })
+    );
+    check(
+      "в режиме файлов видны файлы рабочей папки",
+      palFiles.titles.some((t) => /live-panel\.txt/.test(t)),
+      palFiles.titles.slice(0, 6).join(" / ")
+    );
+    // Escape закрывает палитру общим обработчиком оверлеев.
+    await page.keyboard.press("Escape");
+    await sleep(300);
+    const palClosed = await page.evaluate(() => document.getElementById("palette-overlay").classList.contains("hidden"));
+    check("Escape закрывает палитру", palClosed, "hidden: " + palClosed);
   } catch (e) {
     check("сквозной прогон без исключений", false, e.message);
   } finally {

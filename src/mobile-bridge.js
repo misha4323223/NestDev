@@ -81,6 +81,7 @@ const STATIC_FILES = new Set([
   "settings-search.js",
   "settings-panel.js",
   "project-panel.js",
+  "command-palette.js",
   "deploy-panel.css",
 ]);
 

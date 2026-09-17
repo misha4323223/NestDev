@@ -10735,6 +10735,216 @@ async function testProjectPanel() {
   });
 }
 
+// ── Палитра команд: свой модуль (этап 8) ────────────────────────────────────
+// Палитра уехала из app.js в command-palette.js. Проверяем две вещи: границы
+// (в оболочке осталась только сборка модуля) и ПОВЕДЕНИЕ на игрушечном DOM —
+// список действий с учётом условий, поиск, запуск строки и клавиши.
+async function testCommandPalette() {
+  const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "command-palette.js"), "utf8");
+
+  await test("палитра команд: модуль на месте, оболочка только собирает его", () => {
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const iTag = html.indexOf('src="command-palette.js"');
+    assert.ok(iTag > 0, "разметка не грузит command-palette.js");
+    assert.ok(iTag < html.indexOf('src="app.js"'), "command-palette.js подключён после app.js");
+    assert.ok(
+      /"command-palette\.js"/.test(fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8")),
+      "мост не отдаёт модуль телефону"
+    );
+
+    // Кода палитры в оболочке не осталось — только сборка модуля с зависимостями.
+    const appSrc = uiFile("app.js");
+    for (const gone of [
+      "function paletteActions", "function paletteFilter", "function paletteRows",
+      "function paletteHighlight", "function paletteRender", "function paletteRun",
+      "function openPalette", "function closePalette", "function collectProjectFiles",
+      "function enterFileMode", "paletteFiles",
+    ]) {
+      assert.ok(appSrc.indexOf(gone) === -1, "код палитры остался в app.js: " + gone);
+    }
+    assert.ok(/const CommandPalette = window\.CommandPalette\(\{/.test(appSrc), "app.js не собирает палитру");
+
+    // Проводка: состояние генерации — живой функцией. Копия застыла бы на времени
+    // загрузки, и «Остановить агента» показывалось бы в списке всегда (или никогда).
+    const wiring = appSrc.slice(appSrc.indexOf("const CommandPalette = window.CommandPalette({"));
+    const wiringCall = wiring.slice(0, wiring.indexOf("});"));
+    for (const dep of [
+      "getStreaming: () => streaming", "openSidePanel: openSidePanel", "termReset: termReset",
+      "ChatActions: ChatActions", "ProjectPanel: ProjectPanel", "SettingsPanel: SettingsPanel",
+    ]) {
+      assert.ok(wiringCall.includes(dep), "в проводку палитры не передано " + dep);
+    }
+    // И своё место: Ctrl+K читает модуль на загрузке окна, поэтому сборка обязана
+    // стоять ДО блока горячих клавиш (иначе «Cannot access before initialization»).
+    assert.ok(
+      appSrc.indexOf("const CommandPalette = window.CommandPalette({") < appSrc.indexOf("CommandPalette.openPalette("),
+      "проводка палитры стоит после горячих клавиш"
+    );
+
+    // Границы модуля: чужое состояние — только через внедрение.
+    for (const name of ["settings", "streaming", "chatsData", "session", "msgEls"]) {
+      assert.ok(!new RegExp("(^|[^\\\\w$.])" + name + "\\\\b").test(src), "модуль ссылается на " + name + " без внедрения");
+    }
+    assert.ok(!/localStorage|window\.api\b/.test(src), "модуль лезет в чужие глобалы");
+  });
+
+  await test("палитра команд: список, поиск, запуск и клавиши работают на игрушечном DOM", async () => {
+    // Игрушечный DOM: узлы запоминают детей, обработчики и классы — этого хватает,
+    // потому что палитра строит список сама (createElement + appendChild).
+    const mkNode = (tag) => {
+      const cls = new Set();
+      const node = {
+        tag: tag, className: "", textContent: "", value: "", placeholder: "", title: "",
+        style: {}, children: [], listeners: {}, _html: "",
+        onclick: null, onmousemove: null,
+        clicked: 0,
+        classList: {
+          add: (...cs) => cs.forEach((c) => cls.add(c)),
+          remove: (...cs) => cs.forEach((c) => cls.delete(c)),
+          contains: (c) => cls.has(c),
+          toggle: (c, on) => {
+            const want = on === undefined ? !cls.has(c) : !!on;
+            if (want) cls.add(c); else cls.delete(c);
+            return want;
+          },
+        },
+        appendChild(c) { node.children.push(c); return c; },
+        addEventListener(type, fn) { node.listeners[type] = fn; },
+        click() { node.clicked++; },
+        focus() {},
+        select() {},
+        scrollIntoView() {},
+        querySelectorAll(sel) {
+          const want = String(sel).replace(/^\./, "");
+          return node.children.filter((c) => String(c.className).split(" ").indexOf(want) !== -1);
+        },
+      };
+      Object.defineProperty(node, "innerHTML", {
+        configurable: true,
+        get() { return node._html; },
+        set(v) {
+          node._html = String(v == null ? "" : v);
+          if (node._html === "") node.children.length = 0; // приложение очищает список так же
+        },
+      });
+      return node;
+    };
+    const mkDom = () => {
+      const els = new Map();
+      const $ = (id) => {
+        if (!els.has(id)) els.set(id, mkNode("div"));
+        return els.get(id);
+      };
+      return { $, els };
+    };
+    const build = (deps) => {
+      const base = mkDom();
+      const vm = require("vm");
+      const box = {
+        module: { exports: {} },
+        self: {},
+        console: { log() {}, warn() {}, error() {} },
+        document: { createElement: (tag) => mkNode(tag), querySelectorAll: () => [], addEventListener() {} },
+      };
+      vm.runInNewContext(src, box, { filename: "command-palette.js" });
+      const calls = { toast: [], runs: [], side: [], reset: 0, view: [] };
+      let streaming = false;
+      let projectDir = "/tmp/проект";
+      const api = {
+        fsListTree: async (dir) => ({
+          ok: true,
+          entries: dir === "/tmp/проект"
+            ? [{ name: "a.js", isDir: false }, { name: "src", isDir: true }]
+            : [{ name: "b.js", isDir: false }],
+        }),
+      };
+      const panel = box.module.exports(Object.assign({
+        $: base.$,
+        api: api,
+        isElectron: true,
+        toast: (t) => calls.toast.push(t),
+        createChat: () => calls.runs.push("новый чат"),
+        stop: () => calls.runs.push("стоп"),
+        getStreaming: () => streaming,
+        openSidePanel: (t) => calls.side.push(t),
+        termReset: () => { calls.reset++; },
+        ChatActions: { copyChat() {} },
+        ProjectPanel: {
+          showPanelTab() {}, newProjectFile() {}, newProjectFolder() {},
+          doPush() {}, doPull() {}, openPublishDialog() {}, fileIcon: () => "📄",
+          viewFile: (p) => calls.view.push(p),
+          projectDir: () => projectDir,
+        },
+        SettingsPanel: { openSettings() {}, testConnection() {}, probeLocalModelUI() {} },
+      }, deps || {}));
+      return {
+        panel, calls, $: base.$,
+        setStreaming: (v) => { streaming = v; },
+        setProjectDir: (v) => { projectDir = v; },
+      };
+    };
+    const rows = ($) => $("palette-list").children.filter((c) => /(^| )palette-row( |$)/.test(c.className));
+    const titles = ($) => rows($).map((r) => r.children.map((c) => c.textContent).join(" | "));
+
+    // 1. Список действий: подписи на месте, условия учитываются.
+    const a = build();
+    a.panel.openPalette("actions");
+    assert.ok(!a.$("palette-overlay").classList.contains("hidden"), "палитра не открылась");
+    const all = titles(a.$);
+    assert.ok(all.some((t) => /Новый чат/.test(t)), "в палитре нет «Новый чат»: " + all.join(" / "));
+    assert.ok(all.some((t) => /Открыть файл/.test(t)), "в палитре нет открытия файла (ПК): " + all.join(" / "));
+    assert.ok(!all.some((t) => /Остановить агента/.test(t)), "без генерации предложено остановить агента");
+    a.setStreaming(true);
+    a.panel.openPalette("actions");
+    assert.ok(titles(a.$).some((t) => /Остановить агента/.test(t)), "во время генерации нет остановки агента");
+    assert.ok(a.$("palette-list").children.some((c) => /palette-sec/.test(c.className)), "в списке нет заголовков разделов");
+
+    // 2. Запуск строки: клик по первой строке закрывает палитру и делает своё действие.
+    const first = rows(a.$)[0];
+    first.onclick();
+    assert.ok(a.$("palette-overlay").classList.contains("hidden"), "после запуска палитра осталась открытой");
+    assert.deepStrictEqual(a.calls.runs, ["новый чат"], "первая строка запустила не своё действие: " + a.calls.runs.join(","));
+
+    // 3. Поиск: строка фильтрует список (и заголовки разделов уезжают вместе с ним).
+    a.panel.openPalette("actions");
+    a.$("palette-input").value = "консоль";
+    a.$("palette-input").listeners.input();
+    const filtered = titles(a.$);
+    assert.ok(filtered.length > 0 && filtered.length < all.length, "поиск не сузил список: " + filtered.length);
+    assert.ok(filtered.some((t) => /Консоль/.test(t)), "поиск по «консоль» не нашёл консоль: " + filtered.join(" / "));
+    assert.ok(!filtered.some((t) => /Новый чат/.test(t)), "поиск оставил чужие строки: " + filtered.join(" / "));
+
+    // 4. Клавиши: ArrowDown двигает подсветку, Enter запускает ИМЕННО её.
+    a.panel.openPalette("actions");
+    const before = a.calls.runs.length;
+    const key = (k) => a.$("palette-input").listeners.keydown({ key: k, preventDefault() {}, ctrlKey: false, metaKey: false });
+    key("ArrowDown");
+    key("Enter");
+    assert.ok(a.calls.runs.length === before, "Enter запустил первую строку вместо подсвеченной: " + a.calls.runs.join(","));
+    assert.ok(a.$("btn-continue-chat").clicked > 0, "Enter не выполнил подсвеченную строку");
+
+    // 5. Файлы (Ctrl+P): список собирается обходом проекта, клик открывает файл путём.
+    const b = build();
+    b.setProjectDir("");
+    await b.panel.enterFileMode();
+    assert.ok(b.calls.toast.some((t) => /рабочую папку/.test(t)), "без рабочей папки нет понятного отказа: " + b.calls.toast.join(" / "));
+    b.setProjectDir("/tmp/проект");
+    await b.panel.enterFileMode();
+    const files = titles(b.$);
+    assert.ok(files.some((t) => /a\.js/.test(t)) && files.some((t) => /b\.js/.test(t)), "в списке файлов нет файлов проекта: " + files.join(" / "));
+    const fileRow = rows(b.$).filter((r) => /b\.js/.test(r.children.map((c) => c.textContent).join(" ")))[0];
+    fileRow.onclick();
+    assert.deepStrictEqual(b.calls.view, ["/tmp/проект/src/b.js"], "файл открылся не своим путём: " + b.calls.view.join(","));
+
+    // 6. Не на ПК: палитра не обещает файлов, а честно говорит, где они есть.
+    const c = build({ isElectron: false });
+    c.panel.openPalette("actions");
+    assert.ok(!titles(c.$).some((t) => /Открыть файл/.test(t)), "в браузере предложено открывать файлы: " + titles(c.$).join(" / "));
+    await c.panel.enterFileMode();
+    assert.ok(c.calls.toast.some((t) => /на ПК/.test(t)), "в браузере нет понятного отказа: " + c.calls.toast.join(" / "));
+  });
+}
+
 async function testSettingsPanel() {
   const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "settings-panel.js"), "utf8");
   const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
@@ -11079,7 +11289,8 @@ async function testSettingsSearchLogic() {
     assert.ok(/\$\("btn-probe-model"\)\.onclick/.test(appSrc2), "кнопка в подвале не подключена");
     const setProv = uiFind("  function setProviderUI(p) {", "  function showSettingsTab(name) {").code;
     assert.ok(/refreshProbeButton\(\);/.test(setProv), "видимость кнопки замера не обновляется при смене провайдера");
-    assert.ok(/Замерить скорость локальной модели/.test(appSrc2), "в палитре команд нет замера");
+    // Список действий палитры живёт своим модулем (этап 8) — ищем в нём, а не в app.js.
+    assert.ok(/Замерить скорость локальной модели/.test(uiFile("command-palette.js")), "в палитре команд нет замера");
   });
 }
 
@@ -14928,6 +15139,7 @@ async function testMissions() {
   await testContextWindow();
   await testSecretScopes();
   await testOneNavigation();
+  await testCommandPalette();
   await testRealE2E();
   await testProductionGate();
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");

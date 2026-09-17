@@ -65,6 +65,7 @@
 | src/renderer/settings-panel.js | настройки: вкладки, поля, провайдеры, замер модели, сохранение | app.js: window.SettingsPanel({ |
 | src/renderer/project-panel.js | панель проекта: файлы, правка, вкладки, коммиты, изменения, публикация | app.js: window.ProjectPanel({ |
 | src/renderer/field-guard.js | страховка полей ввода (фокус не теряется) | — сам навешивает защиту |
+| src/renderer/command-palette.js | палитра команд: действия по разделам, поиск по файлам проекта, запуск | app.js: window.CommandPalette({ |
 | src/renderer/app.js | оболочка окна: чат, панели, настройки, события | — собирает всё в окне |
 <!-- UI-MAP:END -->
 
