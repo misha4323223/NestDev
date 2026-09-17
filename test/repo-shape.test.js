@@ -262,13 +262,18 @@ function walk(rel, out) {
   await test("бюджет прямых чтений app.js в тестах не растёт", () => {
     // Разбор app.js идёт этапами: код уезжает в модули, и проверки должны находить его
     // через uiFile/uiAll/uiFind (test/smoke.test.js). Прямое чтение app.js остаётся
-    // только там, где проверяется «в app.js этого больше нет» — таких мест 33, и число
+    // только там, где проверяется «в app.js этого больше нет» — таких мест 29, и число
     // не должно расти: каждое новое чтение привязывает тесты к адресу кода.
+    // Считаем обе формы: и длинную (readFileSync(path.join(...))) и короткий помощник
+    // read("src", "renderer", "app.js") из отдельных наборов — иначе чтение через
+    // помощник осталось бы для сторожа невидимым.
     const files = walk("test", []).filter((f) => f.endsWith(".js"));
     let n = 0;
     for (const rel of files) {
       const text = fs.readFileSync(path.join(ROOT, rel), "utf8");
-      n += (text.match(/readFileSync\(path\.join\(ROOT, "src", "renderer", "app\.js"\)/g) || []).length;
+      n +=
+        (text.match(/readFileSync\(path\.join\(ROOT, "src", "renderer", "app\.js"\)/g) || []).length +
+        (text.match(/\bread\("src", "renderer", "app\.js"\)/g) || []).length;
     }
     assert.ok(n <= 33, "прямых чтений app.js стало " + n + " (потолок 33). Возьмите кусок через uiFile/uiAll/uiFind; если чтение действительно нужно — поднимите потолок здесь осознанно, с пояснением.");
   });

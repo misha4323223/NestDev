@@ -45,7 +45,7 @@
 | src/renderer/yc-console.js | консоль Yandex Cloud в правой панели | yc-panel.js: window.YcConsole |
 | src/renderer/yc-console.css | стили консоли Yandex Cloud | — |
 | src/renderer/yc-panel.js | панель Yandex Cloud: дашборд и подключение в настройках | app.js: window.YcPanel({ |
-| src/renderer/deploy-panel.js | панель деплоя: стадии, логи, откат | app.js: window.DeployPanel |
+| src/renderer/deploy-panel.js | панель деплоя: стадии, логи, откат | chat-events.js: window.DeployPanel |
 | src/renderer/deploy-panel.css | стили панели деплоя | — |
 | src/renderer/dev-run.js | быстрый запуск проекта: dev-сервер, порт, логи | side-panel.js: window.DevRun({ |
 | src/renderer/chat-actions.js | удобство чата: копирование, регенерация, правка сообщения | app.js: window.ChatActions({ |
@@ -57,12 +57,19 @@
 | src/renderer/mobile-panel.js | мобильный доступ: QR, статус моста, PIN, адреса для телефона | app.js: window.MobilePanel({ |
 | src/renderer/chat-thinking.js | блок размышлений модели: сборка, автопрокрутка, свёртывание | app.js: window.ChatThinking() |
 | src/renderer/chat-segments.js | сегменты ответа: лог «текст → действия → текст» | app.js: window.ChatSegments({ |
+| src/renderer/plan-panel.js | план работ: чеклист, разбор плана из текста ответа, галочки | app.js: window.PlanPanel({ |
 | src/renderer/chat-render.js | отрисовка сообщения: текст, вложения, метка времени, кнопки | app.js: window.ChatRender({ |
 | src/renderer/chat-feed.js | лента: умная прокрутка и очередь кадра при стриме | app.js: window.ChatFeed({ |
 | src/renderer/chat-work.js | строки действий агента и группа работ текущего ответа | app.js: window.ChatWork({ |
+| src/renderer/chat-events.js | события агента: разбор `ai:event` и оверлеи картинки/диффа/предпросмотра | app.js: window.ChatEvents({ |
 | src/renderer/openai-profiles.js | сохранённые OpenAI-подключения: список, выбор, удаление | app.js: window.OpenaiProfiles({ |
 | src/renderer/settings-search.js | поиск по настройкам: фильтр по всем вкладкам | app.js: window.SettingsSearch({ |
 | src/renderer/settings-panel.js | настройки: вкладки, поля, провайдеры, замер модели, сохранение | app.js: window.SettingsPanel({ |
+| src/renderer/g4f-panel.js | выбор провайдера G4F: поиск, список, тест провайдера, подбор порта | app.js: window.G4fPanel({ |
+| src/renderer/auto-tasks.js | автозадачи: чат «Автозадачи», очередь дел, запуск по сроку и «▶ сейчас» | app.js: window.AutoTasks({ |
+| src/renderer/model-popup.js | быстрый выбор модели в шапке: попап, кэш списка, «↻ Обновить», клик мимо | app.js: window.ModelPopup({ |
+| src/renderer/ask-modal.js | модалка «вопрос агента» (askUser): показ вопроса, ответ и отмена | app.js: window.AskModal({ |
+| src/renderer/chat-rename.js | переименование чата: инлайн-ввод в заголовке по двойному клику | app.js: window.ChatRename({ |
 | src/renderer/project-panel.js | панель проекта: файлы, правка, вкладки, коммиты, изменения, публикация | app.js: window.ProjectPanel({ |
 | src/renderer/field-guard.js | страховка полей ввода (фокус не теряется) | — сам навешивает защиту |
 | src/renderer/side-panel.js | правая панель и рельса: разделы, консоль рабочей папки, превью; здесь же собираются DevRun и TasksMission | app.js: window.SidePanel({ |
@@ -125,7 +132,7 @@
   Но проверка «функция X есть в `app.js`» при выносе X в модуль должна смотреть в модуль
   (или в `uiAll()`): тест падает громко и называет, что именно править.
 - Прямых чтений `app.js` в тестах ограниченное число, и оно не должно расти
-  (тест «бюджет прямых чтений app.js»; сейчас 33).
+  (тест «бюджет прямых чтений app.js»; сейчас 32 — предел 33).
 
 ### 4. Признаки, что из `app.js` пора выносить
 
@@ -151,7 +158,7 @@
 
 | Файл | Роль |
 |---|---|
-| `src/main.js` | главный процесс: окно, IPC, чат-цикл, инструменты (70 обработчиков) |
+| `src/main.js` | главный процесс: окно, IPC, чат-цикл, инструменты (54 обработчика) |
 | `src/agent-tools.js` | 159 обработчиков инструментов агента (один `createAgentTools(deps)`) |
 | `src/browser-tools.js` | браузер агента: карта страницы, действия, replay, догрузка |
 | `src/agent-store.js` | заметки, чекпоинты, памятки, дела, повторы (папка `.agent/`) |
@@ -159,5 +166,6 @@
 | `src/deploy-*.js`, `cloud-state.js` | деплой: рецепты, состояние, конвейер, проверки |
 | `src/mail.js`, `mail-ipc.js` | почта SMTP/IMAP |
 | `src/git-ipc.js`, `fs-ipc.js`, `system-stack.js` | git, файлы проекта, стек и окружение |
-| `src/mission-store.js`, `app-ui-tools.js`, `tool-policy.js` | миссии, интерфейсные инструменты, разрешения |
+| `src/mission-ipc.js`, `mission-store.js` | дела, миссии и папка работы агента: каналы `tasks:*`, `mission:*`, `agentfiles:*` |
+| `src/app-ui-tools.js`, `tool-policy.js` | интерфейсные инструменты, разрешения |
 | `src/mobile-bridge.js`, `secrets.js`, `ota.js`, `vault.js` | телефон, секреты, обновления, пароли |

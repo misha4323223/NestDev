@@ -252,9 +252,12 @@
     previewLoaded = u;
     getSettings().previewUrl = u;
     persistSettings();
-    // С телефона localhost — это сам телефон; подставляем адрес ПК (мост).
-    const shown = window.mobileApi && window.mobileApi.host
-      ? u.replace(/^https?:\/\/localhost(:\d+)?/i, "http://" + window.mobileApi.host)
+    // С телефона localhost — это сам телефон: подставляем адрес ПК из моста.
+    // Порт берём из адреса ПРОЕКТА, а не из моста: у dev-сервера он свой (5000),
+    // у моста — 9090, и превью открывало страницу самого моста вместо проекта.
+    const bridgeHost = window.mobileApi && window.mobileApi.host;
+    const shown = bridgeHost
+      ? u.replace(/^(https?:\/\/)(?:localhost|127\.0\.0\.1)(?=[:/?#]|$)/i, "$1" + bridgeHost.replace(/:\d+$/, ""))
       : u;
     $("preview-url").value = shown;
     $("preview-frame").src = shown;

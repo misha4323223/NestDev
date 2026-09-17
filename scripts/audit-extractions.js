@@ -30,7 +30,7 @@ const path = require("path");
 
 const MODULES = ["ChatFeed", "ChatThinking", "ChatSegments", "ChatRender", "ChatWork", "ChatActions",
   "SettingsSearch", "SettingsPanel", "OpenaiProfiles", "MobilePanel", "TasksMission", "SecretsPanel",
-  "YcPanel", "DevRun", "WebChat", "ProjectPanel"];
+  "YcPanel", "DevRun", "WebChat", "ProjectPanel", "ChatEvents", "G4fPanel", "AutoTasks", "ModelPopup", "AskModal", "ChatRename"];
 
 const [before, after, ...modules] = process.argv.slice(2);
 if (!before || !after || !modules.length) {
@@ -69,6 +69,28 @@ const canon = (line) =>
     .replace(/\bsetSbVersion\b/g, "@wver@")
     .replace(/\bsbVersion\b/g, "@ver@")
     .replace(/\bgetMobilePanel\(\)\./g, "@mobile@.")
+    // Этап A, часть 1: события агента и оверлеи — свои живые доступы.
+    .replace(/\bgetChatsData\(\)/g, "@chats@")
+    .replace(/\bchatsData\b/g, "@chats@")
+    .replace(/\bgetSession\(\)/g, "@sess@")
+    .replace(/\bsession\b/g, "@sess@")
+    .replace(/\bsetLastUndoCount\b/g, "@wundo@")
+    .replace(/\blastUndoCount\b/g, "@undo@")
+    .replace(/\bsetPlanCollapsed\b/g, "@wplanc@")
+    .replace(/\bplanCollapsed\b/g, "@planc@")
+    .replace(/\bsetRemoteRunNotified\b/g, "@wremn@")
+    .replace(/\bremoteRunNotified\b/g, "@remn@")
+    .replace(/\bgetSidePanel\(\)\./g, "@side@.")
+    // Панель дел зовётся отложенной стрелкой (getTasksMission().renderTasks()), а в
+    // оболочке стояло TasksMission.renderTasks(). Имя модуля снято выше, как и у
+    // остальных панелей: сравниваем действие, а не способ достать панель.
+    .replace(/\bgetTasksMission\(\)\./g, "")
+    // Панель настроек тоже зовётся отложенной стрелкой (getSettingsPanel().updateBadge()).
+    .replace(/\bgetSettingsPanel\(\)\./g, "")
+    // Этап A, часть 4: автозадачи — свой живой доступ к идущему прогону.
+    .replace(/\bgetStreaming\(\)/g, "@run@")
+    .replace(/\bstreaming\b/g, "@run@")
+    .replace(/\bgetProjectPanel\(\)\./g, "@proj@.")
     .replace(/\bsettings\b/g, "@cfg@");
 
 const beforeMap = countMap(lines(show(before, "src/renderer/app.js")));

@@ -89,7 +89,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js"]
+  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -265,7 +265,7 @@ async function testChatActions() {
     };
     // Проводка в app.js: генерация передана ЖИВОЙ проверкой. Копия ("isStreaming: false",
     // снимок в переменную) пропустила бы перегенерацию поверх идущего ответа.
-    const wiring = uiFind("  const ChatActions = window.ChatActions({", "  // ─────────────── Быстрое переключение модели").code;
+    const wiring = uiFind("  const ChatActions = window.ChatActions({", "  // ─── Быстрое переключение модели (попап в шапке)").code;
     assert.ok(/isStreaming: \(\) => streaming/.test(wiring), "идущая генерация передана в модуль копией, а не живой проверкой");
     const A = build();
     assert.deepStrictEqual(Object.keys(A).sort(), ["copyChat", "copyText", "editUserMessage", "isLastAssistant", "regenerate"], "наружу торчит лишнее или чего-то не хватает");
@@ -387,7 +387,7 @@ async function testWebChat() {
     // Проводка в app.js: именно этих зависимостей не хватало раньше, и авто-переключение
     // профилей падало с ReferenceError ровно тогда, когда ключ кончился.
     const wiring = uiFind("  const WebChat = window.WebChat({", "  // ─────────────── Настройки ───────────────").code;
-    assert.ok(/onEvent: onAiEvent/.test(wiring), "в модуль не передан обработчик событий: авто-переключение профилей снова упадёт");
+    assert.ok(/onEvent: ChatEvents\.onAiEvent/.test(wiring), "в модуль не передан обработчик событий: авто-переключение профилей снова упадёт");
     assert.ok(/getSettings: \(\) => settings/.test(wiring), "настройки переданы копией — смена профиля не дойдёт до модуля");
     assert.ok(/openaiProfilesArr: OpenaiProfiles.arr/.test(wiring), "модуль не видит сохранённые подключения");
     // Сборка подключений стоит РАНЬШЕ веб-режима: тот берёт их своим входом.
@@ -612,6 +612,349 @@ async function testChatThinking() {
 // сообщением ниже блока действий, а не дописывается в пузырь сверху; пустой
 // сегмент убирается из данных, из DOM и из сессии; сегменты запуска собираются по
 // порядку. Сессия приходит ЖИВОЙ функцией — проверяем и это.
+async function testChatEvents() {
+  const vm = require("vm");
+  const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "chat-events.js"), "utf8");
+
+  // ── Игрушечное окружение: настоящие id разметки, заглушки модулей, живые доступы ──
+  function buildEnv(opts) {
+    const o = opts || {};
+    const mkNode = (id) => {
+      const cls = new Set();
+      const node = {
+        id: id, value: "", textContent: "", className: "", src: "", alt: "",
+        style: {}, children: [], _html: "", _q: null, removed: false,
+        classList: {
+          add: (...cs) => cs.forEach((c) => cls.add(c)),
+          remove: (...cs) => cs.forEach((c) => cls.delete(c)),
+          contains: (c) => cls.has(c),
+          toggle: (c, on) => { const want = on === undefined ? !cls.has(c) : !!on; if (want) cls.add(c); else cls.delete(c); return want; },
+          has: (c) => cls.has(c),
+        },
+        appendChild(c) { node.children.push(c); return c; },
+        remove() { node.removed = true; },
+        querySelector(sel) { return sel === ".yc-loading" ? node._q : null; },
+        querySelectorAll() { return []; },
+        addEventListener() {}, focus() {}, click() {},
+      };
+      Object.defineProperty(node, "innerHTML", {
+        configurable: true,
+        get() { return node._html; },
+        set(v) { node._html = String(v == null ? "" : v); node.children.length = 0; },
+      });
+      return node;
+    };
+    const els = new Map();
+    const $ = (id) => { if (!els.has(id)) els.set(id, mkNode(id)); return els.get(id); };
+
+    let session = o.session === undefined ? { chatId: "c1", assistantId: "a1" } : o.session;
+    let settings = { openaiActiveProfile: "p0" };
+    let chatsData = { chats: o.chats || [] };
+    let lastUndoCount = 0;
+    let planCollapsed = true;
+    let remoteRunNotified = false;
+
+    const spy = {
+      toast: [], persisted: 0, scroll: 0, scrollSoon: 0, queued: [], rendered: 0,
+      ensureSeg: 0, thinkBox: 0, planFromModel: [], planAdvance: 0, planFinish: 0,
+      planOutcome: 0, planText: 0, planPanel: 0, planSet: [], addRow: [], planAdd: [],
+      built: [], refreshed: [], openAsk: [], closedAsk: 0, context: [], mission: [],
+      tasksRendered: 0, flushed: 0, sidePanel: [], projectRefresh: [], deploy: [], timers: [],
+      settingsSaved: 0, getSettingsCalls: 0, answer: [],
+    };
+    const msgEls = new Map();
+    const autoQueue = [];
+    const seg = { id: "s1", role: "assistant", content: "", pending: true };
+
+    const sandbox = {
+      module: { exports: {} },
+      self: {},
+      console: { log() {}, warn() {}, error() {} },
+      document: { getElementById: $, createElement: (tag) => mkNode(tag), querySelectorAll: () => [], addEventListener() {} },
+      setTimeout: (fn) => { spy.timers.push(fn); },
+    };
+    sandbox.window = o.deployPanel === undefined ? { DeployPanel: { onStage: (s) => spy.deploy.push(s), onDone: (e) => spy.deploy.push(e) } } : { DeployPanel: o.deployPanel };
+    vm.runInNewContext(src, sandbox, { filename: "chat-events.js" });
+    assert.strictEqual(typeof sandbox.module.exports, "function", "модуль не отдал фабрику");
+
+    const deps = {
+      $: $,
+      api: Object.assign({
+        answerQuestion: (t) => spy.answer.push(t),
+        getSettings: async () => ({ openaiActiveProfile: "p9", model: "m", image: {} }),
+      }, o.api),
+      isElectron: o.isElectron === undefined ? true : o.isElectron,
+      uid: (() => { let n = 0; return () => "id" + ++n; })(),
+      toast: (t) => spy.toast.push(t),
+      normalize: (s) => Object.assign({}, s, { model: "нормализовано" }),
+      getSettings: () => { spy.getSettingsCalls++; return settings; },
+      setSettings: (s) => { settings = s; spy.settingsSaved++; },
+      getChatsData: () => chatsData,
+      getSession: () => session,
+      setLastUndoCount: (v) => { lastUndoCount = v; },
+      setPlanCollapsed: (v) => { planCollapsed = v; },
+      getRemoteRunNotified: () => remoteRunNotified,
+      setRemoteRunNotified: (v) => { remoteRunNotified = v; },
+      msgEls: msgEls,
+      autoQueue: autoQueue,
+      flushAutoQueue: () => { spy.flushed++; },
+      persistChatsSoon: () => { spy.persisted++; },
+      buildMessageEl: (m) => { spy.built.push(m.id); return mkNode("msg-" + m.id); },
+      refreshMessage: (m) => spy.refreshed.push(m && m.id),
+      openAskModal: (q, cb) => spy.openAsk.push({ q: q, cb: cb }),
+      closeAskModal: () => { spy.closedAsk++; },
+      renderContext: (ev) => spy.context.push(ev),
+      planFromModel: (chat, ev) => { spy.planFromModel.push(ev); return o.planFromModel === undefined ? true : o.planFromModel; },
+      planTextAdvance: () => { spy.planAdvance++; return true; },
+      planTextFinish: () => { spy.planFinish++; return o.planFinish === undefined ? true : o.planFinish; },
+      planToolOutcome: () => { spy.planOutcome++; return true; },
+      tryPlanFromRunText: () => { spy.planText++; },
+      renderPlanPanel: () => { spy.planPanel++; },
+      ChatSegments: {
+        ensureSegmentForText: () => { spy.ensureSeg++; return seg; },
+        runSegments: () => [seg],
+      },
+      ChatFeed: {
+        queueBubbleRender: (chat, s) => spy.queued.push(s.id),
+        scrollBottom: () => { spy.scroll++; },
+        scrollBottomSoon: () => { spy.scrollSoon++; },
+      },
+      ChatThinking: { ensureThinkBox: () => { spy.thinkBox++; } },
+      ChatWork: {
+        addRow: (el) => spy.addRow.push(el && el.id),
+        planAdd: (ev) => spy.planAdd.push(ev.name),
+        planSet: (ev, ok) => spy.planSet.push(ev.name + ":" + ok),
+      },
+      getSidePanel: () => ({ openSidePanel: (t) => spy.sidePanel.push(t), previewOpen: (u) => spy.sidePanel.push(u) }),
+      getTasksMission: () => ({ renderTasks: () => { spy.tasksRendered++; }, missionFromEvent: (ev) => spy.mission.push(ev.type) }),
+      getProjectPanel: () => ({ setFileViewPath: () => {}, refreshProject: () => spy.projectRefresh.push(1) }),
+    };
+    const ev = sandbox.module.exports(deps);
+    return {
+      onAiEvent: ev.onAiEvent, $: $, els: els, spy: spy, seg: seg, msgEls: msgEls, autoQueue: autoQueue,
+      getSession: () => session, setSession: (v) => { session = v; },
+      getSettings: () => settings, setChatsData: (v) => { chatsData = v; },
+      getChatsData: () => chatsData, getLastUndoCount: () => lastUndoCount,
+      getPlanCollapsed: () => planCollapsed, getRemoteRunNotified: () => remoteRunNotified,
+    };
+  }
+
+  const chatWith = () => {
+    const aMsg = { id: "a1", role: "assistant", content: "", pending: true };
+    return { chat: { id: "c1", messages: [aMsg] }, aMsg: aMsg };
+  };
+
+  await test("события агента: модуль на месте, а оболочка только собирает его", () => {
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const iTag = html.indexOf('src="chat-events.js"');
+    assert.ok(iTag > 0, "разметка не грузит chat-events.js");
+    assert.ok(iTag < html.indexOf('src="app.js"'), "chat-events.js подключён после app.js");
+    assert.ok(/"chat-events\.js"/.test(fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8")), "мост не отдаёт chat-events.js телефону");
+
+    const appSrc = uiFile("app.js");
+    for (const gone of ["function onAiEvent", "function showImageOverlay", "function showPatchOverlay", "function showPreviewOverlay"]) {
+      assert.ok(appSrc.indexOf(gone) === -1, "код событий остался в app.js: " + gone);
+    }
+    assert.ok(!/(^|[^.\w$])onAiEvent\b/.test(appSrc), "в app.js осталось голое имя onAiEvent");
+    assert.ok(/api\.onAiEvent\(ChatEvents\.onAiEvent\);/.test(appSrc), "подписка на события агента потерялась");
+    assert.ok(/onEvent: ChatEvents\.onAiEvent,/.test(appSrc), "веб-режим больше не получает обработчик событий");
+
+    // Границы модуля: переприсваиваемое состояние — только живым доступом.
+    for (const name of ["settings", "chatsData", "session", "lastUndoCount", "planCollapsed", "remoteRunNotified"]) {
+      assert.ok(!new RegExp("(^|[^\\w$.])" + name + "\\b").test(src), "модуль читает " + name + " напрямую вместо живого доступа");
+    }
+    for (const pair of [["SidePanel.", "getSidePanel()"], ["TasksMission.", "getTasksMission()"], ["ProjectPanel.", "getProjectPanel()"]]) {
+      assert.ok(src.indexOf(pair[0]) === -1, "модуль зовёт " + pair[0] + " напрямую вместо " + pair[1]);
+    }
+    assert.ok(!/window\.api\b|localStorage/.test(src), "модуль лезет в чужие глобалы");
+
+    const wiring = uiFind("  const ChatEvents = window.ChatEvents({", "  // ─── Правая панель").code;
+    for (const dep of ["getSettings: () => settings", "setSettings: (s) => { settings = s; }", "getChatsData: () => chatsData",
+      "getSession: () => session", "setLastUndoCount: (v) => { lastUndoCount = v; }", "setPlanCollapsed: (v) => PlanPanel.setPlanCollapsed(v)",
+      "getRemoteRunNotified: () => remoteRunNotified", "setRemoteRunNotified: (v) => { remoteRunNotified = v; }",
+      "getSidePanel: () => SidePanel", "getTasksMission: () => TasksMission", "getProjectPanel: () => ProjectPanel"]) {
+      assert.ok(wiring.includes(dep), "в проводку не передан " + dep);
+    }
+  });
+
+  await test("события агента: текст, размышления, план, действия и итоги", () => {
+    const env = buildEnv();
+    const { chat, aMsg } = chatWith();
+    env.setChatsData({ chats: [chat] });
+
+    // Служебная заметка и напоминания — тостом, без чата.
+    env.onAiEvent({ type: "notice", text: "Ждём лимит провайдера" });
+    assert.deepStrictEqual(env.spy.toast, ["Ждём лимит провайдера"], "заметка прогона не показана тостом");
+    env.onAiEvent({ type: "task-reminder", tasks: [{ title: "Позвонить", late: true }] });
+    assert.ok(/Просрочено: Позвонить/.test(env.spy.toast[1] || ""), "напоминание о деле не показано: " + env.spy.toast[1]);
+    assert.strictEqual(env.spy.tasksRendered, 1, "панель дел не обновилась по напоминанию");
+    env.onAiEvent({ type: "task-auto-failed", tasks: [{ title: "Отчёт", error: "нет ключа" }] });
+    assert.ok(/не запустилась/.test(env.spy.toast[2] || "") && /нет ключа/.test(env.spy.toast[2] || ""), "провал автозадачи не объяснён: " + env.spy.toast[2]);
+
+    // Текст: сегмент, сохранение, очередь кадра, разбор плана из текста.
+    env.seg.content = "";
+    env.onAiEvent({ type: "chunk", text: "привет" });
+    assert.strictEqual(env.seg.content, "привет", "текст не попал в сегмент ответа");
+    assert.strictEqual(env.spy.persisted, 1, "история не сохраняется по ходу стрима");
+    assert.deepStrictEqual(env.spy.queued, ["s1"], "отрисовка идёт не через очередь кадра");
+    assert.ok(env.spy.planText > 0, "текстовый план не разбирается по стриму");
+
+    // Размышления: свой блок в элементе сообщения.
+    const el = { id: "s1" };
+    env.msgEls.set("s1", el);
+    env.onAiEvent({ type: "thinking", text: "думаю" });
+    assert.strictEqual(env.seg.thinking, "думаю", "размышления не попали в сегмент");
+    assert.strictEqual(env.spy.thinkBox, 1, "блок размышлений не открыт");
+    assert.ok(env.spy.scrollSoon > 0, "прокрутка при размышлениях не запрошена");
+
+    // План от модели: панель разворачивается сама.
+    env.onAiEvent({ type: "plan", tasks: [{ text: "Шаг", status: "in_progress" }] });
+    assert.strictEqual(env.getPlanCollapsed(), false, "панель плана осталась свёрнутой");
+    assert.ok(env.spy.planPanel > 0, "панель плана не перерисована");
+
+    // Действие: своё сообщение, класс «в работе», строка действия.
+    chat.plan = { source: "text", items: [{ text: "Шаг", status: "pending" }] };
+    env.onAiEvent({ type: "tool_start", name: "readFile", args: { path: "a.txt" } });
+    const tool = chat.messages[chat.messages.length - 1];
+    assert.strictEqual(tool.role, "tool", "действие не стало сообщением");
+    assert.strictEqual(tool.toolName, "readFile", "имя инструмента потерялось");
+    assert.deepStrictEqual(tool.toolArgs, { path: "a.txt" }, "аргументы инструмента потерялись");
+    assert.strictEqual(tool.pending, true, "действие не помечено незавершённым");
+    assert.deepStrictEqual(env.spy.addRow, ["msg-" + tool.id], "строка действия не показана");
+    assert.deepStrictEqual(env.spy.planAdd, ["readFile"], "действие не попало в группу работ");
+    assert.strictEqual(env.spy.planAdvance, 1, "шаг текстового плана не отмечен «в работе»");
+
+    // Итог действия: сообщение закрывается, план сверяет шаг, панель проекта подтягивается.
+    env.$("project-panel").classList.remove("hidden");
+    env.onAiEvent({ type: "tool_result", name: "readFile", result: "готово" });
+    assert.strictEqual(tool.pending, false, "действие осталось незавершённым");
+    assert.strictEqual(tool.toolResult, "готово", "итог действия не записан");
+    assert.strictEqual(tool.toolOk, true, "успешный итог помечен провалом");
+    assert.deepStrictEqual(env.spy.refreshed, [tool.id], "сообщение не перерисовано");
+    assert.deepStrictEqual(env.spy.planSet, ["readFile:true"], "панель действий не сверена с итогом");
+    // Провал действия читается по тексту результата.
+    env.onAiEvent({ type: "tool_start", name: "runCommand", args: {} });
+    env.onAiEvent({ type: "tool_result", name: "runCommand", result: "Ошибка: не нашёл команду" });
+    assert.deepStrictEqual(env.spy.planSet[1], "runCommand:false", "провал действия не распознан");
+    // Команда тоже подтягивает панель проекта — она в этой проверке открыта.
+    assert.strictEqual(env.spy.timers.length, 1, "обновление панели проекта не запланировано после команды");
+    env.spy.timers.pop()();
+    assert.strictEqual(env.spy.projectRefresh.length, 1, "панель проекта не обновилась после команды");
+    // Правка файлов подтягивает панель проекта — только если она открыта.
+    env.onAiEvent({ type: "tool_start", name: "writeFile", args: { path: "b.txt" } });
+    env.onAiEvent({ type: "tool_result", name: "writeFile", result: "файл записан" });
+    assert.strictEqual(env.spy.timers.length, 1, "обновление панели проекта не запланировано после правки файла");
+    env.spy.timers.pop()();
+    assert.strictEqual(env.spy.projectRefresh.length, 2, "панель проекта не обновилась после правки файла");
+    env.$("project-panel").classList.add("hidden");
+    env.onAiEvent({ type: "tool_start", name: "writeFile", args: { path: "c.txt" } });
+    env.onAiEvent({ type: "tool_result", name: "writeFile", result: "файл записан" });
+    assert.strictEqual(env.spy.timers.length, 0, "закрытая панель проекта всё равно обновляется");
+
+    // Подмена текста (модель переписала ответ), плашки зрения и памяти, контекст.
+    env.onAiEvent({ type: "text_override", text: "переписано" });
+    assert.strictEqual(env.seg.content, "переписано", "переписанный текст не заменил ответ");
+    env.onAiEvent({ type: "vision", text: "смотрю картинку" });
+    env.onAiEvent({ type: "memory", text: "запомнил" });
+    env.onAiEvent({ type: "compact", text: "сжал контекст" });
+    assert.strictEqual(env.$("messages").children.length, 3, "плашки зрения/памяти/сжатия не показаны");
+    env.onAiEvent({ type: "context", used: 10 });
+    assert.strictEqual(env.spy.context.length, 1, "событие контекста не дошло до отрисовки");
+
+    // Вопрос агента, завершение и падение прогона.
+    env.onAiEvent({ type: "ask", question: "Какой файл?" });
+    assert.strictEqual(env.spy.openAsk[0].q, "Какой файл?", "вопрос агента не показан");
+    env.spy.openAsk[0].cb("a.txt");
+    assert.deepStrictEqual(env.spy.answer, ["a.txt"], "ответ на вопрос агента не ушёл в главный процесс");
+    env.onAiEvent({ type: "done" });
+    assert.ok(env.spy.planFinish > 0 && env.spy.planPanel > 1, "финиш запуска не закрыл шаг текстового плана");
+    env.onAiEvent({ type: "error", message: "сеть отвалилась" });
+    assert.strictEqual(env.spy.closedAsk, 1, "модалка вопроса не закрыта при падении");
+    assert.strictEqual(env.seg.pending, false, "сегмент остался незавершённым при падении");
+    assert.strictEqual(env.seg.error, "сеть отвалилась", "причина падения не записана");
+    env.onAiEvent({ type: "undo_available", count: 5 });
+    assert.strictEqual(env.getLastUndoCount(), 5, "счётчик откатов не ушёл в оболочку");
+    env.onAiEvent({ type: "mission", step: 2 });
+    assert.deepStrictEqual(env.spy.mission, ["mission"], "событие миссии не дошло до панели");
+  });
+
+  await test("события агента: автозадачи, чужой прогон, профили, оверлеи и деплой", async () => {
+    const env = buildEnv({ isElectron: true });
+    const { chat } = chatWith();
+    env.setChatsData({ chats: [chat] });
+
+    // Срок автозадачи: одно и то же дело в очередь один раз, и только на ПК.
+    env.onAiEvent({ type: "task-due", tasks: [{ id: "t1", title: "Отчёт" }, { id: "t1", title: "Отчёт" }] });
+    env.onAiEvent({ type: "task-due", tasks: [{ id: "t1", title: "Отчёт" }] });
+    assert.deepStrictEqual(env.autoQueue.map((t) => t.id), ["t1"], "дело попало в очередь дважды: " + JSON.stringify(env.autoQueue));
+    assert.strictEqual(env.spy.flushed, 2, "очередь автозадач не запускается");
+    const web = buildEnv({ isElectron: false });
+    web.onAiEvent({ type: "task-due", tasks: [{ id: "t1" }] });
+    assert.strictEqual(web.autoQueue.length, 0, "в веб-режиме окно пытается запускать автозадачи");
+
+    // Чужой прогон (с телефона) в открытый чат не подмешивается — и говорится один раз.
+    env.setSession(null);
+    env.onAiEvent({ type: "chunk", from: "mobile", text: "чужой текст" });
+    assert.strictEqual(env.spy.toast.filter((t) => /с телефона/.test(t)).length, 1, "про чужой прогон не сказано");
+    env.onAiEvent({ type: "chunk", from: "mobile", text: "ещё" });
+    assert.strictEqual(env.spy.toast.filter((t) => /с телефона/.test(t)).length, 1, "про чужой прогон сказано дважды");
+    assert.strictEqual(env.getRemoteRunNotified(), true, "отметка о чужом прогоне живёт только внутри модуля");
+    assert.strictEqual(env.seg.content, "", "чужой текст подмешался в текущий чат");
+    // Со своей сессией событие идёт в работу как обычно.
+    env.setSession({ chatId: "c1", assistantId: "a1" });
+    env.onAiEvent({ type: "chunk", from: "mobile", text: "свой" });
+    assert.strictEqual(env.seg.content, "свой", "свой прогон перестал обрабатываться");
+
+    // Переключение профиля: сообщение в чат, живые настройки, вычитка из главного процесса.
+    env.onAiEvent({ type: "profile_switched", name: "Второй", id: "p2", error: "кончились средства" });
+    const sys = chat.messages[chat.messages.length - 1];
+    assert.strictEqual(sys.role, "system", "про переключение не написано в чат");
+    assert.ok(/Второй/.test(sys.content) && /кончились средства/.test(sys.content), "в сообщении нет причины и имени профиля: " + sys.content);
+    assert.strictEqual(env.getSettings().openaiActiveProfile, "p2", "активный профиль не переключился");
+    assert.ok(/Второй/.test(env.spy.toast.join(" ")), "про переключение не сообщено тостом");
+    // Настройки из главного процесса перечитываются и заново кладутся в оболочку
+    // (setSettings) — это промис, поэтому ждём тик, а не верим на слово.
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(env.spy.getSettingsCalls > 0, true, "настройки читаются не живьём");
+    assert.strictEqual(env.spy.settingsSaved, 1, "прочитанные настройки не вернулись в оболочку");
+    assert.strictEqual(env.getSettings().model, "нормализовано", "настройки не прошли normalize");
+
+    // Оверлеи: картинка, дифф, предпросмотр.
+    env.onAiEvent({ type: "image", path: "/tmp/кот.png", dataUrl: "data:image/png;base64,AAA" });
+    assert.ok(!env.$("file-overlay").classList.contains("hidden"), "оверлей картинки не открылся");
+    assert.strictEqual(env.$("file-path").textContent, "/tmp/кот.png", "имя файла картинки не показано");
+    assert.ok(env.$("btn-file-edit").classList.contains("hidden") && env.$("btn-file-save").classList.contains("hidden"), "у картинки остались кнопки правки файла");
+    const img = env.$("file-content").children[0];
+    assert.strictEqual(img.src, "data:image/png;base64,AAA", "картинка не попала в оверлей");
+
+    env.onAiEvent({ type: "diff", a: "старый", b: "новый", patch: "--- a\n+++ b\n@@ -1 +1 @@\n-было\n+стало\nконец" });
+    assert.strictEqual(env.$("file-path").textContent, "старый  ↔  новый", "заголовок диффа не показан");
+    const lines = env.$("file-content").children[0].children;
+    assert.strictEqual(lines.length, 6, "строки диффа потерялись: " + lines.length);
+    assert.ok(/\bmeta\b/.test(lines[0].className) && /\bdel\b/.test(lines[3].className) && /\badd\b/.test(lines[4].className), "строки диффа не разрисованы по видам: " + lines.map((l) => l.className).join(" | "));
+
+    env.onAiEvent({ type: "preview", url: "http://localhost:5000" });
+    assert.deepStrictEqual(env.spy.sidePanel, ["preview", "http://localhost:5000"], "предпросмотр не открыл правую панель с адресом");
+
+    // Стадии деплоя и шаги подключения к облаку.
+    env.onAiEvent({ type: "deploy_stage", stage: { id: "build" } });
+    env.onAiEvent({ type: "deploy_done", ok: true });
+    assert.strictEqual(env.spy.deploy.length, 2, "стадии деплоя не дошли до панели");
+    const steps = env.$("yc-deploy-steps");
+    steps._q = { remove() { steps._q.removed = true; } };
+    env.$("yc-deploy-box").classList.remove("hidden");
+    env.onAiEvent({ type: "yc_step", text: "Создаю контейнер" });
+    assert.strictEqual(steps._q.removed, true, "надпись «идёт» не убрана перед шагом");
+    assert.strictEqual(steps.children.length, 1, "шаг подключения не показан");
+    assert.strictEqual(steps.children[0].textContent, "Создаю контейнер", "текст шага потерялся");
+    // Панель деплоя может отсутствовать — событие не должно падать.
+    const noPanel = buildEnv({ deployPanel: null });
+    noPanel.onAiEvent({ type: "deploy_stage", stage: { id: "x" } });
+    noPanel.onAiEvent({ type: "deploy_done", ok: true });
+    assert.strictEqual(noPanel.spy.deploy.length, 0, "без панели деплоя события не должны ничего ломать");
+  });
+}
+
 async function testChatSegments() {
   const vm = require("vm");
   const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "chat-segments.js"), "utf8");
@@ -630,7 +973,7 @@ async function testChatSegments() {
     }
     const wiring = appSrc.slice(appSrc.indexOf("window.ChatSegments({"));
     const wiringCall = wiring.slice(0, wiring.indexOf("});"));
-    for (const dep of ["$: $", "uid: uid", "getSession: () => session", "msgEls: msgEls", "buildMessageEl: buildMessageEl", "scrollBottom: ChatFeed.scrollBottom", "persistChatsSoon: persistChatsSoon", "planRoundStarted: planRoundStarted"]) {
+    for (const dep of ["$: $", "uid: uid", "getSession: () => session", "msgEls: msgEls", "buildMessageEl: buildMessageEl", "scrollBottom: ChatFeed.scrollBottom", "persistChatsSoon: persistChatsSoon", "planRoundStarted: PlanPanel.planRoundStarted"]) {
       assert.ok(wiringCall.includes(dep), "в проводку сегментов не передан " + dep);
     }
     // Границы модуля: сессия только живой функцией, в чужие глобалы не лезем.
@@ -4078,7 +4421,7 @@ const skip = new Set(["anthropic", "cerebras", "cloud", "deepseek", "groq", "mis
     assert.ok(/let activeRunOrigin = "desktop";/.test(main), "нет признака «кто запустил прогон»");
     assert.ok(/activeRunOrigin = e && e\.sender && e\.sender\.id \? "desktop" : "mobile";/.test(main), "ai:send не отмечает источник прогона");
     assert.ok(/from: activeRunOrigin/.test(main), "события не помечаются источником");
-    assert.ok(/if \(ev && ev\.from === "mobile" && !session\)/.test(app), "чужой прогон подмешивается в текущий чат");
+    assert.ok(/if \(ev && ev\.from === "mobile" && !getSession\(\)\)/.test(uiFile("chat-events.js")), "чужой прогон подмешивается в текущий чат");
   });
 
   await test("мобильный интерфейс: сайдбар с настройками открывается на телефоне", () => {
@@ -6309,10 +6652,14 @@ async function testPlanPanel() {
   const cssSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "styles.css"), "utf8");
   const AgentCore = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
 
-  // ── Срез блока плана: чистые функции + отрисовка (без остального приложения) ──
-  const planSlice = uiFind("  // ─────────── План работ (todoWrite):", "  // ─────────────── Рендер ───────────────");
-  assert.ok(planSlice.start > 0, "не нашёл блок плана в интерфейсе (маркеры съехали)");
-  const planSrc = planSlice.code;
+  // ── Модуль плана: собираем НАСТОЯЩИЙ src/renderer/plan-panel.js его фабрикой ──
+  // (этап A, часть 3 — подсистема плана вынесена из app.js). Проверяем не копию
+  // кода из теста, а тот файл, который грузит окно.
+  const planSrc = uiFile("plan-panel.js");
+  // Фабрика вызывается в ТОМ ЖЕ окружении, что и тест: массивы, собранные модулем,
+  // получают обычный прототип, и deepStrictEqual сравнивает данные, а не прототипы.
+  const planFactory = new Function("module", planSrc + "\nreturn module.exports;")({ exports: {} });
+  assert.strictEqual(typeof planFactory, "function", "модуль плана не отдал фабрику");
 
   // Игрушечный DOM: ровно те свойства, которые нужны панели.
   const mkEl = (tag) => {
@@ -6355,30 +6702,61 @@ async function testPlanPanel() {
   const hosts = {};
   let activeChat = null;
 
+  // Лимит истории планов живёт в оболочке (рядом с sanitizeChats) — берём его оттуда,
+  // чтобы тест не разошёлся с настоящим числом.
+  const limitFromShell = Number((/const PLAN_ARCHIVE_LIMIT = (\d+);/.exec(appSrc) || [])[1]);
+  assert.ok(limitFromShell > 0, "в оболочке не найден лимит истории планов");
+  // Зависимости — те же, что даёт оболочка.
   const deps = {
     $: (id) => (hosts[id] = hosts[id] || mkEl("div")),
     document: { createElement: mkEl },
     getActiveChat: () => activeChat,
-    streaming: false,
-    session: null,
+    getStreaming: () => false,
     // Сегменты ответа вынесены в src/renderer/chat-segments.js (этап 3.7, часть 2):
     // в игрушечной среде плана их нет вовсе, поэтому отдаём тот же контракт заглушкой.
-    ChatSegments: {
+    getChatSegments: () => ({
       ensureSegmentForText: (chat, aMsg) => aMsg || null,
       removeSegment: () => {},
       runSegments: (chat, aMsg) => [aMsg].filter(Boolean),
-    },
+    }),
     sendMessage: () => {},
     autoResize: () => {},
     persistChatsSoon: () => {},
-    TOOL_LABEL: { runCommand: "Команда в терминале", writeFile: "Изменение файла", readFile: "Чтение файла" },
+    toast: () => {},
     AgentCore,
+    planArchiveLimit: limitFromShell,
   };
-  const mod = new Function(
-    ...Object.keys(deps),
-    planSrc +
-      "\nreturn { planProgress, planArchive, planFromModel, planFromText, planTextAdvance, planTextFinish, planRoundStarted, planLinesFromText, planToolOutcome, planRotate, planPending, renderPlanPanel, runTextOf, tryPlanFromRunText, PLAN_ARCHIVE_LIMIT };"
-  )(...Object.values(deps));
+  const mod = planFactory(deps);
+
+  await test("план: модуль на месте, оболочка только собирает его", () => {
+    const iTag = htmlSrc.indexOf('src="plan-panel.js"');
+    assert.ok(iTag > 0, "разметка не грузит plan-panel.js");
+    assert.ok(iTag < htmlSrc.indexOf('src="app.js"'), "plan-panel.js подключён после app.js");
+    assert.ok(/<div id="plan-panel"/.test(htmlSrc), "панель плана пропала из разметки");
+    const bridge = fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8");
+    assert.ok(/"plan-panel\.js"/.test(bridge), "мост не отдаёт plan-panel.js телефону");
+    // В app.js реализации плана больше нет — только проводка.
+    for (const gone of ["function renderPlanPanel", "function planFromText", "function planRotate",
+      "function tryPlanFromRunText", "const PLAN_ICON", "let planCollapsed"]) {
+      assert.ok(appSrc.indexOf(gone) === -1, "код плана остался в app.js: " + gone);
+    }
+    assert.ok(appSrc.indexOf("window.PlanPanel({") !== -1, "оболочка не собирает модуль плана");
+    // Проводка отдаёт переписываемое состояние живыми функциями.
+    const wiring = uiFind("  const PlanPanel = window.PlanPanel({", "  // ─────────── /План работ").code;
+    for (const dep of ["$: $", "document: document", "getActiveChat: getActiveChat",
+      "getStreaming: () => streaming", "getChatSegments: () => ChatSegments", "sendMessage: sendMessage",
+      "autoResize: autoResize", "persistChatsSoon: persistChatsSoon", "toast: toast", "AgentCore: AgentCore",
+      "planArchiveLimit: PLAN_ARCHIVE_LIMIT"]) {
+      assert.ok(wiring.includes(dep), "в проводку не передан " + dep);
+    }
+    // Модуль читает состояние окна только живым доступом.
+    for (const name of ["settings", "chatsData", "session", "streaming", "chatsSavePending",
+      "remoteRunNotified", "SidePanel", "SettingsPanel", "ProjectPanel", "ChatSegments"]) {
+      assert.ok(!new RegExp("(^|[^\\w$.])" + name + "\\b").test(planSrc),
+        "модуль читает " + name + " напрямую вместо живого доступа");
+    }
+    assert.ok(/\$\("plan-panel"\)/.test(planSrc), "модуль не ищет #plan-panel");
+  });
 
   await test("план: инструмент todoWrite есть в ядре, с алиасами и правилом промпта", () => {
     const def = AgentCore.TOOL_DEFINITIONS.find((t) => t.function && t.function.name === "todoWrite");
@@ -6442,7 +6820,7 @@ async function testPlanPanel() {
     assert.strictEqual(chat.planHistory[0].items.length, 2);
     // История не растёт бесконечно.
     for (let i = 0; i < 10; i++) mod.planFromModel(chat, { tasks: ["шаг " + i] });
-    assert.strictEqual(chat.planHistory.length, mod.PLAN_ARCHIVE_LIMIT, "история планов не ограничена");
+    assert.strictEqual(chat.planHistory.length, limitFromShell, "история планов не ограничена");
   });
 
   await test("план модели: упавший шаг помечается ⚠️, успешный статус модели не трогает", () => {
@@ -6473,10 +6851,12 @@ async function testPlanPanel() {
     assert.strictEqual(pr.percent, 100);
     assert.strictEqual(pr.finished, true);
     // Следов авто-режима в интерфейсе не осталось.
-    assert.ok(!/planAuto/.test(appSrc), "в app.js остались авто-шаги");
-    assert.ok(appSrc.indexOf("план не задан") === -1, "осталась подпись «план не задан»");
-    assert.ok(appSrc.indexOf("PLAN_AUTO_MAX") === -1, "остался лимит авто-шагов");
-    assert.ok(appSrc.indexOf("plan-hint") === -1, "остался стиль подписи про не заданный план");
+    // Следов авто-режима не осталось НИ в оболочке, НИ в модуле плана.
+    const uiPlan = appSrc + planSrc;
+    assert.ok(!/planAuto/.test(uiPlan), "остались авто-шаги");
+    assert.ok(uiPlan.indexOf("план не задан") === -1, "осталась подпись «план не задан»");
+    assert.ok(uiPlan.indexOf("PLAN_AUTO_MAX") === -1, "остался лимит авто-шагов");
+    assert.ok(uiPlan.indexOf("plan-hint") === -1, "остался стиль подписи про не заданный план");
     assert.ok(cssSrc.indexOf(".plan-hint") === -1, "мёртвый стиль .plan-hint остался в styles.css");
   });
 
@@ -6547,11 +6927,11 @@ async function testPlanPanel() {
     assert.ok(/activeEmit\(\{ type: "plan", tasks: planTasks, title: planTitle \}\)/.test(mainSrc), "main.js не отправляет событие plan");
     assert.ok(/normalizePlanTasks\(/.test(mainSrc) && /planSummary\(/.test(mainSrc), "main.js не нормализует план");
     assert.ok(/normalizePlanTasks,\n  planSummary,/.test(mainSrc), "нормализатор не импортирован в main.js");
-    assert.ok(/case "plan": \{/.test(appSrc), "интерфейс не обрабатывает событие plan");
-    assert.ok(/planFromModel\(chat, ev\)/.test(appSrc), "событие plan не доходит до состояния");
-    assert.ok(/if \(planToolOutcome\(chat, ev, toolOk\)\) renderPlanPanel\(\);/.test(appSrc), "tool_result не проверяет фактический провал шага модели");
+    assert.ok(/case "plan": \{/.test(uiFile("chat-events.js")), "интерфейс не обрабатывает событие plan");
+    assert.ok(/planFromModel\(chat, ev\)/.test(uiFile("chat-events.js")), "событие plan не доходит до состояния");
+    assert.ok(/if \(planToolOutcome\(chat, ev, toolOk\)\) renderPlanPanel\(\);/.test(uiFile("chat-events.js")), "tool_result не проверяет фактический провал шага модели");
     assert.ok(/source: "auto"/.test(appSrc) === false, "в app.js осталось создание авто-плана из вызовов инструментов");
-    assert.ok(/if \(planRotate\(getActiveChat\(\)\)\) renderPlanPanel\(\);/.test(appSrc), "новый запрос не поворачивает план");
+    assert.ok(/if \(PlanPanel\.planRotate\(getActiveChat\(\)\)\) PlanPanel\.renderPlanPanel\(\);/.test(appSrc), "новый запрос не поворачивает план");
     assert.ok(/renderPlanPanel\(\);\n    const chat = getActiveChat\(\);|renderPlanPanel\(\);/.test(appSrc), "панель не перерисовывается вместе с чатом");
     // Веб-режим: todoWrite работает как структура, а не «недоступно в веб-версии».
     // Веб-режим вынесен в свой модуль (src/renderer/web-chat.js): спрашиваем
@@ -6564,7 +6944,7 @@ async function testPlanPanel() {
 
   await test("план: контейнер, оформление и хранение на месте", () => {
     assert.ok(/<div id="plan-panel" class="hidden"><\/div>/.test(htmlSrc), "нет контейнера #plan-panel в index.html");
-    assert.ok(/\$\("plan-panel"\)/.test(appSrc), "app.js не ищет #plan-panel");
+    assert.ok(/\$\("plan-panel"\)/.test(planSrc), "модуль плана не ищет #plan-panel");
     // Панель стоит ВЫШЕ панели действий (иначе ход работ заслонял бы план).
     assert.ok(htmlSrc.indexOf('id="plan-panel"') < htmlSrc.indexOf('id="work-panel"'), "панель плана не над панелью действий");
     for (const rule of [".plan-group", ".plan-head", ".plan-item.st-done", ".plan-fill", ".plan-group.expanded .plan-body", "#plan-panel.hidden"]) {
@@ -6735,10 +7115,10 @@ async function testPlanPanel() {
   });
 
   await test("план: текст ответа связан с панелью (chunk → раунд, tool_start, done)", () => {
-    assert.ok(/if \(planFromText\(chat, runTextOf\(chat, aMsg\)\)\)/.test(appSrc), "интерфейс не разбирает план, написанный текстом");    // Строка «planRoundStarted(chat, seg.id)» живёт в src/renderer/chat-segments.js
+    assert.ok(/if \(planFromText\(chat, runTextOf\(chat, aMsg\)\)\)/.test(planSrc), "интерфейс не разбирает план, написанный текстом");    // Строка «planRoundStarted(chat, seg.id)» живёт в src/renderer/chat-segments.js
         // (этап 3.7): спрашиваем интерфейс целиком, а не адрес кода.
         assert.ok(/planRoundStarted\(chat, seg\.id\);/.test(uiAll()), "новый раунд ответа не двигает галочки текстового плана");
-    assert.ok(/if \(planTextFinish\(chat\)\)/.test(appSrc), "финиш запуска не закрывает шаг текстового плана");
+    assert.ok(/if \(planTextFinish\(chat\)\)/.test(uiFile("chat-events.js")), "финиш запуска не закрывает шаг текстового плана");
     // Веб-версия: в План-режиме список инструментов больше не пуст — todoWrite доходит до модели.
     assert.ok(/tools: planMode \? AgentCore\.PLAN_MODE_TOOL_DEFINITIONS : AgentCore\.TOOL_DEFINITIONS,/.test(uiAll()), "в веб-версии План-режим без todoWrite");
   });
@@ -6811,9 +7191,9 @@ async function testPlanPanel() {
   await test("план: с первым инструментом текущий шаг сразу «в работе»", () => {
     // Иначе до конца первого раунда все пункты висели «ожидает» — и не было видно,
     // какой этап агент выполняет прямо сейчас.
-    assert.ok(/chat\.plan\.source === "text"/.test(appSrc), "нет отметки шага на старте работы");
-    assert.ok(/!chat\.plan\.items\.some\(\(i\) => i\.status === "in_progress"\)/.test(appSrc), "отметка не проверяет, есть ли уже текущий шаг");
-    assert.ok(/if \(planTextAdvance\(chat, true\)\) renderPlanPanel\(\);/.test(appSrc), "шаг не перерисовывается на старте работы");
+    assert.ok(/chat\.plan\.source === "text"/.test(uiFile("chat-events.js")), "нет отметки шага на старте работы");
+    assert.ok(/!chat\.plan\.items\.some\(\(i\) => i\.status === "in_progress"\)/.test(uiFile("chat-events.js")), "отметка не проверяет, есть ли уже текущий шаг");
+    assert.ok(/if \(planTextAdvance\(chat, true\)\) renderPlanPanel\(\);/.test(uiFile("chat-events.js")), "шаг не перерисовывается на старте работы");
     // И это не мешает основному движению по раундам.
     const chat = { messages: [], plan: { source: "text", items: [
       { text: "A", status: "pending" }, { text: "B", status: "pending" },
@@ -6823,9 +7203,9 @@ async function testPlanPanel() {
     assert.strictEqual(chat.plan.items[1].status, "pending");
   });
   await test("план: разбор идёт по стриму (ответ и размышления), заголовок ловится в конце фразы", () => {
-    assert.ok(/case "thinking":[\s\S]{0,700}tryPlanFromRunText\(chat, aMsg\)/.test(appSrc), "размышления не участвуют в разборе плана");
-    assert.ok(/case "chunk":[\s\S]{0,400}tryPlanFromRunText\(chat, aMsg\)/.test(appSrc), "текст ответа не участвует в разборе плана");
-    assert.ok(/PLAN_TAIL_RE/.test(appSrc), "нет распознавания заголовка в конце фразы");
+    assert.ok(/case "thinking":[\s\S]{0,700}tryPlanFromRunText\(chat, aMsg\)/.test(uiFile("chat-events.js")), "размышления не участвуют в разборе плана");
+    assert.ok(/case "chunk":[\s\S]{0,400}tryPlanFromRunText\(chat, aMsg\)/.test(uiFile("chat-events.js")), "текст ответа не участвует в разборе плана");
+    assert.ok(/PLAN_TAIL_RE/.test(planSrc), "нет распознавания заголовка в конце фразы");
     assert.ok(/\.plan-active \{/.test(cssSrc), "нет стиля .plan-active");
   });
 
@@ -8398,15 +8778,15 @@ async function testStreamThrottle() {
 
   await test("стрим: обработчик chunk рисует через очередь кадра, а не на каждый чанк", () => {
     assert.ok(
-      /case "chunk":[\s\S]{0,420}?ChatFeed\.queueBubbleRender\(chat, seg\)/.test(appSrc),
+      /case "chunk":[\s\S]{0,420}?ChatFeed\.queueBubbleRender\(chat, seg\)/.test(uiFile("chat-events.js")),
       "обработчик chunk не использует очередь кадра"
     );
     assert.ok(
-      !/case "chunk":[\s\S]{0,420}?b\.innerHTML = msgHtml\(seg\.content\)/.test(appSrc),
+      !/case "chunk":[\s\S]{0,420}?b\.innerHTML = msgHtml\(seg\.content\)/.test(uiFile("chat-events.js")),
       "chunk всё ещё перерисовывает innerHTML на каждый чанк"
     );
     assert.ok(
-      /case "thinking":[\s\S]{0,420}?ChatFeed\.scrollBottomSoon\(\)/.test(appSrc),
+      /case "thinking":[\s\S]{0,420}?ChatFeed\.scrollBottomSoon\(\)/.test(uiFile("chat-events.js")),
       "размышления всё ещё дёргают прокрутку на каждый токен"
     );
   });
@@ -10979,9 +11359,17 @@ async function testSidePanel() {
 
     // Оболочка зовёт панель только через модуль: голых имён не осталось.
     const wireAt = appSrc.indexOf("const SidePanel = window.SidePanel({");
-    for (const use of ["SidePanel.openSidePanel(", "SidePanel.syncRail", "SidePanel.previewOpen(", "SidePanel.termAppend", "SidePanel.termReset", "SidePanel.switchSideTab(", "SidePanel.sidePanelVisible(", "SidePanel.closeSidePanel(", "SidePanel.getSideTab()"]) {
+    for (const use of ["SidePanel.openSidePanel(", "SidePanel.syncRail", "SidePanel.termAppend", "SidePanel.termReset", "SidePanel.sidePanelVisible(", "SidePanel.closeSidePanel(", "SidePanel.getSideTab()"]) {
       assert.ok(appSrc.includes(use), "оболочка больше не зовёт " + use);
     }
+    // Событие «preview» открывает раздел превью: код события уехал в chat-events.js
+    // (этап A, часть 1), поэтому панель там берётся отложенной стрелкой.
+    assert.ok(/getSidePanel\(\)\.openSidePanel\("preview"\);/.test(uiFile("chat-events.js")), "событие preview не открывает раздел превью");
+    assert.ok(/getSidePanel\(\)\.previewOpen\(ev\.url \|\| ""\);/.test(uiFile("chat-events.js")), "событие preview не отдаёт адрес панели");
+    // Тест провайдера G4F открывает консоль правой панели: сам код уехал в g4f-panel.js
+    // (этап A, часть 2), поэтому панель там берётся отложенной стрелкой.
+    assert.ok(/getSidePanel\(\)\.switchSideTab\("console"\);/.test(uiFile("g4f-panel.js")), "тест провайдера G4F не открывает консоль");
+    assert.ok(/getSidePanel\(\)\.termAppend\(/.test(uiFile("g4f-panel.js")), "тест провайдера G4F не пишет в консоль");
     // Своё место: проводки, читающие панель НА ЗАГРУЗКЕ окна, обязаны стоять ниже сборки —
     // иначе «Cannot access before initialization» и весь остаток загрузки не выполняется.
     // Обращения выше сборки (тест провайдера G4F, события агента) живут внутри функций и
@@ -11156,11 +11544,19 @@ async function testSidePanel() {
     assert.strictEqual(calls.persisted, 1, "настройки не сохранены на диск");
     assert.strictEqual($("preview-url").value, "http://localhost:3000", "адрес не встал в поле");
     assert.strictEqual($("preview-frame").src, "http://localhost:3000", "кадр превью не загрузил адрес");
-    // С телефона localhost — это сам телефон: адрес меняется на адрес ПК из моста.
-    // Подмена — как была (адрес моста вместе с его портом), в выносе поведение не тронуто.
+    // С телефона localhost — это сам телефон: host подменяем на адрес ПК из моста,
+    // а ПОРТ оставляем портом проекта. Мост слушает порт 9090 и отдаёт файлы самого
+    // окна, а не dev-сервер: с портом моста превью открывало приложение вместо сайта.
     sandbox.window.mobileApi = { host: "192.168.1.5:9090" };
     panel.previewOpen("http://localhost:3000/app");
-    assert.strictEqual($("preview-frame").src, "http://192.168.1.5:9090/app", "адрес для телефона не подменился: " + $("preview-frame").src);
+    assert.strictEqual($("preview-frame").src, "http://192.168.1.5:3000/app", "порт проекта потерялся при подмене для телефона: " + $("preview-frame").src);
+    assert.strictEqual(settings.previewUrl, "http://localhost:3000/app", "в настройках оказался адрес для телефона вместо адреса проекта");
+    panel.previewOpen("http://localhost:5000");
+    assert.strictEqual($("preview-frame").src, "http://192.168.1.5:5000", "порт dev-сервера 5000 не сохранился: " + $("preview-frame").src);
+    panel.previewOpen("http://127.0.0.1:5000");
+    assert.strictEqual($("preview-frame").src, "http://192.168.1.5:5000", "127.0.0.1 не подменился на адрес ПК: " + $("preview-frame").src);
+    panel.previewOpen("https://example.com/app");
+    assert.strictEqual($("preview-frame").src, "https://example.com/app", "чужой адрес не должен подменяться на телефоне");
     sandbox.window.mobileApi = null;
     panel.previewOpen("http://localhost:3000");
 
@@ -12230,6 +12626,9 @@ async function testTasks() {
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     const core = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
     const tools = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
+    // Автозадачи вынесены своим модулем (этап A, часть 4): ищем код там, где он живёт,
+    // а у app.js спрашиваем только то, что он и должен теперь делать — звать модуль.
+    const auto = uiFile("auto-tasks.js");
     assert.ok(main.includes("tasksTakeAuto"), "планировщик не берёт автозадачи");
     assert.ok(main.includes('type: "task-due"'), "событие срока автозадачи не отправляется");
     assert.ok(main.includes("taskAuto: true"), "нет настройки «автозадачи выполняет агент»");
@@ -12237,14 +12636,15 @@ async function testTasks() {
     assert.ok(main.includes('{ type: "task-due", from: "desktop", tasks: auto }'), "автозадача уйдёт и на телефон — прогон удвоится");
     assert.ok(app.includes("async function runTurn("), "обычная отправка и автозадача не идут общим путём");
     assert.ok(app.includes("await runTurn(chat, content"), "отправка не пользуется общим прогоном");
-    assert.ok(app.includes('AUTO_CHAT_TITLE = "Автозадачи"'), "нет отдельного чата автозадач");
-    assert.ok(app.includes("ensureAutoChat"), "чат автозадач не создаётся");
-    const raPos = app.indexOf("async function runAutoTask");
+    assert.ok(auto.includes('AUTO_CHAT_TITLE = "Автозадачи"'), "нет отдельного чата автозадач");
+    assert.ok(auto.includes("ensureAutoChat"), "чат автозадач не создаётся");
+    const raPos = auto.indexOf("async function runAutoTask");
     assert.ok(raPos > 0, "окно не умеет запускать автозадачу");
-    const guardPos = app.indexOf("if (!isElectron) return;", raPos);
+    const guardPos = auto.indexOf("if (!isElectron) return;", raPos);
     assert.ok(guardPos > raPos && guardPos - raPos < 600, "автозадачу не ограничили ПК-клиентом");
-    assert.ok(app.includes('ev.type === "task-due"'), "окно не слушает срок автозадачи");
-    assert.ok(app.includes("flushAutoQueue"), "автозадача не ждёт конца текущего прогона");
+    assert.ok(uiFile("chat-events.js").includes('ev.type === "task-due"'), "окно не слушает срок автозадачи");
+    assert.ok(auto.includes("function flushAutoQueue"), "автозадача не ждёт конца текущего прогона");
+    assert.ok(app.includes("AutoTasks.flushAutoQueue();"), "прогон не разбирает очередь автозадач после себя");
     assert.ok(uiFile("settings-panel.js").includes("getSettings().taskAuto"), "галочка автозадач не читается настройками");
     assert.ok(html.includes("s-task-auto"), "в настройках нет галочки автозадач");
     assert.ok(core.includes("repeat: { type:") && core.includes("auto: { type:"), "инструменты дел не знают о повторах и автозапуске");
@@ -13311,7 +13711,7 @@ async function testDeploy() {
 
     const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
     assert.ok(uiFile("side-panel.js").includes("DeployPanel.open("), "панель подключается при открытии вкладки");
-    assert.ok(appSrc.includes('case "deploy_stage"') && appSrc.includes('case "deploy_done"'), "стадии деплоя доходят до панели");
+    assert.ok(uiFile("chat-events.js").includes('case "deploy_stage"') && uiFile("chat-events.js").includes('case "deploy_done"'), "стадии деплоя доходят до панели");
   });
 
   fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -13729,7 +14129,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -13739,7 +14139,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
@@ -15053,9 +15453,11 @@ async function testMissionGuard() {
     assert.ok(/Отчёт по ОДНОЙ И ТОЙ ЖЕ работе/.test(coreData()), "в промпте нет правила «отчёт присылается один раз»");
     // Человеческий путь «▶ Продолжить»: миссия возвращается в работу, запоминается
     // как просьба человека (пауза сама не подхватывается) и продолжается в СВОЁМ чате.
-    const resumeAt = mainSrc.indexOf('ipcMain.handle("mission:resume"');
-    assert.ok(resumeAt > 0, "main.js не умеет продолжать миссию по кнопке");
-    const resumeBlock = mainSrc.slice(resumeAt, mainSrc.indexOf("mission:open", resumeAt));
+    // Каналы миссий вынесены в src/mission-ipc.js (этап B, часть 1) — спрашиваем модуль.
+    const missionIpc = fs.readFileSync(path.join(ROOT, "src", "mission-ipc.js"), "utf8");
+    const resumeAt = missionIpc.indexOf('ipcMain.handle("mission:resume"');
+    assert.ok(resumeAt > 0, "модуль не умеет продолжать миссию по кнопке");
+    const resumeBlock = missionIpc.slice(resumeAt, missionIpc.indexOf("mission:open", resumeAt));
     assert.ok(resumeBlock.indexOf('rec.status = "active"') > 0, "кнопка «Продолжить» не возвращает миссию в работу");
     assert.ok(/missionClaim = rec\.id/.test(resumeBlock), "просьба человека не запоминается для следующего прогона");
     const missionUi = fs.readFileSync(path.join(ROOT, "src", "renderer", "tasks-mission.js"), "utf8");
@@ -15115,10 +15517,11 @@ async function testMissions() {
     const panelSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "tasks-mission.js"), "utf8");
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     assert.ok(html.includes('id="btn-mission-delete"'), "нет кнопки удаления в карточке миссии");
-    assert.ok(/ipcMain\.handle\("mission:delete"/.test(mainSrc), "нет канала mission:delete");
+    const missionIpcSrc = fs.readFileSync(path.join(ROOT, "src", "mission-ipc.js"), "utf8");
+    assert.ok(/ipcMain\.handle\("mission:delete"/.test(missionIpcSrc), "нет канала mission:delete");
     assert.ok(/missionDelete: \(id\) => ipcRenderer\.invoke\("mission:delete"/.test(preloadSrc), "мост не отдаёт удаление в окно");
     // Во время прогона удалять нельзя: агент держит миссию в памяти и продолжит писать.
-    assert.ok(/global\.__agentRunning/.test(mainSrc.split('ipcMain.handle("mission:delete"')[1].split("ipcMain.handle(")[0]), "канал не отказывает во время прогона");
+    assert.ok(/global\.__agentRunning/.test(missionIpcSrc.split('ipcMain.handle("mission:delete"')[1].split("ipcMain.handle(")[0]), "канал не отказывает во время прогона");
     assert.ok(/btn-mission-delete"\)\.onclick/.test(panelSrc), "кнопка в карточке ни к чему не подключена");
     assert.ok(/isStreaming\(\)/.test(panelSrc.split('$("btn-mission-delete").onclick')[1].split("};")[0]), "кнопка удаления работает и во время прогона");
     assert.ok(/ms-past-del/.test(panelSrc), "у прошлых миссий нет кнопки удаления");
@@ -15241,6 +15644,8 @@ async function testMissions() {
 
   await test("миссии: файлы работы пишутся по своей галочке, а не по памяти диалогов", () => {
     const main = mainOnlySrc();
+    // Каналы файлов работы вынесены в src/mission-ipc.js (этап B, часть 1).
+    const missionIpc = fs.readFileSync(path.join(ROOT, "src", "mission-ipc.js"), "utf8");
     // Зеркала решают своё условие: иначе контекст и задачи не попадали на диск,
     // пока пользователь не включит «Память диалогов» (это про другое — про поиск по дням).
     assert.ok(/if \(settings\.agentWorkFiles !== false\) \{\n\s+try \{\n\s+missionStore\.contextMirror/.test(main), "зеркало контекста зависит не от своей галочки");
@@ -15249,13 +15654,147 @@ async function testMissions() {
     assert.ok(!/if \(!s\.longWork\) return;/.test(main), "зеркало дел всё ещё привязано к «долгой работе»");
     assert.ok(/agentWorkFiles: true/.test(main), "файлы работы выключены по умолчанию");
     for (const ch of ["agentfiles:status", "agentfiles:openDir", "agentfiles:clear"]) {
-      assert.ok(main.indexOf('ipcMain.handle("' + ch + '"') >= 0, "нет канала " + ch);
+      assert.ok(missionIpc.indexOf('ipcMain.handle("' + ch + '"') >= 0, "нет канала " + ch);
     }
-    assert.ok(main.indexOf("missionStore.mirrorStatus") >= 0, "состояние папки не считается модулем миссий");
+    assert.ok(missionIpc.indexOf("missionStore.mirrorStatus") >= 0, "состояние папки не считается модулем миссий");
+  });
+
+  await test("дела и миссии: модуль собирается, каналы на месте, missionClaim ходит мостом live", async () => {
+    // Блок дел, миссий и файлов работы агента вынесен из main.js в src/mission-ipc.js
+    // (этап B, часть 1). Собираем НАСТОЯЩИЙ модуль его же фабрикой и водим по каналам.
+    const { registerMissionIpc } = require(path.join(ROOT, "src", "mission-ipc.js"));
+    const handlers = new Map();
+    const calls = { emitted: 0, armed: 0, saved: [], notes: [], finished: [], deleted: [], shown: "", opened: "" };
+    let claim = "";
+    const dir = path.join(os.tmpdir(), "mission-ipc-test");
+    const active = {
+      id: "m1", title: "Разобрать 10 писем", status: "paused", createdAt: 1, updatedAt: 2,
+      steps: ["a", "b"], rounds: 3, metrics: { tokens: 100 }, role: "manager", chatId: "c1",
+    };
+    const missionStore = {
+      agentRoot: (d) => path.join(d, ".agent"),
+      missionActive: () => active,
+      missionList: () => [active],
+      missionProgress: (m) => ({ done: 1, total: m.steps.length, percent: 50, finished: false }),
+      missionJournal: () => [{ ts: 1, text: "шаг" }],
+      missionLoad: (d, id) => (id === "m1" ? active : null),
+      missionSave: (d, rec) => { calls.saved.push(rec.status); return { ok: true }; },
+      missionNote: (d, id, kind, text) => { calls.notes.push(text); return { ok: true }; },
+      missionFinish: (d, id, opts) => { calls.finished.push({ id: id, opts: opts }); return { ok: true, mission: { id: id, status: "stopped" } }; },
+      missionDelete: (d, id) => { calls.deleted.push(id); return { ok: true, id: id }; },
+      missionDirOf: (d, id) => path.join(d, ".agent", "missions", String(id)),
+      missionResumeText: (rec, journal) => "ПРОДОЛЖИ " + rec.id + " (" + journal + ")",
+      missionJournalText: () => "журнал",
+      mirrorStatus: (d) => ({ dir: d, root: path.join(d, ".agent"), exists: true, tasks: { bytes: 10, mtime: 1 }, contextDays: ["2026-09-17.md"], missions: 2, bytes: 34 }),
+      mirrorClear: () => ({ ok: true, removed: ["tasks.md", "context"] }),
+    };
+    const agentStore = {
+      tasksBoard: () => ({ ok: true, groups: [{ id: "today", title: "Сегодня", tasks: [] }], done: [], summary: { active: 0, total: 0 } }),
+      tasksList: () => ({ ok: true, tasks: [] }),
+      tasksAdd: () => ({ ok: true, key: "t1" }),
+      tasksUpdate: () => ({ ok: true }),
+      tasksDone: () => ({ ok: true }),
+      tasksDelete: () => ({ ok: true }),
+      tasksAutoAck: () => ({ ok: true }),
+      tasksAutoRearm: () => ({ ok: true }),
+    };
+    const mod = registerMissionIpc({
+      ipcMain: { handle: (ch, fn) => handlers.set(ch, fn) },
+      fs: { mkdirSync: () => {} },
+      shell: { showItemInFolder: (p) => { calls.shown = p; }, openPath: async (p) => { calls.opened = p; return ""; } },
+      agentStore: agentStore,
+      missionStore: missionStore,
+      loadSettings: () => ({ longWork: true, workingDir: dir, agentWorkFiles: true }),
+      agentWorkDir: (s) => (s && s.workingDir) || dir,
+      userDataDir: () => path.join(dir, "userData"),
+      emitTasksChanged: () => { calls.emitted++; },
+      armTaskWake: () => { calls.armed++; },
+      live: { missionClaim: () => claim, setMissionClaim: (v) => { claim = v; } },
+    });
+
+    // 1. Каналы: ровно те, за которыми ходит окно и телефон.
+    const channels = [...handlers.keys()].sort();
+    assert.deepStrictEqual(channels, [
+      "agentfiles:clear", "agentfiles:openDir", "agentfiles:status",
+      "mission:delete", "mission:finish", "mission:list", "mission:open",
+      "mission:pause", "mission:resume", "mission:state", "mission:stop",
+      "tasks:add", "tasks:auto-ack", "tasks:auto-rearm", "tasks:board",
+      "tasks:delete", "tasks:done", "tasks:list", "tasks:update",
+    ], "набор каналов модуля изменился: " + channels.join(", "));
+    assert.strictEqual(typeof mod.missionStateForUi, "function", "модуль не отдаёт состояние миссий");
+    assert.strictEqual(typeof mod.agentFilesStatus, "function", "модуль не отдаёт состояние папки работы");
+
+    // 2. Состояние для панели: активная миссия, прогресс, журнал, список, прогон.
+    const st = await handlers.get("mission:state")();
+    assert.strictEqual(st.enabled, true, "долгая работа не видна панели");
+    assert.strictEqual(st.active.id, "m1", "активная миссия не отдана панели");
+    assert.strictEqual(st.journal.length, 1, "журнал миссии не отдан");
+    assert.strictEqual(st.list.length, 1, "список миссий пуст");
+    assert.strictEqual(st.list[0].steps, 2, "число шагов не посчитано");
+    assert.strictEqual(st.list[0].tokens, 100, "метрики миссии потеряны");
+    assert.strictEqual(st.running, !!global.__agentRunning, "признак прогона не отдан");
+    assert.strictEqual(st.paused, !!global.__agentPauseRequested, "признак паузы не отдан");
+
+    // 3. «▶ Продолжить»: миссия возвращается в работу, а id уходит в живое значение main.js.
+    const resumed = await handlers.get("mission:resume")();
+    assert.strictEqual(resumed.ok, true, "миссию не удалось продолжить");
+    assert.strictEqual(claim, "m1", "просьба человека не запомнена для следующего прогона");
+    assert.deepStrictEqual(calls.saved, ["active"], "миссия не вернулась в работу на диске");
+    assert.ok(/Человек вернул миссию/.test(calls.notes[0] || ""), "в журнал не записано, кто продолжил: " + calls.notes[0]);
+    assert.ok(resumed.text.indexOf("ПРОДОЛЖИ m1") === 0, "текст продолжения потерян: " + resumed.text);
+
+    // 4. Удаление: во время прогона по этой же миссии — отказ, иначе — удаляем.
+    global.__agentRunning = true;
+    const refused = await handlers.get("mission:delete")(null, "m1");
+    assert.strictEqual(refused.ok, false, "миссия удалена во время прогона по ней");
+    assert.ok(/Стоп|Закрыть/.test(refused.error || ""), "отказ не объясняет, что делать: " + refused.error);
+    global.__agentRunning = false;
+    const del = await handlers.get("mission:delete")(null, "m1");
+    assert.strictEqual(del.ok, true, "миссию не удалось удалить");
+    assert.deepStrictEqual(calls.deleted, ["m1"], "удаление ушло не с тем id");
+    assert.strictEqual(claim, "", "после удаления просьба человека осталась висеть");
+
+    // 5. Дела: изменение подтягивает будильник и сообщает окну.
+    const added = await handlers.get("tasks:add")(null, { title: "Позвонить" });
+    assert.strictEqual(added.ok, true, "дело не добавилось");
+    assert.strictEqual(calls.emitted, 1, "окно не извещено об изменении дел");
+    assert.strictEqual(calls.armed, 1, "будильник на срок не перезаряжен");
+    await handlers.get("tasks:list")(null, {});
+    assert.strictEqual(calls.emitted, 1, "чтение дел дёргает окно");
+
+    // 6. Файлы работы: состояние, открытие папки и очистка зеркал с понятным текстом.
+    const files = await handlers.get("agentfiles:status")();
+    assert.strictEqual(files.exists, true, "состояние папки работы не посчитано");
+    assert.deepStrictEqual(files.contextDays, ["2026-09-17.md"], "дни контекста потеряны");
+    const opened = await handlers.get("agentfiles:openDir")(null, "m2");
+    assert.ok(/missions[\\/]m2$/.test(calls.opened), "открылась не папка миссии: " + calls.opened);
+    assert.strictEqual(opened.ok, true, "папка миссии не открылась");
+    const cleared = await handlers.get("agentfiles:clear")();
+    assert.strictEqual(cleared.ok, true, "зеркала не очистились");
+    assert.ok(/Зеркала очищены: tasks\.md, context/.test(cleared.message || ""), "текст очистки невнятный: " + cleared.message);
+    assert.ok(/Миссии не затронуты/.test(cleared.message || ""), "текст очистки не успокаивает про миссии");
+
+    // 7. Проводка в main.js: живое значение обязано идти мостом — и чтением, и записью.
+    // Копия «застыла» бы на пустой строке, и продолженная миссия снова не подхватилась бы.
+    const mainSrc = mainOnlySrc();
+    const wiringAt = mainSrc.indexOf('const { registerMissionIpc } = require("./mission-ipc.js");');
+    assert.ok(wiringAt > 0, "main.js не собирает модуль дел и миссий");
+    const wiring = mainSrc.slice(wiringAt, mainSrc.indexOf("\n});", wiringAt));
+    for (const dep of ["ipcMain,", "fs,", "shell,", "agentStore,", "missionStore,", "loadSettings,",
+      "agentWorkDir,", "userDataDir,", "emitTasksChanged,", "armTaskWake,",
+      "missionClaim: () => missionClaim,", "setMissionClaim: (v) => { missionClaim = v; },"]) {
+      assert.ok(wiring.includes(dep), "в проводку модуля не передан " + dep);
+    }
+    // И самого кода дел и миссий в main.js больше нет — только проводка.
+    for (const gone of ['ipcMain.handle("tasks:board"', 'ipcMain.handle("mission:state"', "function missionStateForUi"]) {
+      assert.strictEqual(mainSrc.indexOf(gone), -1, "код дел и миссий остался в main.js: " + gone);
+    }
   });
 
   await test("долгая работа: батчи, авто-продолжение и мягкие стопы вместо обрыва на 26-м раунде", () => {
     const main = mainOnlySrc();
+    // Часть долгой работы (каналы дел и миссий) вынесена в src/mission-ipc.js.
+    const missionIpc = fs.readFileSync(path.join(ROOT, "src", "mission-ipc.js"), "utf8");
     assert.ok(main.indexOf("for (let batch = 1; ; batch++)") >= 0, "нет внешнего цикла батчей");
     assert.ok(/const afterBatch = await missionAfterBatch\(\);/.test(main), "граница батча не считается");
     assert.ok(/if \(!afterBatch\.continue\) \{/.test(main), "конец батча не продолжает и не завершает работу");
@@ -15267,7 +15806,8 @@ async function testMissions() {
     assert.ok(main.indexOf("MISSION_JOURNAL_PER_BATCH") >= 0, "журнал может превратиться в поток");
     assert.ok(/longWork: true/.test(main), "долгая работа выключена по умолчанию");
     assert.ok(/longWorkHours: 8/.test(main), "рабочий день по умолчанию не 8 часов");
-    assert.ok(main.indexOf("missionResumeText") >= 0, "нет продолжения миссии с места остановки");
+    // Текст продолжения собирает канал mission:resume, а он живёт в src/mission-ipc.js.
+    assert.ok(missionIpc.indexOf("missionResumeText") >= 0, "нет продолжения миссии с места остановки");
     assert.ok(main.indexOf("global.__agentPauseRequested") >= 0, "нет паузы у долгой работы");
     // Жёсткий лимит раундов остался только для короткой работы и режима плана.
     assert.ok(/const maxRounds = planMode \? 3 : 25;/.test(main), "лимит раундов отрезка изменился");
@@ -15355,6 +15895,7 @@ async function testMissions() {
   await testOpenaiProfiles();
   await testProjectPanel();
   await testSettingsPanel();
+  await testG4fPanel();
   await testLeftRail();
   await testSandboxObstacles();
   await testVkFieldFixes();
@@ -15380,6 +15921,7 @@ async function testMissions() {
   await testWebChat();
   await testChatThinking();
   await testChatSegments();
+  await testChatEvents();
   await testChatRender();
   await testChatFeed();
   await testChatWork();
@@ -16350,5 +16892,404 @@ async function testVkFieldFixes() {
     assert.ok(/check: false/.test(core), "writeFile не рассказывает про проверку");
     // Роль «Менеджер»: прямая просьба про код — не самовольство.
     assert.ok(/прямо попросил код/.test(core), "правило роли «Менеджер» осталось запрещающим");
+  });
+}
+
+// ── Выбор провайдера G4F в настройках (src/renderer/g4f-panel.js, этап A, часть 2) ──
+// Модуль вынесен из app.js. Проверяем ПОВЕДЕНИЕ на заглушках настоящей разметки:
+// список и поиск по провайдерам, выбор провайдера с подгрузкой его моделей, полный
+// тест провайдера с логами в консоль, подбор живого порта g4f и связку с пресетами.
+// Заглушка $ падает, если модуль ищет элемент, которого в разметке нет.
+async function testG4fPanel() {
+  const vm = require("vm");
+  const src = uiFile("g4f-panel.js");
+  const html = uiFile("index.html");
+  const known = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
+  // Классы из НАСТОЯЩЕЙ разметки: в окне часть полей уже скрыта (class="hidden"),
+  // и заглушка обязана начинать с того же состояния, иначе проверка была бы ложной.
+  const initialClasses = new Map();
+  for (const tag of html.matchAll(/<[^>]*id="([^"]+)"[^>]*>/g)) {
+    const cls = /class="([^"]*)"/.exec(tag[0]);
+    initialClasses.set(tag[1], new Set((cls ? cls[1] : "").split(/\s+/).filter(Boolean)));
+  }
+
+  // Заглушка ведёт className и classList одной коллекцией: в браузере это одно и то же.
+  function mkEl(id) {
+    let cls = new Set(initialClasses.get(id) || []);
+    let markup = "";
+    const node = {
+      id: id, value: "", textContent: "", title: "", style: {}, dataset: {},
+      children: [], onclick: null, focused: 0, listeners: {}, queried: {},
+      get className() { return [...cls].join(" "); },
+      set className(v) { cls = new Set(String(v || "").split(/\s+/).filter(Boolean)); },
+      get innerHTML() { return markup; },
+      set innerHTML(v) { markup = String(v == null ? "" : v); if (!markup) node.children.length = 0; },
+      classList: {
+        add: (...c) => c.forEach((x) => cls.add(x)),
+        remove: (...c) => c.forEach((x) => cls.delete(x)),
+        contains: (c) => cls.has(c),
+        toggle: (c, on) => (on === undefined ? (cls.has(c) ? cls.delete(c) : cls.add(c)) : on ? cls.add(c) : cls.delete(c)),
+      },
+      appendChild(c) { node.children.push(c); return c; },
+      append(...cs) { cs.forEach((x) => node.children.push(x)); },
+      addEventListener(t, fn) { node.listeners[t] = fn; },
+      focus() { node.focused++; },
+      querySelector(sel) {
+        if (!node.queried[sel]) node.queried[sel] = mkEl(sel);
+        return node.queried[sel];
+      },
+      querySelectorAll: () => [],
+    };
+    return node;
+  }
+
+  // Сборка модуля в песочнице: те же зависимости, что даёт оболочка. Встроенные
+  // объекты отдаём внутрь, чтобы собранные модулем массивы имели обычный прототип.
+  function buildG4f(world) {
+    const o = world || {};
+    const els = new Map();
+    const $ = (id) => {
+      assert.ok(known.has(id), "модуль ищет элемент, которого нет в разметке: " + id);
+      if (!els.has(id)) els.set(id, mkEl(id));
+      return els.get(id);
+    };
+    const calls = { hints: [], msgs: [], console: [], server: [], probed: [], tested: [] };
+    const pending = [];
+    let preset = o.preset || "g4f";
+    let now = 1000000;
+    const providers = o.providers || [
+      { name: "default", desc: "авто-режим: G4F сам выберет провайдера и модель", rec: true, models: [] },
+      { name: "DeepSeek", desc: "стабильный, без ключа", rec: true, models: ["DeepSeek-V3", "DeepSeek-R1"] },
+      { name: "ChatGpt", desc: "чат-провайдер", rec: false, models: [] },
+    ];
+    const chips = (o.chips || ["deepseek", "g4f", "openai"]).map((p) => {
+      const c = mkEl("chip-" + p);
+      c.dataset.preset = p;
+      return c;
+    });
+    let observerCb = null;
+    const box = {
+      module: { exports: {} }, self: {},
+      console: { log() {}, warn() {}, error() {} },
+      Object, Array, JSON, Date: { now: () => now }, Math, Promise, Error, String, RegExp,
+      Number, Boolean, isNaN, parseInt, parseFloat, Set, Map,
+      document: {
+        getElementById: $,
+        createElement: () => mkEl("created"),
+        querySelectorAll: (sel) => (/\.chip\[data-preset\]/.test(sel) ? chips : []),
+        addEventListener() {},
+      },
+    };
+    // В браузере window — это и есть глобальный объект, поэтому наблюдатель виден и как
+    // window.MutationObserver, и как MutationObserver: повторяем это в песочнице.
+    box.window = box;
+    box.MutationObserver = function (cb) { observerCb = cb; return { observe() {} }; };
+    vm.runInNewContext(src, box, { filename: "g4f-panel.js" });
+    assert.strictEqual(typeof box.module.exports, "function", "модуль не отдал фабрику");
+    const panel = box.module.exports({
+      $, isElectron: o.isElectron === undefined ? true : o.isElectron,
+      G4F_PROVIDERS: providers,
+      URL_INPUT: { openai: "s-openai-url" },
+      api: Object.assign({
+        g4fTest: async (a) => { calls.tested.push(a); return o.testResult || { log: [] }; },
+        g4fProbe: async (a) => { calls.probed.push(a); return o.probeResult || { ok: true, base: "http://localhost:1337" }; },
+      }, o.api || {}),
+      getPreset: () => preset,
+      getSettingsPanel: () => ({
+        renderModelHints: (p, list) => calls.hints.push({ p: p, list: list || null }),
+        setSettingsMsg: (text, err) => calls.msgs.push({ text: text, err: !!err }),
+        requestModelsList: () => new Promise((resolve) => { pending.push(resolve); }),
+      }),
+      getSidePanel: () => ({
+        switchSideTab: (t) => calls.console.push("tab:" + t),
+        termAppend: (h) => calls.console.push(h),
+      }),
+      getProjectPanel: () => ({ escHtml: (s) => "[" + s + "]", esc: (s) => "{" + s + "}" }),
+      getDevRun: () => ({ termServerAppend: (h) => calls.server.push(h) }),
+    });
+    return {
+      panel, $, calls, providers, pending,
+      chips: chips, exports: Object.keys(panel).sort(),
+      setPreset: (p) => { preset = p; },
+      advance: (ms) => { now += ms; },
+      resolve: (list, idx) => { const i = idx === undefined ? pending.length - 1 : idx; const r = pending[i]; pending[i] = null; if (r) r(list); },
+      observer: () => observerCb,
+    };
+  }
+  const tick = () => new Promise((r) => setImmediate(r));
+  // Объекты и массивы, собранные ВНУТРИ модуля, живут в своём окружении — сравниваем
+  // их значения, приведя к обычным (иначе различие прототипов выдаётся за разницу данных).
+  const plain = (v) => JSON.parse(JSON.stringify(v));
+
+  await test("выбор провайдера G4F: модуль на месте, оболочка только собирает его", () => {
+    const iTag = html.indexOf('src="g4f-panel.js"');
+    assert.ok(iTag > 0, "разметка не грузит g4f-panel.js");
+    assert.ok(iTag < html.indexOf('src="app.js"'), "g4f-panel.js подключён после app.js");
+    const bridge = fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8");
+    assert.ok(/"g4f-panel\.js"/.test(bridge), "мост не отдаёт g4f-panel.js телефону");
+
+    const appSrc = uiFile("app.js");
+    for (const gone of [
+      "function renderG4fProviderList", "function refreshG4fModels", "function testG4fProvider",
+      "function probeG4fPort", "function syncG4fProviderBox", "function wireG4fProviderPicker",
+      "let g4fProviderQuery", "let g4fProbeLastTs", "let g4fModelReqSeq",
+    ]) {
+      assert.ok(appSrc.indexOf(gone) === -1, "код G4F остался в app.js: " + gone);
+    }
+    assert.ok(/G4fPanel\.wireG4fProviderPicker\(\);/.test(appSrc), "модуль не подключается к полям настроек");
+    assert.ok(appSrc.indexOf("renderG4fProviderList: G4fPanel.renderG4fProviderList,") > 0, "настройки не получают список провайдеров");
+    assert.ok(appSrc.indexOf("probeG4fPort: G4fPanel.probeG4fPort,") > 0, "настройки не получают подбор порта");
+
+    // Границы модуля: общее состояние — только внедрением (пояснения в комментариях не считаем).
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    for (const bare of ["currentPreset", "settings"]) {
+      assert.ok(!new RegExp("(^|[^\\w$.\"'])" + bare + "\\b").test(code), "модуль читает оболочку напрямую: " + bare);
+    }
+    for (const foreign of ["SettingsPanel.", "SidePanel.", "ProjectPanel.", "DevRun."]) {
+      assert.ok(code.indexOf(foreign) === -1, "модуль зовёт " + foreign + " напрямую вместо get*()");
+    }
+    assert.ok(!/localStorage|\bwindow\.api\b/.test(code), "модуль лезет в чужие глобалы");
+
+    // Проводка: панели объявлены НИЖЕ, поэтому внутрь идут только отложенные стрелки.
+    const wiring = uiFind("  const G4fPanel = window.G4fPanel({", "\n  const uid = () =>").code;
+    for (const dep of [
+      "$: $,", "api: api,", "isElectron: isElectron,", "G4F_PROVIDERS: G4F_PROVIDERS,", "URL_INPUT: URL_INPUT,",
+      "getPreset: () => currentPreset,", "getSettingsPanel: () => SettingsPanel,", "getSidePanel: () => SidePanel,",
+      "getProjectPanel: () => ProjectPanel,", "getDevRun: () => DevRun,",
+    ]) {
+      assert.ok(wiring.includes(dep), "в проводку не передан " + dep);
+    }
+  });
+
+  await test("выбор провайдера G4F: список, поиск, выбор провайдера и его моделей", async () => {
+    const env = buildG4f();
+    assert.deepStrictEqual(env.exports, ["probeG4fPort", "renderG4fProviderList", "wireG4fProviderPicker"],
+      "наружу торчит лишнее или чего-то не хватает: " + env.exports.join(", "));
+    const list = env.$("g4f-provider-list");
+    const status = env.$("g4f-provider-status");
+
+    env.panel.renderG4fProviderList();
+    assert.strictEqual(list.children.length, 3, "показаны не все провайдеры: " + list.children.length);
+    assert.ok(/Провайдеров G4F: 3/.test(status.textContent), "итог по провайдерам не показан: " + status.textContent);
+    assert.strictEqual(status.className, "gh-repos-status", "успешный итог помечен как ошибка");
+    assert.ok(/★/.test(list.children[1].innerHTML) && /◆/.test(list.children[2].innerHTML), "стабильные провайдеры не отличаются значком");
+    assert.ok(/\[DeepSeek\]/.test(list.children[1].innerHTML), "имя провайдера не погашено");
+    assert.ok(/repo-test-btn/.test(list.children[1].innerHTML), "у провайдера нет кнопки теста");
+
+    // Подсвечен ВЫБРАННЫЙ провайдер — по полю модели, а не «первый в списке».
+    env.$("s-openai-model").value = "DeepSeek:DeepSeek-V3";
+    env.panel.renderG4fProviderList();
+    assert.ok(list.children[1].classList.contains("selected"), "выбранный провайдер не подсвечен");
+    assert.ok(!list.children[2].classList.contains("selected"), "подсветился чужой провайдер");
+
+    // Поиск: по имени, по описанию и «ничего не найдено».
+    env.$("s-openai-model").value = "";
+    env.panel.wireG4fProviderPicker();
+    const search = env.$("g4f-provider-search");
+    const clear = env.$("g4f-provider-clear");
+    search.value = "chat";
+    search.listeners.input();
+    assert.strictEqual(list.children.length, 1, "поиск по имени не сузил список: " + list.children.length);
+    assert.ok(!clear.classList.contains("hidden"), "кнопка очистки поиска не показалась");
+    search.value = "без ключа";
+    search.listeners.input();
+    assert.strictEqual(list.children.length, 1, "поиск по описанию не сработал: " + list.children.length);
+    assert.ok(/\[стабильный, без ключа\]/.test(list.children[0].innerHTML), "нашёлся не тот провайдер");
+    search.value = "яяя";
+    search.listeners.input();
+    assert.strictEqual(list.children.length, 0, "мусорный поиск что-то оставил: " + list.children.length);
+    assert.ok(/ничего не найдено/.test(status.textContent), "пустой поиск не объяснён: " + status.textContent);
+    assert.ok(/err/.test(status.className), "пустой поиск не помечен как проблема");
+    search.listeners.keydown({ key: "Escape" });
+    assert.strictEqual(search.value, "", "Escape не очистил поиск");
+    assert.strictEqual(list.children.length, 3, "Escape не вернул полный список");
+
+    // Клик по провайдеру: маршрут «Провайдер:», подсказки, тихая подгрузка, сообщение.
+    const deepseek = [...list.children][1];
+    deepseek.onclick();
+    assert.strictEqual(env.$("s-openai-model").value, "DeepSeek:", "маршрут «Провайдер:» не вставлен");
+    assert.ok(env.$("s-openai-model").focused > 0, "поле модели не получило фокус");
+    assert.deepStrictEqual(env.calls.hints[env.calls.hints.length - 1], { p: "openai", list: ["DeepSeek-V3", "DeepSeek-R1"] },
+      "модели провайдера не подсказаны");
+    assert.ok(/выбран/.test(env.calls.msgs[env.calls.msgs.length - 1].text), "о выборе провайдера не сказано");
+    assert.strictEqual(env.calls.msgs[env.calls.msgs.length - 1].err, false, "выбор провайдера помечен ошибкой");
+    assert.strictEqual(env.calls.tested.length, 0, "выбор провайдера сам по себе что-то тестировал");
+
+    // Модели от живого g4f: реестровые первыми, алиасы с префиксом, дубликаты убраны.
+    env.resolve(["DeepSeek-V3", "ChatGpt:gpt-4o", "Qwen2.5", "ChatGpt:gpt-4o"]);
+    await tick();
+    await tick();
+    const merged = env.calls.hints[env.calls.hints.length - 1].list;
+    assert.deepStrictEqual(plain(merged), ["DeepSeek-V3", "DeepSeek-R1", "DeepSeek:DeepSeek-V3", "ChatGpt:gpt-4o", "DeepSeek:Qwen2.5"],
+      "живой список слит неверно: " + JSON.stringify(merged));
+    assert.ok(/5 моделей/.test(env.calls.msgs[env.calls.msgs.length - 1].text),
+      "число моделей не названо: " + env.calls.msgs[env.calls.msgs.length - 1].text);
+
+    // Молчащий g4f: остаются офлайн-подсказки провайдера, лишних сообщений нет.
+    const quiet = buildG4f();
+    quiet.panel.renderG4fProviderList();
+    quiet.$("g4f-provider-list").children[1].onclick();
+    const msgsBefore = quiet.calls.msgs.length;
+    quiet.resolve([]);
+    await tick();
+    await tick();
+    assert.deepStrictEqual(quiet.calls.hints[quiet.calls.hints.length - 1].list, ["DeepSeek-V3", "DeepSeek-R1"],
+      "без ответа g4f подсказки провайдера потерялись");
+    assert.strictEqual(quiet.calls.msgs.length, msgsBefore, "молчащий g4f показал сообщение об ошибке");
+
+    // Поздний ответ от прошлого провайдера не подменяет список текущего.
+    const race = buildG4f();
+    race.panel.renderG4fProviderList();
+    race.$("g4f-provider-list").children[1].onclick();
+    race.$("g4f-provider-list").children[2].onclick();
+    const hintsBefore = race.calls.hints.length;
+    race.resolve(["Qwen2.5"], 0); // ответ для первого (DeepSeek)
+    await tick();
+    await tick();
+    assert.strictEqual(race.calls.hints.length, hintsBefore, "поздний ответ чужого провайдера применён");
+  });
+
+  await test("выбор провайдера G4F: авто-режим, тест провайдера и подбор порта", async () => {
+    // «default» — авто-режим: в поле «default», моделей провайдера не подсказываем.
+    const auto = buildG4f();
+    auto.panel.renderG4fProviderList();
+    auto.calls.hints.length = 0;
+    auto.$("g4f-provider-list").children[0].onclick();
+    assert.strictEqual(auto.$("s-openai-model").value, "default", "авто-режим не вставился в поле модели");
+    assert.deepStrictEqual(auto.calls.hints, [{ p: "openai", list: null }], "авто-режим показал модели провайдера");
+    assert.ok(/Авто-режим/.test(auto.calls.msgs[auto.calls.msgs.length - 1].text), "авто-режим не объяснён");
+    assert.strictEqual(auto.pending.length, 0, "авто-режим зря пошёл за списком моделей");
+
+    // Полный тест провайдера: консоль, строки логов с видами, вердикт.
+    const env = buildG4f({ testResult: { log: [{ level: "info", text: "запрос к провайдеру" }, { level: "ok", text: "ответ получен" }, { level: "err", text: "сбой вызова" }] } });
+    env.$("s-openai-url").value = "http://localhost:1337/v1";
+    env.panel.renderG4fProviderList();
+    const btn = env.$("g4f-provider-list").children[1].queried[".repo-test-btn"];
+    assert.ok(btn, "у строки провайдера не нашлась кнопка теста");
+    let stopped = 0;
+    btn.onclick({ stopPropagation: () => stopped++ });
+    assert.strictEqual(stopped, 1, "клик по кнопке теста не остановлен — он бы ещё и выбрал провайдера");
+    assert.strictEqual(env.calls.console[0], "tab:console", "тест не открыл консоль правой панели");
+    assert.ok(/Тест провайдера/.test(env.calls.console[1]), "в консоли нет строки о начале теста");
+    await tick();
+    await tick();
+    assert.strictEqual(env.calls.tested.length, 1, "главный процесс не получил запрос на тест");
+    assert.deepStrictEqual(plain(env.calls.tested[0]), { url: "http://localhost:1337/v1", provider: "DeepSeek", model: "DeepSeek-V3" },
+      "тест ушёл с неверными данными: " + JSON.stringify(env.calls.tested[0]));
+    assert.strictEqual(env.calls.server.length, 3, "строки логов не выведены в консоль: " + env.calls.server.length);
+    assert.ok(/ts-info/.test(env.calls.server[0]) && /ts-ok/.test(env.calls.server[1]) && /ts-err/.test(env.calls.server[2]),
+      "виды строк логов не различаются");
+    assert.ok(/есть проблемы/.test(env.calls.msgs[env.calls.msgs.length - 1].text), "вердикт с ошибками не вынесен");
+    assert.strictEqual(env.calls.msgs[env.calls.msgs.length - 1].err, true, "провальный тест не помечен ошибкой");
+
+    // Успех и вовсе без ответов — свои формулировки, а не «всё хорошо» по умолчанию.
+    const okEnv = buildG4f({ testResult: { log: [{ level: "ok", text: "ответ" }] } });
+    okEnv.panel.renderG4fProviderList();
+    okEnv.$("g4f-provider-list").children[1].queried[".repo-test-btn"].onclick({ stopPropagation() {} });
+    const emptyEnv = buildG4f({ testResult: { log: [] } });
+    emptyEnv.panel.renderG4fProviderList();
+    emptyEnv.$("g4f-provider-list").children[1].queried[".repo-test-btn"].onclick({ stopPropagation() {} });
+    await tick();
+    await tick();
+    assert.ok(/отвечает/.test(okEnv.calls.msgs[okEnv.calls.msgs.length - 1].text), "успешный тест не подтверждён");
+    assert.ok(/ответов нет/.test(emptyEnv.calls.msgs[emptyEnv.calls.msgs.length - 1].text), "пустой ответ не назван своим словом");
+
+    // В браузере тест честно недоступен: в главный процесс ничего не уходит.
+    const web = buildG4f({ isElectron: false });
+    web.$("s-openai-url").value = "http://localhost:1337";
+    await web.panel.probeG4fPort();
+    assert.strictEqual(web.calls.probed.length, 0, "в браузере подбор порта всё-таки пошёл");
+    web.panel.renderG4fProviderList();
+    web.$("g4f-provider-list").children[1].queried[".repo-test-btn"].onclick({ stopPropagation() {} });
+    await tick();
+    await tick();
+    assert.strictEqual(web.calls.tested.length, 0, "в браузере тест всё-таки ушёл в главный процесс");
+    assert.ok(/ПК/.test(web.calls.msgs[web.calls.msgs.length - 1].text), "нет честного отказа в веб-режиме: " + web.calls.msgs[web.calls.msgs.length - 1].text);
+    assert.ok(/десктоп/.test(web.calls.server[web.calls.server.length - 1]), "в консоль не сказано, что тест только на ПК");
+
+    // Подбор порта: свой localhost подменяется, чужой адрес — только предупреждение.
+    const local = buildG4f({ probeResult: { ok: true, base: "http://localhost:1337" } });
+    local.$("s-openai-url").value = "http://localhost:8080/";
+    await local.panel.probeG4fPort();
+    assert.strictEqual(local.$("s-openai-url").value, "http://localhost:1337", "живой порт G4F не подставлен");
+    assert.ok(/URL обновлён/.test(local.calls.msgs[0].text), "о подборе порта не сказано: " + local.calls.msgs[0].text);
+
+    const remote = buildG4f({ probeResult: { ok: true, base: "http://localhost:1337" } });
+    remote.$("s-openai-url").value = "http://192.168.1.5:1337";
+    await remote.panel.probeG4fPort();
+    assert.strictEqual(remote.$("s-openai-url").value, "http://192.168.1.5:1337", "чужой адрес перезаписан автоматически");
+    assert.ok(/если это не тот адрес/.test(remote.calls.msgs[0].text), "про несовпадение адреса не сказано");
+
+    const same = buildG4f({ probeResult: { ok: true, base: "http://localhost:1337" } });
+    same.$("s-openai-url").value = "http://localhost:1337";
+    await same.panel.probeG4fPort();
+    assert.strictEqual(same.calls.msgs.length, 0, "сообщение показано без повода");
+    assert.strictEqual(same.calls.probed.length, 1, "подбор порта ушёл не одним запросом");
+
+    // Молчащий сервер (запрос упал) — тоже без сообщений: это фоновая проверка.
+    const dead = buildG4f({ api: { g4fProbe: async () => { throw new Error("сервер молчит"); } } });
+    dead.$("s-openai-url").value = "http://localhost:8080";
+    await dead.panel.probeG4fPort();
+    assert.strictEqual(dead.calls.msgs.length, 0, "молчащий сервер напугал пользователя сообщением");
+  });
+
+  await test("выбор провайдера G4F: блок по пресету, аккордеон и поиск подключены", async () => {
+    const env = buildG4f();
+    env.panel.wireG4fProviderPicker();
+    const box = env.$("g4f-provider-box");
+    const body = env.$("g4f-provider-body");
+    const chev = env.$("g4f-prov-chev");
+
+    // Чипы пресетов: блок виден только на G4F, и при показе подбирается живой порт.
+    env.chips[2].listeners.click();
+    assert.ok(box.classList.contains("hidden"), "блок провайдеров показан на чужом пресете");
+    env.chips[1].listeners.click();
+    assert.ok(!box.classList.contains("hidden"), "блок провайдеров не показался на G4F");
+    assert.strictEqual(env.calls.probed.length, 1, "при показе блока не подобрался живой порт");
+    // Чаще раза в 30 секунд порт не подбираем — иначе дёргали бы локальный сервер зря.
+    env.chips[2].listeners.click();
+    env.chips[1].listeners.click();
+    assert.strictEqual(env.calls.probed.length, 1, "подбор порта идёт чаще, чем раз в 30 секунд");
+    env.advance(31000);
+    env.chips[2].listeners.click();
+    env.chips[1].listeners.click();
+    assert.strictEqual(env.calls.probed.length, 2, "после 30 секунд подбор порта не повторился");
+
+    // Пресет чипа важнее состояния оболочки: наш слушатель срабатывает раньше SettingsPanel.
+    env.setPreset("openai");
+    env.chips[1].listeners.click();
+    assert.ok(!box.classList.contains("hidden"), "пресет чипа проигнорирован — блок спрятался");
+    env.setPreset("g4f");
+
+    // Открытие окна настроек (наблюдатель за классом) синхронизирует блок.
+    const obs = env.observer();
+    assert.strictEqual(typeof obs, "function", "наблюдатель за открытием настроек не поставлен");
+    box.classList.add("hidden");
+    env.$("settings-overlay").classList.remove("hidden");
+    obs();
+    assert.ok(!box.classList.contains("hidden"), "при открытии настроек блок не показался");
+    box.classList.add("hidden");
+    env.$("settings-overlay").classList.add("hidden");
+    obs();
+    assert.ok(box.classList.contains("hidden"), "на закрытых настройках блок показан");
+
+    // Аккордеон: шапка раскрывает список и меняет стрелку в обе стороны.
+    assert.ok(body.classList.contains("hidden"), "список провайдеров открыт сразу");
+    env.$("g4f-provider-head").onclick();
+    assert.ok(!body.classList.contains("hidden"), "шапка не раскрыла список");
+    assert.strictEqual(chev.textContent, "▾", "стрелка не сменилась на «открыто»: " + chev.textContent);
+    env.$("g4f-provider-head").onclick();
+    assert.ok(body.classList.contains("hidden"), "шапка не свернула список");
+    assert.strictEqual(chev.textContent, "▸", "стрелка не вернулась в «закрыто»: " + chev.textContent);
+
+    // Поиск: ввод сужает список, крестик возвращает полный.
+    const search = env.$("g4f-provider-search");
+    const clear = env.$("g4f-provider-clear");
+    search.value = "deep";
+    search.listeners.input();
+    assert.strictEqual(env.$("g4f-provider-list").children.length, 1, "ввод в поиск не сузил список");
+    clear.onclick();
+    assert.strictEqual(search.value, "", "крестик не очистил поиск");
+    assert.strictEqual(env.$("g4f-provider-list").children.length, 3, "после очистки список не вернулся");
   });
 }
