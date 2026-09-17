@@ -211,6 +211,54 @@ function walk(rel, out) {
     assert.ok(checkedCalls > 50, "вызовов модулей проверено подозрительно мало: " + checkedCalls);
   });
 
+  await test("проводки модулей не читают модуль, объявленный ниже (окно падает на загрузке)", () => {
+    // Почему: зависимости проводки вычисляются на загрузке окна. Если внутри блока
+    // `const Panel = window.Panel({ ... })` прочитать модуль, объявленный НИЖЕ, окно
+    // падает с «Cannot access before initialization» — и весь остаток загрузки (в том
+    // числе подписка на события агента) не выполняется. Именно так дважды подряд падал
+    // вынос панели настроек: сначала SettingsPanel, потом YcPanel.
+    const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    const lines = appSrc.split("\n");
+    const decl = new Map(); // имя модуля → номер строки объявления
+    lines.forEach((l, i) => {
+      const m = /^  const ([A-Za-z_$][\w$]*) = window\.[A-Za-z_$][\w$]*\(\{/.exec(l);
+      if (m) decl.set(m[1], i + 1);
+    });
+    assert.ok(decl.size > 10, "не нашёл объявления модулей в app.js: " + decl.size);
+
+    let checked = 0;
+    for (const [name, start] of decl) {
+      let end = start;
+      if (!/\}\);\s*$/.test(lines[start - 1])) {
+        for (let i = start; i < lines.length; i++) {
+          if (/^  \}\);/.test(lines[i])) { end = i + 1; break; }
+        }
+      }
+      assert.ok(end >= start, name + ": не нашёл конец блока проводки");
+      for (let i = start; i < end; i++) { // строка объявления не в счёт: в ней есть и "window." + имя
+        const line = lines[i];
+        if (/^\s*\//.test(line)) continue; // комментарий ничего не читает
+        if (line.indexOf("=>") !== -1) continue; // отложенное чтение — безопасно
+        // Ловим и \`Модуль.метод\`, и прямое чтение значения (\`YcPanel: YcPanel\`): на загрузке
+        // окна оба берут биндинг const, а он ещё не инициализирован. Ключ объекта —
+        // не чтение, поэтому \`Имя:\` пропускаем.
+        for (const m of line.matchAll(/[A-Za-z_$][\w$]*/g)) {
+          const w = m[0];
+          if (!decl.has(w)) continue;
+          if (/^\s*:/.test(line.slice(m.index + w.length))) continue;
+          if (decl.get(w) >= start) {
+            assert.fail(
+              "app.js:" + (i + 1) + " проводка " + name + " читает " + w +
+                " (объявлен строкой " + decl.get(w) + ") — нужна отложенная стрелка"
+            );
+          }
+        }
+      }
+      checked++;
+    }
+    assert.ok(checked > 10, "проводок проверено подозрительно мало: " + checked);
+  });
+
   await test("бюджет прямых чтений app.js в тестах не растёт", () => {
     // Разбор app.js идёт этапами: код уезжает в модули, и проверки должны находить его
     // через uiFile/uiAll/uiFind (test/smoke.test.js). Прямое чтение app.js остаётся

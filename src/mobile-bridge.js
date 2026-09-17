@@ -79,6 +79,8 @@ const STATIC_FILES = new Set([
   "chat-work.js",
   "openai-profiles.js",
   "settings-search.js",
+  "settings-panel.js",
+  "project-panel.js",
   "deploy-panel.css",
 ]);
 

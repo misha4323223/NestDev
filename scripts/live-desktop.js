@@ -812,6 +812,167 @@ function startFakeProvider(seen, rounds, rate, script) {
       if (close) close.click();
       await new Promise((r) => setTimeout(r, 200));
     });
+    console.log("\n[16] Панель настроек: вкладка, пресет и сохранение живут своим модулем");
+    // Этап 3.8, часть 3: вся панель настроек уехала в settings-panel.js. Проверяем её
+    // в НАСТОЯЩЕМ окне и через форму, как человек: открыть, переключить вкладку, выбрать
+    // пресет, вписать значения, сохранить, открыть снова — и посмотреть файл на диске.
+    const panel = await page.evaluate(async () => {
+      const $ = (id) => document.getElementById(id);
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      $("btn-settings").click();
+      await wait(400);
+      const navMemory = document.querySelector('.stab[data-tab="memory"]');
+      const bodyMemory = document.querySelector('.settings-tab-body[data-tab-body="memory"]');
+      const bodyModel = document.querySelector('.settings-tab-body[data-tab-body="model"]');
+      navMemory.click();
+      await wait(250);
+      const switched = {
+        active: navMemory.classList.contains("active"),
+        bodyVisible: !!bodyMemory && !bodyMemory.classList.contains("hidden"),
+        modelHidden: !!bodyModel && bodyModel.classList.contains("hidden"),
+      };
+      // Пресет: клик по чипу подставляет адрес и модель в поля — это работа панели.
+      const chip = document.querySelector('.chip[data-preset="deepseek"]');
+      chip.click();
+      await wait(250);
+      const preset = {
+        url: $("s-openai-url").value,
+        model: $("s-openai-model").value,
+        chipActive: chip.classList.contains("active"),
+      };
+      // Правки в полях + «Сохранить настройки»: форма обязана собрать их в настройки.
+      $("s-openai-url").value = "https://live-panel.example/v1";
+      $("s-openai-model").value = "живая-модель-панели";
+      $("btn-save-settings").click();
+      await wait(800);
+      // Открываем снова: вкладка помнится, поля показывают сохранённое.
+      $("btn-settings").click();
+      await wait(500);
+      return {
+        switched,
+        preset,
+
+        remembered: document.querySelector('.stab[data-tab="memory"]').classList.contains("active"),
+        urlBack: $("s-openai-url").value,
+        modelBack: $("s-openai-model").value,
+        memStatus: ($("memory-status") || {}).textContent || "",
+        toast: Array.from(document.body.children)
+          .map((e) => e.textContent || "")
+          .filter((x) => /Настройки сохранены/.test(x))[0] || "",
+      };
+    });
+    check(
+      "панель настроек: вкладка переключается и прячет чужое тело",
+      panel.switched.active && panel.switched.bodyVisible && panel.switched.modelHidden,
+      JSON.stringify(panel.switched)
+    );
+    check(
+      "пресет подставляет адрес и модель в поля",
+      panel.preset.chipActive && /deepseek\.com/.test(panel.preset.url) && panel.preset.model.length > 0,
+      JSON.stringify(panel.preset)
+    );
+    check(
+      "сохранение прочитало модель из поля и вернуло её при открытии",
+      panel.modelBack === "живая-модель-панели",
+      "в поле: " + panel.modelBack
+    );
+    check("повторное открытие вернулось на запомненную вкладку", panel.remembered, "вкладка «Память» активна: " + panel.remembered);
+    check("человек увидел подтверждение сохранения", /Настройки сохранены/.test(panel.toast), panel.toast || "подтверждения не было");
+    check("вкладка «Память» получила текст от панели", panel.memStatus.length > 0, panel.memStatus.slice(0, 110));
+    // Диск: приложение должно было записать правку в свой settings.json.
+    const settingsFile = path.join(userData, "settings.json");
+    const settingsOnDisk = fs.existsSync(settingsFile) ? JSON.parse(fs.readFileSync(settingsFile, "utf8")) : {};
+    check(
+      "правка поля доехала до файла настроек",
+      settingsOnDisk.openaiUrl === "https://live-panel.example/v1",
+      "в файле: " + (settingsOnDisk.openaiUrl || "нет")
+    );
+
+    console.log("\n[17] Панель проекта: дерево, вкладки и правка файла живут своим модулем");
+    // Этап 7: панель проекта уехала в project-panel.js. Структурные наборы такую поломку
+    // не видят (проводка есть, а окно её не выполнило) — проверяем в НАСТОЯЩЕМ окне:
+    // файл на диске, дерево, вкладки, открытие файла, правка и сохранение.
+    const livePanelFile = path.join(workDir, "live-panel.txt");
+    fs.writeFileSync(livePanelFile, "первый вариант\n");
+    fs.mkdirSync(path.join(workDir, "live-folder"), { recursive: true });
+    const livePanel = await page.evaluate(async () => {
+      const $ = (id) => document.getElementById(id);
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      const tab = (name) => Array.from(document.querySelectorAll(".panel-tab")).filter((b) => b.dataset.tab === name)[0];
+      const rows = () => Array.from(document.querySelectorAll("#tree .tree-row"));
+      const nameOf = (r) => ((r.querySelector(".tree-name") || {}).textContent || "");
+      if ($("project-panel").classList.contains("hidden")) $("btn-toggle-panel").click();
+      await wait(400);
+      const open = !$("project-panel").classList.contains("hidden");
+
+      tab("changes").click();
+      await wait(500);
+      const changesTab = {
+        files: $("panel-files").classList.contains("hidden"),
+        changes: $("panel-changes").classList.contains("hidden"),
+        summary: ($("changes-summary") || {}).textContent || "",
+      };
+      tab("commits").click();
+      await wait(600);
+      const commitsTab = {
+        commits: $("panel-commits").classList.contains("hidden"),
+        text: ($("commit-summary") || {}).textContent || "",
+      };
+      tab("files").click();
+      await wait(700);
+      let names = rows().map(nameOf);
+      let row = rows().filter((r) => nameOf(r) === "live-panel.txt")[0];
+      if (!row) {
+        $("btn-panel-refresh").click();
+        await wait(700);
+        names = rows().map(nameOf);
+        row = rows().filter((r) => nameOf(r) === "live-panel.txt")[0];
+      }
+      if (row) row.click();
+      await wait(800);
+      const opened = {
+        overlay: !$("file-overlay").classList.contains("hidden"),
+        path: $("file-path").textContent,
+        body: ($("file-content") || {}).textContent || "",
+        canEdit: !$("btn-file-edit").classList.contains("hidden"),
+        tabs: Array.from(document.querySelectorAll("#file-tabs > *")).map((t) => t.textContent),
+      };
+      // Правка: панель обязана открыть редактор и сохранить текст на диск.
+      $("btn-file-edit").click();
+      await wait(500);
+      const editor = $("file-editor");
+      if (editor) {
+        editor.value = "второй вариант — правка из окна\n";
+        editor.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      const saveVisible = !$("btn-file-save").classList.contains("hidden");
+      if (saveVisible) $("btn-file-save").click();
+      await wait(800);
+      const afterSave = { editorWas: !!editor, saveVisible: saveVisible, toolbar: ($("file-path") || {}).textContent || "" };
+      $("btn-file-close").click();
+      await wait(300);
+      return {
+        open: open, names: names, changesTab: changesTab, commitsTab: commitsTab,
+        opened: opened, afterSave: afterSave,
+        closed: $("file-overlay").classList.contains("hidden"),
+      };
+    });
+    check("панель проекта открывается и показывает дерево рабочей папки", livePanel.open && livePanel.names.includes("live-panel.txt"), "в дереве: " + livePanel.names.join(", "));
+    check(
+      "вкладки панели переключают тела (изменения и коммиты)",
+      livePanel.changesTab.files && !livePanel.changesTab.changes && !livePanel.commitsTab.commits,
+      JSON.stringify({ changes: livePanel.changesTab, commits: livePanel.commitsTab })
+    );
+    check(
+      "файл открывается в окне своим путём и содержимым",
+      livePanel.opened.overlay && /live-panel\.txt$/.test(livePanel.opened.path) && /первый вариант/.test(livePanel.opened.body) && livePanel.opened.canEdit,
+      JSON.stringify({ path: livePanel.opened.path, body: livePanel.opened.body.slice(0, 40), edit: livePanel.opened.canEdit })
+    );
+    check("вкладка открытого файла показывает имя", livePanel.opened.tabs.some((t) => /live-panel\.txt/.test(t)), livePanel.opened.tabs.join(" / "));
+    check("кнопка правки открывает редактор файла", livePanel.afterSave.editorWas && livePanel.afterSave.saveVisible, JSON.stringify(livePanel.afterSave));
+    const savedOnDisk = fs.existsSync(livePanelFile) ? fs.readFileSync(livePanelFile, "utf8") : "";
+    check("правка из окна доехала до файла на диске", /второй вариант/.test(savedOnDisk), JSON.stringify(savedOnDisk.slice(0, 60)));
+    check("окно просмотра файла закрывается", livePanel.closed, "overlay hidden: " + livePanel.closed);
   } catch (e) {
     check("сквозной прогон без исключений", false, e.message);
   } finally {

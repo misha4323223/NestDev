@@ -1865,10 +1865,10 @@ async function testAgentCore() {
     assert.ok(/Buffer\.from\(img\.b64, "base64"\)/.test(mainSrc), "main.js не пишет файл из base64");
     assert.ok(/провайдер: " \+ img\.label/.test(mainSrc), "в отчёте агента нет определённого провайдера");
     assert.ok(/Тип подключения приложение определяет по адресу само/.test(mainSrc), "ошибка не объясняет автоопределение");
-    const appSrc2 = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
     const htmlSrc2 = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     assert.ok(/id="vision-detect-hint"/.test(htmlSrc2), "нет строки «определено» в настройках");
-    assert.ok(/AgentCore\.imageProviderLabel\(url\)/.test(appSrc2), "настройки не показывают определённого провайдера");
+    // Строку «определено» рисует панель настроек (app.js: window.SettingsPanel).
+    assert.ok(/AgentCore\.imageProviderLabel\(url\)/.test(uiFile("settings-panel.js")), "настройки не показывают определённого провайдера");
     // Генерация изображений живёт в отдельном модуле (agent-core только раздаёт её наружу).
     const imgSrc2 = fs.readFileSync(path.join(ROOT, "src", "renderer", "image-tools.js"), "utf8");
     // Прокси браузерного режима ждёт «/api/llm/<кодированная база>/<путь>»: если закодировать
@@ -3536,7 +3536,7 @@ async function testMobilePanel() {
     }
     const wiring = appSrc.slice(appSrc.indexOf("window.MobilePanel({"));
     const wiringCall = wiring.slice(0, wiring.indexOf("});"));
-    for (const dep of ["$: $", "api: api", "isElectron: isElectron", "getSettings: () => settings", "setSettingsMsg: setSettingsMsg"]) {
+    for (const dep of ["$: $", "api: api", "isElectron: isElectron", "getSettings: () => settings", "setSettingsMsg: SettingsPanel.setSettingsMsg"]) {
       assert.ok(wiringCall.includes(dep), "в проводку панели не передан " + dep);
     }
     // Границы модуля: настройки только через getSettings(), в чужие глобалы не лезем.
@@ -3729,7 +3729,7 @@ async function testSessionExtras() {
   });
 
   // Отрисовку индикатора берём как реальный код из app.js и подставляем простой DOM.
-  const ctxSlice = uiFind("  function fmtTokens(n) {", "  // Состояние постоянного профиля браузера");
+  const ctxSlice = uiFind("  function fmtTokens(n) {", "  function fmtClock(ts) {");
   assert.ok(ctxSlice.start > 0, "не нашёл функции индикатора контекста в интерфейсе");
   const ctxMod = new Function(
     "$",
@@ -3814,7 +3814,7 @@ async function testSessionExtras() {
       "s-browser-connect", "s-browser-connect-port", "btn-browser-connect", "browser-connect-info",
     ]) {
       assert.ok(htmlSrc.includes('id="' + id + '"'), "нет id=" + id + " в index.html");
-      assert.ok(appSrc.includes('"' + id + '"'), "нет ссылки на " + id + " в app.js");
+      assert.ok(uiAll().includes('"' + id + '"'), "нет ссылки на " + id + " в интерфейсе");
     }
     assert.ok(preSrc.includes('"browser:profileInfo"'), "нет канала browser:profileInfo");
     assert.ok(preSrc.includes('"browser:clearProfile"'), "нет канала browser:clearProfile");
@@ -4577,8 +4577,8 @@ async function testMail() {
     for (const id of ["s-mail-address", "s-mail-pass", "s-mail-imap-host", "s-mail-smtp-host", "s-mail-allow-send", "btn-mail-test"]) {
       assert.ok(html.includes('id="' + id + '"'), "в index.html нет " + id);
     }
-    const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
-    assert.ok(app.includes('settings.mailAddress = $("s-mail-address")'), "app.js не сохраняет адрес почты");
+    // Сбор полей настроек живёт в панели настроек (app.js: window.SettingsPanel).
+    assert.ok(uiFile("settings-panel.js").includes('getSettings().mailAddress = $("s-mail-address")'), "настройки не сохраняют адрес почты");
     assert.ok(uiAll().includes("mailDoTest") && uiAll().includes("mailFillServers"), "в интерфейсе нет логики почты");
   });
 }
@@ -4899,7 +4899,8 @@ async function testYandexCloud() {
     assert.ok(!/function ycLoadDashboard|const YC_CREATABLE/.test(appSrc), "код панели остался в app.js");
     assert.ok(/const YcPanel = window\.YcPanel\(\{/.test(appSrc), "app.js не собирает панель");
     for (const dep of ["$: $", "api: api", "isElectron: isElectron", "toast: toast", "termAppend: termAppend",
-      "confirmModal: confirmModal", "inputDialog: inputDialog", "openSettings: openSettings",
+      "confirmModal: (...a) => ProjectPanel.confirmModal(...a)",
+      "inputDialog: (...a) => ProjectPanel.inputDialog(...a)", "openSettings: SettingsPanel.openSettings",
       "openSidePanel: openSidePanel", "getSettings: () => settings"]) {
       assert.ok(appSrc.includes(dep), "в проводку панели не передан " + dep);
     }
@@ -6025,9 +6026,10 @@ async function testShellAndCdp() {
     assert.ok(/browserConnect === true/.test(mainFull), "настройка не читается");
     for (const id of ["s-browser-connect", "s-browser-connect-port", "btn-browser-connect", "browser-connect-info"]) {
       assert.ok(html2.includes('id="' + id + '"'), "нет id=" + id + " в index.html");
-      assert.ok(app2.includes('"' + id + '"'), "app.js не ссылается на " + id);
+      assert.ok(uiAll().includes('"' + id + '"'), "интерфейс не ссылается на " + id);
     }
-    assert.ok(app2.includes("settings.browserConnect = !!$(\"s-browser-connect\").checked"), "настройка не сохраняется");
+    // Сохранение настройки живёт в панели настроек (app.js: window.SettingsPanel).
+    assert.ok(uiFile("settings-panel.js").includes('getSettings().browserConnect = !!$("s-browser-connect").checked'), "настройка не сохраняется");
     assert.ok(app2.includes("api.browserConnect({ port })"), "кнопка не вызывает подключение");
   });
 }
@@ -6040,7 +6042,8 @@ async function testContextMemory() {
   const coreSrc = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
   const preloadSrc = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
   const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
-  const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+  // Настройки памяти читаем в панели настроек, а не в оболочке (app.js: window.SettingsPanel).
+  const panelSrc = uiFile("settings-panel.js");
 
   await test("память: выключено по умолчанию, инструменты, IPC и UI на месте", () => {
     assert.ok(/contextMemory: false,/.test(mainSrc), "нет contextMemory: false (должно быть выключено по умолчанию)");
@@ -6060,8 +6063,8 @@ async function testContextMemory() {
     assert.ok(/memory_list: "memoryList"/.test(coreSrc), "нет алиасов инструментов");
     assert.ok(htmlSrc.includes('id="s-context-memory"'), "нет галочки в настройках");
     assert.ok(htmlSrc.includes('data-tab="memory"') && htmlSrc.includes('data-tab-body="memory"'), "нет вкладки настроек");
-    assert.ok(appSrc.includes('settings.contextMemory = !!$("s-context-memory").checked'), "галочка не сохраняется");
-    assert.ok(appSrc.includes("renderMemoryStatus"), "нет отображения статуса памяти");
+    assert.ok(panelSrc.includes('getSettings().contextMemory = !!$("s-context-memory").checked'), "галочка не сохраняется");
+    assert.ok(panelSrc.includes("renderMemoryStatus"), "нет отображения статуса памяти");
   });
 
   await test("память: сохранение, список дней, чтение и поиск", () => {
@@ -7965,7 +7968,7 @@ async function testOtaCodeVersion() {
 
     // 3. Панель показывает версию кода отдельно от номера набора и не молчит про пустые источники.
     const panel = uiFind("  async function renderOtaStatus() {");
-    assert.ok(/sbVersion = code \|\| "базовая"/.test(panel.code), "строка состояния не показывает версию кода");
+    assert.ok(/setSbVersion\(code \|\| "базовая"\)/.test(panel.code), "строка состояния не получает версию кода");
     assert.ok(/применён набор/.test(panel.code), "панель не различает номер набора и версию кода");
     assert.ok(/Источников обновлений нет/.test(panel.code), "панель молчит, когда папок-источников нет");
     assert.ok(/st\.candidate/.test(panel.code), "панель не говорит, что за обновление доступно");
@@ -9524,7 +9527,7 @@ async function testPromptCacheAndUsage() {
     assert.ok(/probeLocalModel: invoke\("ai:probeLocal"\)/.test(mobileSrc), "нет метода в мобильном API");
     const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
     assert.ok(/\$\("btn-probe-ollama"\)\.onclick/.test(appSrc), "кнопка замера не подключена");
-    assert.ok(/AgentCore\.probeLocalModel\(cfg, \{ fromBrowser: true \}\)/.test(appSrc), "в веб-превью замер недоступен");
+    assert.ok(/AgentCore\.probeLocalModel\(cfg, \{ fromBrowser: true \}\)/.test(uiFile("settings-panel.js")), "в веб-превью замер недоступен");
     const htmlSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     assert.ok(/id="ollama-probe-result"/.test(htmlSrc), "нет блока отчёта в настройках");
   });
@@ -9793,8 +9796,8 @@ async function testToolRouter() {
     assert.ok(/const forceAllTools = !!settings\.sendAllTools;/.test(mainSrc), "настройка не читается агентом");
     assert.ok(/if \(o\.forceAll\)/.test(coreSrc), "forceAll не поддерживается роутером");
     assert.ok(/id="s-send-all-tools"/.test(htmlSrc), "нет чекбокса в настройках");
-    assert.ok(/settings\.sendAllTools = !!\$\("s-send-all-tools"\)\.checked;/.test(appSrc), "чекбокс не сохраняется");
-    assert.ok(/\$\("s-send-all-tools"\)\.checked = !!settings\.sendAllTools;/.test(appSrc), "чекбокс не восстанавливается");
+    assert.ok(/getSettings\(\)\.sendAllTools = !!\$\("s-send-all-tools"\)\.checked;/.test(uiFile("settings-panel.js")), "чекбокс не сохраняется");
+    assert.ok(/\$\("s-send-all-tools"\)\.checked = !!getSettings\(\)\.sendAllTools;/.test(uiFile("settings-panel.js")), "чекбокс не восстанавливается");
     // Метрика раунда говорит, сколько групп ушло и что срезано.
     assert.ok(/· групп " \+ routeInfo\.groups\.length/.test(mainSrc), "метрика без числа групп");
     assert.ok(/срезано: " \+ routeInfo\.dropped\.join/.test(mainSrc), "метрика молчит о срезанных группах");
@@ -10133,8 +10136,8 @@ async function testOllamaWindow() {
       const ctxSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "context-window.js"), "utf8");
       assert.ok(htmlSrc.indexOf('id="s-no-tools-model"') !== -1, "галочки нет в настройках");
       assert.ok(/^    noToolsModel: false,/m.test(appSrc), "у настройки нет значения по умолчанию");
-      assert.ok(/if \(\$\("s-no-tools-model"\)\) \$\("s-no-tools-model"\)\.checked = !!settings\.noToolsModel;/.test(appSrc), "галочка не читается из настроек");
-      assert.ok(/if \(\$\("s-no-tools-model"\)\) settings\.noToolsModel = !!\$\("s-no-tools-model"\)\.checked;/.test(appSrc), "галочка не сохраняется");
+      assert.ok(/if \(\$\("s-no-tools-model"\)\) \$\("s-no-tools-model"\)\.checked = !!getSettings\(\)\.noToolsModel;/.test(uiFile("settings-panel.js")), "галочка не читается из настроек");
+      assert.ok(/if \(\$\("s-no-tools-model"\)\) getSettings\(\)\.noToolsModel = !!\$\("s-no-tools-model"\)\.checked;/.test(uiFile("settings-panel.js")), "галочка не сохраняется");
       assert.ok(/const noTools = noToolsDetected \|\| !!settings\.noToolsModel;/.test(mainSrc), "настройка не влияет на протокол вызовов");
       // Сжатие контекста тоже знает про местный сервер: на CPU это минуты, а не 30 с.
       assert.ok(/const slowLocal = !!\(o\.local \|\| provider === "ollama"\);/.test(ctxSrc), "сжатие у местного сервера уходит в облачный таймаут");
@@ -10324,7 +10327,7 @@ async function testSettingsRedesign() {
 
   await test("настройки: вкладка запоминается, клик по кнопке не передаёт событие", () => {
     assert.ok(appSrc.includes("let lastSettingsTab"), "вкладка не запоминается");
-    assert.ok(appSrc.includes('showSettingsTab(tab || lastSettingsTab || "model")'), "открытие настроек не восстанавливает вкладку");
+    assert.ok(uiFile("settings-panel.js").includes('showSettingsTab(tab || getLastTab() || "model")'), "открытие настроек не восстанавливает вкладку");
     assert.ok(appSrc.includes('openSettings("model")'), "«выбрать модель» не ведёт на вкладку модели");
     assert.ok(!appSrc.includes('$("btn-settings").onclick = openSettings;'), "клик по кнопке настроек передаёт событие как вкладку");
     assert.ok(!appSrc.includes('$("btn-model-needed").onclick = openSettings;'), "кнопка «выбрать модель» передаёт событие как вкладку");
@@ -10526,6 +10529,435 @@ function miniDom() {
   };
 }
 
+
+// ── Панель настроек (этап 3.8, часть 3) ─────────────────────────────────────
+// Модуль берём с диска целиком и собираем ТОЙ ЖЕ фабрикой, что и приложение:
+// проверяются настоящие поля, вкладки и сохранение, а не вырезка из app.js.
+function fakeEl(id) {
+  const cls = new Set();
+  return {
+    id: id,
+    value: "",
+    checked: false,
+    textContent: "",
+    innerHTML: "",
+    type: "password",
+    style: {},
+    className: "",
+    title: "",
+    classList: {
+      add: (...cs) => cs.forEach((c) => cls.add(c)),
+      remove: (...cs) => cs.forEach((c) => cls.delete(c)),
+      contains: (c) => cls.has(c),
+      toggle: (c, on) => {
+        const want = on === undefined ? !cls.has(c) : !!on;
+        if (want) cls.add(c);
+        else cls.delete(c);
+        return want;
+      },
+    },
+    appendChild() {},
+    setAttribute() {},
+    addEventListener() {},
+    querySelector: () => null,
+    querySelectorAll: () => [],
+  };
+}
+
+// ── Панель проекта (этап 7) ──────────────────────────────────────────────────
+// Модуль берём с диска целиком и собираем ТОЙ ЖЕ фабрикой, что и приложение:
+// проверяется, что он поднимается на одних объявленных зависимостях (пропущенная
+// зависимость — это ReferenceError на загрузке окна, и окно останется пустым).
+function panelDom() {
+  const el = {
+    id: "", value: "", checked: false, textContent: "", innerHTML: "", className: "", title: "",
+    type: "text", src: "", alt: "", scrollTop: 0, scrollHeight: 0, firstChild: null,
+    children: [], parentNode: null, files: null, dataset: {}, style: {},
+    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    appendChild: () => el, insertBefore: () => el, removeChild: () => el, remove: () => el,
+    setAttribute: () => el, removeAttribute: () => el, getAttribute: () => null,
+    addEventListener: () => el, removeEventListener: () => el, dispatchEvent: () => true,
+    querySelector: () => panelDom(), querySelectorAll: () => [],
+    closest: () => null, matches: () => false, contains: () => false,
+    focus() {}, select() {}, click() {}, blur() {},
+    getBoundingClientRect: () => ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 }),
+  };
+  return el;
+}
+
+async function testProjectPanel() {
+  const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "project-panel.js"), "utf8");
+  const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+  const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+
+  await test("панель проекта: модуль на месте, оболочка только собирает его", () => {
+    // 1. Разметка грузит модуль раньше app.js; телефон получает тот же файл.
+    const iTag = html.indexOf('src="project-panel.js"');
+    assert.ok(iTag > 0, "разметка не грузит project-panel.js");
+    assert.ok(iTag < html.indexOf('src="app.js"'), "project-panel.js подключён после app.js");
+    assert.ok(
+      /"project-panel\.js"/.test(fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8")),
+      "мост не отдаёт модуль телефону"
+    );
+
+    // 2. В app.js не осталось кода панели — только сборка модуля с зависимостями.
+    for (const gone of [
+      "function refreshTree", "function loadChildren", "function buildTreeEntry",
+      "function renderFileEditor", "function saveEditedFile", "function renderFileTabs",
+      "function buildCommitRow", "function showDiff", "function doCommit",
+      "function openPublishDialog", "function initProjectDnD", "function fetchRepos",
+      "function wireGithubEvents", "function connectGithub",
+    ]) {
+      assert.ok(appSrc.indexOf(gone) === -1, "код панели остался в app.js: " + gone);
+    }
+    assert.ok(/const ProjectPanel = window\.ProjectPanel\(\{/.test(appSrc), "app.js не собирает панель проекта");
+
+    // 3. Живые зависимости. Настройки грузятся и сохраняются ЦЕЛИКОМ, поэтому внутрь
+    //    идёт живая пара getSettings/setSettings: копия молча устарела бы.
+    const wiringAt = appSrc.indexOf("const ProjectPanel = window.ProjectPanel({");
+    const wiring = appSrc.slice(wiringAt, appSrc.indexOf("});", wiringAt));
+    for (const dep of [
+      "getSettings: () => settings", "setSettings: (s) => { settings = s; }",
+      "normalize: normalize", "persistSettings: persistSettings", "toast: toast",
+      "syncRail: syncRail", "ensureProjectChat: ensureProjectChat",
+      "DevRun: DevRun", "SettingsPanel: SettingsPanel",
+    ]) {
+      assert.ok(wiring.includes(dep), "в проводку панели проекта не передано " + dep);
+    }
+    assert.ok(appSrc.indexOf("let githubReposList") === -1, "список репозиториев остался в оболочке");
+
+    // 4. Проводки ДРУГИХ модулей стоят выше панели проекта: значение берётся отложенной
+    //    стрелкой, иначе окно падает на загрузке («Cannot access before initialization»).
+    for (const dep of [
+      "esc: (t) => ProjectPanel.esc(t)",
+      "projectDir: () => ProjectPanel.projectDir()",
+      "updateStatusBar: () => ProjectPanel.updateStatusBar()",
+      "refreshProject: () => ProjectPanel.refreshProject()",
+      "renderGithubSection: () => ProjectPanel.renderGithubSection()",
+      "setSbVersion: (v) => { ProjectPanel.setSbVersion(v); }",
+      "confirmModal: (...a) => ProjectPanel.confirmModal(...a)",
+      "inputDialog: (...a) => ProjectPanel.inputDialog(...a)",
+    ]) {
+      assert.ok(appSrc.includes(dep), "отложенная зависимость потеряна: " + dep);
+    }
+
+    // 5. Оболочка не зовёт вынесенное напрямую — только через ProjectPanel.
+    for (const name of [
+      "refreshTree", "loadChildren", "renderFileEditor", "saveEditedFile", "doCommit",
+      "doPush", "buildCommitRow", "showDiff", "initProjectDnD", "fetchRepos", "wireGithubEvents",
+    ]) {
+      assert.ok(!new RegExp("(^|[^\\w$.])" + name + "\\b").test(appSrc), "оболочка зовёт " + name + " напрямую");
+    }
+
+    // 6. Границы модуля: своё состояние, настройки только через getSettings().
+    for (const name of ["chatsData", "session", "streaming", "sideTab", "currentPreset"]) {
+      assert.ok(!new RegExp("(^|[^\\w$.])" + name + "\\b").test(src), "модуль ссылается на " + name + " без внедрения");
+    }
+    assert.ok(!/(^|[^\w.])settings\./.test(src), "модуль ходит в settings напрямую вместо getSettings()");
+    assert.ok(!/localStorage|window\.api\b/.test(src), "модуль лезет в чужие глобалы");
+  });
+
+  await test("панель проекта: поднимается на объявленных зависимостях и отдаёт наружу нужное", () => {
+    const calls = { toast: [], persisted: 0, statusBar: 0 };
+    let settings = { workingDir: "/tmp/panel-proj", githubRepoDir: "", projects: [], activeProjectId: "" };
+    // Маленький честный div: esc() строит текст через textContent -> innerHTML, поэтому
+    // на «пустом объекте» он вернул бы пустую строку и проверка ничего бы не стоила.
+    const escapingDiv = () => {
+      const el = panelDom();
+      Object.defineProperty(el, "textContent", {
+        configurable: true,
+        get() { return el.innerHTML; },
+        set(v) {
+          el.innerHTML = String(v == null ? "" : v)
+            .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+        },
+      });
+      return el;
+    };
+    const documentStub = {
+      getElementById: () => panelDom(),
+      createElement: (tag) => (tag === "div" ? escapingDiv() : panelDom()),
+      querySelector: () => panelDom(),
+      querySelectorAll: () => [],
+      addEventListener() {},
+      visibilityState: "visible",
+      body: { classList: { add() {}, remove() {}, toggle() {} }, appendChild() {} },
+      documentElement: { style: {}, classList: { add() {}, remove() {} } },
+    };
+    const sandbox = {
+      module: { exports: {} },
+      window: {},
+      self: {},
+      document: documentStub,
+      console: { log() {}, warn() {}, error() {} },
+    };
+    const vm = require("vm");
+    vm.runInNewContext(src, sandbox, { filename: "project-panel.js" });
+    const panel = sandbox.module.exports({
+      $: () => panelDom(),
+      api: {},
+      isElectron: false,
+      getSettings: () => settings,
+      setSettings: (s) => { settings = s; },
+      normalize: (s) => s,
+      persistSettings: () => { calls.persisted++; },
+      toast: (t) => calls.toast.push(t),
+      syncRail() {},
+      toggleModelPopup() {},
+      openSidePanel() {},
+      ensureProjectChat() {},
+      DevRun: { previewRunning: false, refreshDevControls() {} },
+      SettingsPanel: { providerLabel: () => "Ollama", openSettings() {}, setSettingsMsg() {} },
+    });
+    assert.ok(panel, "фабрика ничего не вернула");
+
+    // Наружу — ровно то, что зовёт оболочка (иначе «ProjectPanel.x не функция» в окне).
+    for (const name of [
+      "esc", "toastShort", "projectDir", "refreshProject", "refreshProjects", "switchProject",
+      "fileIcon", "viewFile", "inputDialog", "newProjectFile", "newProjectFolder", "showPanelTab",
+      "updateStatusBar", "doPush", "doPull", "openPublishDialog", "confirmModal",
+      "renderGithubSection", "escHtml", "closeDeviceModal", "wireGithubEvents",
+      "getFileViewPath", "setFileViewPath", "getSbVersion", "setSbVersion",
+    ]) {
+      assert.strictEqual(typeof panel[name], "function", "панель не отдаёт " + name);
+    }
+
+    // Живые значения: гашение файла и версия кода доходят до оболочки.
+    assert.strictEqual(panel.esc('<i>&"'), "&lt;i&gt;&amp;&quot;", "esc испортился");
+    assert.strictEqual(panel.projectDir(), "/tmp/panel-proj", "рабочая папка не из настроек");
+    panel.setFileViewPath("/tmp/panel-proj/a.js");
+    assert.strictEqual(panel.getFileViewPath(), "/tmp/panel-proj/a.js", "текущий файл не запомнился");
+    panel.setSbVersion("1.5.137");
+    assert.strictEqual(panel.getSbVersion(), "1.5.137", "версия кода не запомнилась");
+    panel.toastShort("привет");
+    assert.deepStrictEqual(calls.toast, ["привет"], "короткий тост не дошёл до окна");
+    assert.ok(String(panel.fileIcon("a.js")).length > 0, "иконка файла пустая");
+  });
+}
+
+async function testSettingsPanel() {
+  const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "settings-panel.js"), "utf8");
+  const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+
+  await test("панель настроек: модуль на месте, оболочка только собирает его", () => {
+    // 1. Разметка грузит модуль раньше app.js; телефон получает тот же файл.
+    const iTag = html.indexOf('src="settings-panel.js"');
+    assert.ok(iTag > 0, "разметка не грузит settings-panel.js");
+    assert.ok(iTag < html.indexOf('src="app.js"'), "settings-panel.js подключён после app.js");
+    assert.ok(
+      /"settings-panel\.js"/.test(fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8")),
+      "мост не отдаёт модуль телефону"
+    );
+
+    // 2. Кода панели в оболочке не осталось — только сборка модуля с зависимостями.
+    const appSrc = uiFile("app.js");
+    for (const gone of [
+      "function fillSettingsUI", "function collectSettingsFromUI", "function openSettings",
+      "function setProviderUI", "function setPreset", "function showSettingsTab", "function setSettingsMsg",
+      "function renderModelHints", "function probeLocalModelUI", "function renderProbeResult",
+      "function refreshProbeButton", "function renderOtaStatus", "function renderMemoryStatus",
+      "function renderBrowserProfileInfo", "function renderBrowserConnectInfo", "function renderAgentFilesStatus",
+      "function renderVisionDetect", "function saveSettingsUI", "function toggleKey", "function updateBadge",
+    ]) {
+      assert.ok(appSrc.indexOf(gone) === -1, "код панели остался в app.js: " + gone);
+    }
+    assert.ok(/const SettingsPanel = window\.SettingsPanel\(\{/.test(appSrc), "app.js не собирает панель");
+
+    // 3. Живые зависимости: настройки, пресет, последняя вкладка и версия кода переписываются —
+    //    копия устарела бы молча (ровно так номер набора выдавал себя за версию кода в 1.5.135).
+    // Проверяем СВОЮ проводку: те же строки встречаются и в сборке других модулей,
+    // поэтому «где-то в app.js» — не доказательство (поймано негативным контролем).
+    const wiring = appSrc.slice(appSrc.indexOf("const SettingsPanel = window.SettingsPanel({"));
+    const wiringCall = wiring.slice(0, wiring.indexOf("});"));
+    for (const dep of [
+      "getSettings: () => settings", "getPreset: () => currentPreset", "setCurrentPreset: (p) => { currentPreset = p; }",
+      "setSbVersion: (v) => { ProjectPanel.setSbVersion(v); }", "getLastTab: () => lastSettingsTab", "setLastTab: (t) => { lastSettingsTab = t; }",
+      "getMobilePanel: () => MobilePanel", "getYcPanel: () => YcPanel", "search: SettingsSearch", "cachedModels: cachedModels",
+    ]) {
+      assert.ok(wiringCall.includes(dep), "в проводку панели не передано " + dep);
+    }
+
+    // 4. Границы модуля: своё состояние — только через внедрение.
+    for (const name of ["chatsData", "session", "streaming", "msgEls", "currentPreset", "lastSettingsTab", "sbVersion", "projectDir"]) {
+      assert.ok(!new RegExp("(^|[^\\w$.])" + name + "\\b").test(src), "модуль ссылается на " + name + " без внедрения");
+    }
+    assert.ok(!/(^|[^\w.])settings\./.test(src), "модуль ходит в settings напрямую вместо getSettings()");
+    assert.ok(!/localStorage|window\.api\b/.test(src), "модуль лезет в чужие глобалы");
+  });
+
+  await test("панель настроек: поля, вкладки, пресет и сохранение работают на игрушечном DOM", () => {
+    const els = new Map();
+    const $ = (id) => {
+      if (!els.has(id)) els.set(id, fakeEl(id));
+      return els.get(id);
+    };
+    const cls = () => {
+      const s = new Set();
+      return {
+        _s: s,
+        add: (...cs) => cs.forEach((c) => s.add(c)),
+        remove: (...cs) => cs.forEach((c) => s.delete(c)),
+        contains: (c) => s.has(c),
+        toggle: (c, on) => {
+          const want = on === undefined ? !s.has(c) : !!on;
+          if (want) s.add(c);
+          else s.delete(c);
+          return want;
+        },
+      };
+    };
+    const tabs = [{ dataset: { tab: "model" }, classList: cls() }, { dataset: { tab: "mail" }, classList: cls() }];
+    const bodies = [{ dataset: { tabBody: "model" }, classList: cls() }, { dataset: { tabBody: "mail" }, classList: cls() }];
+    const acc = cls();
+    const documentStub = {
+      querySelectorAll: (sel) => (sel === ".stab" ? tabs : sel === ".settings-tab-body" ? bodies : []),
+      querySelector: (sel) =>
+        String(sel).indexOf(".acc") === 0 ? { classList: acc, querySelector: () => ({ classList: cls() }) } : null,
+      createElement: () => fakeEl("new"),
+    };
+
+    let searchActive = false; // состояние поиска по настройкам (его спрашивает переключение вкладок)
+    const settings = {};
+    const calls = { persisted: 0, collected: 0, preset: [], version: [], tab: [], toast: [], projectRefreshed: 0, modelNeeded: 0, search: [] };
+    const sandbox = {
+      module: { exports: {} },
+      window: {},
+      self: {},
+      document: documentStub,
+      console: { log() {}, warn() {}, error() {} },
+    };
+    const vm = require("vm"); // в этом файле vm подключается локально в каждой функции
+    vm.runInNewContext(src, sandbox, { filename: "settings-panel.js" });
+    const api = sandbox.module.exports({
+      $: $,
+      api: {},
+      isElectron: false,
+      getSettings: () => settings,
+      getPreset: () => "deepseek",
+      setCurrentPreset: (p) => calls.preset.push(p),
+      setSbVersion: (v) => calls.version.push(v),
+      cachedModels: {},
+      persistSettings: () => { calls.persisted++; },
+      updateStatusBar: () => {},
+      updateModelNeeded: () => { calls.modelNeeded++; },
+      refreshProject: () => { calls.projectRefreshed++; },
+      toast: (tx) => calls.toast.push(tx),
+      esc: (s) => String(s),
+      renderGithubSection: () => {},
+      probeG4fPort: () => {},
+      renderG4fProviderList: () => {},
+      search: { active: () => searchActive, reset: () => calls.search.push("reset") },
+      getLastTab: () => "model",
+      setLastTab: (n) => calls.tab.push(n),
+      getMobilePanel: () => ({ applyMobileFields: () => calls.search.push("mobileFill"), readMobileFields: () => calls.search.push("mobileRead") }),
+      AgentCore: { roleById: (id) => ({ id: id || "coder" }), imageProviderLabel: () => "OpenRouter" },
+      SecretsPanel: { renderEnvVars: () => {}, renderVault: () => {} },
+      getYcPanel: () => ({ refreshSettingsUI: () => {} }),
+      OpenaiProfiles: { render: () => {} },
+      PRESETS: { deepseek: { url: "https://api.deepseek.com", model: "deepseek-chat" } },
+      PRESET_LABEL: { deepseek: "DeepSeek" },
+      MODEL_KEY: { ollama: "ollamaModel", openai: "openaiModel", anthropic: "anthropicModel" },
+      MODEL_INPUT: { ollama: "s-ollama-model", openai: "s-openai-model", anthropic: "s-anth-model" },
+      URL_INPUT: { ollama: "s-ollama-url", openai: "s-openai-url", anthropic: "s-anth-url" },
+      URL_KEY: { ollama: "ollamaUrl", openai: "openaiUrl", anthropic: "anthropicUrl" },
+    });
+    for (const fn of ["openSettings", "fillSettingsUI", "collectSettingsFromUI", "showSettingsTab", "setPreset",
+      "setProviderUI", "setSettingsMsg", "saveSettingsUI", "renderOtaStatus", "renderMemoryStatus",
+      "renderBrowserConnectInfo", "renderAgentFilesStatus", "toggleKey", "probeLocalModelUI", "loadModels",
+      "testConnection", "requestModelsList", "renderModelHints", "loadAuxModels", "renderVisionDetect",
+      "renderBrowserProfileInfo", "refreshProbeButton", "renderProbeResult", "updateBadge", "providerLabel"]) {
+      assert.strictEqual(typeof api[fn], "function", "модуль не отдаёт " + fn);
+    }
+
+    // 1. Заполнение полей из памяти: что лежит в настройках, то и в поле.
+    settings.openaiUrl = "https://api.example.com/v1";
+    settings.openaiApiKey = "sk-test";
+    settings.openaiModel = "модель-1";
+    settings.visionEnabled = true;
+    settings.otaDir = "D:/проект/ota";
+    settings.sendAllTools = true;
+    settings.agentWorkFiles = false;
+    api.fillSettingsUI();
+    assert.strictEqual($("s-openai-url").value, "https://api.example.com/v1", "адрес не доехал в поле");
+    assert.strictEqual($("s-openai-key").value, "sk-test", "ключ не доехал в поле");
+    assert.strictEqual($("s-openai-model").value, "модель-1", "модель не доехала в поле");
+    assert.strictEqual($("s-ota-dir").value, "D:/проект/ota", "папка обновлений не доехала в поле");
+    assert.strictEqual($("s-vision-enabled").checked, true, "галочка зрения не восстановлена");
+    assert.strictEqual($("s-send-all-tools").checked, true, "галочка «все инструменты» не восстановлена");
+    assert.strictEqual($("vision-fields").classList.contains("hidden"), false, "поля зрения остались скрытыми");
+    assert.ok(calls.search.indexOf("mobileFill") !== -1, "поля мобильной панели не заполняются");
+
+    // 2. Обратное чтение: правки в полях уходят в настройки (тот же объект — живой).
+    $("s-openai-url").value = "https://api.other.com/v1";
+    $("s-openai-key").value = "  sk-новый  ";
+    $("s-openai-model").value = "модель-2";
+    $("s-mail-smtp-port").value = "2525";
+    $("s-allow-agent-push").checked = true;
+    api.collectSettingsFromUI();
+    assert.strictEqual(settings.openaiUrl, "https://api.other.com/v1", "адрес не сохранился");
+    assert.strictEqual(settings.openaiApiKey, "sk-новый", "ключ не обрезан");
+    assert.strictEqual(settings.openaiModel, "модель-2", "модель не сохранилась");
+    assert.strictEqual(settings.mailSmtpPort, 2525, "порт почты не сохранился");
+    assert.strictEqual(settings.allowAgentPush, true, "разрешение пуша не сохранилось");
+    assert.ok(calls.search.indexOf("mobileRead") !== -1, "поля мобильной панели не читаются обратно");
+
+    // 3. Вкладки: переключение запоминается, активный поиск сбрасывается, лишние вкладки скрыты.
+    searchActive = true; // в поле поиска что-то было — панель обязана вернуть вкладки
+    api.showSettingsTab("mail");
+    assert.deepStrictEqual(calls.tab, ["mail"], "вкладка не запомнилась");
+    assert.strictEqual(tabs[1].classList.contains("active"), true, "нажатая вкладка не подсвечена");
+    assert.strictEqual(tabs[0].classList.contains("active"), false, "старая вкладка осталась активной");
+    assert.strictEqual(bodies[1].classList.contains("hidden"), false, "тело вкладки «Почта» скрыто");
+    assert.strictEqual(bodies[0].classList.contains("hidden"), true, "чужое тело вкладки показано");
+    assert.strictEqual(calls.search.filter((x) => x === "reset").length, 1, "активный поиск не сброшен при переключении вкладок");
+
+    // 4. Пресет: подставляет адрес и модель, пишет пресет через живую функцию.
+    api.setPreset("deepseek");
+    assert.deepStrictEqual(calls.preset, ["deepseek"], "пресет не записан");
+    assert.strictEqual($("s-openai-url").value, "https://api.deepseek.com", "адрес пресета не подставился");
+    assert.strictEqual($("s-openai-model").value, "deepseek-chat", "модель пресета не подставилась");
+    assert.strictEqual($("yandex-project-field").classList.contains("hidden"), true, "поле Yandex показано не вовремя");
+    assert.strictEqual($("g4f-hint").classList.contains("hidden"), true, "подсказка G4F показана не вовремя");
+
+    // 5. Сообщение панели: текст и признак ошибки.
+    api.setSettingsMsg("Сохранено", false);
+    assert.strictEqual($("settings-msg").textContent, "Сохранено", "сообщение не дошло до панели");
+    assert.strictEqual($("settings-msg").className, "settings-msg ok", "класс успеха не выставлен");
+    api.setSettingsMsg("Ошибка", true);
+    assert.strictEqual($("settings-msg").className, "settings-msg err", "класс ошибки не выставлен");
+
+    // 6. Сохранение: перечитать поля, записать настройки, закрыть окно, сказать человеку.
+    api.saveSettingsUI();
+    assert.ok(calls.persisted >= 1, "настройки не записаны на диск");
+    assert.ok(calls.modelNeeded >= 1, "перед сохранением не проверено наличие модели");
+    assert.ok(calls.projectRefreshed >= 1, "проект не перечитан после смены рабочей папки");
+    assert.deepStrictEqual(calls.toast, ["Настройки сохранены"], "человек не увидел подтверждения");
+    assert.strictEqual($("settings-overlay").classList.contains("hidden"), true, "окно настроек осталось открытым");
+
+    // 7. Глазок у секретного поля: пароль ↔ текст, ничего больше.
+    $("s-openai-key").type = "password";
+    api.toggleKey("s-openai-key");
+    assert.strictEqual($("s-openai-key").type, "text", "секрет не показался");
+    api.toggleKey("s-openai-key");
+    assert.strictEqual($("s-openai-key").type, "password", "секрет не спрятался обратно");
+
+    // 8. Открытие панели: секреты перечитаны, поля заполнены, окно показано, сообщение очищено.
+    $("settings-overlay").classList.add("hidden");
+    searchActive = false; // поиск пуст — трогать вкладки не нужно
+    api.openSettings("model");
+    assert.strictEqual(calls.search.filter((x) => x === "reset").length, 1, "поиск сбрасывается, даже когда его нет");
+    assert.strictEqual($("settings-overlay").classList.contains("hidden"), false, "окно настроек не открылось");
+    assert.strictEqual($("settings-msg").textContent, "", "старое сообщение осталось в панели");
+    assert.deepStrictEqual(calls.tab, ["mail", "model"], "открытие не переключило вкладку");
+
+    // 9. Внешние вызовы настроек не роняют окно в браузере (нет Electron) — говорят словами.
+    api.renderOtaStatus();
+    assert.ok(/Доступно в приложении на ПК/.test($("ota-status").textContent), "статус обновлений молчит в браузере");
+    api.renderMemoryStatus();
+    assert.ok($("memory-status").textContent.length > 0, "статус памяти пуст");
+  });
+}
+
 async function testSettingsSearchLogic() {
 
   await test("поиск настроек: фильтрует по всем вкладкам, включая карточки провайдеров", () => {
@@ -10632,7 +11064,8 @@ async function testSettingsSearchLogic() {
         remove: (c) => btn.cls.delete(c),
         toggle: (c, on) => (on ? btn.cls.add(c) : btn.cls.delete(c)),
       };
-      const fn = new Function("$", "AgentCore", "settings", show + "\nreturn refreshProbeButton;")((id) => (id === "btn-probe-model" ? btn : null), { isLocalEndpoint: () => local }, {});
+      // Кнопка живёт в панели настроек: настройки приходят туда живой функцией getSettings().
+      const fn = new Function("$", "AgentCore", "getSettings", show + "\nreturn refreshProbeButton;")((id) => (id === "btn-probe-model" ? btn : null), { isLocalEndpoint: () => local }, () => ({}));
       fn();
       return btn.cls;
     };
@@ -10644,7 +11077,7 @@ async function testSettingsSearchLogic() {
     assert.ok(/id="btn-probe-model"[^>]*class="[^>]*hidden/.test(html), "кнопка в подвале видна до проверки типа модели");
     const appSrc2 = uiFile("app.js");
     assert.ok(/\$\("btn-probe-model"\)\.onclick/.test(appSrc2), "кнопка в подвале не подключена");
-    const setProv = uiFind("  function setProviderUI(p) {", "  // Переключение вкладок настроек").code;
+    const setProv = uiFind("  function setProviderUI(p) {", "  function showSettingsTab(name) {").code;
     assert.ok(/refreshProbeButton\(\);/.test(setProv), "видимость кнопки замера не обновляется при смене провайдера");
     assert.ok(/Замерить скорость локальной модели/.test(appSrc2), "в палитре команд нет замера");
   });
@@ -11349,7 +11782,7 @@ async function testTasks() {
     assert.ok(guardPos > raPos && guardPos - raPos < 600, "автозадачу не ограничили ПК-клиентом");
     assert.ok(app.includes('ev.type === "task-due"'), "окно не слушает срок автозадачи");
     assert.ok(app.includes("flushAutoQueue"), "автозадача не ждёт конца текущего прогона");
-    assert.ok(app.includes("settings.taskAuto"), "галочка автозадач не читается окном");
+    assert.ok(uiFile("settings-panel.js").includes("getSettings().taskAuto"), "галочка автозадач не читается настройками");
     assert.ok(html.includes("s-task-auto"), "в настройках нет галочки автозадач");
     assert.ok(core.includes("repeat: { type:") && core.includes("auto: { type:"), "инструменты дел не знают о повторах и автозапуске");
     assert.ok(core.includes("Автозадачи"), "роль «Менеджер» не знает про чат автозадач");
@@ -11609,8 +12042,8 @@ async function testToolPolicy() {
     assert.ok(src.indexOf("const DANGEROUS_CMD_RE = toolPolicy.DANGEROUS_CMD_RE;") >= 0, "регулярка опасных команд раздвоилась");
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     assert.ok(html.indexOf('id="s-audit-log"') >= 0, "нет переключателя журнала в настройках");
-    const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
-    assert.ok(app.indexOf('$("s-audit-log")') >= 0, "переключатель журнала не подключён к форме");
+    // Настройка журнала живёт в панели настроек (app.js: window.SettingsPanel).
+    assert.ok(uiAll().indexOf('$("s-audit-log")') >= 0, "переключатель журнала не подключён к форме");
   });
 }
 
@@ -14401,7 +14834,7 @@ async function testMissions() {
       assert.ok(html.indexOf('id="' + id + '"') >= 0, "в интерфейсе нет " + id);
     }
     assert.ok(app.indexOf("renderAgentFilesStatus") >= 0, "настройки окна не показывают папку работы");
-    assert.ok(app.indexOf("agentWorkFiles") >= 0, "окно не сохраняет галочку файлов работы");
+    assert.ok(uiAll().indexOf("agentWorkFiles") >= 0, "интерфейс не сохраняет галочку файлов работы");
     assert.ok(app.indexOf("agentFilesClear") >= 0 && app.indexOf("agentFilesOpen") >= 0, "кнопки папки работы ни к чему не привязаны");
     for (const k of ["missionState", "missionPause", "missionStop", "missionResume", "missionOpen", "agentFilesStatus"]) {
       assert.ok(pre.indexOf(k) >= 0, "мост не отдаёт " + k);
@@ -14457,6 +14890,8 @@ async function testMissions() {
   await testSettingsRedesign();
   await testSettingsSearchLogic();
   await testOpenaiProfiles();
+  await testProjectPanel();
+  await testSettingsPanel();
   await testLeftRail();
   await testSandboxObstacles();
   await testVkFieldFixes();

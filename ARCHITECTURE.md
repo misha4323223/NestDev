@@ -52,7 +52,7 @@
 | src/renderer/web-chat.js | веб-режим: цикл чата в браузере без главного процесса | app.js: window.WebChat({ |
 | src/renderer/tasks-mission.js | роли чата, дела и миссия: панели и их состояние | app.js: window.TasksMission({ |
 | src/renderer/secrets-panel.js | секреты: пароли сайтов, почта, переменные агента | app.js: window.SecretsPanel({ |
-| src/renderer/highlight.js | подсветка кода для читалки файлов | app.js: window.Highlight |
+| src/renderer/highlight.js | подсветка кода для читалки файлов | project-panel.js: window.Highlight |
 | src/renderer/qr.js | QR-код подключения телефона | mobile-panel.js: window.QR |
 | src/renderer/mobile-panel.js | мобильный доступ: QR, статус моста, PIN, адреса для телефона | app.js: window.MobilePanel({ |
 | src/renderer/chat-thinking.js | блок размышлений модели: сборка, автопрокрутка, свёртывание | app.js: window.ChatThinking() |
@@ -62,6 +62,8 @@
 | src/renderer/chat-work.js | строки действий агента и группа работ текущего ответа | app.js: window.ChatWork({ |
 | src/renderer/openai-profiles.js | сохранённые OpenAI-подключения: список, выбор, удаление | app.js: window.OpenaiProfiles({ |
 | src/renderer/settings-search.js | поиск по настройкам: фильтр по всем вкладкам | app.js: window.SettingsSearch({ |
+| src/renderer/settings-panel.js | настройки: вкладки, поля, провайдеры, замер модели, сохранение | app.js: window.SettingsPanel({ |
+| src/renderer/project-panel.js | панель проекта: файлы, правка, вкладки, коммиты, изменения, публикация | app.js: window.ProjectPanel({ |
 | src/renderer/field-guard.js | страховка полей ввода (фокус не теряется) | — сам навешивает защиту |
 | src/renderer/app.js | оболочка окна: чат, панели, настройки, события | — собирает всё в окне |
 <!-- UI-MAP:END -->
@@ -77,6 +79,12 @@
 3. Имя файла в `STATIC_FILES` моста (`src/mobile-bridge.js`) — иначе телефон получит 404
    и раздел на телефоне молча перестанет работать.
 4. Строка в карте выше. Всё это проверяет `repo-shape` (раскладка интерфейса).
+5. **Зависимости проводки вычисляются на загрузке окна.** Если модуль объявлен НИЖЕ
+   блока `window.Xxx({ ... })`, внутрь идёт отложенная стрелка (`getYcPanel: () => YcPanel`),
+   а не значение: прямое чтение биндинга падает с «Cannot access before initialization»
+   и обрывает всю оставшуюся загрузку (вместе с подпиской на события агента). Ловят
+   это сторож `repo-shape` («проводки модулей не читают модуль, объявленный ниже»)
+   и живой прогон десктопа.
 
 ### 2. Вынос куска из большого файла (процесс, он же чек-лист приёмки)
 
@@ -90,8 +98,11 @@
    уже был ценой пустого чата: `pinnedToBottom = true; scrollBottom();` заменили на
    `ChatFeed.jumpToBottom()`, который дополнительно трогал кнопку «↓» внутри ленты.
 4. Перенос **проверяется аудитом**: `bun run audit:extract <до> <после> <модули...>`
-   раскладывает ушедшие из оболочки строки на «перенесено как есть», «переименование
-   вызова» и «требует глаз»; последние объясняются вручную. Каждая замена нескольких
+   раскладывает ушедшие из оболочки строки на «перенесено как есть», «перенесено
+   с живым доступом» (`settings.x` → `getSettings().x`, `currentPreset` → `getPreset()`,
+   `sbVersion = v` → `setSbVersion(v)`, `MobilePanel.x` → `getMobilePanel().x`),
+   «переименование вызова» и «требует глаз»; последние объясняются вручную.
+   Вместо ревизии «после» можно указать `WORKTREE` — аудит до коммита. Каждая замена нескольких
    строк одним вызовом (например `ensureWorkGroup(); body.appendChild(el)` →
    `ChatWork.addRow(el)`) должна быть сверена по коду модуля.
 5. Один этап = один заход, `npm test` целиком зелёный после него.
