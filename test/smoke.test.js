@@ -4898,10 +4898,10 @@ async function testYandexCloud() {
     // 3. В app.js не осталось кода панели — только сборка модуля с зависимостями.
     assert.ok(!/function ycLoadDashboard|const YC_CREATABLE/.test(appSrc), "код панели остался в app.js");
     assert.ok(/const YcPanel = window\.YcPanel\(\{/.test(appSrc), "app.js не собирает панель");
-    for (const dep of ["$: $", "api: api", "isElectron: isElectron", "toast: toast", "termAppend: termAppend",
+    for (const dep of ["$: $", "api: api", "isElectron: isElectron", "toast: toast", "termAppend: SidePanel.termAppend",
       "confirmModal: (...a) => ProjectPanel.confirmModal(...a)",
       "inputDialog: (...a) => ProjectPanel.inputDialog(...a)", "openSettings: SettingsPanel.openSettings",
-      "openSidePanel: openSidePanel", "getSettings: () => settings"]) {
+      "openSidePanel: SidePanel.openSidePanel", "getSettings: () => settings"]) {
       assert.ok(appSrc.includes(dep), "в проводку панели не передан " + dep);
     }
     // 4. Границы модуля: настройки только через getSettings(), в чужие глобалы не лезем.
@@ -9572,7 +9572,9 @@ async function testPromptCacheAndUsage() {
     assert.ok(/includeUsage = false;/.test(mainSrc), "флаг не выключается после отказа");
     assert.ok(/round--;\s*continue;/.test(mainSrc), "раунд не повторяется после отказа");
     // Интерфейс
-    assert.ok(/ev\.type === "metrics"/.test(appSrc), "app.js не принимает метрики");
+    // Строка метрик живёт в приёмнике событий терминала (side-panel.js).
+    const metricsUi = uiFind('ev.type === "metrics"');
+    assert.ok(metricsUi.code.indexOf("ts-metrics") !== -1, "метрики не уходят в консоль");
     assert.ok(/\.ts-metrics \{/.test(cssSrc), "нет стиля строки метрик");
   });
 }
@@ -10619,7 +10621,7 @@ async function testProjectPanel() {
     for (const dep of [
       "getSettings: () => settings", "setSettings: (s) => { settings = s; }",
       "normalize: normalize", "persistSettings: persistSettings", "toast: toast",
-      "syncRail: syncRail", "ensureProjectChat: ensureProjectChat",
+      "syncRail: SidePanel.syncRail", "ensureProjectChat: ensureProjectChat",
       "DevRun: DevRun", "SettingsPanel: SettingsPanel",
     ]) {
       assert.ok(wiring.includes(dep), "в проводку панели проекта не передано " + dep);
@@ -10630,8 +10632,7 @@ async function testProjectPanel() {
     //    стрелкой, иначе окно падает на загрузке («Cannot access before initialization»).
     for (const dep of [
       "esc: (t) => ProjectPanel.esc(t)",
-      "projectDir: () => ProjectPanel.projectDir()",
-      "updateStatusBar: () => ProjectPanel.updateStatusBar()",
+      "getProjectPanel: () => ProjectPanel", "getYcPanel: () => YcPanel",
       "refreshProject: () => ProjectPanel.refreshProject()",
       "renderGithubSection: () => ProjectPanel.renderGithubSection()",
       "setSbVersion: (v) => { ProjectPanel.setSbVersion(v); }",
@@ -10769,7 +10770,7 @@ async function testCommandPalette() {
     const wiring = appSrc.slice(appSrc.indexOf("const CommandPalette = window.CommandPalette({"));
     const wiringCall = wiring.slice(0, wiring.indexOf("});"));
     for (const dep of [
-      "getStreaming: () => streaming", "openSidePanel: openSidePanel", "termReset: termReset",
+      "getStreaming: () => streaming", "openSidePanel: SidePanel.openSidePanel", "termReset: SidePanel.termReset",
       "ChatActions: ChatActions", "ProjectPanel: ProjectPanel", "SettingsPanel: SettingsPanel",
     ]) {
       assert.ok(wiringCall.includes(dep), "в проводку палитры не передано " + dep);
@@ -10942,6 +10943,255 @@ async function testCommandPalette() {
     assert.ok(!titles(c.$).some((t) => /Открыть файл/.test(t)), "в браузере предложено открывать файлы: " + titles(c.$).join(" / "));
     await c.panel.enterFileMode();
     assert.ok(c.calls.toast.some((t) => /на ПК/.test(t)), "в браузере нет понятного отказа: " + c.calls.toast.join(" / "));
+  });
+}
+
+// ── Правая панель, рельса, консоль и превью: свой модуль (этап 9) ───────────
+// Панель уехала из app.js в side-panel.js. Проверяем границы (в оболочке осталась
+// только сборка), порядок загрузки и ПОВЕДЕНИЕ на игрушечном DOM: разделы, подсветка,
+// консоль и превью с адресом из настроек.
+async function testSidePanel() {
+  const src = fs.readFileSync(path.join(ROOT, "src", "renderer", "side-panel.js"), "utf8");
+  const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+
+  await test("панель и рельса: модуль на месте, оболочка только собирает его", () => {
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const iTag = html.indexOf('src="side-panel.js"');
+    assert.ok(iTag > 0, "разметка не грузит side-panel.js");
+    assert.ok(iTag < html.indexOf('src="app.js"'), "side-panel.js подключён после app.js");
+    assert.ok(
+      /"side-panel\.js"/.test(fs.readFileSync(path.join(ROOT, "src", "mobile-bridge.js"), "utf8")),
+      "мост не отдаёт модуль телефону"
+    );
+
+    // Кода панели в оболочке не осталось — только сборка модуля с зависимостями.
+    for (const gone of [
+      "function syncRail", "function markPanelButtons", "function setSidebarCollapsed",
+      "function toggleSidebarCollapsed", "function sidePanelVisible", "function openSidePanel",
+      "function closeSidePanel", "function switchSideTab", "function termAppend", "function termReset",
+      "function ensureTerminal", "function termSend", "function onTermEvent", "function previewOpen",
+      "function previewSetDevice", "function previewOpenTab", "let sideTab", "let termBuf",
+      "let previewLoaded", "const TasksMission = window.TasksMission({", "const DevRun = window.DevRun({",
+    ]) {
+      assert.ok(appSrc.indexOf(gone) === -1, "код панели остался в app.js: " + gone);
+    }
+    assert.ok(/const SidePanel = window\.SidePanel\(\{/.test(appSrc), "app.js не собирает панель");
+
+    // Оболочка зовёт панель только через модуль: голых имён не осталось.
+    const wireAt = appSrc.indexOf("const SidePanel = window.SidePanel({");
+    for (const use of ["SidePanel.openSidePanel(", "SidePanel.syncRail", "SidePanel.previewOpen(", "SidePanel.termAppend", "SidePanel.termReset", "SidePanel.switchSideTab(", "SidePanel.sidePanelVisible(", "SidePanel.closeSidePanel(", "SidePanel.getSideTab()"]) {
+      assert.ok(appSrc.includes(use), "оболочка больше не зовёт " + use);
+    }
+    // Своё место: проводки, читающие панель НА ЗАГРУЗКЕ окна, обязаны стоять ниже сборки —
+    // иначе «Cannot access before initialization» и весь остаток загрузки не выполняется.
+    // Обращения выше сборки (тест провайдера G4F, события агента) живут внутри функций и
+    // выполняются позже — им модуль уже доступен.
+    for (const later of ["const ProjectPanel = window.ProjectPanel({", "const CommandPalette = window.CommandPalette({"]) {
+      const at = appSrc.indexOf(later);
+      assert.ok(at > 0, "в оболочке нет проводки " + later);
+      assert.ok(wireAt < at, "сборка панели стоит после " + later);
+    }
+    // Подмодули панели оболочка берёт под своими именами (события и автозадачи зовут их как раньше).
+    assert.ok(appSrc.indexOf("const DevRun = SidePanel.DevRun;") > wireAt, "оболочка не берёт DevRun из панели");
+    assert.ok(appSrc.indexOf("const TasksMission = SidePanel.TasksMission;") > wireAt, "оболочка не берёт дела из панели");
+
+    // Живые зависимости: настройки и история чатов переписываются целиком, состояние
+    // генерации меняется, панель проекта и облако создаются позже — копия устарела бы молча.
+    const wiring = appSrc.slice(wireAt, appSrc.indexOf("});", wireAt));
+    for (const dep of [
+      "getSettings: () => settings", "getChatsData: () => chatsData", "getStreaming: () => streaming",
+      "getProjectPanel: () => ProjectPanel", "getYcPanel: () => YcPanel", "esc: (t) => ProjectPanel.esc(t)",
+      "persistSettings: persistSettings", "isElectron: isElectron",
+    ]) {
+      assert.ok(wiring.includes(dep), "в проводку панели не передано " + dep);
+    }
+
+    // Границы модуля: чужое состояние — только через внедрение.
+    for (const name of ["settings", "chatsData", "streaming", "session", "msgEls"]) {
+      assert.ok(!new RegExp("(^|[^\\\\w$.])" + name + "\\\\b").test(src), "модуль ссылается на " + name + " без внедрения");
+    }
+    assert.ok(!/(^|[^\\w.])settings\\./.test(src), "модуль ходит в settings напрямую вместо getSettings()");
+    assert.ok(!/ProjectPanel\\.|YcPanel\\./.test(src), "модуль зовёт чужую панель напрямую вместо доступа через проводку");
+  });
+
+  await test("панель и рельса: разделы, подсветка, консоль и превью работают на игрушечном DOM", () => {
+    const mkNode = (id) => {
+      const cls = new Set();
+      const node = {
+        id: id, value: "", textContent: "", placeholder: "", title: "", src: "",
+        style: {}, dataset: {}, children: [], listeners: {}, _html: "",
+        onclick: null, className: "",
+        classList: {
+          add: (...cs) => cs.forEach((c) => cls.add(c)),
+          remove: (...cs) => cs.forEach((c) => cls.delete(c)),
+          contains: (c) => cls.has(c),
+          toggle: (c, on) => {
+            const want = on === undefined ? !cls.has(c) : !!on;
+            if (want) cls.add(c); else cls.delete(c);
+            return want;
+          },
+        },
+        appendChild(c) { node.children.push(c); return c; },
+        addEventListener(type, fn) { node.listeners[type] = fn; },
+        click() { if (node.onclick) node.onclick(); },
+        focus() {},
+        scrollIntoView() {},
+        querySelectorAll() { return []; },
+      };
+      Object.defineProperty(node, "innerHTML", {
+        configurable: true,
+        get() { return node._html; },
+        set(v) { node._html = String(v == null ? "" : v); },
+      });
+      return node;
+    };
+    const els = new Map();
+    const $ = (id) => {
+      if (!els.has(id)) els.set(id, mkNode(id));
+      return els.get(id);
+    };
+    // Вкладки панели и переключатели устройств — их модуль ищет по классам.
+    const spBtns = ["console", "preview", "cloud", "deploy", "mission", "tasks"].map((tab) => {
+      const b = mkNode("sp-btn-" + tab);
+      b.dataset = { sp: tab };
+      return b;
+    });
+    const devBtns = ["390", "768", "100%"].map((w) => {
+      const b = mkNode("dev-" + w);
+      b.dataset = { w: w };
+      return b;
+    });
+    const store = {};
+    const sandbox = {
+      module: { exports: {} },
+      self: {},
+      console: { log() {}, warn() {}, error() {} },
+      document: {
+        getElementById: $,
+        createElement: (tag) => mkNode(tag),
+        querySelectorAll: (sel) => (/sp-btn/.test(sel) ? spBtns : /dev-btns/.test(sel) ? devBtns : []),
+        addEventListener() {},
+      },
+      localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } },
+      setTimeout: (fn) => { fn(); },
+    };
+    const calls = { toast: [], persisted: 0, refreshDev: 0, dashboards: 0, termCalls: 0, closed: 0 };
+    // Подмодули панели — заглушки с теми методами, которые панель реально зовёт.
+    sandbox.window = {
+      innerWidth: 1280,
+      DevRun: () => ({
+        refreshDevControls() { calls.refreshDev++; },
+        onDevEvent() {}, devStartClick() {}, devStopClick() {}, termTabComplete() {}, termServerAppend() {},
+      }),
+      TasksMission: () => ({ refreshMission() {}, renderTasks() {}, missionFromEvent() {} }),
+    };
+    const vm = require("vm");
+    vm.runInNewContext(src, sandbox, { filename: "side-panel.js" });
+
+    let settings = { workingDir: "/tmp/проект", previewUrl: "" };
+    const api = {
+      onTermEvent: (fn) => { api._termEvent = fn; },
+      onDevEvent: (fn) => { api._devEvent = fn; },
+      termStatus: async () => ({ running: true }),
+      termStart: async () => ({ ok: true }),
+      termInput: () => { calls.termCalls++; },
+      termStop() {}, openExternal() {},
+    };
+    const panel = sandbox.module.exports({
+      $: $,
+      api: api,
+      isElectron: true,
+      toast: (t) => calls.toast.push(t),
+      AgentCore: {},
+      esc: (t) => String(t == null ? "" : t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"),
+      persistSettings: () => { calls.persisted++; },
+      getSettings: () => settings,
+      getProjectPanel: () => ({ updateStatusBar() {}, projectDir: () => "/tmp/проект" }),
+      getYcPanel: () => ({ loadDashboard() { calls.dashboards++; } }),
+      getChatsData: () => ({ chats: [], activeId: null }),
+      getStreaming: () => false,
+      getActiveChat: () => null,
+      persistChatsNow() {}, selectChat() {}, renderSidebar() {}, sendMessage() {},
+      startAutoRunNow() {}, autoResize() {},
+    });
+    assert.ok(panel, "фабрика ничего не вернула");
+    for (const name of ["openSidePanel", "closeSidePanel", "sidePanelVisible", "getSideTab", "switchSideTab", "syncRail", "termAppend", "termReset", "previewOpen"]) {
+      assert.strictEqual(typeof panel[name], "function", "панель не отдаёт " + name);
+    }
+    assert.ok(panel.DevRun && panel.TasksMission, "панель не отдала подмодули (DevRun/TasksMission)");
+
+    // Подписки на события ставит сама панель: без них консоль и запуск проекта молчат.
+    assert.strictEqual(typeof api._termEvent, "function", "панель не подписалась на события терминала");
+    assert.strictEqual(typeof api._devEvent, "function", "панель не подписалась на события запуска проекта");
+    const railActive = () => ["rail-console", "rail-preview", "rail-cloud", "rail-deploy", "rail-mission", "rail-tasks"].filter((id) => $(id).classList.contains("active"));
+
+    // 1. Раздел «Консоль»: панель выезжает, тело переключается, подсветка одна, заголовок — свой.
+    panel.openSidePanel("console");
+    assert.ok(panel.sidePanelVisible() && panel.getSideTab() === "console", "консоль не открылась");
+    assert.ok(!$("sp-console").classList.contains("hidden") && $("sp-preview").classList.contains("hidden"), "тело раздела не переключилось");
+    assert.strictEqual($("sp-title").textContent, "Консоль", "заголовок раздела не обновился");
+    assert.deepStrictEqual(railActive(), ["rail-console"], "подсветка рельсы: " + railActive().join(","));
+    assert.ok($("btn-toggle-console").classList.contains("active"), "кнопка раздела не подсветилась");
+
+    // 2. Консоль принимает вывод и гасит его (esc приходит из панели проекта).
+    api._termEvent({ type: "out", text: "<b>привет</b>" });
+    assert.ok(/\&lt;b\&gt;привет\&lt;\/b\&gt;/.test($("term-out").innerHTML), "вывод консоли не погашен: " + $("term-out").innerHTML);
+    api._termEvent({ type: "in", text: "ls" });
+    assert.ok(/\$|\u276f/.test($("term-out").innerHTML), "команда не показана в консоли");
+    $( "btn-term-stop").classList.add("hidden");
+    api._termEvent({ type: "start", cwd: "/tmp/проект" });
+    assert.ok(!$("btn-term-stop").classList.contains("hidden"), "кнопка остановки не показалась при старте");
+    api._termEvent({ type: "exit", code: 0 });
+    assert.ok($("btn-term-stop").classList.contains("hidden"), "кнопка остановки осталась после выхода");
+    panel.termReset();
+    assert.ok(/Консоль рабочей директории/.test($("term-out").innerHTML), "очистка консоли не вернула подсказку");
+
+    // 3. Раздел «Превью»: адрес сохраняется в настройках, кадр грузит его, устройства переключаются.
+    panel.switchSideTab("preview");
+    assert.ok(!$("sp-preview").classList.contains("hidden") && $("sp-console").classList.contains("hidden"), "превью не показалось");
+    assert.strictEqual($("sp-title").textContent, "Превью", "заголовок превью не обновился");
+    assert.ok(calls.refreshDev >= 1, "панель не обновила кнопки запуска проекта");
+    panel.previewOpen("http://localhost:3000");
+    assert.strictEqual(settings.previewUrl, "http://localhost:3000", "адрес превью не сохранён в настройках");
+    assert.strictEqual(calls.persisted, 1, "настройки не сохранены на диск");
+    assert.strictEqual($("preview-url").value, "http://localhost:3000", "адрес не встал в поле");
+    assert.strictEqual($("preview-frame").src, "http://localhost:3000", "кадр превью не загрузил адрес");
+    // С телефона localhost — это сам телефон: адрес меняется на адрес ПК из моста.
+    // Подмена — как была (адрес моста вместе с его портом), в выносе поведение не тронуто.
+    sandbox.window.mobileApi = { host: "192.168.1.5:9090" };
+    panel.previewOpen("http://localhost:3000/app");
+    assert.strictEqual($("preview-frame").src, "http://192.168.1.5:9090/app", "адрес для телефона не подменился: " + $("preview-frame").src);
+    sandbox.window.mobileApi = null;
+    panel.previewOpen("http://localhost:3000");
+
+    // 4. Рельса: иконка нажимает кнопку шапки и подсвечивается вместе с ней.
+    let toggles = 0;
+    $("btn-toggle-preview").onclick = () => { toggles++; $("btn-toggle-preview").classList.add("active"); };
+    $("rail-preview").onclick();
+    assert.strictEqual(toggles, 1, "иконка рельсы не нажала кнопку шапки");
+    assert.ok($("rail-preview").classList.contains("active"), "иконка рельсы не подсветилась");
+    // Синхронизация: кнопка шапки, нажатая напрямую, тоже зажигает рельсу.
+    $("rail-preview").classList.remove("active");
+    $("btn-toggle-preview").classList.add("active");
+    panel.syncRail();
+    assert.ok($("rail-preview").classList.contains("active"), "рельса не синхронизировалась с кнопкой шапки");
+
+    // 5. Свёрнутый список чатов: состояние запоминается и возвращается.
+    $("rail-chats").onclick();
+    assert.ok($("sidebar").classList.contains("collapsed"), "иконка «Чаты» не свернула панель");
+    assert.strictEqual(store.sidebarCollapsed, "1", "свёрнутость не запомнилась");
+    $("btn-side-collapse").onclick();
+    assert.ok(!$("sidebar").classList.contains("collapsed"), "кнопка в шапке не развернула панель");
+    assert.strictEqual(store.sidebarCollapsed, "0", "разворот не запомнился");
+
+    // 6. Закрытие: панель уезжает, подсветка снимается целиком, и открыть её можно снова.
+    panel.closeSidePanel();
+    assert.ok(!panel.sidePanelVisible(), "панель не закрылась");
+    assert.deepStrictEqual(railActive(), [], "подсветка осталась: " + railActive().join(","));
+    assert.ok(!$("btn-toggle-console").classList.contains("active"), "кнопка раздела осталась подсвеченной");
+    panel.openSidePanel("cloud");
+    assert.ok(calls.dashboards === 1, "облако не загрузило дашборд при открытии раздела");
+    assert.deepStrictEqual(railActive(), ["rail-cloud"], "подсветка облака: " + railActive().join(","));
   });
 }
 
@@ -11435,7 +11685,9 @@ async function testOpenaiProfiles() {
 
 // ── 4d. Левая рельса (как в Replit): разметка + живая логика ───────────────
 async function testLeftRail() {
-  const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+  // Рельса и сворачивание панели чатов живут в side-panel.js (этап 9): читаем модуль,
+  // а не адрес кода. Разметка и живая логика — по-прежнему здесь.
+  const panelSrc = uiFile("side-panel.js");
   const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
   const css = fs.readFileSync(path.join(ROOT, "src", "renderer", "styles.css"), "utf8");
 
@@ -11454,15 +11706,15 @@ async function testLeftRail() {
     const targets = ["btn-toggle-console", "btn-toggle-preview", "btn-toggle-cloud", "btn-toggle-panel", "btn-new-chat", "btn-settings"];
     for (const t of targets) assert.ok(html.indexOf('id="' + t + '"') !== -1, "нет цели нажатия " + t);
     for (const r of RAIL_IDS.slice(1, 6)) {
-      assert.ok(appSrc.indexOf('proxy("' + r + '"') !== -1, "иконка " + r + " ни на что не нажимает");
+      assert.ok(panelSrc.indexOf('proxy("' + r + '"') !== -1, "иконка " + r + " ни на что не нажимает");
     }
-    assert.ok(appSrc.indexOf('proxy("rail-new", "btn-new-chat")') !== -1, "«новый чат» на рельсе не работает");
-    assert.ok(appSrc.indexOf('proxy("rail-settings", "btn-settings")') !== -1, "«настройки» на рельсе не работают");
+    assert.ok(panelSrc.indexOf('proxy("rail-new", "btn-new-chat")') !== -1, "«новый чат» на рельсе не работает");
+    assert.ok(panelSrc.indexOf('proxy("rail-settings", "btn-settings")') !== -1, "«настройки» на рельсе не работают");
   });
 
   await test("рельса: панель чатов сворачивается, рельса остаётся", () => {
-    assert.ok(/function setSidebarCollapsed\(/.test(appSrc), "нет сворачивания панели чатов");
-    assert.ok(/localStorage\.setItem\("sidebarCollapsed"/.test(appSrc), "свёрнутость не запоминается");
+    assert.ok(/function setSidebarCollapsed\(/.test(panelSrc), "нет сворачивания панели чатов");
+    assert.ok(/localStorage\.setItem\("sidebarCollapsed"/.test(panelSrc), "свёрнутость не запоминается");
     assert.ok(/#sidebar\.collapsed \{[\s\S]*?width: 0;/.test(css), "свёрнутая панель не уезжает");
     // На телефоне свёрнутость не должна ломать выезжающую панель.
     const m900 = css.match(/@media \(max-width: 900px\) \{([\s\S]*?)\n\}/);
@@ -13058,7 +13310,7 @@ async function testDeploy() {
     assert.ok(html.includes('id="rail-deploy"') && html.includes('id="btn-toggle-deploy"'));
 
     const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
-    assert.ok(appSrc.includes("DeployPanel.open("), "панель подключается при открытии вкладки");
+    assert.ok(uiFile("side-panel.js").includes("DeployPanel.open("), "панель подключается при открытии вкладки");
     assert.ok(appSrc.includes('case "deploy_stage"') && appSrc.includes('case "deploy_done"'), "стадии деплоя доходят до панели");
   });
 
@@ -15139,6 +15391,7 @@ async function testMissions() {
   await testContextWindow();
   await testSecretScopes();
   await testOneNavigation();
+  await testSidePanel();
   await testCommandPalette();
   await testRealE2E();
   await testProductionGate();
@@ -15383,8 +15636,9 @@ async function testOneNavigation() {
     assert.ok(m900 && /\.sp-switch \{ display: flex; \}/.test(m900[1]), "на телефоне вкладки панели не вернулись");
     // Вместо вкладок панель показывает название раздела.
     assert.ok(html.indexOf('id="sp-title"') !== -1, "в шапке панели нет названия раздела");
-    assert.ok(/SP_TITLES = \{[\s\S]{0,200}?tasks: "Дела"/.test(appSrc), "нет названий разделов");
-    assert.ok(/spTitle\.textContent = SP_TITLES\[sideTab\]/.test(appSrc), "название раздела не обновляется");
+    const navSrc = uiFile("side-panel.js");
+    assert.ok(/SP_TITLES = \{[\s\S]{0,200}?tasks: "Дела"/.test(navSrc), "нет названий разделов");
+    assert.ok(/spTitle\.textContent = SP_TITLES\[sideTab\]/.test(navSrc), "название раздела не обновляется");
     // Каскад: мобильное правило обязано идти ПОСЛЕ базового и лежать внутри блока 900px —
     // иначе скрытие не переопределится и на телефоне не останется навигации вообще.
     const baseDupe = css.indexOf(".header-btns .hdr-dupe { display: none; }");
@@ -15409,7 +15663,7 @@ async function testOneNavigation() {
     const openBody = uiFind("  function openSidePanel(tab) {", "  function closeSidePanel() {").code;
     assert.ok(openBody.indexOf("markPanelButtons();") !== -1, "openSidePanel не пересчитывает подсветку");
     assert.ok(openBody.indexOf('.classList.add("active")') === -1, "openSidePanel снова включает подсветку вручную");
-    assert.ok(/function markPanelButtons\(\)/.test(appSrc), "нет единой точки подсветки разделов");
+    assert.ok(/function markPanelButtons\(\)/.test(uiFile("side-panel.js")), "нет единой точки подсветки разделов");
 
     // Живая логика: берём из app.js сам блок навигации и прогоняем на игрушечном
     // DOM. sidePanelVisible и sideTab объявлены в файле рядом — подставляем их

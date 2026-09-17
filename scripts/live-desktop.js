@@ -1061,6 +1061,139 @@ function startFakeProvider(seen, rounds, rate, script) {
     await sleep(300);
     const palClosed = await page.evaluate(() => document.getElementById("palette-overlay").classList.contains("hidden"));
     check("Escape закрывает палитру", palClosed, "hidden: " + palClosed);
+    console.log("\n[19] Рельса и правая панель: разделы, подсветка, консоль и превью живут своим модулем");
+    // Этап 9: панель, рельса, консоль и превью уехали в side-panel.js. Проверяем в
+    // НАСТОЯЩЕМ окне: клики по рельсе, переключение разделов, ровно одна подсветка,
+    // свёрнутый список чатов с памятью и адрес превью, доехавший до файла настроек.
+    await page.evaluate(async () => {
+      const $ = (id) => document.getElementById(id);
+      if (!$("side-panel").classList.contains("hidden")) $("btn-sp-close").click();
+      localStorage.removeItem("sidebarCollapsed");
+      await new Promise((r) => setTimeout(r, 200));
+    });
+    const railConsole = await page.evaluate(async () => {
+      const $ = (id) => document.getElementById(id);
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      const rails = ["rail-console", "rail-preview", "rail-cloud", "rail-deploy", "rail-mission", "rail-tasks"];
+      const active = () => rails.filter((id) => $(id).classList.contains("active"));
+      $("rail-console").click();
+      await wait(600);
+      const opened = {
+        visible: !$("side-panel").classList.contains("hidden"),
+        consoleBody: !$("sp-console").classList.contains("hidden"),
+        previewBody: $("sp-preview").classList.contains("hidden"),
+        title: $("sp-title").textContent,
+        active: active(),
+        btn: $("btn-toggle-console").classList.contains("active"),
+        consoleHasText: ($("term-out").textContent || "").length > 20,
+      };
+      $("rail-preview").click();
+      await wait(400);
+      const preview = {
+        previewBody: !$("sp-preview").classList.contains("hidden"),
+        consoleBody: $("sp-console").classList.contains("hidden"),
+        title: $("sp-title").textContent,
+        active: active(),
+      };
+      // Кнопка раздела — переключатель: с чужого раздела она переключает на свой,
+      // а на своём повторное нажатие закрывает панель.
+      $("rail-console").click();
+      await wait(400);
+      const switchedBack = { title: $("sp-title").textContent, active: active() };
+      $("rail-console").click();
+      await wait(400);
+      const closed = { visible: !$("side-panel").classList.contains("hidden"), active: active() };
+      return { opened, preview, switchedBack, closed };
+    });
+    check(
+      "иконка рельсы открывает раздел «Консоль» с одним заголовком и одной подсветкой",
+      railConsole.opened.visible && railConsole.opened.consoleBody && railConsole.opened.previewBody &&
+        railConsole.opened.title === "Консоль" && railConsole.opened.btn &&
+        railConsole.opened.active.length === 1 && railConsole.opened.active[0] === "rail-console",
+      JSON.stringify(railConsole.opened)
+    );
+    check("консоль в открытом разделе показывает текст", railConsole.opened.consoleHasText, "текст консоли: " + (railConsole.opened.consoleHasText ? "есть" : "пусто"));
+    check(
+      "иконка «Превью» переключает раздел и заголовок",
+      railConsole.preview.previewBody && railConsole.preview.consoleBody &&
+        railConsole.preview.title === "Превью" && railConsole.preview.active.join(",") === "rail-preview",
+      JSON.stringify(railConsole.preview)
+    );
+    check(
+      "нажатие на чужом разделе возвращает свой раздел",
+      railConsole.switchedBack.title === "Консоль" && railConsole.switchedBack.active.join(",") === "rail-console",
+      JSON.stringify(railConsole.switchedBack)
+    );
+    check(
+      "повторное нажатие на своём разделе закрывает панель и снимает подсветку",
+      !railConsole.closed.visible && railConsole.closed.active.length === 0,
+      JSON.stringify(railConsole.closed)
+    );
+
+    // Свёрнутый список чатов: состояние запоминается, разворот возвращает панель.
+    const railChats = await page.evaluate(async () => {
+      const $ = (id) => document.getElementById(id);
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      $("rail-chats").click();
+      await wait(300);
+      const collapsed = {
+        cls: $("sidebar").classList.contains("collapsed"),
+        saved: localStorage.getItem("sidebarCollapsed"),
+        railActive: $("rail-chats").classList.contains("active"),
+      };
+      $("btn-side-collapse").click();
+      await wait(300);
+      return {
+        collapsed: collapsed,
+        back: {
+          cls: $("sidebar").classList.contains("collapsed"),
+          saved: localStorage.getItem("sidebarCollapsed"),
+          railActive: $("rail-chats").classList.contains("active"),
+        },
+      };
+    });
+    check(
+      "список чатов сворачивается по рельсе и запоминает состояние",
+      railChats.collapsed.cls && railChats.collapsed.saved === "1" && !railChats.collapsed.railActive,
+      JSON.stringify(railChats.collapsed)
+    );
+    check(
+      "кнопка в шапке разворачивает панель обратно",
+      !railChats.back.cls && railChats.back.saved === "0" && railChats.back.railActive,
+      JSON.stringify(railChats.back)
+    );
+
+    // Превью: адрес из поля доезжает до кадра, полей и файла настроек.
+    const livePreview = await page.evaluate(async () => {
+      const $ = (id) => document.getElementById(id);
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      $("rail-preview").click();
+      await wait(500);
+      $("preview-url").value = "http://127.0.0.1:8123/live-preview";
+      $("btn-preview-open").click();
+      await wait(600);
+      return {
+        frame: $("preview-frame").src,
+        url: $("preview-url").value,
+        device: (() => {
+          const b = document.querySelector('.dev-btns .dev[data-w="390"]');
+          if (b) b.click();
+          return $("preview-device").style.width;
+        })(),
+      };
+    });
+    check(
+      "адрес превью уходит в кадр и в поле",
+      /127\.0\.0\.1:8123\/live-preview/.test(livePreview.frame) && /127\.0\.0\.1:8123\/live-preview/.test(livePreview.url),
+      JSON.stringify({ frame: livePreview.frame.slice(0, 60), url: livePreview.url })
+    );
+    check("переключатель устройств задал ширину кадра", livePreview.device === "390px", "ширина: " + livePreview.device);
+    const settingsAfterPreview = fs.existsSync(settingsFile) ? JSON.parse(fs.readFileSync(settingsFile, "utf8")) : {};
+    check(
+      "адрес превью сохранён в файле настроек",
+      settingsAfterPreview.previewUrl === "http://127.0.0.1:8123/live-preview",
+      "в файле: " + (settingsAfterPreview.previewUrl || "нет")
+    );
   } catch (e) {
     check("сквозной прогон без исключений", false, e.message);
   } finally {

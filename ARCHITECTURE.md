@@ -41,16 +41,16 @@
 | src/renderer/agent-core.js | ядро агента: запросы, инструменты, план, память | app.js: window.AgentCore |
 | src/renderer/markdown.js | рендер markdown и диаграмм без библиотек | chat-render.js: MdRender.render( |
 | src/renderer/bootstrap.js | заглушка для телефона + страховочная загрузка field-guard | — |
-| src/renderer/mobile-api.js | работа окна на телефоне: IPC через WebSocket | app.js: window.mobileApi |
+| src/renderer/mobile-api.js | работа окна на телефоне: IPC через WebSocket | side-panel.js: window.mobileApi |
 | src/renderer/yc-console.js | консоль Yandex Cloud в правой панели | yc-panel.js: window.YcConsole |
 | src/renderer/yc-console.css | стили консоли Yandex Cloud | — |
 | src/renderer/yc-panel.js | панель Yandex Cloud: дашборд и подключение в настройках | app.js: window.YcPanel({ |
 | src/renderer/deploy-panel.js | панель деплоя: стадии, логи, откат | app.js: window.DeployPanel |
 | src/renderer/deploy-panel.css | стили панели деплоя | — |
-| src/renderer/dev-run.js | быстрый запуск проекта: dev-сервер, порт, логи | app.js: window.DevRun({ |
+| src/renderer/dev-run.js | быстрый запуск проекта: dev-сервер, порт, логи | side-panel.js: window.DevRun({ |
 | src/renderer/chat-actions.js | удобство чата: копирование, регенерация, правка сообщения | app.js: window.ChatActions({ |
 | src/renderer/web-chat.js | веб-режим: цикл чата в браузере без главного процесса | app.js: window.WebChat({ |
-| src/renderer/tasks-mission.js | роли чата, дела и миссия: панели и их состояние | app.js: window.TasksMission({ |
+| src/renderer/tasks-mission.js | роли чата, дела и миссия: панели и их состояние | side-panel.js: window.TasksMission({ |
 | src/renderer/secrets-panel.js | секреты: пароли сайтов, почта, переменные агента | app.js: window.SecretsPanel({ |
 | src/renderer/highlight.js | подсветка кода для читалки файлов | project-panel.js: window.Highlight |
 | src/renderer/qr.js | QR-код подключения телефона | mobile-panel.js: window.QR |
@@ -65,6 +65,7 @@
 | src/renderer/settings-panel.js | настройки: вкладки, поля, провайдеры, замер модели, сохранение | app.js: window.SettingsPanel({ |
 | src/renderer/project-panel.js | панель проекта: файлы, правка, вкладки, коммиты, изменения, публикация | app.js: window.ProjectPanel({ |
 | src/renderer/field-guard.js | страховка полей ввода (фокус не теряется) | — сам навешивает защиту |
+| src/renderer/side-panel.js | правая панель и рельса: разделы, консоль рабочей папки, превью; здесь же собираются DevRun и TasksMission | app.js: window.SidePanel({ |
 | src/renderer/command-palette.js | палитра команд: действия по разделам, поиск по файлам проекта, запуск | app.js: window.CommandPalette({ |
 | src/renderer/app.js | оболочка окна: чат, панели, настройки, события | — собирает всё в окне |
 <!-- UI-MAP:END -->
