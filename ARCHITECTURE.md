@@ -209,6 +209,8 @@
 | `src/bg-processes.js` | фоновые процессы и постоянные оболочки (`bgSpawn`/`bgKill`, кольцевой буфер вывода, остановка вместе с деревом), распознавание dev-команд (`SERVER_CMD_RE`), освобождение порта (`killProcessesOnPort`) и HTTP-проверка адреса (`checkUrlStatus`) |
 | `src/undo-store.js` | снимки отката правок агента (`snapshotFileForUndo` с вытеснением на файл) и чекпоинт на диске (`persistUndo`/`loadPersistedUndo`, `undoFile`) |
 | `src/project-search.js` | обход проекта (`walkProject`), список файлов для «осмотра» (`listProjectFiles`) и поиск по содержимому (`searchProjectFiles`) |
+| `src/project-analysis.js` | анализ проекта: сбор исходников (`projectSourceFiles`), структура файла (`buildFileStructure`), переименование по границам слова (`refactorRenameFiles`) и поиск ссылок на символ (`findSymbolReferences`) |
+| `src/tool-helpers.js` | помощники инструментов: пакетный менеджер по lockfile (`detectPackageManager`/`hasLock`), сводка итога тестов (`summarizeTestOutput`), unified-дифф через git (`unifiedDiff`) |
 | `src/paths-git.js` | пути и git для всего бэкенда: `resolvePath`/`sanitizeDir`/`sanitizePath`, `gitDirOrHome`/`agentWorkDir`, `repoNameFromUrl`/`stripUrlCreds`, `runGit` (окружение по назначению + Basic-авторизация) |
 | `src/app-ui-tools.js`, `tool-policy.js` | интерфейсные инструменты, разрешения |
 | `src/mobile-bridge.js`, `secrets.js`, `ota.js`, `vault.js` | телефон, секреты, обновления, пароли |

@@ -606,189 +606,24 @@ function runTerminalCommand(command, cwd, timeoutMs, shellName) {
   });
 }
 
-// ─────────────────────────── Помощники новых инструментов ───────────────────────────
-// Определяет пакетный менеджер проекта по lockfile.
-function detectPackageManager(cwd) {
-  const has = (name) => fs.existsSync(path.join(cwd, name));
-  if (has("bun.lockb") || has("bun.lock")) return { name: "bun", bin: "bun", add: "add", flagDev: "-d" };
-  if (has("pnpm-lock.yaml")) return { name: "pnpm", bin: "pnpm", add: "add", flagDev: "-D" };
-  if (has("yarn.lock")) return { name: "yarn", bin: "yarn", add: "add", flagDev: "-D" };
-  return { name: "npm", bin: "npm", add: "install", flagDev: "-D" };
-}
+// ── Помощники инструментов — код в src/tool-helpers.js ──
+// Имена те же: вызовы в инструментах и каналах остались дословно прежними.
+const { createToolHelpers } = require("./tool-helpers.js");
+const { detectPackageManager, hasLock, summarizeTestOutput, unifiedDiff } = createToolHelpers({
+  fs,
+  path,
+  execFile,
+  envFor,
+  stripAnsi,
+  agentWorkDir,
+  loadSettings,
+});
 
-function hasLock(kind) {
-  const cwd = agentWorkDir(loadSettings());
-  const has = (name) => fs.existsSync(path.join(cwd, name));
-  if (kind === "bun") return has("bun.lockb") || has("bun.lock");
-  return has("package-lock.json") || has("npm-shrinkwrap.json");
-}
 
-// Выжимает из вывода тестового раннера краткий итог: сколько прошло/упало и какие тесты упали.
-function summarizeTestOutput(out) {
-  const s = String(out || "");
-  const summary = [];
-  const passMatch = s.match(/Tests:?\s+(\d+)\s+(passed|passing|пройден)/i) || s.match(/(\d+)\s*(passed|passing|пройден)/i) || s.match(/passed\s*(\d+)/i);
-  const failMatch = s.match(/Tests:?\s+.*?(\d+)\s+(failed|failing|упал)/i) || s.match(/(\d+)\s*(failed|failing|упал)/i) || s.match(/failed\s*(\d+)/i);
-  if (passMatch) summary.push("✅ прошло: " + passMatch[1]);
-  if (failMatch) summary.push("❌ упало: " + failMatch[1]);
-  const failLines = s.split("\n").map((l) => l.trim()).filter((l) => l && l.length < 200 && /^(✕|✗|×|FAIL\b|●|✖|❌)/.test(l)).slice(0, 15);
-  if (failLines.length) summary.push("Упавшие тесты:\n" + failLines.join("\n"));
-  if (!summary.length && /(fail|error)/i.test(s)) summary.push("В выводе есть ошибки/упавшие тесты — смотри полный вывод.");
-  return summary.join("\n");
-}
+// ── Анализ проекта: структура, переименование, ссылки — код в src/project-analysis.js ──
+const { createProjectAnalysis } = require("./project-analysis.js");
+const { projectSourceFiles, buildFileStructure, refactorRenameFiles, findSymbolReferences, argsPathIsFile, escRe } = createProjectAnalysis({ fs, path });
 
-// Unified-дифф двух файлов/папок через git diff --no-index (git уже есть в системе).
-function unifiedDiff(p1, p2) {
-  return new Promise((resolve) => {
-    execFile("git", ["diff", "--no-index", "--", p1, p2], {
-      timeout: 30000,
-      maxBuffer: 16 * 1024 * 1024,
-      windowsHide: true,
-      env: { ...envFor("git.read"), GIT_TERMINAL_PROMPT: "0" },
-    }, (err, stdout, stderr) => {
-      // git diff --no-index возвращает код 1 при различиях — это норма, патч в stdout.
-      resolve({ patch: stripAnsi((stdout || "") + (stderr || "")).trim() });
-    });
-  });
-}
-
-// ─────────────────────────── Помощники: анализ/рефакторинг/API/БД ───────────────────────────
-const escRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-// Собирает исходники проекта, исключая node_modules/.git/dist и прочий мусор.
-function projectSourceFiles(root) {
-  const SKIP = new Set(["node_modules", ".git", "dist", "build", "out", ".next", ".nuxt", "coverage", "__pycache__", ".venv", "venv", "target", "vendor", ".idea", ".vscode", ".cache", ".turbo", "node_modules"]);
-  const EXT_OK = /\.(js|jsx|ts|tsx|mjs|cjs|json|css|scss|sass|less|html|htm|vue|svelte|py|go|rs|java|kt|kts|rb|php|cs|dart|md|markdown|yml|yaml|toml|sh|sql)$/i;
-  const out = [];
-  const walk = (dir) => {
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      if (out.length >= 3000) return;
-      if (e.name.startsWith(".") && e.name !== ".env" && e.name !== ".env.local") continue;
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) {
-        if (!SKIP.has(e.name)) walk(full);
-      } else if (EXT_OK.test(e.name)) {
-        out.push(full);
-      }
-    }
-  };
-  walk(root);
-  return out;
-}
-
-// Структура файла: импорты, экспорты и объявления верхнего уровня с номерами строк.
-function buildFileStructure(abs, filter) {
-  let content;
-  try {
-    content = fs.readFileSync(abs, "utf8");
-  } catch (e) {
-    return { error: "не удалось прочитать файл: " + (e.message || String(e)) };
-  }
-  if (content.includes("\u0000")) return { error: "файл бинарный — структуру не показать" };
-  const lines = content.split("\n");
-  const filterRe = filter ? (() => { try { return new RegExp(String(filter), "i"); } catch { return null; } })() : null;
-  const rows = [];
-  const push = (lineNo, kind, text) => {
-    const t = String(text || "").trim().slice(0, 110);
-    if (!t) return;
-    if (filterRe && !filterRe.test(kind + " " + t)) return;
-    if (rows.length < 400) rows.push({ line: lineNo, kind, text: t });
-  };
-  for (let i = 0; i < lines.length; i++) {
-    const ln = lines[i];
-    if (rows.length >= 400) break;
-    // импорты: import ... from 'x' / import 'x' / require('x')
-    const imp = ln.match(/^\s*import\s+[^"']+?\s+from\s+["']([^"']+)["']/) ||
-      ln.match(/^\s*import\s+\("?\s*["']([^"']+)["']/) ||
-      ln.match(/^\s*import\s+["']([^"']+)["']\s*;?/) ||
-      ln.match(/^\s*(?:const|let|var)\s+[\w$,\s{}*]+\s*=\s*require\s*\(\s*["']([^"']+)["']\s*\)/);
-    if (imp) { push(i + 1, "import", imp[1]); continue; }
-    // экспорты
-    const exp = ln.match(/^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)/) ||
-      ln.match(/^\s*export\s*\{[^}]*\}/) ||
-      ln.match(/^\s*export\s+\*\s+from\s+["'][^"']+["']/);
-    if (exp) { push(i + 1, "export", exp[1] || ln.trim().slice(0, 80)); continue; }
-    // объявления верхнего уровня (без отступа)
-    if (!/^\s/.test(ln)) {
-      const dec = ln.match(/^(?:export\s+)?(?:declare\s+)?(?:async\s+)?(?:function|class|interface|type|enum|const|let|var|def|func|fn|public|private|internal|static)\b[^;{=]*/);
-      if (dec) push(i + 1, "decl", dec[0].trim());
-    }
-  }
-  return { rows, totalLines: lines.length };
-}
-
-// Переименование идентификатора по границам слова во всех исходниках проекта (или в одном файле/папке).
-function refactorRenameFiles(root, oldName, newName, dryRun) {
-  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(oldName)) return { error: "oldName должен быть валидным идентификатором (буквы/цифры/_/$)" };
-  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(newName)) return { error: "newName должен быть валидным идентификатором (буквы/цифры/_/$)" };
-  if (oldName === newName) return { error: "oldName и newName совпадают" };
-  const rootIsFile = argsPathIsFile(root);
-  const files = rootIsFile ? [root] : projectSourceFiles(root);
-  const re = new RegExp("(?<![A-Za-z0-9_$])" + escRe(oldName) + "(?![A-Za-z0-9_$])", "g");
-  const changed = [];
-  let total = 0;
-  for (const f of files) {
-    let buf;
-    try { buf = fs.readFileSync(f); } catch { continue; }
-    if (buf.includes(0)) continue; // бинарный файл
-    let content;
-    try { content = buf.toString("utf8"); } catch { continue; }
-    const m = content.match(re);
-    if (!m) continue;
-    const count = m.length;
-    total += count;
-    const sampleLines = content.split("\n").filter((l) => new RegExp("(?<![A-Za-z0-9_$])" + escRe(oldName) + "(?![A-Za-z0-9_$])").test(l)).slice(0, 2).map((l) => l.trim().slice(0, 120));
-    if (!dryRun) {
-      try { fs.writeFileSync(f, content.replace(re, newName), "utf8"); } catch { continue; }
-    }
-    const relBase = rootIsFile ? path.dirname(root) : root;
-    changed.push({ rel: path.relative(relBase, f).split(path.sep).join("/"), count, sample: sampleLines.join(" | ") });
-  }
-  return { dryRun, changed, total };
-}
-function argsPathIsFile(p) {
-  try { return fs.statSync(p).isFile(); } catch { return false; }
-}
-
-// Поиск использований символа по границам слова (аналог «Найти все ссылки» в IDE).
-// root — рабочая папка проекта или конкретный файл/папка. Каждая строка-совпадение
-// классифицируется: определение / импорт / вызов / ссылка.
-function findSymbolReferences(root, symbol) {
-  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(symbol)) return { error: "symbol должен быть валидным идентификатором (буквы/цифры/_/$)" };
-  const isFile = argsPathIsFile(root);
-  const files = isFile ? [root] : projectSourceFiles(root);
-  const re = new RegExp("(?<![A-Za-z0-9_$])" + escRe(symbol) + "(?![A-Za-z0-9_$])");
-  const esc = escRe(symbol);
-  const hits = [];
-  for (const f of files) {
-    if (hits.length >= 100) break;
-    let buf;
-    try { buf = fs.readFileSync(f); } catch { continue; }
-    if (buf.includes(0)) continue; // бинарный файл
-    const lines = buf.toString("utf8").split("\n");
-    const rel = path.relative(isFile ? path.dirname(root) : root, f).split(path.sep).join("/") || path.basename(f);
-    let perFile = 0;
-    for (let i = 0; i < lines.length && perFile < 25 && hits.length < 100; i++) {
-      const raw = lines[i];
-      if (!re.test(raw)) continue;
-      const t = raw.trim();
-      let kind = "ссылка";
-      const mods = "(?:async\\s+|static\\s+|get\\s+|set\\s+)*";
-      if (/(^|[^A-Za-z0-9_$])(import\b|require\s*\()/.test(t) && !/^\s*(?:const|let|var)\s/.test(t)) kind = "импорт";
-      else if (new RegExp("^(?:export\\s+)?(?:async\\s+)?(?:function|class|interface|type|enum|def|func|fn)\\s+" + esc + "\\b").test(t)) kind = "определение";
-      else if (new RegExp("^(?:export\\s+)?(?:const|let|var)\\s+" + esc + "\\s*(?:=|:)").test(t)) kind = "определение";
-      else if (new RegExp("^" + esc + "\\s*:\\s*(?:async\\s*)?\\([^)]*\\)\\s*=>").test(t)) kind = "определение";
-      else if (new RegExp("^\\s{1,}" + mods + esc + "\\s*\\(").test(raw) && /\{\s*$/.test(raw)) kind = "определение";
-      else if (new RegExp("(?:^|[^A-Za-z0-9_$])(?:new\\s+)?" + esc + "\\s*\\(").test(t)) kind = "вызов";
-      else if (new RegExp("(^|[^A-Za-z0-9_$])new\\s+" + esc + "\\b").test(t)) kind = "вызов";
-      hits.push({ file: rel, n: i + 1, kind, text: t.slice(0, 140) });
-      perFile++;
-    }
-  }
-  return { error: null, hits, truncated: hits.length >= 100 };
-}
 
 // Запуск команды со сбором вывода, пока не появится waitFor / процесс не завершится / не выйдет таймаут.
 function spawnCollect(command, cwd, timeoutMs, waitFor) {
