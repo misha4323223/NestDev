@@ -2553,68 +2553,22 @@ async function runAi(settings, messages, win, opts) {
 // ─────────────────────────── Окно ───────────────────────────
 let mainWindow = null;
 
-function createWindow() {
-  mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 800,
-    minWidth: 900,
-    minHeight: 600,
-    title: "AI Developer Agent",
-    backgroundColor: "#0f1115",
-    autoHideMenuBar: true,
-    webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
-  });
-  // Напоминания о делах: проверяем раз в минуту (плюс сразу после старта, если что-то
-  // уже просрочено). Таймер живёт вместе с приложением, окно может быть свёрнуто.
-  // Интервал можно укоротить для живого теста: AI_AGENT_TASK_REMINDER_MS.
-  const taskReminderEvery = Math.max(2000, Number(process.env.AI_AGENT_TASK_REMINDER_MS) || 60000);
-  setTimeout(checkTaskReminders, Math.min(8000, taskReminderEvery));
-  setInterval(checkTaskReminders, taskReminderEvery);
+// ── Окно — код в src/app-window.js ──
+// Живые значения — мостами: окно создаётся позже и закрывается (setWindow),
+// а метку запуска (чей прогон — ПК или телефон) пишет прогон агента (getRunOrigin).
+const { createAppWindow } = require("./app-window.js");
+const { createWindow } = createAppWindow({
+  app,
+  path,
+  shell,
+  mobileBridge,
+  BrowserWindow,
+  checkTaskReminders,
+  getRunOrigin: () => activeRunOrigin,
+  setWindow: (w) => { mainWindow = w; },
+  appDir: __dirname,
+});
 
-  // Прокси webContents.send: все события (ai:event, term:event, dev:event, github:event)
-  // дополнительно транслируются клиентам мобильного моста по WebSocket.
-  // Windows: без AppUserModelID уведомления приходят «от Electron» (или не приходят).
-  if (process.platform === "win32") {
-    try { app.setAppUserModelId("AI Developer Agent"); } catch {}
-  }
-
-  const _wcSend = mainWindow.webContents.send.bind(mainWindow.webContents);
-  mainWindow.webContents.send = (ch, ev) => {
-    // Клиентов теперь несколько (окно на ПК + телефоны), и прогон агента может
-    // быть чужим. У событий нет привязки к переписке, поэтому помечаем их тем,
-    // кто запустил прогон: иначе ответ с телефона подмешивался бы в открытый чат
-    // на ПК, а плашки «сжатие контекста» и превью всплывали бы не там.
-    if (ch === "ai:event" && ev && typeof ev === "object" && ev.from === undefined) {
-      ev = { ...ev, from: activeRunOrigin };
-    }
-    try {
-      mobileBridge.broadcast(ch, ev);
-    } catch {}
-    return _wcSend(ch, ev);
-  };
-  mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
-  // Кликабельные ссылки из чата: http(s) открываются в браузере пользователя,
-  // а не в новом окне Electron.
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:/i.test(url)) shell.openExternal(url).catch(() => {});
-    return { action: "deny" };
-  });
-  mainWindow.webContents.on("will-navigate", (e, url) => {
-    if (/^https?:/i.test(url)) {
-      e.preventDefault();
-      shell.openExternal(url).catch(() => {});
-    }
-  });
-  mainWindow.on("closed", () => {
-    mainWindow = null;
-  });
-}
-
-// ─────────────────────────── Пользовательский терминал (нижняя панель, как в Replit) ───────────────────────────
 // ── Пользовательский терминал (нижняя панель, как в Replit) — код в src/terminal-panel.js ──
 // Имена те же: панель, каналы term:* и инструменты агента зовут их дословно.
 // Окно приходит функцией — оно создаётся позже сборки модуля и может быть закрыто.
