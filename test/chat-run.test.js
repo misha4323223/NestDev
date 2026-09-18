@@ -200,6 +200,11 @@ function buildChatRun(opts) {
     for (const call of ["getChatRun().setStreaming(true);", "getChatRun().finishStream(chat, assistantMsg);"]) {
       assert.ok(SEND_SRC.includes(call), "прогон не зовёт модуль прогона: " + call);
     }
+    // Завершение прогона обязано трогать ШАПКУ, а не только состояние. Здесь это
+    // проверяется по исходнику — чтобы было видно сразу, что именно потеряли, если
+    // кто-то заменит вызов на «как бы такой же» (одно состояние + крутилка навсегда).
+    assert.ok(MODULE_SRC.includes("setStreaming(false);"), "завершение прогона не возвращает шапку");
+    assert.ok(!MODULE_SRC.includes("setStreamingFlag(false)"), "завершение прогона меняет только состояние, а не шапку");
     const build = APP_SRC.indexOf("  const ChatRun = window.ChatRun({");
     assert.ok(build > 0, "в оболочке нет сборки модуля");
     const wiring = APP_SRC.slice(build, APP_SRC.indexOf("  });", build));
@@ -265,6 +270,21 @@ function buildChatRun(opts) {
     assert.strictEqual(env.log.sidebar, 1, "список чатов не перерисован");
     assert.strictEqual(env.log.finishGroup, 1, "группа работ не закрыта");
     assert.strictEqual(env.log.resetGroup, 1, "группа работ не сброшена");
+  });
+
+  await test("прогон: по завершении ответа в шапке снова «Отправить», а не «Стоп»", async () => {
+    // Ровно та тихая поломка, которая ломала весь следующий шаг: признак прогона
+    // снимался, а ШАПКА не перерисовывалась — крутилка и «Стоп» оставались на месте,
+    // кнопка «Отправить» была скрыта, и отправить следующую команду было нечем
+    // (видно только в живом окне: в структурном тесте состояние «как бы» верное).
+    const segs = [{ id: "msg1", content: "готово", pending: true }];
+    const env = buildChatRun({ segments: segs, bubbleText: "" });
+    env.mod.setStreaming(true);
+    await env.mod.finishStream(env.chat, segs[0]);
+    assert.strictEqual(env.state.streaming, false, "признак прогона остался включённым");
+    assert.strictEqual(env.$("btn-stop").classList.contains("hidden"), true, "кнопка «Стоп» осталась в шапке после ответа");
+    assert.strictEqual(env.$("typing").classList.contains("hidden"), true, "крутилка осталась в шапке после ответа");
+    assert.strictEqual(env.$("btn-send").classList.contains("hidden"), false, "кнопка «Отправить» не вернулась — следующую команду отправить нечем");
   });
 
   await test("прогон: ответ без текста не оставляет пустоту", async () => {

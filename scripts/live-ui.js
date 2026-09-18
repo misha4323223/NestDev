@@ -15,6 +15,7 @@
    разу ни в одном сценарии. Структурный тест этого не видел, потому что сам
    подставлял нормализатор в область видимости. */
 const { spawn } = require("child_process");
+const fs = require("fs");
 const net = require("net");
 const path = require("path");
 
@@ -123,6 +124,19 @@ async function startServer(port) {
       const rr = await fetch(BASE + "/" + f);
       check("GET /" + f + " → 200", rr.status === 200);
     }
+    // Каждый модуль, который грузит само окно, обязан отдаваться. Пропавший файл
+    // (неполный набор обновления) в собранном приложении выглядит как «в чате пусто»,
+    // а не как ошибка сервера — поэтому список берём из самой разметки, а не из головы:
+    // новый модуль попадает под проверку сам, без правки этого скрипта.
+    const indexHtml = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    const scripts = [...indexHtml.matchAll(/<script[^>]+src="([^"]+)"/g)].map((m) => m[1]);
+    check("разметка перечисляет модули окна", scripts.length >= 10, "модулей в разметке: " + scripts.length);
+    const missingScripts = [];
+    for (const f of scripts) {
+      const rr = await fetch(BASE + "/" + f);
+      if (rr.status !== 200) missingScripts.push(f + " → " + rr.status);
+    }
+    check("все модули окна отдаются сервером", missingScripts.length === 0, missingScripts.join(", "));
   } catch (e) {
     check("сервер поднялся", false, e.message);
   }
@@ -241,6 +255,19 @@ async function startServer(port) {
     return false;
   }
 
+  /* Ждём, пока шапка вернётся в спокойное состояние: после ответа на месте должна быть
+     кнопка «Отправить», а не «Стоп» и крутилка. Раньше следующей раздел просто жал на
+     кнопку — и получал таймаут в 30 с без объяснения причины («element is not visible»),
+     а причина была в том, что прогон не завершился или шапка не перерисовалась. */
+  async function waitIdle(timeoutMs) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      if (await page.locator("#btn-send").isVisible()) return true;
+      await sleep(200);
+    }
+    return false;
+  }
+
   try {
     console.log("\n[2] Живой интерфейс");
     await page.goto(BASE, { waitUntil: "load" });
@@ -319,15 +346,25 @@ async function startServer(port) {
       await page.evaluate(() => Array.from(document.querySelectorAll("div")).some((d) => /чеклист/i.test(d.textContent || "")))
     );
 
+    // После ответа шапка обязана вернуться: снова «Отправить», иначе человек не может
+    // отправить следующую команду (кнопка скрыта), а следующий раздел не может начаться.
+    check(
+      "после ответа шапка вернулась — снова «Отправить», а не «Стоп»",
+      await waitIdle(15000),
+      "кнопка отправки скрыта: прогон не завершился или шапка не перерисовалась"
+    );
+
     console.log("\n[4] План через инструмент todoWrite → панель плана");
     await page.click("#rail-new");
     await sleep(500);
     calls = 0;
     scenario = "tool";
     await page.fill("#input", "Составь план работ");
+    check("новый чат начался: кнопка отправки на месте", await waitIdle(5000), "после «нового чата» отправлять нечем");
     await page.click("#btn-send");
     const shownTool = await waitPlan(25000);
     check("панель плана появилась от инструмента", shownTool);
+    check("прогон с инструментом завершился", await waitIdle(15000), "кнопка отправки не вернулась после прогона с инструментом");
     const toolPanel = shownTool ? (await page.locator("#plan-panel").innerText()).trim() : "";
     check("видны пункты от инструмента", /Прочитать|кнопку|Нажать/i.test(toolPanel), JSON.stringify(toolPanel.slice(0, 90)));
     check("было ≥2 раунда (инструмент + ответ)", calls >= 2, "запросов к модели: " + calls);

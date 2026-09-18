@@ -56,7 +56,10 @@
       kept.push(s);
     }
     const lastSeg = kept[kept.length - 1] || aMsg;
-    setStreamingFlag(false);
+    // Именно setStreaming, а НЕ setStreamingFlag: одно только состояние оставило бы
+    // в шапке крутилку и кнопку «Стоп» вместо «Отправить» — человек не смог бы
+    // отправить следующую команду (кнопка скрыта), хотя прогон давно кончился.
+    setStreaming(false);
     ChatStore.persistChatsNow();
     renderSidebar();
     const el = msgEls.get(lastSeg.id);

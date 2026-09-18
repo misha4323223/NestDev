@@ -63,7 +63,10 @@ async function liveHttp() {
 }
 
 // ── 2. Запуск окна в порядке тегов ─────────────────────────────────────────
-function bootWindow() {
+// preload — то, что должно лежать в localStorage ДО загрузки скриптов (настройки:
+// без модели окно справедливо отказывается отправлять запрос).
+// fetchImpl — чем отвечает сеть: нужен, чтобы прогнать НАСТОЯЩИЙ цикл ответа.
+function bootWindow(preload, fetchImpl) {
   console.log("\n[2] Запуск окна: " + scripts.length + " скриптов в порядке тегов");
   const stubs = new Map();
   // Заглушка не строит дерево DOM, но у неё есть текст настоящей разметки: только для
@@ -88,11 +91,20 @@ function bootWindow() {
         add: (...c) => c.forEach((x) => set.add(x)),
         remove: (...c) => c.forEach((x) => set.delete(x)),
         contains: (c) => set.has(c),
-        toggle: (c) => (set.has(c) ? set.delete(c) : set.add(c)),
+        // Второй довод (force) настоящий classList.toggle уважает: без него проверка
+        // «класс добавлен/убран» в песочнице врала бы — молча оставляла как было.
+        toggle: (c, force) => {
+          const want = force === undefined ? !set.has(c) : !!force;
+          if (want) set.add(c);
+          else set.delete(c);
+        },
       },
       setAttribute() {}, getAttribute: () => "", removeAttribute() {}, hasAttribute: () => false,
-      appendChild(c) { this.children.push(c); return c; }, removeChild() {},
-      insertBefore(c) { this.children.push(c); return c; }, replaceChildren() {},
+      // parentNode проставляется как в настоящем DOM: без этого перерисовка сообщения
+      // (old.parentNode.insertBefore) в песочнице падала бы на null — то есть
+      // песочница врала бы про ошибку в окне.
+      appendChild(c) { c.parentNode = this; this.children.push(c); return c; }, removeChild() {},
+      insertBefore(c) { c.parentNode = this; this.children.push(c); return c; }, replaceChildren() {},
       remove() {}, focus() {}, blur() {}, click() {}, select() {}, scrollIntoView() {}, scrollTo() {},
       closest(sel) { return closestByHtml(this.id, sel); }, querySelector: () => null, querySelectorAll: () => [],
       // Запоминаем подписку на click/change — иначе честная панель, которая вешает
@@ -135,6 +147,7 @@ function bootWindow() {
     addEventListener() {}, removeEventListener() {}, dispatchEvent: () => true,
     getComputedStyle: () => ({ getPropertyValue: () => "" }),
     requestAnimationFrame: (fn) => setTimeout(fn, 0), cancelAnimationFrame() {},
+    AbortController, AbortSignal, TextDecoder, TextEncoder, ReadableStream, Response, Blob,
     innerWidth: 1440, innerHeight: 900, devicePixelRatio: 1,
     setTimeout, clearTimeout, setInterval, clearInterval,
     console: { log() {}, warn() {}, error() {}, info() {} },
@@ -149,6 +162,8 @@ function bootWindow() {
   win.top = win;
   win.globalThis = win;
   win.__stubs = stubs; // для проверки обработчиков ниже
+  if (fetchImpl) win.fetch = fetchImpl;
+  if (preload) for (const [k, v] of Object.entries(preload)) win.localStorage.setItem(k, v);
   const ctx = vm.createContext(win);
 
   for (const file of scripts) {
@@ -294,12 +309,118 @@ async function liveProbe() {
   }
 }
 
+// ── 5. Живой цикл ответа через НАСТОЯЩЕЕ окно ─────────────────────────────
+// Самый дорогой класс тихих поломок при разрезании окна: код переехал, состояние
+// меняется, а ШАПКА не перерисовывается — крутилка и «Стоп» остаются на месте,
+// кнопка «Отправить» скрыта, и отправить следующую команду нечем. Именно это и
+// случилось при выносе прогона (chat-run.js): признак снимался, разметка — нет.
+// Здесь проверяется настоящий путь: щелчок по «Отправить» → прогон → завершение.
+// Провайдера нет — но проверяется не провайдер, а то, что окно возвращается в рабочее
+// состояние и в ленте появляется ответ (та же ошибка — тоже ответ).
+async function liveAnswerCycle() {
+  console.log("\n[5] Живой цикл ответа: шапка возвращается после прогона");
+  const sse =
+    "data: " + JSON.stringify({ choices: [{ index: 0, delta: { content: "Готово: живой прогон окна." } }] }) + "\n\n" +
+    "data: [DONE]\n\n";
+  const win = bootWindow(
+    {
+      settings: JSON.stringify({
+        provider: "openai",
+        openaiUrl: "https://api.groq.com/openai/v1",
+        openaiApiKey: "live-boot-key",
+        openaiModel: "live-boot-model",
+        model: "live-boot-model",
+      }),
+      chats: JSON.stringify({ chats: [], activeId: null }),
+    },
+    // Отвечаем настоящим потоком: та же форма, что у провайдера (SSE + [DONE]).
+    async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } })
+  );
+  const stubs = win.__stubs;
+  if (!stubs) return;
+  // Элементы берём через getElementById: заглушка появляется при первом обращении,
+  // а до прогона окно к «typing» может и не обращаться.
+  const send = win.document.getElementById("btn-send");
+  const stop = win.document.getElementById("btn-stop");
+  const typing = win.document.getElementById("typing");
+  ok(!!send && !!stop && !!typing, "кнопки шапки есть в окне");
+  if (!send || !stop || !typing) return;
+  ok(!send.classList.contains("hidden"), "до прогона кнопка «Отправить» на месте");
+
+  const input = win.document.getElementById("input");
+  input.value = "живая проверка окна";
+  let promise = null;
+  try {
+    promise = send.onclick(); // это и есть ChatSend.sendMessage из разметки
+  } catch (e) {
+    ok(false, "живая отправка упала: " + ((e && e.message) || e));
+    return;
+  }
+  ok(promise && typeof promise.then === "function", "отправка завела прогон");
+  ok(stop.classList.contains("hidden") === false, "во время прогона видна кнопка «Стоп»");
+  ok(send.classList.contains("hidden") === true, "во время прогона «Отправить» скрыта (крутилка на месте)");
+  try {
+    await promise;
+  } catch (e) {
+    ok(false, "живой прогон упал исключением: " + ((e && e.message) || e));
+    return;
+  }
+  ok(send.classList.contains("hidden") === false, "после прогона «Отправить» вернулась — иначе следующую команду отправить нечем");
+  ok(stop.classList.contains("hidden") === true, "после прогона «Стоп» убран из шапки");
+  ok(typing.classList.contains("hidden") === true, "после прогона крутилка погасла");
+  // Ответ должен дойти до ЧАТА, а не только до консоли: заглушки DOM текст детей
+  // не собирают, поэтому смотрим сохранённый чат — тот же путь, на котором ответ
+  // рисовался и сохранялся в окне.
+  const saved = String(win.localStorage.getItem("chats") || "");
+  ok(/Готово: живой прогон окна/.test(saved), "ответ агента дошёл до чата и сохранён: " + JSON.stringify(saved.slice(0, 90)));
+  ok(/живая проверка окна/.test(saved), "запрос человека тоже в истории чата");
+  // И человек должен мочь отправить ещё раз — повторный щелчок не отказывает.
+  input.value = "вторая команда";
+  const second = send.onclick();
+  ok(stop.classList.contains("hidden") === false, "вторая отправка тоже началась (окно не заперто)");
+  try {
+    await second;
+  } catch (e) {}
+  ok(send.classList.contains("hidden") === false, "после второй команды «Отправить» снова на месте");
+
+  // Самый частый случай в жизни: провайдер ответил ошибкой. Прогон обрывается — и
+  // кнопка ОБЯЗАНА вернуться, иначе человек не может даже повторить запрос.
+  const errWin = bootWindow(
+    {
+      settings: JSON.stringify({
+        provider: "openai",
+        openaiUrl: "https://api.groq.com/openai/v1",
+        openaiApiKey: "live-boot-key",
+        openaiModel: "live-boot-model",
+        model: "live-boot-model",
+      }),
+      chats: JSON.stringify({ chats: [], activeId: null }),
+    },
+    async () => new Response("server exploded", { status: 500, headers: { "content-type": "text/plain" } })
+  );
+  const eSend = errWin.document.getElementById("btn-send");
+  const eStop = errWin.document.getElementById("btn-stop");
+  const eInput = errWin.document.getElementById("input");
+  eInput.value = "запрос, который упадёт";
+  try {
+    await eSend.onclick();
+  } catch (e) {
+    ok(false, "прогон с ошибкой провайдера упал исключением: " + ((e && e.message) || e));
+    return;
+  }
+  ok(eSend.classList.contains("hidden") === false, "после ошибки провайдера «Отправить» вернулась — можно повторить запрос");
+  ok(eStop.classList.contains("hidden") === true, "после ошибки «Стоп» убран из шапки");
+  const errSaved = String(errWin.localStorage.getItem("chats") || "");
+  ok(/API error 500|server exploded|ошиб/i.test(errSaved), "ошибка провайдера объяснена в чате: " + JSON.stringify(errSaved.slice(0, 90)));
+}
+
 (async () => {
   console.log("Живой прогон окна" + (STRIP ? " (негативный контроль: без " + STRIP + ")" : ""));
   await liveHttp();
   const win = bootWindow();
   if (win.__stubs) checkWiring(win);
   await liveProbe();
+  await liveAnswerCycle();
   console.log(failures ? "\nЖИВОЙ ПРОГОН: провалов " + failures : "\nЖИВОЙ ПРОГОН: всё чисто");
   process.exit(failures ? 1 : 0);
 })();
