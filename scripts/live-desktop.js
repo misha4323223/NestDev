@@ -566,26 +566,56 @@ function startFakeProvider(seen, rounds, rate, script) {
     check("отказ — действие не выполнено", /НЕ выполнено/.test(denyOut), denyOut.slice(-180));
 
     console.log("\n[10b] Секреты агента и команда-дамп");
-    await page.evaluate(async () => {
-      await window.api.setSettings({ agentEnv: { LIVE_LIVE_SECRET: "live-secret-value-42" } });
-    });
-    script.call = { name: "runCommand", args: { command: "printenv" } };
-    const dumpRun = page.evaluate(async () => {
-      window.__ev.length = 0;
-      try { await window.api.sendMessage([{ role: "user", content: "выведи всё окружение" }], {}); } catch (e) { window.__ev.push({ type: "throw", message: String((e && e.message) || e) }); }
-      return (window.__ev || []).map((e) => JSON.stringify(e));
-    });
-    const dumpOut = (await dumpRun).join(" | ");
-    check("дамп окружения не показывает секрет агента", !dumpOut.includes("live-secret-value-42"), "длина вывода: " + dumpOut.length);
+    // Язык оболочки у каждой системы свой: на Windows команды агента по умолчанию идут
+    // в cmd, а `printenv` там не существует («не является внутренней или внешней
+    // командой»). Проверки спрашивали дамп по-юниксовому, поэтому на Windows падала
+    // вторая из них — при РАБОЧЕЙ функции: до команды доходила пустота. А первая при
+    // этом «прятала» секрет не защитой, а отсутствием самой команды. Спрашиваем так,
+    // как это сделал бы пользователь на своей системе.
+    const SECRET = "live-secret-value-42";
+    const win = process.platform === "win32";
+    // На Windows пробуем и cmd, и PowerShell: оболочка команды зависит от настроек,
+    // а имя переменной в них разное (set ИМЯ против $env:ИМЯ).
+    const dumpCmds = win ? ["set", "Get-ChildItem Env:"] : ["printenv"];
+    const explicitCmds = win ? ["set LIVE_LIVE_SECRET", "$env:LIVE_LIVE_SECRET"] : ["printenv LIVE_LIVE_SECRET"];
 
-    script.call = { name: "runCommand", args: { command: "printenv LIVE_LIVE_SECRET" } };
-    const explicitRun = page.evaluate(async () => {
-      window.__ev.length = 0;
-      try { await window.api.sendMessage([{ role: "user", content: "покажи значение переменной LIVE_LIVE_SECRET" }], {}); } catch (e) { window.__ev.push({ type: "throw", message: String((e && e.message) || e) }); }
-      return (window.__ev || []).map((e) => JSON.stringify(e));
-    });
-    const explicitOut = (await explicitRun).join(" | ");
-    check("явный запрос переменной работает как раньше", explicitOut.includes("live-secret-value-42"), "переменная дошла до команды");
+    await page.evaluate(async (value) => {
+      await window.api.setSettings({ agentEnv: { LIVE_LIVE_SECRET: value } });
+    }, SECRET);
+
+    async function runsScripted(command, text) {
+      script.call = { name: "runCommand", args: { command: command } };
+      return page.evaluate(async (args) => {
+        window.__ev.length = 0;
+        try { await window.api.sendMessage([{ role: "user", content: args.text }], {}); } catch (e) { window.__ev.push({ type: "throw", message: String((e && e.message) || e) }); }
+        return (window.__ev || []).map((e) => JSON.stringify(e));
+      }, { text: text });
+    }
+
+    const dumps = [];
+    for (const cmd of dumpCmds) {
+      dumps.push({ cmd: cmd, out: (await runsScripted(cmd, "выведи всё окружение")).join(" | ") });
+    }
+    // Проверка ниже — про отсутствие секрета, и она бессмысленна, если окружение
+    // вообще не напечаталось (команды нет в этой оболочке). PATH есть всегда.
+    const dumpShown = dumps.some((d) => /path/i.test(d.out));
+    check("дамп окружения действительно напечатал переменные", dumpShown, dumps.map((d) => d.cmd + " → " + d.out.length + " симв.").join(", "));
+    const leaked = dumps.find((d) => d.out.includes(SECRET));
+    check("дамп окружения не показывает секрет агента", !leaked, leaked ? "утечка через «" + leaked.cmd + "»" : dumps.map((d) => d.cmd).join(", "));
+
+    let explicitOut = "";
+    let explicitCmd = "";
+    for (const cmd of explicitCmds) {
+      explicitOut = (await runsScripted(cmd, "покажи значение переменной LIVE_LIVE_SECRET")).join(" | ");
+      explicitCmd = cmd;
+      if (explicitOut.includes(SECRET)) break;
+    }
+    const explicitOk = explicitOut.includes(SECRET);
+    check(
+      "явный запрос переменной работает как раньше",
+      explicitOk,
+      "команда «" + explicitCmd + "»" + (explicitOk ? "" : ", вывод: " + (explicitOut.slice(-200) || "(пусто)"))
+    );
 
     console.log("\n[11] Журнал действий на диске");
     const auditFile = path.join(userData, "audit.log");

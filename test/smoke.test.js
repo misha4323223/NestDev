@@ -89,7 +89,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js"]
+  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -973,7 +973,7 @@ async function testChatSegments() {
     }
     const wiring = appSrc.slice(appSrc.indexOf("window.ChatSegments({"));
     const wiringCall = wiring.slice(0, wiring.indexOf("});"));
-    for (const dep of ["$: $", "uid: uid", "getSession: () => session", "msgEls: msgEls", "buildMessageEl: buildMessageEl", "scrollBottom: ChatFeed.scrollBottom", "persistChatsSoon: persistChatsSoon", "planRoundStarted: PlanPanel.planRoundStarted"]) {
+    for (const dep of ["$: $", "uid: uid", "getSession: () => session", "msgEls: msgEls", "buildMessageEl: buildMessageEl", "scrollBottom: ChatFeed.scrollBottom", "persistChatsSoon: ChatStore.persistChatsSoon", "planRoundStarted: PlanPanel.planRoundStarted"]) {
       assert.ok(wiringCall.includes(dep), "в проводку сегментов не передан " + dep);
     }
     // Границы модуля: сессия только живой функцией, в чужие глобалы не лезем.
@@ -1116,7 +1116,7 @@ async function testChatRender() {
     const actionsAt = appSrc.indexOf("window.ChatActions({");
     assert.ok(wiringAt > 0 && wiringAt > actionsAt, "отрисовка собрана раньше действий чата");
     const wiringCall = appSrc.slice(wiringAt, appSrc.indexOf("});", wiringAt));
-    for (const dep of ["MdRender: MdRender", "fmtClock: fmtClock", "ChatThinking: ChatThinking", "ChatActions: ChatActions", "continueInterruptedAnswer: continueInterruptedAnswer", "getChatsData: () => chatsData"]) {
+    for (const dep of ["MdRender: MdRender", "fmtClock: fmtClock", "ChatThinking: ChatThinking", "ChatActions: ChatActions", "continueInterruptedAnswer: ChatSend.continueInterruptedAnswer", "getChatsData: () => chatsData"]) {
       assert.ok(wiringCall.includes(dep), "в проводке отрисовки нет " + dep);
     }
     // Границы модуля: чужие имена берём только из deps. Это дешёвая родня
@@ -1124,7 +1124,10 @@ async function testChatRender() {
     for (const name of ["chatsData", "session", "streaming", "msgEls", "pinnedToBottom"]) {
       assert.ok(!new RegExp("(^|[^\\w$.])" + name + "\\b").test(src), "модуль ссылается на " + name + " без внедрения");
     }
-    const calls = (appSrc.match(/ChatRender\.\w+/g) || []).sort();
+    // Часть вызовов после разбора app.js живёт в модулях: готовый ответ рисует
+    // chat-run.js. Считаем по обоим файлам — проверка про вызовы, а не про адрес.
+    const renderCallers = appSrc + "\n" + fs.readFileSync(path.join(ROOT, "src", "renderer", "chat-run.js"), "utf8");
+    const calls = (renderCallers.match(/ChatRender\.\w+/g) || []).sort();
     assert.deepStrictEqual(calls, ["ChatRender.buildBubbleEl", "ChatRender.msgHtml", "ChatRender.msgHtml", "ChatRender.msgText", "ChatRender.msgText"],
       "вызовов модуля не пять ожидаемых: " + calls.join(", "));
 
@@ -3843,7 +3846,7 @@ async function testSecretsPanel() {
     const appSrc2 = uiFile("app.js");
     const wiring = appSrc2.slice(appSrc2.indexOf("window.SecretsPanel({"));
     const wiringCall = wiring.slice(0, wiring.indexOf("});"));
-    for (const need of ["$: $", "api: api", "isElectron: isElectron", "toast: toast", "persistSettings: persistSettings", "getSettings: () => settings"]) {
+    for (const need of ["$: $", "api: api", "isElectron: isElectron", "toast: toast", "persistSettings: ChatStore.persistSettings", "getSettings: () => settings"]) {
       assert.ok(wiringCall.includes(need), "в проводке панели секретов нет " + need + ": " + wiringCall.replace(/\s+/g, " "));
     }
     assert.ok(/SecretsPanel\.mailDoTest\b/.test(appSrc2), "кнопка проверки почты не связана с панелью");
@@ -4171,8 +4174,9 @@ async function testSessionExtras() {
   });
 
   await test("прерванный ответ: пометка и кнопка «Дописать ответ» на месте", () => {
-    assert.ok(/interrupted: true/.test(appSrc), "пометка прерванного ответа не ставится");
-    assert.ok(/function continueInterruptedAnswer\(chatId, m\)/.test(appSrc), "нет функции продолжения");
+    assert.ok(/interrupted: true/.test(uiAll()), "пометка прерванного ответа не ставится");
+    // Функция продолжения вынесена своим модулем (этап A, часть 9): спрашиваем интерфейс целиком.
+    assert.ok(/function continueInterruptedAnswer\(chatId, m\)/.test(uiAll()), "нет функции продолжения");
     // Кнопка живёт в модуле отрисовки сообщения (этап 3.7) — спрашиваем интерфейс целиком.
     assert.ok(/Дописать ответ/.test(uiAll()), "нет кнопки «Дописать ответ»");
     // Привязка живёт в модуле отрисовки сообщения (этап 3.7): там живые данные чатов
@@ -4415,8 +4419,10 @@ const skip = new Set(["anthropic", "cerebras", "cloud", "deepseek", "groq", "mis
     assert.ok(/senderId === mainWindow\.webContents\.id\) return;/.test(main), "своё же окно получает лишнее уведомление");
     assert.ok(/onChatsReload/.test(pre), "в preload нет onChatsReload");
     assert.ok(/onChatsReload/.test(mob), "в mobile-api нет onChatsReload");
-    assert.ok(/api\.onChatsReload\(\(\) => reloadChatsFromDisk\(\)\)/.test(app), "интерфейс не подписан на chats:reload");
-    assert.ok(/if \(session \|\| chatsSavePending\) return;/.test(app), "перезагрузка может затереть свой прогон или несохранённые правки");
+    assert.ok(/api\.onChatsReload\(\(\) => ChatStore\.reloadChatsFromDisk\(\)\)/.test(app), "интерфейс не подписан на chats:reload");
+    // Сама перезагрузка истории вынесена в хранилище (этап A, часть 10): спрашиваем модуль.
+    assert.ok(/if \(getSession\(\) \|\| getChatsSavePending\(\)\) return;/.test(uiFile("chat-store.js")), "перезагрузка может затереть свой прогон или несохранённые правки");
+    assert.ok(/getChatsSavePending,/.test(uiFile("chat-store.js")), "хранилище не отвечает, есть ли несохранённые правки");
     // Прогон, запущенный телефоном, помечается в событиях и не подмешивается в чужой чат.
     assert.ok(/let activeRunOrigin = "desktop";/.test(main), "нет признака «кто запустил прогон»");
     assert.ok(/activeRunOrigin = e && e\.sender && e\.sender\.id \? "desktop" : "mobile";/.test(main), "ai:send не отмечает источник прогона");
@@ -4689,15 +4695,13 @@ async function testChatPersistence() {
     assert.deepStrictEqual(loadChats(), { chats: [], activeId: null });
   });
 
-  // Логику автосохранения берём из renderer/app.js и подсовываем заглушки окружения.
-  const appSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
-  const a0 = appSrc.indexOf("  function persistChats() {");
-  const vis = appSrc.indexOf('  document.addEventListener("visibilitychange"');
-  const a1 = appSrc.indexOf("});", vis) + 3;
-  assert.ok(a0 > 0 && vis > a0 && a1 > vis, "не нашёл блок автосохранения чатов в app.js");
+  // Логику автосохранения ищем маркером по интерфейсу, а не по адресу файла:
+  // после разбора app.js она живёт в chat-store.js, и тест не должен это знать.
+  const autoAll = uiFind("  function persistChats() {", "  return {");
+  assert.ok(autoAll.start > 0 && autoAll.end > autoAll.start, "не нашёл блок автосохранения чатов в " + autoAll.file);
 
   function makeAutosave(syncSupported) {
-    const block = appSrc.slice(a0, a1);
+    const block = autoAll.code;
     const syncSaves = [];
     const asyncSaves = [];
     const timers = [];
@@ -4713,22 +4717,23 @@ async function testChatPersistence() {
       "document",
       "isElectron",
       "api",
-      "chatsData",
+      "getChatsData",
       "localStorage",
       "setTimeout",
       "clearTimeout",
-      block + "\nreturn { persistChats, persistChatsSoon, persistChatsNow, flushChats };"
+      block + "\nreturn { persistChats, persistChatsSoon, persistChatsNow, flushChats, wire };"
     );
     const fns = mk(
       win,
       doc,
       true,
       api,
-      { chats: [{ id: "c1", messages: [] }], activeId: "c1" },
+      () => ({ chats: [{ id: "c1", messages: [] }], activeId: "c1" }),
       { setItem() {} },
       (fn, ms) => { const t = { fn, ms }; timers.push(t); return t; },
       (t) => { if (t) t.cancelled = true; }
     );
+    fns.wire(); // в приложении сброс при закрытии окна навешивает оболочка (ChatStore.wire())
     return { ...fns, syncSaves, asyncSaves, timers, handlers, doc };
   }
 
@@ -6744,8 +6749,8 @@ async function testPlanPanel() {
     // Проводка отдаёт переписываемое состояние живыми функциями.
     const wiring = uiFind("  const PlanPanel = window.PlanPanel({", "  // ─────────── /План работ").code;
     for (const dep of ["$: $", "document: document", "getActiveChat: getActiveChat",
-      "getStreaming: () => streaming", "getChatSegments: () => ChatSegments", "sendMessage: sendMessage",
-      "autoResize: autoResize", "persistChatsSoon: persistChatsSoon", "toast: toast", "AgentCore: AgentCore",
+      "getStreaming: () => streaming", "getChatSegments: () => ChatSegments", "sendMessage: ChatSend.sendMessage",
+      "autoResize: autoResize", "persistChatsSoon: ChatStore.persistChatsSoon", "toast: toast", "AgentCore: AgentCore",
       "planArchiveLimit: PLAN_ARCHIVE_LIMIT"]) {
       assert.ok(wiring.includes(dep), "в проводку не передан " + dep);
     }
@@ -6931,7 +6936,7 @@ async function testPlanPanel() {
     assert.ok(/planFromModel\(chat, ev\)/.test(uiFile("chat-events.js")), "событие plan не доходит до состояния");
     assert.ok(/if \(planToolOutcome\(chat, ev, toolOk\)\) renderPlanPanel\(\);/.test(uiFile("chat-events.js")), "tool_result не проверяет фактический провал шага модели");
     assert.ok(/source: "auto"/.test(appSrc) === false, "в app.js осталось создание авто-плана из вызовов инструментов");
-    assert.ok(/if \(PlanPanel\.planRotate\(getActiveChat\(\)\)\) PlanPanel\.renderPlanPanel\(\);/.test(appSrc), "новый запрос не поворачивает план");
+    assert.ok(/if \(getPlanPanel\(\)\.planRotate\(getActiveChat\(\)\)\) getPlanPanel\(\)\.renderPlanPanel\(\);/.test(uiFile("chat-send.js")), "новый запрос не поворачивает план");
     assert.ok(/renderPlanPanel\(\);\n    const chat = getActiveChat\(\);|renderPlanPanel\(\);/.test(appSrc), "панель не перерисовывается вместе с чатом");
     // Веб-режим: todoWrite работает как структура, а не «недоступно в веб-версии».
     // Веб-режим вынесен в свой модуль (src/renderer/web-chat.js): спрашиваем
@@ -6951,9 +6956,9 @@ async function testPlanPanel() {
       assert.ok(cssSrc.indexOf(rule) !== -1, "нет стиля " + rule);
     }
     // План сохраняется вместе с чатом и чистится при загрузке.
-    assert.ok(/if \(c\.plan !== undefined\)/.test(appSrc), "sanitizeChats не проверяет план");
-    assert.ok(/Array\.isArray\(c\.plan\.items\)/.test(appSrc), "sanitizeChats не отвергает повреждённый план");
-    assert.ok(/c\.planHistory = c\.planHistory\.slice\(0, PLAN_ARCHIVE_LIMIT\)/.test(appSrc), "история планов не ограничивается при загрузке");
+    assert.ok(/if \(c\.plan !== undefined\)/.test(uiAll()), "sanitizeChats не проверяет план");
+    assert.ok(/Array\.isArray\(c\.plan\.items\)/.test(uiAll()), "sanitizeChats не отвергает повреждённый план");
+    assert.ok(/c\.planHistory = c\.planHistory\.slice\(0, (PLAN_ARCHIVE_LIMIT|getPlanArchiveLimit\(\))\)/.test(uiAll()), "история планов не ограничивается при загрузке");
   });
 
   await test("план: написанный текстом («План: 1. …») становится панелью-чеклистом", () => {
@@ -7240,9 +7245,9 @@ async function testPlanPanel() {
     }
     const fn = new Function(
       "AgentCore",
-      "PLAN_ARCHIVE_LIMIT",
+      "getPlanArchiveLimit",
       rawLines.slice(0, endLine + 1).join("\n") + "\nreturn sanitizeChats;"
-    )(AgentCore, AgentCore.PLAN_MAX_ITEMS);
+    )(AgentCore, () => AgentCore.PLAN_MAX_ITEMS);
     const out = fn({
       activeId: "c1",
       chats: [
@@ -7286,7 +7291,7 @@ async function testPlanPanel() {
       if (new RegExp("(^|[^.\\w$])" + name + "\\s*\\(").test(appSrc)) bad.push(name);
     }
     assert.deepStrictEqual(bad, [], "голые вызовы функций ядра в app.js — нужно AgentCore.<имя>: " + bad.join(", "));
-    assert.ok(appSrc.indexOf("AgentCore.normalizePlanTasks") !== -1, "нормализация плана не через ядро агента");
+    assert.ok(uiAll().indexOf("AgentCore.normalizePlanTasks") !== -1, "нормализация плана не через ядро агента");
   });
 }
 
@@ -9897,10 +9902,12 @@ async function testPromptCacheAndUsage() {
   });
 
   await test("замер локальной модели: канал IPC, preload, мобильный API и кнопка на месте", () => {
-    const mainS = mainOnlySrc();
-    assert.ok(/ipcMain\.handle\("ai:probeLocal"/.test(mainS), "нет канала ai:probeLocal");
-    assert.ok(/probeLocalModel\(s, s\.model,\s*\{/.test(mainS), "обработчик не вызывает замер");
-    assert.ok(/numCtx = provider === "ollama" \? ollamaNumCtx\(budget, win\)/.test(mainS), "num_ctx для замера не тот, что у чата");
+    // Канал и вызов замера вынесены в src/model-ipc.js (этап B, часть 2).
+    const modelIpc = fs.readFileSync(path.join(ROOT, "src", "model-ipc.js"), "utf8");
+    assert.ok(/ipcMain\.handle\("ai:probeLocal"/.test(modelIpc), "нет канала ai:probeLocal");
+    assert.ok(/probeLocalModel\(s, s\.model,\s*\{/.test(modelIpc), "обработчик не вызывает замер");
+    assert.ok(/numCtx = provider === "ollama" \? ollamaNumCtx\(budget, win\)/.test(modelIpc), "num_ctx для замера не тот, что у чата");
+    assert.strictEqual(mainOnlySrc().indexOf('ipcMain.handle("ai:probeLocal"'), -1, "канал замера остался в main.js");
     const preloadSrc = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
     assert.ok(/probeLocalModel: \(ui\) => ipcRenderer\.invoke\("ai:probeLocal"/.test(preloadSrc), "нет метода в preload");
     const mobileSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "mobile-api.js"), "utf8");
@@ -10554,7 +10561,9 @@ async function testChatContextTransfer() {
   });
 
   await test("история чата уходит в модель целиком и со служебными заметками", () => {
-    const historySlice = uiFind("let history = chat.messages", "session = { chatId: chat.id");
+    // Маркер конца — внутри самого куска (правило 3 в ARCHITECTURE.md): начало сессии
+    // уехало в модуль отправки и зовётся там через setSession.
+    const historySlice = uiFind("let history = chat.messages", "setSession({ chatId: chat.id");
     assert.ok(historySlice.start > 0, "не нашёл сборку истории в sendMessage");
     const block = historySlice.code;
     assert.ok(!block.includes("AgentCore.trimConversation(history"), "история по-прежнему режется в интерфейсе по полному бюджету");
@@ -11000,7 +11009,7 @@ async function testProjectPanel() {
     const wiring = appSrc.slice(wiringAt, appSrc.indexOf("});", wiringAt));
     for (const dep of [
       "getSettings: () => settings", "setSettings: (s) => { settings = s; }",
-      "normalize: normalize", "persistSettings: persistSettings", "toast: toast",
+      "normalize: normalize", "persistSettings: ChatStore.persistSettings", "toast: toast",
       "syncRail: SidePanel.syncRail", "ensureProjectChat: ensureProjectChat",
       "DevRun: DevRun", "SettingsPanel: SettingsPanel",
     ]) {
@@ -11389,7 +11398,7 @@ async function testSidePanel() {
     for (const dep of [
       "getSettings: () => settings", "getChatsData: () => chatsData", "getStreaming: () => streaming",
       "getProjectPanel: () => ProjectPanel", "getYcPanel: () => YcPanel", "esc: (t) => ProjectPanel.esc(t)",
-      "persistSettings: persistSettings", "isElectron: isElectron",
+      "persistSettings: ChatStore.persistSettings", "isElectron: isElectron",
     ]) {
       assert.ok(wiring.includes(dep), "в проводку панели не передано " + dep);
     }
@@ -12622,7 +12631,7 @@ async function testTasks() {
 
   await test("задачи по сроку: приложение будит агента и пишет в чат «Автозадачи»", () => {
     const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
-    const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
+    const send = uiFile("chat-send.js"); // прогон агента живёт своим модулем (этап A, часть 9)
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     const core = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
     const tools = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
@@ -12634,8 +12643,8 @@ async function testTasks() {
     assert.ok(main.includes("taskAuto: true"), "нет настройки «автозадачи выполняет агент»");
     assert.ok(main.includes("armTaskWake") && main.includes("tasksNextDue"), "нет точного будильника на срок");
     assert.ok(main.includes('{ type: "task-due", from: "desktop", tasks: auto }'), "автозадача уйдёт и на телефон — прогон удвоится");
-    assert.ok(app.includes("async function runTurn("), "обычная отправка и автозадача не идут общим путём");
-    assert.ok(app.includes("await runTurn(chat, content"), "отправка не пользуется общим прогоном");
+    assert.ok(send.includes("async function runTurn("), "обычная отправка и автозадача не идут общим путём");
+    assert.ok(send.includes("await runTurn(chat, content"), "отправка не пользуется общим прогоном");
     assert.ok(auto.includes('AUTO_CHAT_TITLE = "Автозадачи"'), "нет отдельного чата автозадач");
     assert.ok(auto.includes("ensureAutoChat"), "чат автозадач не создаётся");
     const raPos = auto.indexOf("async function runAutoTask");
@@ -12644,7 +12653,7 @@ async function testTasks() {
     assert.ok(guardPos > raPos && guardPos - raPos < 600, "автозадачу не ограничили ПК-клиентом");
     assert.ok(uiFile("chat-events.js").includes('ev.type === "task-due"'), "окно не слушает срок автозадачи");
     assert.ok(auto.includes("function flushAutoQueue"), "автозадача не ждёт конца текущего прогона");
-    assert.ok(app.includes("AutoTasks.flushAutoQueue();"), "прогон не разбирает очередь автозадач после себя");
+    assert.ok(send.includes("getAutoTasks().flushAutoQueue();"), "прогон не разбирает очередь автозадач после себя");
     assert.ok(uiFile("settings-panel.js").includes("getSettings().taskAuto"), "галочка автозадач не читается настройками");
     assert.ok(html.includes("s-task-auto"), "в настройках нет галочки автозадач");
     assert.ok(core.includes("repeat: { type:") && core.includes("auto: { type:"), "инструменты дел не знают о повторах и автозапуске");
@@ -14129,7 +14138,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14139,7 +14148,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));

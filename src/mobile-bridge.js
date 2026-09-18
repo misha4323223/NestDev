@@ -89,6 +89,10 @@ const STATIC_FILES = new Set([
   "model-popup.js",
   "ask-modal.js",
   "chat-rename.js",
+  "chat-store.js",
+  "chat-run.js",
+  "chat-send.js",
+  "chat-continue.js",
   "side-panel.js",
   "deploy-panel.css",
 ]);

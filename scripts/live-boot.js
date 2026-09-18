@@ -179,6 +179,20 @@ function bootWindow() {
     ["ChatWork", "function"],
     ["SettingsSearch", "function"],
     ["OpenaiProfiles", "function"],
+    // Модули, вынесенные из app.js разбором (этапы A и B): каждый — фабрика,
+    // которую оболочка собирает своей проводкой. Забытый тег или сломанная проводка
+    // видны именно здесь — на настоящем порядке тегов из index.html.
+    ["ChatEvents", "function"],
+    ["G4fPanel", "function"],
+    ["PlanPanel", "function"],
+    ["AutoTasks", "function"],
+    ["ModelPopup", "function"],
+    ["AskModal", "function"],
+    ["ChatRename", "function"],
+    ["ChatStore", "function"],
+    ["ChatRun", "function"],
+    ["ChatSend", "function"],
+    ["ChatContinue", "function"],
   ];
   for (const [name, kind] of globals) ok(typeof win[name] === kind, "модуль в окне: " + name + " (" + kind + ")");
   return win;

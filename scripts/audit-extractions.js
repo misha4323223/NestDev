@@ -30,7 +30,7 @@ const path = require("path");
 
 const MODULES = ["ChatFeed", "ChatThinking", "ChatSegments", "ChatRender", "ChatWork", "ChatActions",
   "SettingsSearch", "SettingsPanel", "OpenaiProfiles", "MobilePanel", "TasksMission", "SecretsPanel",
-  "YcPanel", "DevRun", "WebChat", "ProjectPanel", "ChatEvents", "G4fPanel", "AutoTasks", "ModelPopup", "AskModal", "ChatRename"];
+  "YcPanel", "DevRun", "WebChat", "ProjectPanel", "ChatEvents", "G4fPanel", "AutoTasks", "ModelPopup", "AskModal", "ChatRename", "ChatStore", "ChatRun", "ChatSend", "ChatContinue", "PlanPanel"];
 
 const [before, after, ...modules] = process.argv.slice(2);
 if (!before || !after || !modules.length) {
@@ -74,6 +74,13 @@ const canon = (line) =>
     .replace(/\bchatsData\b/g, "@chats@")
     .replace(/\bgetSession\(\)/g, "@sess@")
     .replace(/\bsession\b/g, "@sess@")
+    // Этап A, часть 8: прогон ответа — счётчик отката, признак показанной кнопки
+    // и объект остановки читаются живьём (их меняют и разбор событий агента, и
+    // загрузка истории, и старт прогона). Правила стоят ДО замены самих имён,
+    // иначе модульные формы не свелись бы к виду оболочки.
+    .replace(/\bgetLastUndoCount\(\)/g, "lastUndoCount")
+    .replace(/\bgetUndoRestoreShown\(\)/g, "undoRestoreShown")
+    .replace(/\bgetWebAbort\(\)/g, "webAbort")
     .replace(/\bsetLastUndoCount\b/g, "@wundo@")
     .replace(/\blastUndoCount\b/g, "@undo@")
     .replace(/\bsetPlanCollapsed\b/g, "@wplanc@")
@@ -87,6 +94,21 @@ const canon = (line) =>
     .replace(/\bgetTasksMission\(\)\./g, "")
     // Панель настроек тоже зовётся отложенной стрелкой (getSettingsPanel().updateBadge()).
     .replace(/\bgetSettingsPanel\(\)\./g, "")
+    // Этап A, часть 7: хранилище — предел истории планов объявлен в оболочке ниже
+    // точки сбора, поэтому читается стрелкой (иначе окно падало бы на загрузке).
+    .replace(/\bgetPlanArchiveLimit\(\)/g, "PLAN_ARCHIVE_LIMIT")
+    // Этап A, часть 9: отправка — свои живые доступы. Стрелки к модулям, собранным
+    // НИЖЕ точки выноса, снимаются так же, как у панелей выше: сравниваем действие.
+    .replace(/\bgetChatFeed\(\)\./g, "")
+    .replace(/\bgetPlanPanel\(\)\./g, "")
+    .replace(/\bgetChatEvents\(\)\./g, "")
+    .replace(/\bgetChatRun\(\)\./g, "")
+    .replace(/\bgetAutoTasks\(\)\./g, "")
+    .replace(/\bgetWebChat\(\)\./g, "")
+    .replace(/\bgetPlanToggleOn\(\)/g, "planToggleOn")
+    .replace(/\bplanToggleOn\b/g, "@plan@")
+    .replace(/\bgetPendingImage\(\)/g, "pendingImage")
+    .replace(/\bpendingImage\b/g, "@img@")
     // Этап A, часть 4: автозадачи — свой живой доступ к идущему прогону.
     .replace(/\bgetStreaming\(\)/g, "@run@")
     .replace(/\bstreaming\b/g, "@run@")

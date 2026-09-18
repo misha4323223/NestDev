@@ -163,123 +163,30 @@
   }
 
   // ─────────────── Хранилище ───────────────
-  function loadState() {
-    if (isElectron) {
-      return Promise.all([api.getSettings(), api.loadChats()]).then(([s, c]) => {
-        settings = normalize(s);
-        chatsData = sanitizeChats(c || { chats: [], activeId: null });
-        persistChats();
-      });
-    }
-    try {
-      settings = normalize(JSON.parse(localStorage.getItem("settings") || "null"));
-    } catch {}
-    try {
-      chatsData = sanitizeChats(JSON.parse(localStorage.getItem("chats") || "null") || { chats: [], activeId: null });
-    } catch {}
-    return Promise.resolve();
-  }
-
-  // ─── Восстановление после аварийного закрытия ───
-  // В сохранённой истории могли остаться незавершённые сообщения (pending).
-  // Снимаем флаги, чтобы после перезапуска не висел вечный индикатор «выполняется»,
-  // и один раз поясняем, что ответ был прерван.
-  function sanitizeChats(d) {
-    if (!d || !Array.isArray(d.chats)) return d || { chats: [], activeId: null };
-    for (const c of d.chats) {
-      if (!Array.isArray(c.messages)) c.messages = [];
-      // План работ сохраняется вместе с чатом. Битые пункты (старый формат,
-      // ручная правка файла) чистим тем же нормализатором, что и данные модели.
-      // Защищается try/catch: sanitizeChats работает с файлом чатов при запуске и
-      // не должен падать ни при каких данных (битый chats.json — не повод не стартовать).
-      try {
-        // Поле трогаем только если оно есть: чаты без плана не должны менять форму
-        // (иначе каждый запуск перезаписывал бы весь файл истории).
-        if (c.plan !== undefined) {
-          const pi = c.plan && typeof c.plan === "object" && Array.isArray(c.plan.items) ? AgentCore.normalizePlanTasks(c.plan.items) : [];
-          // legacy-планы со source "auto" отбрасываем — панель показывает только план модели.
-          if (pi.length && c.plan.source !== "auto") c.plan = { title: String(c.plan.title || ""), source: c.plan.source === "text" ? "text" : "model", items: pi, updatedAt: Number(c.plan.updatedAt) || Date.now() };
-          else c.plan = null;
-        }
-        if (Array.isArray(c.planHistory)) c.planHistory = c.planHistory.slice(0, PLAN_ARCHIVE_LIMIT);
-      } catch { c.plan = null; c.planHistory = []; }
-      let interrupted = false;
-      for (const m of c.messages) {
-        if (!m.pending) continue;
-        m.pending = false;
-        interrupted = true;
-        if (m.role === "tool") {
-          if (!m.toolResult) {
-            m.toolResult = "Действие не завершилось: приложение закрылось раньше.";
-            m.toolOk = false;
-          }
-        } else if (!m.content) {
-          m.content = "…";
-        }
-      }
-      if (interrupted && c.id === d.activeId) {
-        c.messages.push({
-          id: "recovered-" + c.id + "-" + Date.now(),
-          role: "system",
-          content: "⚠️ Предыдущий ответ был прерван закрытием приложения. Сохранённая часть осталась в истории — можно продолжить с этого места.",
-          interrupted: true,
-          chatId: c.id,
-          createdAt: Date.now(),
-        });
-      }
-    }
-    return d;
-  }
-  function persistSettings() {
-    if (isElectron) api.setSettings(settings);
-    else localStorage.setItem("settings", JSON.stringify(settings));
-  }
-  function persistChats() {
-    if (isElectron) api.saveChats(chatsData);
-    else localStorage.setItem("chats", JSON.stringify(chatsData));
-  }
-  // ─── Автосохранение во время длинного ответа ───
-  // Раньше чат писался на диск только в начале и в конце хода. Если приложение
-  // закрыть посреди ответа, весь уже полученный текст и действия пропадали.
-  // Теперь пишем не чаще раза в 1.5 c и гарантированно сбрасываем данные
-  // при закрытии/сворачивании окна.
-  let chatsSaveTimer = null;
-  let chatsSavePending = false;
-  const CHATS_SAVE_INTERVAL = 1500;
-  function persistChatsSoon() {
-    chatsSavePending = true;
-    if (chatsSaveTimer) return;
-    chatsSaveTimer = setTimeout(() => {
-      chatsSaveTimer = null;
-      if (!chatsSavePending) return;
-      chatsSavePending = false;
-      persistChats();
-    }, CHATS_SAVE_INTERVAL);
-  }
-  function persistChatsNow() {
-    if (chatsSaveTimer) { clearTimeout(chatsSaveTimer); chatsSaveTimer = null; }
-    chatsSavePending = false;
-    persistChats();
-  }
-  function flushChats(sync) {
-    if (chatsSaveTimer) { clearTimeout(chatsSaveTimer); chatsSaveTimer = null; }
-    if (!chatsSavePending) return;
-    chatsSavePending = false;
-    if (isElectron) {
-      // Синхронный канал доступен в Electron: успевает записать файл при закрытии окна.
-      if (sync && typeof api.saveChatsSync === "function") {
-        try { api.saveChatsSync(chatsData); return; } catch {}
-      }
-      api.saveChats(chatsData);
-    } else {
-      localStorage.setItem("chats", JSON.stringify(chatsData));
-    }
-  }
-  window.addEventListener("beforeunload", () => flushChats(true));
-  window.addEventListener("pagehide", () => flushChats(true));
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") flushChats(true);
+  // Код живёт в src/renderer/chat-store.js. Модуль собирается на прежнем месте куска.
+  // Значениями переданы только неизменные (признак Electron, мост api, нормализатор
+  // настроек и ядро), а переписываемое состояние — живыми функциями: настройки и
+  // история чатов переприсваиваются ЦЕЛИКОМ (загрузка с диска и синхронизация с
+  // другого устройства), а предел истории планов объявлен НИЖЕ точки сбора.
+  const ChatStore = window.ChatStore({
+    isElectron: isElectron,
+    api: api,
+    AgentCore: AgentCore,
+    normalize: normalize,
+    getSettings: () => settings,
+    setSettings: (s) => { settings = s; },
+    getChatsData: () => chatsData,
+    setChatsData: (c) => { chatsData = c; },
+    getPlanArchiveLimit: () => PLAN_ARCHIVE_LIMIT,
+    getSession: () => session,
+    setRemoteRunNotified: (v) => { remoteRunNotified = v; },
+    renderSidebar: renderSidebar,
+    renderMessages: renderMessages,
+    toast: toast,
+    getProjectPanel: () => ProjectPanel,
   });
+  // Сброс на диск при закрытии/сворачивании окна — на прежнем месте куска.
+  ChatStore.wire();
 
   // ─────────────── Чат ───────────────
   function getActiveChat() {
@@ -293,7 +200,7 @@
     chatsData.activeId = c.id;
     renderSidebar();
     renderMessages();
-    persistChats();
+    ChatStore.persistChats();
     return c;
   }
   // Найти чат, привязанный к проекту, или создать новый (с именем проекта).
@@ -304,7 +211,7 @@
       chat = createChat();
       chat.projectId = projectId;
       chat.title = projectName || "Новый чат";
-      persistChats();
+      ChatStore.persistChats();
       renderSidebar();
       renderMessages();
     } else {
@@ -331,7 +238,7 @@
     if (chatsData.activeId === id) chatsData.activeId = chatsData.chats[0] ? chatsData.chats[0].id : null;
     renderSidebar();
     renderMessages();
-    persistChats();
+    ChatStore.persistChats();
   }
   function selectChat(id) {
     if (streaming) return;
@@ -345,7 +252,7 @@
     chatsData.activeId = id;
     renderSidebar();
     renderMessages();
-    persistChats();
+    ChatStore.persistChats();
   }
 
   // ─── План работ (todoWrite): чеклист, разбор плана из текста, галочки ───
@@ -356,43 +263,65 @@
   // Сколько прошлых планов хранит чат: тем же числом ограничивается история при
   // загрузке чатов с диска (sanitizeChats) — один источник правды на оба места.
   const PLAN_ARCHIVE_LIMIT = 5;
+  // ─── Отправка: ход агента, обычная отправка и досылка прерванного ответа ───
+  // Код живёт в src/renderer/chat-send.js. Сборка стоит ВЫШЕ прежнего места куска:
+  // панель плана (ниже) берёт `sendMessage` значением — её кнопка «Выполнить план»
+  // отправляет запрос тем же путём. Живые доступы — функциями: признак прогона,
+  // сессия, прерывание браузера, режим плана, вложение и счётчик отката меняются
+  // по ходу хода, настройки и история чатов переписываются целиком. Что собирается
+  // НИЖЕ (лента, панель настроек, разбор событий агента, прогон ответа, автозадачи
+  // и веб-режим) — стрелками.
+  const ChatSend = window.ChatSend({
+    $: $,
+    isElectron: isElectron,
+    api: api,
+    uid: uid,
+    toast: toast,
+    renderSidebar: renderSidebar,
+    buildMessageEl: buildMessageEl,
+    autoResize: autoResize,
+    hideAttachBar: hideAttachBar,
+    selectChat: selectChat,
+    getActiveChat: getActiveChat,
+    createChat: createChat,
+    getSettings: () => settings,
+    getChatsData: () => chatsData,
+    getStreaming: () => streaming,
+    getPlanToggleOn: () => planToggleOn,
+    setPlanToggleOn: (v) => { planToggleOn = v; },
+    getPendingImage: () => pendingImage,
+    setLastUndoCount: (v) => { lastUndoCount = v; },
+    setSession: (v) => { session = v; },
+    getWebAbort: () => webAbort,
+    setWebAbort: (v) => { webAbort = v; },
+    getChatFeed: () => ChatFeed,
+    getPlanPanel: () => PlanPanel,
+    getSettingsPanel: () => SettingsPanel,
+    getChatEvents: () => ChatEvents,
+    getChatRun: () => ChatRun,
+    getAutoTasks: () => AutoTasks,
+    getWebChat: () => WebChat,
+    ChatStore: ChatStore,
+  });
+
   const PlanPanel = window.PlanPanel({
     $: $,
     document: document,
     getActiveChat: getActiveChat,
     getStreaming: () => streaming,
     getChatSegments: () => ChatSegments,
-    sendMessage: sendMessage,
+    sendMessage: ChatSend.sendMessage,
     autoResize: autoResize,
-    persistChatsSoon: persistChatsSoon,
+    persistChatsSoon: ChatStore.persistChatsSoon,
     toast: toast,
     AgentCore: AgentCore,
     planArchiveLimit: PLAN_ARCHIVE_LIMIT,
   });
   // ─────────── /План работ ───────────
-  // ─── Синхронизация истории между устройствами ───
-  // История чатов лежит в одном файле, а клиентов несколько: окно на ПК и телефоны.
-  // Когда сохраняет другой клиент, приходит событие chats:reload — раньше его не
-  // было, и ответ, написанный с телефона, появлялся на ПК только после перезапуска.
+  // Синхронизация истории между устройствами (событие chats:reload) живёт
+  // в хранилище — см. `ChatStore.reloadChatsFromDisk()`. Здесь остаётся только
+  // признак «про чужой прогон уже сказали»: его читает и пишет разбор событий агента.
   let remoteRunNotified = false;
-  async function reloadChatsFromDisk() {
-    if (!isElectron || typeof api.loadChats !== "function") return;
-    // Свой прогон агента или несохранённые правки — перезагрузка их потеряет.
-    if (session || chatsSavePending) return;
-    let c = null;
-    try {
-      c = await api.loadChats();
-    } catch {
-      return;
-    }
-    if (!c || !Array.isArray(c.chats)) return;
-    chatsData = sanitizeChats(c);
-    remoteRunNotified = false;
-    renderSidebar();
-    renderMessages();
-    try { ProjectPanel.refreshProject(); } catch {}
-    toast("📱 История обновлена с другого устройства");
-  }
 
   // ─────────────── Рендер ───────────────
   function renderSidebar() {
@@ -431,7 +360,7 @@
   }
 
   function renderMessages() {
-    maybeRestoreUndoButton();
+    ChatRun.maybeRestoreUndoButton();
     updateModelNeeded();
     PlanPanel.renderPlanPanel();
     const wrap = $("messages");
@@ -514,113 +443,6 @@
     msgHtml: (c) => ChatRender.msgHtml(c),
   });
 
-  // ─────────────── Отправка ───────────────
-  // Продолжить ответ, прерванный закрытием приложения. Идём тем же путём, что и
-  // обычная отправка (в историю попадает прозрачная просьба дописать), поэтому
-  // агент видит контекст и просто доводит задачу до конца.
-  function continueInterruptedAnswer(chatId, m) {
-    if (streaming) {
-      toast("Дождись окончания текущего ответа");
-      return;
-    }
-    const chat = chatsData.chats.find((c) => c.id === chatId);
-    if (!chat) return;
-    if (m) m.interrupted = false;
-    if (chatsData.activeId !== chat.id) selectChat(chat.id);
-    const input = $("input");
-    input.value = "Продолжи предыдущий ответ с того места, где он прервался, и доведи задачу до конца. Не начинай заново и не повторяй уже сделанное.";
-    autoResize();
-    sendMessage();
-  }
-
-  // Один прогон агента в конкретном чате. Сюда идут И обычная отправка, И автозадача:
-  // второй копии логики (история, сессия, стрим, завершение) быть не должно — иначе
-  // починка в одном месте обходит другое.
-  async function runTurn(chat, content, opts) {
-    opts = opts || {};
-    const usePlan = !!opts.plan;
-    chat.messages.push({ id: uid(), role: "user", content, createdAt: Date.now() });
-    const assistantMsg = { id: uid(), role: "assistant", content: "", pending: true, createdAt: Date.now() };
-    if (usePlan) assistantMsg.plan = true;
-    chat.messages.push(assistantMsg);
-    renderSidebar();
-    $("welcome").classList.add("hidden");
-    $("messages").appendChild(buildMessageEl(chat.messages[chat.messages.length - 2]));
-    $("messages").appendChild(buildMessageEl(assistantMsg));
-    ChatFeed.scrollBottom();
-    persistChats();
-    setStreaming(true);
-
-    // История уходит в main ЦЕЛИКОМ: там её держат в бюджете модели, а при переполнении
-    // голова уходит в памятку (сжатие). Раньше история обрезалась здесь по ПОЛНОМУ бюджету
-    // модели — на длинном чате срез схлопывался до одного последнего сообщения, сжатию было
-    // нечего сворачивать, и агент терял задачу («перестаёт нормально работать»).
-    let history = chat.messages
-      .filter((m) => {
-        if (!m || !m.content) return false;
-        if (m.role === "user" || m.role === "assistant") return true;
-        // Служебные заметки (перенос задачи из прошлого чата, восстановление после сбоя,
-        // авто-переключение подключения) — тоже часть контекста.
-        return m.role === "system";
-      })
-      .map((m) => ({ role: m.role, content: m.content }));
-
-    session = { chatId: chat.id, assistantId: assistantMsg.id, segmentIds: [assistantMsg.id] };
-    try {
-      if (isElectron) {
-        await api.sendMessage(history, { plan: usePlan, role: chat.role || "dev", chatId: chat.id });
-      } else {
-        webAbort = new AbortController();
-        try {
-          await WebChat.webSend(history, ChatEvents.onAiEvent, webAbort.signal, { plan: usePlan, role: chat.role || "dev", chatId: chat.id });
-        } catch (e) {
-          if (e.name !== "AbortError") ChatEvents.onAiEvent({ type: "error", message: e.message || String(e) });
-        }
-      }
-    } finally {
-      finishStream(chat, assistantMsg);
-      session = null;
-      webAbort = null;
-      AutoTasks.flushAutoQueue(); // во время прогона автозадача ждала — самое время её запустить
-    }
-    return assistantMsg;
-  }
-
-  async function sendMessage() {
-    const input = $("input");
-    const text = input.value.trim();
-    if (!text || streaming) return;
-    lastUndoCount = 0; // новый запуск — счётчик отката обнуляется
-    if (PlanPanel.planRotate(getActiveChat())) PlanPanel.renderPlanPanel();
-    if (!settings.model) {
-      // У чипов-действий («Создать файл» и т.п.) не получается выполнить задачу
-      // без модели — показываем понятное сообщение в настройках.
-      SettingsPanel.openSettings("model");
-      SettingsPanel.setSettingsMsg(
-        "Сначала выбери модель: провайдер → API-ключ (для облака) → кнопка «Проверить подключение» → клик по модели из списка → «Сохранить настройки». Пока модель не выбрана, команды агенту («создай файл…») выполнить нельзя.",
-        true
-      );
-      return;
-    }
-    let chat = getActiveChat();
-    if (!chat) chat = createChat();
-    if (chat.title === "Новый чат") chat.title = text.slice(0, 42) + (text.length > 42 ? "…" : "");
-
-    const usePlan = planToggleOn;
-    if (usePlan) {
-      // Режим плана применяется к одному запросу, дальше выключается
-      planToggleOn = false;
-      $("btn-plan").classList.remove("active");
-    }
-    const content = pendingImage
-      ? [{ type: "text", text }, { type: "image_url", image_url: { url: pendingImage } }]
-      : text;
-    hideAttachBar();
-    input.value = "";
-    autoResize();
-    await runTurn(chat, content, { plan: usePlan });
-  }
-
   // ─── Автозадачи (планировщик дел) — код в src/renderer/auto-tasks.js ───
   // Модуль собирается на прежнем месте куска. Живые значения — функциями: настройки,
   // признак идущего прогона и история чатов переписываются целиком. Дела с миссией
@@ -631,10 +453,10 @@
     toast: toast,
     uid: uid,
     createChat: createChat,
-    persistChats: persistChats,
+    persistChats: ChatStore.persistChats,
     renderSidebar: renderSidebar,
     selectChat: selectChat,
-    runTurn: runTurn,
+    runTurn: ChatSend.runTurn,
     getSettings: () => settings,
     getStreaming: () => streaming,
     getChatsData: () => chatsData,
@@ -649,7 +471,7 @@
     msgEls: msgEls,
     buildMessageEl: buildMessageEl,
     scrollBottom: ChatFeed.scrollBottom,
-    persistChatsSoon: persistChatsSoon,
+    persistChatsSoon: ChatStore.persistChatsSoon,
     planRoundStarted: PlanPanel.planRoundStarted,
   });
 
@@ -684,7 +506,7 @@
     msgEls: msgEls,
     autoQueue: AutoTasks.autoQueue,
     flushAutoQueue: AutoTasks.flushAutoQueue,
-    persistChatsSoon: persistChatsSoon,
+    persistChatsSoon: ChatStore.persistChatsSoon,
     buildMessageEl: buildMessageEl,
     refreshMessage: refreshMessage,
     openAskModal: AskModal.openAskModal,
@@ -717,17 +539,17 @@
     toast: toast,
     AgentCore: AgentCore,
     esc: (t) => ProjectPanel.esc(t),
-    persistSettings: persistSettings,
+    persistSettings: ChatStore.persistSettings,
     getSettings: () => settings,
     getProjectPanel: () => ProjectPanel,
     getYcPanel: () => YcPanel,
     getChatsData: () => chatsData,
     getStreaming: () => streaming,
     getActiveChat: getActiveChat,
-    persistChatsNow: persistChatsNow,
+    persistChatsNow: ChatStore.persistChatsNow,
     selectChat: selectChat,
     renderSidebar: renderSidebar,
-    sendMessage: sendMessage,
+    sendMessage: ChatSend.sendMessage,
     startAutoRunNow: AutoTasks.startAutoRunNow,
     autoResize: autoResize,
   });
@@ -744,9 +566,9 @@
     $: $,
     toast: toast,
     getActiveChat: getActiveChat,
-    persistChats: persistChats,
+    persistChats: ChatStore.persistChats,
     renderMessages: renderMessages,
-    sendMessage: sendMessage,
+    sendMessage: ChatSend.sendMessage,
     autoResize: autoResize,
     msgText: (c) => ChatRender.msgText(c),
     chatTitle: chatTitle,
@@ -759,7 +581,7 @@
     fmtClock: fmtClock,
     ChatThinking: ChatThinking,
     ChatActions: ChatActions,
-    continueInterruptedAnswer: continueInterruptedAnswer,
+    continueInterruptedAnswer: ChatSend.continueInterruptedAnswer,
     getChatsData: () => chatsData,
   });
 
@@ -774,7 +596,7 @@
     api: api,
     AgentCore: AgentCore,
     toast: toast,
-    persistSettings: persistSettings,
+    persistSettings: ChatStore.persistSettings,
     PRESET_LABEL: PRESET_LABEL,
     MODEL_KEY: MODEL_KEY,
     MODEL_INPUT: MODEL_INPUT,
@@ -792,7 +614,7 @@
     getActiveChat: getActiveChat,
     getStreaming: () => streaming,
     chatTitle: chatTitle,
-    persistChats: persistChats,
+    persistChats: ChatStore.persistChats,
     renderSidebar: renderSidebar,
   });
 
@@ -802,135 +624,42 @@
     api: api,
     isElectron: isElectron,
     toast: toast,
-    persistSettings: persistSettings,
+    persistSettings: ChatStore.persistSettings,
     getSettings: () => settings,
   });
 
-  async function finishStream(chat, aMsg) {
-    // Все сегменты текущего запуска: помечаем готовыми, пустые промежуточные убираем.
-    const segs = ChatSegments.runSegments(chat, aMsg);
-    const anyText = segs.some((s) => s.content && !s.error);
-    const kept = [];
-    for (const s of segs) {
-      s.pending = false;
-      if (!s.content && !s.error) {
-        if (!anyText && segs.indexOf(s) === segs.length - 1) s.content = "…";
-        else {
-          ChatSegments.removeSegment(chat, s);
-          continue;
-        }
-      }
-      kept.push(s);
-    }
-    const lastSeg = kept[kept.length - 1] || aMsg;
-    setStreaming(false);
-    persistChatsNow();
-    renderSidebar();
-    const el = msgEls.get(lastSeg.id);
-    if (el) {
-      const b = el.querySelector(".bubble");
-      if (b) {
-        if (lastSeg.error) {
-          b.textContent = lastSeg.error;
-        } else {
-          b.classList.add("md");
-          b.innerHTML = ChatRender.msgHtml(lastSeg.content) || "…";
-        }
-        b.classList.remove("pending");
-      }
-    }
-    ChatWork.finishGroup();
-    // Ответ готов: сворачиваем блок «Размышление», если пользователь сам его не трогал
-    for (const s of kept) {
-      const sEl = msgEls.get(s.id);
-      if (!sEl) continue;
-      ChatThinking.collapseThinkBox(sEl);
-    }
-    // Кнопки действий под ответом: выполнить план / отменить изменения агента
-    if (el && !lastSeg.error) {
-      if (lastSeg.plan && lastSeg.content) {
-        let actRow = el.querySelector(".ai-actions");
-        if (!actRow) {
-          actRow = document.createElement("div");
-          actRow.className = "ai-actions";
-          el.appendChild(actRow);
-        }
-        const bGo = document.createElement("button");
-        bGo.className = "btn btn-primary btn-small";
-        bGo.textContent = "▶ Выполнить план";
-        bGo.onclick = () => {
-          if (streaming) return;
-          lastSeg.plan = false;
-          const cur = getActiveChat();
-          if (!cur) return;
-          // Отправляем короткую команду — модель видит предыдущий план в истории
-          const inp = $("input");
-          inp.value = "Выполни план, который ты составил. Не пересказывай план — сразу действуй.";
-          autoResize();
-          sendMessage();
-        };
-        actRow.appendChild(bGo);
-      }
-      if (isElectron) {
-        let n = lastUndoCount;
-        if (!n) {
-          try {
-            const st = await api.undoStatus();
-            n = st && st.ok ? st.count : 0;
-          } catch {}
-        }
-        if (n > 0) addUndoButton(el);
-      }
-    }
-    ChatWork.resetGroup();
-  }
+  // ─── Прогон ответа: состояние, завершение, остановка, откат — код в src/renderer/chat-run.js ───
+  // Сборка стоит на прежнем месте куска. Живые доступы — функциями: признак прогона,
+  // счётчик отката, признак «кнопка отката уже показана» и объект остановки меняются
+  // по ходу хода, а панель проекта объявлена НИЖЕ точки сбора — потому стрелкой.
+  const ChatRun = window.ChatRun({
+    $: $,
+    isElectron: isElectron,
+    api: api,
+    toast: toast,
+    msgEls: msgEls,
+    getStreaming: () => streaming,
+    setStreamingFlag: (v) => { streaming = v; },
+    getLastUndoCount: () => lastUndoCount,
+    setLastUndoCount: (v) => { lastUndoCount = v; },
+    getUndoRestoreShown: () => undoRestoreShown,
+    setUndoRestoreShown: (v) => { undoRestoreShown = v; },
+    getWebAbort: () => webAbort,
+    getActiveChat: getActiveChat,
+    renderSidebar: renderSidebar,
+    autoResize: autoResize,
+    sendMessage: ChatSend.sendMessage,
+    getProjectPanel: () => ProjectPanel,
+    ChatStore: ChatStore,
+    ChatSegments: ChatSegments,
+    ChatWork: ChatWork,
+    ChatThinking: ChatThinking,
+    ChatRender: ChatRender,
+  });
 
-  // Кнопка «Отменить изменения агента» под ответом (чекпоинт последнего запуска).
-  // Используется и сразу после ответа, и после перезапуска приложения (чекпоинт на диске).
-  function addUndoButton(el) {
-    if (!el) return;
-    let actRow = el.querySelector(".ai-actions");
-    if (!actRow) {
-      actRow = document.createElement("div");
-      actRow.className = "ai-actions";
-      el.appendChild(actRow);
-    }
-    const bUndo = document.createElement("button");
-    bUndo.className = "btn btn-ghost btn-small";
-    bUndo.textContent = "↩ Отменить изменения агента (" + (lastUndoCount || 0) + ")";
-    bUndo.title = "Вернуть файлы к состоянию до этого ответа";
-    bUndo.onclick = async () => {
-      if (streaming) return;
-      const r = await api.undoRollback();
-      lastUndoCount = 0;
-      if (r && r.ok) {
-        ProjectPanel.toastShort("✅ Отменено: " + (r.count || 0) + " файлов");
-        bUndo.remove();
-        if (!$("project-panel").classList.contains("hidden")) ProjectPanel.refreshProject();
-      } else {
-        toast("Не удалось отменить изменения");
-      }
-    };
-    actRow.appendChild(bUndo);
-  }
-
-  // После перезапуска приложения чекпоинт изменений агента (undo.json) ещё жив —
-  // показываем кнопку отката под последним ответом. Вызывается из renderMessages
-  // (первый рендер), дальше — один раз, чтобы не дублировать кнопку при смене чатов.
+  // Признак «кнопка отката уже показана» ещё нужен оболочке: его сбрасывает загрузка
+  // истории с другого устройства. Сама кнопка и её показ живут в chat-run.js.
   let undoRestoreShown = false;
-  function maybeRestoreUndoButton() {
-    if (undoRestoreShown || !isElectron) return;
-    undoRestoreShown = true;
-    api.undoStatus().then((st) => {
-      if (!(st && st.ok && st.count > 0)) return;
-      lastUndoCount = st.count;
-      const chat = getActiveChat();
-      const lastAssistant =
-        chat && [...chat.messages].reverse().find((m) => m.role === "assistant" && !m.error);
-      if (lastAssistant) addUndoButton(msgEls.get(lastAssistant.id));
-    });
-  }
-
   // Баннер «нужна модель» на приветственном экране. Бейдж модели всегда статичен.
   function updateModelNeeded() {
     const chat = getActiveChat();
@@ -940,18 +669,6 @@
   }
 
 
-  function setStreaming(v) {
-    streaming = v;
-    $("typing").classList.toggle("hidden", !v);
-    $("btn-stop").classList.toggle("hidden", !v);
-    $("btn-send").classList.toggle("hidden", v);
-  }
-
-  function stop() {
-    if (isElectron) api.stopMessage();
-    else if (webAbort) webAbort.abort();
-  }
-
   // ─────────────── Сохранённые OpenAI-подключения ───────────────
   // Код живёт в src/renderer/openai-profiles.js. Сборка стоит раньше веб-режима:
   // тот берёт список подключений своим входом (OpenaiProfiles.arr).
@@ -960,7 +677,7 @@
     uid: uid,
     getSettings: () => settings,
     PRESETS: PRESETS,
-    persistSettings: persistSettings,
+    persistSettings: ChatStore.persistSettings,
     // Панель настроек объявлена НИЖЕ этой проводки: прямое чтение SettingsPanel.setSettingsMsg
     // упало бы на загрузке окна («Cannot access before initialization» — поймал живой прогон).
     setSettingsMsg: (t, e) => SettingsPanel.setSettingsMsg(t, e),
@@ -973,7 +690,7 @@
     AgentCore: AgentCore,
     getSettings: () => settings,
     openaiProfilesArr: OpenaiProfiles.arr,
-    persistSettings: persistSettings,
+    persistSettings: ChatStore.persistSettings,
     onEvent: ChatEvents.onAiEvent, // то же окно событий, что и у desktop-цикла
     openAskModal: AskModal.openAskModal,
   });
@@ -999,7 +716,7 @@
     setCurrentPreset: (p) => { currentPreset = p; },
     setSbVersion: (v) => { ProjectPanel.setSbVersion(v); },
     cachedModels: cachedModels,
-    persistSettings: persistSettings,
+    persistSettings: ChatStore.persistSettings,
     updateStatusBar: () => ProjectPanel.updateStatusBar(),
     updateModelNeeded: updateModelNeeded,
     refreshProject: () => ProjectPanel.refreshProject(),
@@ -1111,8 +828,8 @@
     });
   }
 
-  $("btn-send").onclick = sendMessage;
-  $("btn-stop").onclick = stop;
+  $("btn-send").onclick = ChatSend.sendMessage;
+  $("btn-stop").onclick = ChatRun.stop;
   $("btn-plan").onclick = () => {
     if (streaming) return;
     planToggleOn = !planToggleOn;
@@ -1122,7 +839,7 @@
   $("input").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      sendMessage();
+      ChatSend.sendMessage();
     }
   });
   $("input").addEventListener("input", autoResize);
@@ -1132,66 +849,17 @@
   $("btn-new-chat").onclick = () => {
     if (!streaming) createChat();
   };
-  // Контекст для кнопки «Продолжить контекст предыдущего чата»: переносим не только
-  // последний ответ, а суть задачи — последний запрос пользователя, последний ответ
-  // агента и хвост диалога. Ограничено по символам: перенос должен быть компактным,
-  // а не копией всего чата.
-  function buildContinuationContext(prev) {
-    const CONTEXT_LIMIT = 6000;
-    const textOf = (m) => {
-      const c = m && m.content;
-      if (typeof c === "string") return c.trim();
-      if (Array.isArray(c)) {
-        return c.filter((p) => p && p.type === "text").map((p) => p.text || "").join("\n").trim();
-      }
-      return "";
-    };
-    const turns = [];
-    for (const m of prev.messages) {
-      if (!m || m.role === "tool") continue;
-      const t = textOf(m);
-      if (!t) continue;
-      turns.push({ role: m.role, text: t });
-    }
-    let lastUserId = -1;
-    let lastAssistantId = -1;
-    for (let i = turns.length - 1; i >= 0; i--) {
-      if (lastUserId < 0 && turns[i].role === "user") lastUserId = i;
-      if (lastAssistantId < 0 && turns[i].role === "assistant") lastAssistantId = i;
-      if (lastUserId >= 0 && lastAssistantId >= 0) break;
-    }
-    const lastUser = lastUserId >= 0 ? turns[lastUserId].text : "";
-    const lastAssistant = lastAssistantId >= 0 ? turns[lastAssistantId].text : "";
-    // Хвост собираем с конца: свежие реплики важнее ранних.
-    const tail = [];
-    let used = 900 + lastUser.length + lastAssistant.length;
-    for (let i = turns.length - 1; i >= 0; i--) {
-      if (i === lastUserId || i === lastAssistantId) continue;
-      const t = turns[i];
-      const label = t.role === "user" ? "Пользователь" : t.role === "assistant" ? "Агент" : "Заметка";
-      const part = label + ": " + t.text;
-      if (used + part.length > CONTEXT_LIMIT) break;
-      used += part.length;
-      tail.unshift(part);
-    }
-    const title = prev.title && prev.title !== "Новый чат" ? prev.title : "";
-    const out = ["ПРОДОЛЖЕНИЕ ПРЕДЫДУЩЕГО ЧАТА (перенесено из другого чата — считай сделанное сделанным и не начинай заново)."];
-    if (title) out.push("Тема/задача: " + title);
-    if (lastUser) out.push("", "Последний запрос пользователя:", lastUser.slice(0, 2500));
-    if (lastAssistant) out.push("", "Последний ответ агента:", lastAssistant.slice(0, 2500));
-    if (tail.length) out.push("", "Хвост диалога (последние реплики):", tail.join("\n"));
-    return out.join("\n");
-  }
-  $("btn-continue-chat").onclick = () => {
-    if (streaming) return;
-    const prev = getActiveChat();
-    if (!prev || !prev.messages.length) { createChat(); return; }
-    const title = prev.title && prev.title !== "Новый чат" ? prev.title : "";
-    createChat({
-      contextMsg: buildContinuationContext(prev),
-      title: title ? title + " (продолжение)" : "Новый чат (продолжение)",
-    });
-  };
+  // ─── Продолжение чата: контекст из прошлого чата — код в src/renderer/chat-continue.js ───
+  // Сборка стоит на прежнем месте куска, а `wire()` навешивает обработчик там, где он
+  // висел раньше: кнопку жмут и мышью, и из палитры команд (`.click()`). Живые доступы —
+  // функциями: признак прогона и активный чат берутся в момент нажатия, копия застыла бы.
+  const ChatContinue = window.ChatContinue({
+    $: $,
+    getStreaming: () => streaming,
+    getActiveChat: getActiveChat,
+    createChat: createChat,
+  });
+  ChatContinue.wire();
   // ── Yandex Cloud (дашборд + настройки) — код в src/renderer/yc-panel.js ──
   // Отдаём панели ровно то, что принадлежит оболочке окна: DOM, IPC, всплывашки,
   // переходы и живой доступ к настройкам.
@@ -1236,7 +904,7 @@
     if (!chip || !chip.dataset.prompt) return;
     $("input").value = chip.dataset.prompt;
     autoResize();
-    sendMessage();
+    ChatSend.sendMessage();
   });
 
   // Поиск по чатам. В поле поиска может оказаться «мусор» от автозаполнения браузера —
@@ -1340,17 +1008,17 @@
   });
   $("btn-refresh-models").onclick = () => {
     SettingsPanel.collectSettingsFromUI();
-    persistSettings();
+    ChatStore.persistSettings();
     SettingsPanel.loadModels();
   };
   $("btn-refresh-anth-models").onclick = () => {
     SettingsPanel.collectSettingsFromUI();
-    persistSettings();
+    ChatStore.persistSettings();
     SettingsPanel.loadModels();
   };
   $("btn-refresh-ollama-models").onclick = () => {
     SettingsPanel.collectSettingsFromUI();
-    persistSettings();
+    ChatStore.persistSettings();
     SettingsPanel.loadModels();
   };
   $("btn-probe-ollama").onclick = () => {
@@ -1362,7 +1030,7 @@
   };
   $("btn-test").onclick = () => {
     SettingsPanel.collectSettingsFromUI();
-    persistSettings();
+    ChatStore.persistSettings();
     SettingsPanel.testConnection();
   };
   $("btn-save-settings").onclick = SettingsPanel.saveSettingsUI;
@@ -1428,7 +1096,7 @@
     getSettings: () => settings,
     setSettings: (s) => { settings = s; },
     normalize: normalize,
-    persistSettings: persistSettings,
+    persistSettings: ChatStore.persistSettings,
     toast: toast,
     syncRail: SidePanel.syncRail,
     toggleModelPopup: ModelPopup.toggleModelPopup,
@@ -1474,7 +1142,7 @@
     isElectron: isElectron,
     toast: toast,
     createChat: createChat,
-    stop: stop,
+    stop: ChatRun.stop,
     getStreaming: () => streaming,
     openSidePanel: SidePanel.openSidePanel,
     termReset: SidePanel.termReset,
@@ -1514,7 +1182,7 @@
     if (mod && e.key.toLowerCase() === "enter") {
       if (inField && t.id === "input") {
         e.preventDefault();
-        sendMessage();
+        ChatSend.sendMessage();
       }
       return;
     }
@@ -1536,7 +1204,7 @@
       if (SidePanel.sidePanelVisible()) SidePanel.closeSidePanel();
       // Esc во время генерации = явная остановка агента. Только реальные нажатия
       // пользователя (e.isTrusted) — синтетические клики агента (appPress Escape) не сработают.
-      if (streaming && e.isTrusted) stop();
+      if (streaming && e.isTrusted) ChatRun.stop();
     }
   });
 
@@ -1688,7 +1356,7 @@
 
 
   // ─────────────── Старт ───────────────
-  loadState().then(() => {
+  ChatStore.loadState().then(() => {
     // Чистим поле поиска: автозаполнение браузера могло подставить URL из настроек
     $("chat-search").value = "";
     if (!chatsData.chats.length) {
@@ -1709,7 +1377,7 @@
     if (isElectron) {
       api.onAiEvent(ChatEvents.onAiEvent);
       // История чатов общая: телефон сохранил переписку — перечитываем файл.
-      if (typeof api.onChatsReload === "function") api.onChatsReload(() => reloadChatsFromDisk());
+      if (typeof api.onChatsReload === "function") api.onChatsReload(() => ChatStore.reloadChatsFromDisk());
       ProjectPanel.wireGithubEvents();
     }
   });

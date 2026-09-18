@@ -206,7 +206,7 @@ const lastMsg = (env) => env.calls.msgs[env.calls.msgs.length - 1] || "";
     const wiring = APP_SRC.slice(start, APP_SRC.indexOf("  });", start));
     for (const dep of [
       "$: $,", "isElectron: isElectron,", "api: api,", "AgentCore: AgentCore,", "toast: toast,",
-      "persistSettings: persistSettings,", "PRESET_LABEL: PRESET_LABEL,", "MODEL_KEY: MODEL_KEY,",
+      "persistSettings: ChatStore.persistSettings,", "PRESET_LABEL: PRESET_LABEL,", "MODEL_KEY: MODEL_KEY,",
       "MODEL_INPUT: MODEL_INPUT,", "cachedModels: cachedModels,", "getSettings: () => settings,",
       "getSettingsPanel: () => SettingsPanel,",
     ]) {

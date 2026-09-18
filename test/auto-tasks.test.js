@@ -56,6 +56,9 @@ const MODULE_SRC = read("src", "renderer", "auto-tasks.js");
 const APP_SRC = read("src", "renderer", "app.js");
 const HTML_SRC = read("src", "renderer", "index.html");
 const BRIDGE_SRC = read("src", "mobile-bridge.js");
+// Прогон агента вынесен своим модулем (этап A, часть 9): конец прогона разбирает
+// очередь автозадач именно там, поэтому и спрашиваем модуль отправки.
+const SEND_SRC = read("src", "renderer", "chat-send.js");
 
 // ── Сборка модуля в песочнице ───────────────────────────────────────────────
 // Модуль живёт в окне, но собирается той же фабрикой, что и в приложении, поэтому
@@ -147,7 +150,8 @@ const task = (extra) => Object.assign({ id: "t1", title: "Позвонить в 
     // Очередь — общая с разбором событий агента: значит, отдаётся из модуля, а не копией.
     assert.ok(APP_SRC.includes("autoQueue: AutoTasks.autoQueue,"), "события агента получили копию очереди");
     assert.ok(APP_SRC.includes("flushAutoQueue: AutoTasks.flushAutoQueue,"), "события агента зовут не тот запуск");
-    assert.ok(APP_SRC.includes("AutoTasks.flushAutoQueue();"), "прогон не разбирает очередь после себя");
+    assert.ok(APP_SRC.includes("getAutoTasks: () => AutoTasks,"), "прогон не получает автозадачи живым доступом");
+    assert.ok(SEND_SRC.includes("getAutoTasks().flushAutoQueue();"), "прогон не разбирает очередь после себя");
     assert.ok(APP_SRC.includes("startAutoRunNow: AutoTasks.startAutoRunNow,"), "дела с миссией не зовут «▶ сейчас»");
 
     // Проводка: панели объявлены НИЖЕ, поэтому внутрь идут только отложенные стрелки.
@@ -156,8 +160,8 @@ const task = (extra) => Object.assign({ id: "t1", title: "Позвонить в 
     const wiring = APP_SRC.slice(start, APP_SRC.indexOf("  });", start));
     for (const dep of [
       "isElectron: isElectron,", "api: api,", "toast: toast,", "uid: uid,",
-      "createChat: createChat,", "persistChats: persistChats,", "renderSidebar: renderSidebar,",
-      "selectChat: selectChat,", "runTurn: runTurn,", "getSettings: () => settings,",
+      "createChat: createChat,", "persistChats: ChatStore.persistChats,", "renderSidebar: renderSidebar,",
+      "selectChat: selectChat,", "runTurn: ChatSend.runTurn,", "getSettings: () => settings,",
       "getStreaming: () => streaming,", "getChatsData: () => chatsData,",
       "getTasksMission: () => TasksMission,",
     ]) {
