@@ -89,7 +89,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js"]
+  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -4273,8 +4273,9 @@ async function testMobileBridge() {
     const uiSrc = uiAll();
     assert.ok(/getSettings\(\)\.mobileHost = \$\("s-mobile-host"\)\.value\.trim\(\)/.test(uiSrc), "поле не сохраняется");
     assert.ok(/st\.host && !st\.hostActive/.test(uiSrc), "нет предупреждения о недостижимом адресе");
-    const mainS = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
-    assert.ok(/mobileHost: "192\.168\.1\.72"/.test(mainS), "адрес по умолчанию не задан");
+    // Схема настроек вынесена в src/settings-store.js (этап B, часть 5).
+    const storeS = fs.readFileSync(path.join(ROOT, "src", "settings-store.js"), "utf8");
+    assert.ok(/mobileHost: "192\.168\.1\.72"/.test(storeS), "адрес по умолчанию не задан");
   });
 
 
@@ -4648,11 +4649,13 @@ async function testHighlight() {
 // ── 11. Хранение чатов: атомарная запись, .bak-восстановление, автосейв ──────
 async function testChatPersistence() {
   // Функции хранения берём прямо из main.js (реальный код, не копия).
-  const mainSrc = backendSrc();
-  const s0 = mainSrc.indexOf("// Чтение чатов:");
-  const s1 = mainSrc.indexOf("// ─────────────────────────── Пути и файлы");
-  assert.ok(s0 > 0 && s1 > s0, "не нашёл функции хранения чатов в main.js");
-  const chatCode = mainSrc.slice(s0, s1);
+  // Код хранения чатов вынесен в src/settings-store.js (этап B, часть 5) — берём его
+  // оттуда: это по-прежнему настоящий код, а не копия.
+  const storeSrc = fs.readFileSync(path.join(ROOT, "src", "settings-store.js"), "utf8");
+  const s0 = storeSrc.indexOf("// Чтение чатов:");
+  const s1 = storeSrc.indexOf("\n  return {", s0);
+  assert.ok(s0 > 0 && s1 > s0, "не нашёл функции хранения чатов в src/settings-store.js");
+  const chatCode = storeSrc.slice(s0, s1);
 
   function makeStore(dir) {
     const chatMod = new Function(
@@ -12632,6 +12635,8 @@ async function testTasks() {
   await test("задачи по сроку: приложение будит агента и пишет в чат «Автозадачи»", () => {
     const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
     const send = uiFile("chat-send.js"); // прогон агента живёт своим модулем (этап A, часть 9)
+    // Схема настроек вынесена в src/settings-store.js (этап B, часть 5).
+    const store = fs.readFileSync(path.join(ROOT, "src", "settings-store.js"), "utf8");
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     const core = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
     const tools = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
@@ -12640,7 +12645,7 @@ async function testTasks() {
     const auto = uiFile("auto-tasks.js");
     assert.ok(main.includes("tasksTakeAuto"), "планировщик не берёт автозадачи");
     assert.ok(main.includes('type: "task-due"'), "событие срока автозадачи не отправляется");
-    assert.ok(main.includes("taskAuto: true"), "нет настройки «автозадачи выполняет агент»");
+    assert.ok(store.includes("taskAuto: true"), "нет настройки «автозадачи выполняет агент»");
     assert.ok(main.includes("armTaskWake") && main.includes("tasksNextDue"), "нет точного будильника на срок");
     assert.ok(main.includes('{ type: "task-due", from: "desktop", tasks: auto }'), "автозадача уйдёт и на телефон — прогон удвоится");
     assert.ok(send.includes("async function runTurn("), "обычная отправка и автозадача не идут общим путём");
@@ -14138,7 +14143,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14148,7 +14153,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
@@ -15653,6 +15658,8 @@ async function testMissions() {
 
   await test("миссии: файлы работы пишутся по своей галочке, а не по памяти диалогов", () => {
     const main = mainOnlySrc();
+    // Схема настроек вынесена в src/settings-store.js (этап B, часть 5).
+    const store = fs.readFileSync(path.join(ROOT, "src", "settings-store.js"), "utf8");
     // Каналы файлов работы вынесены в src/mission-ipc.js (этап B, часть 1).
     const missionIpc = fs.readFileSync(path.join(ROOT, "src", "mission-ipc.js"), "utf8");
     // Зеркала решают своё условие: иначе контекст и задачи не попадали на диск,
@@ -15661,7 +15668,7 @@ async function testMissions() {
     assert.ok(/if \(!settings\.contextMemory\) return null;/.test(main), "дневник памяти больше не спрашивает свою галочку");
     assert.ok(/if \(s\.agentWorkFiles === false\) return;/.test(main), "зеркало дел не слушает галочку файлов работы");
     assert.ok(!/if \(!s\.longWork\) return;/.test(main), "зеркало дел всё ещё привязано к «долгой работе»");
-    assert.ok(/agentWorkFiles: true/.test(main), "файлы работы выключены по умолчанию");
+    assert.ok(/agentWorkFiles: true/.test(store), "файлы работы выключены по умолчанию");
     for (const ch of ["agentfiles:status", "agentfiles:openDir", "agentfiles:clear"]) {
       assert.ok(missionIpc.indexOf('ipcMain.handle("' + ch + '"') >= 0, "нет канала " + ch);
     }
@@ -15802,6 +15809,8 @@ async function testMissions() {
 
   await test("долгая работа: батчи, авто-продолжение и мягкие стопы вместо обрыва на 26-м раунде", () => {
     const main = mainOnlySrc();
+    // Схема настроек вынесена в src/settings-store.js (этап B, часть 5).
+    const store = fs.readFileSync(path.join(ROOT, "src", "settings-store.js"), "utf8");
     // Часть долгой работы (каналы дел и миссий) вынесена в src/mission-ipc.js.
     const missionIpc = fs.readFileSync(path.join(ROOT, "src", "mission-ipc.js"), "utf8");
     assert.ok(main.indexOf("for (let batch = 1; ; batch++)") >= 0, "нет внешнего цикла батчей");
@@ -15813,8 +15822,8 @@ async function testMissions() {
     assert.ok(main.indexOf("MISSION_AUTO_ROUND") >= 0, "миссия не заводится сама на длинной работе");
     assert.ok(main.indexOf("missionSignatures") >= 0, "нет защиты от зацикливания на одном вызове");
     assert.ok(main.indexOf("MISSION_JOURNAL_PER_BATCH") >= 0, "журнал может превратиться в поток");
-    assert.ok(/longWork: true/.test(main), "долгая работа выключена по умолчанию");
-    assert.ok(/longWorkHours: 8/.test(main), "рабочий день по умолчанию не 8 часов");
+    assert.ok(/longWork: true/.test(store), "долгая работа выключена по умолчанию");
+    assert.ok(/longWorkHours: 8/.test(store), "рабочий день по умолчанию не 8 часов");
     // Текст продолжения собирает канал mission:resume, а он живёт в src/mission-ipc.js.
     assert.ok(missionIpc.indexOf("missionResumeText") >= 0, "нет продолжения миссии с места остановки");
     assert.ok(main.indexOf("global.__agentPauseRequested") >= 0, "нет паузы у долгой работы");
@@ -16135,7 +16144,9 @@ async function testSecretScopes() {
     assert.ok(/finally\s*\{\s*activeToolCapability = prevCapability;/.test(main), "назначение не возвращается после инструмента");
     assert.ok(main.includes("agentEnvScopes"), "настройки выдачи не читаются");
     assert.ok(main.includes('ipcMain.handle("policy:groups"'), "окно не может получить группы выдачи");
-    assert.ok(/s\.agentEnvScopes = toolPolicy\.normalizeScopes/.test(main), "сохранённая выдача не чистится политикой");
+    // Чистка сохранённой выдачи уехала вместе со схемой настроек — в src/settings-store.js.
+    const storeSrc = fs.readFileSync(path.join(ROOT, "src", "settings-store.js"), "utf8");
+    assert.ok(/s\.agentEnvScopes = toolPolicy\.normalizeScopes/.test(storeSrc), "сохранённая выдача не чистится политикой");
   });
 
   await test("секреты: выдача видна в настройках и доступна с телефона", () => {

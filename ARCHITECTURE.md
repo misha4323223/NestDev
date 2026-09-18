@@ -195,5 +195,6 @@
 | `src/mission-ipc.js`, `mission-store.js` | дела, миссии и папка работы агента: каналы `tasks:*`, `mission:*`, `agentfiles:*` |
 | `src/model-ipc.js` | модели, замер локальной модели и G4F: каналы `ai:models`, `ai:probeLocal`, `g4f:probe`, `g4f:test` |
 | `src/github-ipc.js` | GitHub: вход по коду, список и поиск репозиториев, выбор и клонирование, публикация нового репозитория: каналы `github:*` |
+| `src/settings-store.js` | схема настроек и миграции, чтение и запись (секреты — отдельно), OpenAI-подключения с кулдауном, история чатов: `loadSettings`/`saveSettings`/`loadChats`/`saveChats` |
 | `src/app-ui-tools.js`, `tool-policy.js` | интерфейсные инструменты, разрешения |
 | `src/mobile-bridge.js`, `secrets.js`, `ota.js`, `vault.js` | телефон, секреты, обновления, пароли |
