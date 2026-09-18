@@ -196,6 +196,7 @@
 | `src/model-ipc.js` | модели, замер локальной модели и G4F: каналы `ai:models`, `ai:probeLocal`, `g4f:probe`, `g4f:test` |
 | `src/github-ipc.js` | GitHub: вход по коду, список и поиск репозиториев, выбор и клонирование, публикация нового репозитория: каналы `github:*` |
 | `src/settings-store.js` | схема настроек и миграции, чтение и запись (секреты — отдельно), OpenAI-подключения с кулдауном, история чатов: `loadSettings`/`saveSettings`/`loadChats`/`saveChats` |
+| `src/project-search.js` | обход проекта (`walkProject`), список файлов для «осмотра» (`listProjectFiles`) и поиск по содержимому (`searchProjectFiles`) |
 | `src/paths-git.js` | пути и git для всего бэкенда: `resolvePath`/`sanitizeDir`/`sanitizePath`, `gitDirOrHome`/`agentWorkDir`, `repoNameFromUrl`/`stripUrlCreds`, `runGit` (окружение по назначению + Basic-авторизация) |
 | `src/app-ui-tools.js`, `tool-policy.js` | интерфейсные инструменты, разрешения |
 | `src/mobile-bridge.js`, `secrets.js`, `ota.js`, `vault.js` | телефон, секреты, обновления, пароли |
