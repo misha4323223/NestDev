@@ -1115,56 +1115,27 @@ const { walkProject, listProjectFiles, searchProjectFiles } = createProjectSearc
 });
 
 
-// Снимок файла для «отката изменений агента». Снимок делается ПЕРЕД каждой правкой,
-// поэтому undoEdit(path, steps) умеет откатывать на несколько шагов назад.
-// На файл хранится не более UNDO_MAX_PER_FILE последних снимков (старые вытесняются).
-// content === null означает, что файл был создан агентом (откат = удалить).
-const UNDO_MAX_PER_FILE = 5;
-function snapshotFileForUndo(p) {
-  try {
-    let content;
-    if (fs.existsSync(p)) {
-      const st = fs.statSync(p);
-      if (!st.isFile() || st.size > 10 * 1024 * 1024) return; // очень большие файлы не копируем
-      content = fs.readFileSync(p, "utf8");
-    } else {
-      content = null; // создан агентом
-    }
-    activeRunUndo.push({ path: p, content, ts: Date.now() });
-    // вытесняем самые старые снимки этого файла, оставляя UNDO_MAX_PER_FILE
-    let total = 0;
-    for (const u of activeRunUndo) if (u.path === p) total++;
-    let drop = total - UNDO_MAX_PER_FILE;
-    if (drop > 0) {
-      const kept = [];
-      for (let i = 0; i < activeRunUndo.length; i++) {
-        const u = activeRunUndo[i];
-        if (u.path === p && drop > 0) { drop--; continue; }
-        kept.push(u);
-      }
-      activeRunUndo = kept;
-    }
-  } catch {}
-}
+// ── Снимки отката и чекпоинт — код в src/undo-store.js ──
+// Имена те же: вызовы в инструментах, каналах и панели проекта не менялись.
+// Живые значения (снимки запуска и журнал отката) — мостом live со сеттерами: их
+// пишет и разбор правок, и каналы отката, копия «застыла» бы на пустом массиве.
+const { createUndoStore } = require("./undo-store.js");
+const { snapshotFileForUndo, persistUndo, loadPersistedUndo, undoFile } = createUndoStore({
+  fs,
+  path,
+  userDataDir: () => app.getPath("userData"),
+  live: {
+    activeRunUndo: () => activeRunUndo,
+    setActiveRunUndo: (v) => {
+      activeRunUndo = v;
+    },
+    lastUndoLog: () => lastUndoLog,
+    setLastUndoLog: (v) => {
+      lastUndoLog = v;
+    },
+  },
+});
 
-// ── Чекпоинт: снимок изменений последнего запуска сохраняется на диск, ──
-// ── чтобы откат пережил перезапуск приложения. ──
-const undoFile = () => path.join(app.getPath("userData"), "undo.json");
-
-function persistUndo() {
-  try {
-    fs.mkdirSync(path.dirname(undoFile()), { recursive: true });
-    fs.writeFileSync(undoFile(), JSON.stringify(lastUndoLog), "utf8");
-  } catch {}
-}
-
-function loadPersistedUndo() {
-  if (lastUndoLog.length) return;
-  try {
-    const d = JSON.parse(fs.readFileSync(undoFile(), "utf8"));
-    if (Array.isArray(d)) lastUndoLog = d;
-  } catch {}
-}
 
 // ─────────────────────────── Выполнение инструментов ───────────────────────────
 function numberedLines(all, fromLine, toLine, total) {
