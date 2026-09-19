@@ -560,6 +560,11 @@
             if (obj.usage && onUsage) onUsage(normalizeUsage(obj.usage));
             const choice = obj.choices && obj.choices[0];
             if (!choice) continue;
+            // finish_reason «length» = модель упёрлась в лимит вывода и оборвала ответ
+            // на полуслове. Раньше эту пометку получал только Ollama (done_reason), и у
+            // облачных провайдеров (DeepSeek, Groq, OpenAI) обрезанный ответ выглядел
+            // законченным: человек не знал, что нужно написать «продолжай».
+            if (choice.finish_reason === "length" && onTruncated) onTruncated();
             const delta = choice.delta || {};
             if (delta.content && onText) onText(delta.content);
             // DeepSeek и другие OpenAI-совместимые шлют рассуждения отдельным полем
@@ -600,6 +605,8 @@
               onUsage(normalizeUsage(obj.message.usage));
             }
             if (onUsage && type === "message_delta" && obj.usage) onUsage(normalizeUsage(obj.usage));
+            // stop_reason «max_tokens» = ответ оборван лимитом вывода (у Claude своё имя).
+            if (type === "message_delta" && obj.delta && obj.delta.stop_reason === "max_tokens" && onTruncated) onTruncated();
             if (type === "content_block_start") {
               const block = obj.content_block || {};
               const cur = accum.get(obj.index) || { id: "", name: "", args: "" };

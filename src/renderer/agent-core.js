@@ -131,14 +131,29 @@
     let visible = "";
     let hidden = "";
     let inBlock = false;
-    const hold = 16; // хвост, в котором может прятаться незавершённый тег
+    /* Хвост держим ровно настолько, насколько он может оказаться НАЧАЛОМ тега.
+       Раньше держали жёстко 16 символов, и это видел человек: короткий ответ
+       (меньше 16 видимых символов) приезжал в чат одним куском только в самом
+       конце — пауза вместо текста, хотя модель уже всё написала. Тем же жёстким
+       хвостом объяснялись рассуждения, приходящие в блок мыслей по одному символу. */
+    const OPEN_HEAD = "<thinking"; // начала открывающего тега — его префиксы
+    const CLOSE_HEAD = "</thinking";
     const openRe = /<think(ing)?>/i;
     const closeRe = /<\/think(ing)?>/i;
+    // Сколько символов с конца может оказаться началом тега (0 — держать нечего).
+    function tagHold(text, head) {
+      const s = String(text || "");
+      for (let k = Math.min(head.length, s.length); k > 0; k--) {
+        if (head.slice(0, k).toLowerCase() === s.slice(s.length - k).toLowerCase()) return k;
+      }
+      return 0;
+    }
     function flushHidden() {
       if (!onHidden || !inBlock) return;
-      if (hidden.length > hold) {
-        const out = hidden.slice(0, hidden.length - hold);
-        hidden = hidden.slice(hidden.length - hold);
+      const keep = tagHold(hidden, CLOSE_HEAD);
+      if (hidden.length > keep) {
+        const out = hidden.slice(0, hidden.length - keep);
+        hidden = hidden.slice(hidden.length - keep);
         if (out) onHidden(out);
       }
     }
@@ -148,7 +163,7 @@
         for (const ch of text) {
           if (!inBlock) {
             visible += ch;
-            const m = visible.slice(-hold).match(openRe);
+            const m = visible.slice(-(OPEN_HEAD.length + 1)).match(openRe);
             if (m) {
               visible = visible.slice(0, visible.length - m[0].length);
               hidden = "";
@@ -156,10 +171,10 @@
             }
           } else {
             hidden += ch;
-            flushHidden();
-            const close = hidden.slice(-hold).match(closeRe);
+            const close = hidden.slice(-(CLOSE_HEAD.length + 1)).match(closeRe);
             if (close) {
-              // Дофлашиваем рассуждения, не включая сам закрывающий тег
+              // Дофлашиваем рассуждения, не включая сам закрывающий тег. Закрытие
+              // проверяем ДО досылки остатка: иначе хвост ушёл бы дважды.
               const idx = hidden.lastIndexOf(close[0]);
               if (idx > 0 && onHidden) onHidden(hidden.slice(0, idx));
               hidden = "";
@@ -167,10 +182,16 @@
             }
           }
         }
+        // Рассуждения отдаём ОДИН раз за вызов, а не по символу: иначе блок мыслей
+        // пополняется по букве и выглядит как медленно печатающийся текст.
+        flushHidden();
         let out = "";
-        if (!inBlock && visible.length > hold) {
-          out = visible.slice(0, visible.length - hold);
-          visible = visible.slice(visible.length - hold);
+        if (!inBlock) {
+          const keep = tagHold(visible, OPEN_HEAD);
+          if (visible.length > keep) {
+            out = visible.slice(0, visible.length - keep);
+            visible = visible.slice(visible.length - keep);
+          }
         }
         return out;
       },

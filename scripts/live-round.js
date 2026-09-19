@@ -121,6 +121,16 @@ const answerFor = (n) => {
       { choices: [], usage: { completion_tokens: 40, prompt_tokens_details: { cached_tokens: 96 } } },
     ]);
   }
+  // Четвёртый запрос — обрыв ответа лимитом вывода у ОБЛАЧНОГО провайдера:
+  // до правки эта пометка приходила только от Ollama, и обрезанный ответ выглядел
+  // законченным. Здесь проверяем, что прогон видит finish_reason «length».
+  if (n === 4) {
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Начало ответа, который " } }] },
+      { choices: [{ index: 0, delta: { content: "оборвался" } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "length" }] },
+    ]);
+  }
   return sse([
     { choices: [{ index: 0, delta: { role: "assistant", content: "<think>внутреннее рассуждение модели</think>" } }] },
     { choices: [{ index: 0, delta: { content: "Ответ готов, файл записан." } }] },
@@ -284,7 +294,17 @@ const callIpc = (channel, ...args) => {
   ok(metrics.some((t) => /· всего \d+\.\d+ с/.test(t)), "полное время раунда показано: " + JSON.stringify(metrics));
   ok(!metrics.some((t) => /провайдер не прислал/.test(t)), "usage провайдера дошёл — оценки вместо настоящих токенов нет");
 
-  console.log("\n[6] Завершение прогона");
+  console.log("\n[6] Обрыв ответа лимитом вывода у облачного провайдера");
+  const chunksBeforeCut = events.filter((e) => e.ev && e.ev.type === "chunk").length;
+  const run2 = await callIpc("ai:send", [{ role: "user", content: "Напиши длинный ответ" }], { chatId: "chat-live-round-cut", role: "developer" });
+  ok(run2 && run2.ok === true, "прогон с обрывом завершился без ошибки: " + JSON.stringify(run2 && run2.error));
+  const cutText = events.slice().filter((e) => e.ev && e.ev.type === "chunk").slice(chunksBeforeCut).map((e) => e.ev.text).join("");
+  const cutNotices = events.filter((e) => e.ev && e.ev.type === "notice").map((e) => e.ev.text).filter((t) => /оборван лимитом вывода/.test(t));
+  ok(cutNotices.length === 1, "обрыв ответа (finish_reason «length») замечен прогоном ровно один раз: " + JSON.stringify(cutNotices));
+  ok(cutNotices.some((t) => /продолжай/.test(t)), "человеку сказано, что делать с оборванным ответом: " + JSON.stringify(cutNotices));
+  ok(/Начало ответа, который оборвался/.test(cutText), "текст второго прогона дошёл целиком: " + JSON.stringify(cutText));
+
+  console.log("\n[7] Завершение прогона");
   ok(events.some((e) => e.ev && e.ev.type === "done"), "прогон сообщил о завершении");
   ok(fs.existsSync(path.join(workDir, "round-live.txt")), "инструмент раунда выполнился: файл создан");
 
