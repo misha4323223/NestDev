@@ -89,7 +89,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js"]
+  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -9951,15 +9951,15 @@ async function testPromptCacheAndUsage() {
     assert.ok(/roundUsage\.cached = Math\.max\(roundUsage\.cached, u\.cached \|\| 0\)/.test(mainSrc), "кэш не собирается по раунду");
     assert.ok(/termEmit\(\{[\s\S]{0,80}?type: "metrics"/.test(mainSrc), "строка метрик не отправляется");
     assert.ok(/staticSystem: SYSTEM_PROMPT/.test(mainSrc), "граница статичного промпта не передана в запрос");
-    assert.ok(/includeUsage: includeUsage/.test(mainSrc), "флаг токен-отчёта не передаётся в запрос");
+    assert.ok(/includeUsage: retry\.state\.includeUsage/.test(mainSrc), "флаг токен-отчёта не передаётся в запрос");
     assert.ok(/roundTtfbMs = Date\.now\(\) - roundStartedAt/.test(mainSrc), "нет замера времени до первого байта");
     // Строгий сервер без stream_options: выключаем и повторяем раунд, а не падаем.
     assert.ok(
-      /includeUsage &&\s*\(res\.status === 400 \|\| res\.status === 422\)/.test(mainSrc),
+      /state\.includeUsage &&\s*\(status === 400 \|\| status === 422\)/.test(mainSrc),
       "нет отката для сервера без stream_options"
     );
     assert.ok(
-      /includeUsage && \/stream_options\|include_usage\/i\.test\(errText\)/.test(mainSrc),
+      /retry\.state\.includeUsage && \/stream_options\|include_usage\/i\.test\(errText\)/.test(mainSrc),
       "нет отката, если провайдер отверг stream_options внутри ответа"
     );
     assert.ok(/includeUsage = false;/.test(mainSrc), "флаг не выключается после отказа");
@@ -10163,10 +10163,10 @@ async function testToolRouter() {
     assert.ok(core.coldCacheInfo(500, "cache_only_cold", 1).cold, "холодный отказ под 500 не распознан");
     // И это подключено в main.js: повтор ТОГО ЖЕ раунда вместо падения с сырым JSON.
     const mainSrc = backendSrc();
-    assert.ok(/const cold = coldCacheInfo\(res\.status, detail, unavailableRetries \+ 1\)/.test(mainSrc), "503 не обрабатывается");
-    assert.ok(/unavailableRetries\+\+;/.test(mainSrc), "нет счётчика повторов 503");
+    assert.ok(/const cold = coldCacheInfo\(status, detail, state\.unavailableRetries \+ 1\)/.test(mainSrc), "503 не обрабатывается");
+    assert.ok(/state\.unavailableRetries\+\+;/.test(mainSrc), "нет счётчика повторов 503");
     assert.ok(
-      /if \(res\.ok\) \{\s*rateRetries = 0;\s*unavailableRetries = 0;\s*\}/.test(mainSrc),
+      /const noteSuccess = \(\) => \{\s*state\.rateRetries = 0;\s*state\.unavailableRetries = 0;/.test(mainSrc),
       "счётчик повторов 503 не сбрасывается на успешном ответе"
     );
     assert.ok(/cache_only_cold: провайдер принимает только запрос с готовым кэшем/.test(mainSrc), "нет понятного сообщения после исчерпания повторов");
@@ -12292,26 +12292,26 @@ async function testSandboxObstacles() {
   });
 
   await test("main.js: 429 больше не роняет раунд (ждём сами и повторяем)", () => {
-    assert.ok(/rateLimiter = rateLimiterFor\(settings\)/.test(mainSrc), "нет держателя темпа в main.js");
+    assert.ok(/rateLimiter: rateLimiterFor\(settings\)/.test(mainSrc), "нет держателя темпа в main.js");
     assert.ok(/const paced = await rateLimiter\.take\(\);/.test(mainSrc), "запросы не расставляются по темпу заранее");
-    assert.ok(/res\.status === 429\) \{/.test(mainSrc), "429 не обрабатывается");
+    assert.ok(/if \(status === 429\) \{/.test(mainSrc), "429 не обрабатывается");
     // Предела «не больше 3 попыток» больше нет: именно он заставлял пользователя
     // писать «продолжай» руками при лимите «8 запросов в минуту».
     assert.ok(!/rateRetries < 3/.test(mainSrc), "вернулся жёсткий предел в 3 попытки");
-    assert.ok(/rateRetries\+\+;/.test(mainSrc) && /round--;\s*\n\s*continue;/.test(mainSrc), "повтор не возвращает раунд на перезапуск");
+    assert.ok(/state\.rateRetries\+\+;/.test(mainSrc) && /round--;\s*\n\s*continue;/.test(mainSrc), "повтор не возвращает раунд на перезапуск");
     assert.ok(
-      /if \(res\.ok\) \{\s*rateRetries = 0;\s*unavailableRetries = 0;\s*\}/.test(mainSrc),
+      /const noteSuccess = \(\) => \{\s*state\.rateRetries = 0;\s*state\.unavailableRetries = 0;/.test(mainSrc),
       "счётчики повторов не сбрасываются на успехе"
     );
     // Ждём до бюджета, и бюджет ограничивает паузу сверху — иначе прогон висел бы вечно.
     assert.ok(/RATE_WAIT_BUDGET_MS/.test(mainSrc), "нет бюджета ожидания лимита");
-    assert.ok(/rateWaitedMs \+= waitMs/.test(mainSrc), "ожидание не накапливается");
+    assert.ok(/state\.rateWaitedMs \+= waitMs/.test(mainSrc), "ожидание не накапливается");
     assert.ok(/Math\.min\(wantMs, leftMs\)/.test(mainSrc), "пауза не ограничена бюджетом");
     // Пользователь должен видеть, что прогон жив и ждёт сам.
     assert.ok(/type: "notice"/.test(mainSrc), "пользователю не сообщают об ожидании");
     // Порядок важен: сначала совет по токенному лимиту Groq (повтор там бессмысленен).
-    const i = mainSrc.indexOf("const friendly = friendlyRateLimitError(res.status, detail, settings);");
-    const j = mainSrc.indexOf("if (res.status === 429) {");
+    const i = mainSrc.indexOf("const friendly = friendlyRateLimitError(status, detail, settings);");
+    const j = mainSrc.indexOf("if (status === 429) {");
     assert.ok(i > 0 && j > i, "повтор 429 стоит раньше совета по токенному лимиту");
 
     // Веб-режим (превью и телефон) раньше падал на 429 сразу: своей обработки там не было

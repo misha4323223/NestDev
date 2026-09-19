@@ -84,6 +84,7 @@ const missionStore = require("./mission-store.js"); // миссии: цель, �
 const missionGuard = require("./mission-guard.js"); // сторож миссий: кого продолжать и когда перестать приставать
 const { createRunMission } = require("./run-mission.js"); // миссия прогона: батчи, журнал, цикл, призывы (своим модулем)
 const { createRunTools } = require("./run-tools.js"); // роутер инструментов и справочники прогона: группы, предохранители, вес схем, гайды
+const { createRunRetry } = require("./run-retry.js"); // восстановление прогона после отказа запроса: лимиты, сбои пула, переполнение контекста
 const unifiedPatch = require("./unified-patch.js"); // применение unified diff (applyPatch)
 const codeIndex = require("./code-index.js"); // семантический индекс кода (BM25 + стемминг)
 const yandexCloud = require("./yandex-cloud.js"); // Yandex Cloud REST API: авторизация, дашборд, создание ресурсов
@@ -1400,17 +1401,8 @@ async function runAi(settings, messages, win, opts) {
     termEmit({ type: "metrics", text: noToolsNote });
     emit({ type: "notice", text: noToolsNote });
   }
-  let contextRetried = false; // при переполнении контекста пробуем ещё раз с меньшим бюджетом
-  // Лимит 429: не роняем раунд — ждём столько, сколько просит провайдер, и повторяем.
-  let rateRetries = 0;
-  // 5xx и «холодный» отказ пула: тоже повторяем ТОТ ЖЕ раунд, но с растущей паузой.
-  let unavailableRetries = 0;
-  // Сколько всего разрешено простоять в ожидании лимита (429) за один запуск.
-  // Три паузы по 5 с лимит «8 запросов в минуту» не лечат: раньше прогон падал, и пользователь
-  // писал «продолжай» руками. Ждём сами, но с потолком — чтобы не висеть вечно.
-  const RATE_WAIT_BUDGET_MS = Math.max(60000, Number(process.env.AI_AGENT_RATE_WAIT_MS) || 10 * 60 * 1000);
-  let rateWaitedMs = 0;
-  const rateLimiter = rateLimiterFor(settings);
+  // Счётчики повторов, ожидание лимита и лимитер провайдера живут в src/run-retry.js,
+  // который собирается ниже (после истории: ему нужно уметь ужимать контекст).
   let reportRetried = false; // пустой финальный текст — один раз просим итоговый отчёт
   let planNudges = 0; // «план не закрыт, а модель замолчала» — просим продолжить делом (макс. 2)
   activePlanSummary = null; // план прошлого прогона не должен влиять на этот
@@ -1585,6 +1577,40 @@ async function runAi(settings, messages, win, opts) {
     },
     ...sanitizeToolPairs(runHistory.map((m) => ({ role: m.role, content: m.content }))),
   ];
+
+  // Ужать историю при переполнении контекста: бюджет уменьшается, список пересобирается.
+  // Ровно та же работа нужна и при сжатии между раундами, поэтому — одной точкой входа.
+  const shrinkContext = async () => {
+    budget = Math.max(3000, Math.floor(budget * 0.4));
+    tools.state.histBudget = tools.histBudgetAfterOverflow();
+    if (canonical.length > 1) {
+      const sys = canonical[0];
+      canonical = [sys, ...(await ctxManager.manage(canonical.slice(1), tools.state.histBudget))];
+      emitContext(canonical);
+    }
+    if (canonical.length > 1) {
+      const sys = canonical[0];
+      canonical = [sys, ...sanitizeToolPairs(canonical.slice(1))];
+    }
+  };
+
+  // Восстановление после отказа запроса (лимиты 429, «холодный» пул 503, переполнение
+  // контекста, отказ строгого сервера) живёт в src/run-retry.js: там же объяснено,
+  // почему ждём сами и что сбрасывает счётчики. Здесь — сборка с живыми значениями.
+  const retry = createRunRetry({
+    settings,
+    provider,
+    emit,
+    termEmit,
+    rateLimiter: rateLimiterFor(settings),
+    getBudget: () => budget,
+    shrinkContext: shrinkContext,
+    friendlyRateLimitError,
+    rateLimitInfo,
+    coldCacheInfo,
+    UNAVAILABLE_MAX,
+  });
+
   const maxRounds = planMode ? 3 : 25;
   let finalText = "";
 
@@ -1603,10 +1629,6 @@ async function runAi(settings, messages, win, opts) {
   // Авто-повтор после сбоя: при любой ошибке (сеть/API/провайдер/инструмент) делаем ещё
   // попытку с продолжением контекста (история canonical сохраняется) — до AUTO_RETRY_LIMIT повторов.
   const AUTO_RETRY_LIMIT = 2;
-  // Метрики раунда: токены/кэш/TTFB. Провайдер отдаёт их только по флагу
-  // stream_options.include_usage; строгий сервер может его не знать — тогда
-  // выключаем флаг на весь запуск и повторяем раунд (см. обработку !res.ok).
-  let includeUsage = true;
   let roundUsage = null; // { prompt, completion, cached } текущего раунда
   for (let attemptNum = 1; ; attemptNum++) {
   try {
@@ -1662,7 +1684,7 @@ async function runAi(settings, messages, win, opts) {
       // Статичный префикс промпта: до этой границы ставится точка кэша, чтобы
       // динамический «паспорт проекта» не обнулял кэш на каждом витке.
       staticSystem: SYSTEM_PROMPT,
-      includeUsage: includeUsage,
+      includeUsage: retry.state.includeUsage,
       // Ollama: сколько контекста выделить (num_ctx) — считает agent-core из бюджета
       // и реального окна модели, чтобы сервер не резал запрос молча.
       numCtxBudget: budget,
@@ -1670,15 +1692,9 @@ async function runAi(settings, messages, win, opts) {
       // Модель без инструментов: схемы не отправляем, вместо них текстовый каталог.
       noTools: noTools,
     });
-    // Темп: если лимит провайдера уже известен, выдерживаем паузу ЗАРАНЕЕ, а не
-    // после отказа. Это главный выигрыш по времени: 429 — потерянный раунд.
-    const paced = await rateLimiter.take();
-    if (paced > 800) {
-      termEmit({
-        type: "metrics",
-        text: "⏳ Держу темп провайдера: пауза " + Math.round(paced / 1000) + " с перед запросом (лимит уже известен).",
-      });
-    }
+    // Темп провайдера: пауза выдерживается ЗАРАНЕЕ, если лимит уже известен (429 —
+    // потерянный раунд). Решение и текст — в src/run-retry.js.
+    await retry.pace();
     let res;
     try {
       res = await fetch(req.url, {
@@ -1692,116 +1708,17 @@ async function runAi(settings, messages, win, opts) {
       throw new Error("Сетевая ошибка при запросе к " + provider + ": " + e.message);
     }
     roundTtfbMs = Date.now() - roundStartedAt; // заголовки ответа = первый байт
-    if (res.ok) {
-      rateRetries = 0;
-      unavailableRetries = 0;
-    }
+    if (res.ok) retry.noteSuccess();
     if (!res.ok) {
       const detail = await readApiError(res);
-      // Строгий OpenAI-совместимый сервер может не знать stream_options (мы просили им
-      // токены и кэш). Это не ошибка пользователя: выключаем флаг и повторяем раунд.
-      if (
-        includeUsage &&
-        (res.status === 400 || res.status === 422) &&
-        /stream_options|include_usage|unknown|unrecognized|unsupported|extra|invalid/i.test(detail) &&
-        !/context|too long|maximum|num_ctx/i.test(detail)
-      ) {
-        includeUsage = false;
-        termEmit({
-          type: "metrics",
-          text: "Провайдер не понял stream_options.include_usage — отключаю (запрос без метрик токенов).",
-        });
+      // Повтор со паузой, отключение метрик, ужатие контекста или честная ошибка —
+      // решает src/run-retry.js; ожидание оно делает само, а раунд повторяем здесь.
+      const verdict = await retry.plan({ status: res.status, headers: res.headers, detail: detail });
+      if (verdict.kind === "repeat") {
         round--;
         continue;
       }
-      // Лимиты провайдера (Groq free ~7K токенов/мин): понятное объяснение вместо сырого JSON.
-      // Проверяем ДО повтора: у Groq лимит по токенам, повтор бессмысленен — там свой совет.
-      const friendly = friendlyRateLimitError(res.status, detail, settings);
-      if (friendly) throw new Error(friendly);
-      // 429 (лимит запросов): ждём столько, сколько просил провайдер, и повторяем ТОТ ЖЕ раунд.
-      // Ждём САМИ — до потолка RATE_WAIT_BUDGET_MS. Раньше после трёх коротких пауз прогон
-      // падал с ошибкой, и пользователю приходилось писать «продолжай» вручную — хотя всё,
-      // что нужно, это подождать окно лимита.
-      if (res.status === 429) {
-        const info = rateLimitInfo(res.status, res.headers, detail);
-        rateLimiter.note(info);
-        const wantMs = Math.max(2000, Math.min(info.retryMs || 5000, 60000));
-        const leftMs = RATE_WAIT_BUDGET_MS - rateWaitedMs;
-        if (leftMs < 1000) {
-          throw new Error(
-            "API error 429: лимит провайдера на запросы. Ждал сам " + Math.round(rateWaitedMs / 1000) +
-            " с, но лимит не отпускает — подожди минуту и напиши «продолжай» или выбери модель " +
-            "с большим лимитом в настройках."
-          );
-        }
-        const waitMs = Math.min(wantMs, leftMs);
-        rateRetries++;
-        rateWaitedMs += waitMs;
-        const sec = Math.max(1, Math.round(waitMs / 1000));
-        const note =
-          "⏳ Лимит провайдера на запросы: жду " + sec + " с и повторю сам (попытка " + rateRetries + ")" +
-          (info.rpm ? ", лимит ≈" + Math.round(info.rpm) + " запросов/мин" : "") +
-          ". Писать ничего не нужно.";
-        termEmit({ type: "metrics", text: note + " Всего в ожидании: " + Math.round(rateWaitedMs / 1000) + " с." });
-        emit({ type: "notice", text: note });
-        await new Promise((r) => setTimeout(r, waitMs));
-        if (waitMs >= 15000) emit({ type: "notice", text: "▶ Продолжаю работу после лимита." });
-        round--;
-        continue;
-      }
-      // 503 и cache_only_cold: пул провайдера отклонил «холодный» запрос (принимает
-      // только попадание в кэш) или перегружен. Раньше это падало сырым JSON провайдера,
-      // хотя лечится повтором того же раунда: историю мы не переписываем, поэтому
-      // повтор уже может попасть в кэш. Смена ключа внутри того же пула не поможет.
-      {
-        const cold = coldCacheInfo(res.status, detail, unavailableRetries + 1);
-        if (cold) {
-          if (unavailableRetries < UNAVAILABLE_MAX) {
-            unavailableRetries++;
-            termEmit({ type: "metrics", text: cold.text });
-            await new Promise((r) => setTimeout(r, cold.waitMs));
-            round--;
-            continue;
-          }
-          throw new Error(
-            cold.cold
-              ? "API error 503 cache_only_cold: провайдер принимает только запрос с готовым кэшем. " +
-                "Повторил " + UNAVAILABLE_MAX + " раза — пул всё ещё отказывает. Подожди 10–30 с и напиши «продолжай» " +
-                "или выбери другую модель/тариф: смена ключа внутри того же бесплатного пула не поможет."
-              : "API error " + res.status + ": провайдер временно недоступен. Повторил " + UNAVAILABLE_MAX +
-                " раза — подожди немного и напиши «продолжай»."
-          );
-        }
-      }
-      // Переполнение контекста (частая беда локальных моделей Ollama с малым окном):
-      // один раз повторяем запрос с резко урезанной историей, чтобы не падать.
-      if (
-        !contextRetried &&
-        /context|too long|maximum|num_ctx|token/i.test(detail) &&
-        budget > 3000
-      ) {
-        contextRetried = true;
-        budget = Math.max(3000, Math.floor(budget * 0.4));
-        tools.state.histBudget = tools.histBudgetAfterOverflow();
-        if (canonical.length > 1) {
-          const sys = canonical[0];
-          canonical = [sys, ...(await ctxManager.manage(canonical.slice(1), tools.state.histBudget))];
-          emitContext(canonical);
-        }
-        if (canonical.length > 1) {
-          const sys = canonical[0];
-          canonical = [sys, ...sanitizeToolPairs(canonical.slice(1))];
-        }
-        round--;
-        continue;
-      }
-      // 402 = Insufficient Balance: у провайдера кончились деньги. Подсказываем по-русски.
-      if (res.status === 402) {
-        throw new Error(
-          "API error 402: Недостаточно средств на балансе провайдера (" + (settings.provider || "openai") + "). Пополни счёт или выбери другого провайдера/модель в настройках."
-        );
-      }
-      throw new Error("API error " + res.status + ": " + detail);
+      throw verdict.error;
     }
 
     let truncated = false;
@@ -2141,8 +2058,8 @@ async function runAi(settings, messages, win, opts) {
     const errText = String((e && e.message) || e).slice(0, 800);
     // Провайдер отверг stream_options уже внутри ответа (не ошибкой на заголовках) —
     // снимаем флаг: авто-повтор ниже пойдёт без него.
-    if (includeUsage && /stream_options|include_usage/i.test(errText)) {
-      includeUsage = false;
+    if (retry.state.includeUsage && /stream_options|include_usage/i.test(errText)) {
+      retry.state.includeUsage = false;
       termEmit({
         type: "metrics",
         text: "Провайдер отверг stream_options — повторяю запрос без метрик токенов.",
