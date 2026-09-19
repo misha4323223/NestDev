@@ -70,6 +70,18 @@ const BREAKS = {
     "  const canRunParallel = (calls, planMode) =>\n    !planMode && calls.length > 1 && calls.every((c) => PARALLEL_SAFE_TOOLS.has(c.name));\n",
     "  const canRunParallel = (calls, planMode) => false;\n",
   ],
+  // ── строгая очередь (часть 19а) ──
+  strictdeny: [
+    "src/run-strict.js",
+    '      } else if (c.name === "runCommand" && toolPolicy.isDangerousCommand((c.args && c.args.command) || "")) {\n',
+    "      } else if (false) {\n",
+  ],
+  strictaudit: [
+    "src/run-strict.js",
+    "      audit.record({ tool: c.name, args: c.args, decision, result, source: getRunOrigin() });\n",
+    "",
+  ],
+  strictask: ["src/run-strict.js", '      if (c.name === "askUser") {\n', "      if (false) {\n"],
 };
 let brokenFile = null;
 if (BREAK) {
@@ -194,6 +206,71 @@ const answerFor = (n) => {
   if (n === 7) {
     return sse([
       { choices: [{ index: 0, delta: { role: "assistant", content: "Готово." } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ]);
+  }
+  // Четвёртый прогон: СТРОГАЯ очередь (часть 19а). Модель зовёт опасную команду
+  // дважды (первую человек отклонит, вторую подтвердит) и задаёт вопрос человеку.
+  // Всё это живёт в src/run-strict.js и решается человеком через ai:answer.
+  if (n === 8) {
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Удаляю лишнее.\n" } }] },
+      {
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                call(0, "call_d1", "runCommand", {
+                  command: "rm -rf " + path.join(workDir, "нет-такого") + " && touch " + path.join(workDir, "отказ.txt"),
+                }),
+              ],
+            },
+          },
+        ],
+      },
+      { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    ]);
+  }
+  if (n === 9) {
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Чищу временное.\n" } }] },
+      {
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                call(0, "call_d2", "runCommand", {
+                  command: "rm -rf " + path.join(workDir, "тоже-нет") + " && touch " + path.join(workDir, "согласие.txt"),
+                }),
+              ],
+            },
+          },
+        ],
+      },
+      { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    ]);
+  }
+  if (n === 10) {
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Уточняю.\n" } }] },
+      {
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [call(0, "call_q1", "askUser", { question: "На каком порту поднимать сервер?" })],
+            },
+          },
+        ],
+      },
+      { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    ]);
+  }
+  if (n === 11) {
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Готово: очередь пройдена." } }] },
       { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
     ]);
   }
@@ -420,7 +497,88 @@ const callIpc = (channel, ...args) => {
   );
   ok(readResults.length === 2, "в историю записаны результаты обоих прочитанных файлов: " + readResults.length);
 
-  console.log("\n[8] Завершение прогона");
+  console.log("\n[8] Строгая очередь: отказ, согласие, аудит и вопрос человеку");
+  const evBefore4 = events.length;
+  const servedBefore4 = served;
+  // Ответы человека по порядку: отказ опасной команде, согласие, ответ на вопрос.
+  const answers = ["нет", "да", "порт 8080"];
+  let answeredCount = 0;
+  let run4done = false;
+  const run4p = callIpc("ai:send", [{ role: "user", content: "Почисти лишнее и уточни порт" }], {
+    chatId: "chat-live-round-strict",
+    role: "developer",
+  }).then((r) => {
+    run4done = true;
+    return r;
+  });
+  // Отвечаем на вопросы, ПОКА прогон ждёт: askUser держит раунд открытым.
+  const answerer = (async () => {
+    while (!run4done) {
+      await sleep(40);
+      const asks = events.filter((e) => e.ev && e.ev.type === "ask");
+      while (answeredCount < asks.length) {
+        await callIpc("ai:answer", answers[answeredCount] || "нет");
+        answeredCount++;
+      }
+    }
+  })();
+  const run4 = await run4p;
+  await answerer;
+  ok(run4 && run4.ok === true, "прогон со строгой очередью завершился без ошибки: " + JSON.stringify(run4 && run4.error));
+  ok(served - servedBefore4 === 4, "провайдер получил 4 запроса (отказ, согласие, вопрос, финал): " + (served - servedBefore4));
+
+  const asks = events.slice(evBefore4).filter((e) => e.ev && e.ev.type === "ask").map((e) => e.ev.question);
+  ok(asks.length === 3, "человека спросили три раза (опасное дважды и вопрос модели): " + JSON.stringify(asks));
+  ok(
+    asks[0] && /потенциально опасна/.test(asks[0]) && /rm -rf/.test(asks[0]),
+    "первым спросили про опасную команду и показали её: " + JSON.stringify(asks[0])
+  );
+  ok(asks[2] === "На каком порту поднимать сервер?", "вопрос модели дошёл до человека дословно: " + JSON.stringify(asks[2]));
+
+  const deniedFile = path.join(workDir, "отказ.txt");
+  const approvedFile = path.join(workDir, "согласие.txt");
+  ok(!fs.existsSync(deniedFile), "отклонённая команда НЕ выполнена — файла нет");
+  ok(fs.existsSync(approvedFile), "подтверждённая команда выполнена — файл создан");
+
+  const run4Events = events.slice(evBefore4);
+  const denied = run4Events.filter((e) => e.ev && e.ev.type === "tool_result" && /НЕ выполнена/.test(String(e.ev.result || "")));
+  ok(denied.length === 1, "модели объяснён отказ (она не думает, что команда сработала): " + denied.length);
+
+  // Журнал действий — на диске, в папке приложения: подтверждения и отказы пишутся всегда.
+  const auditPath = path.join(userData, "audit.log");
+  let auditRows = [];
+  try {
+    auditRows = fs
+      .readFileSync(auditPath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+  } catch (e) {
+    auditRows = [];
+  }
+  ok(auditRows.some((r) => r.tool === "runCommand" && r.decision === "denied"), "отказ человека записан в журнал действий");
+  ok(auditRows.some((r) => r.tool === "runCommand" && r.decision === "approved"), "согласие человека записано в журнал действий");
+  ok(
+    auditRows.filter((r) => r.decision === "denied" || r.decision === "approved").every((r) => r.source === "desktop"),
+    "источник действия записан в журнал: " + JSON.stringify(auditRows.map((r) => r.source).slice(0, 6))
+  );
+
+  // Ответ человека и отказ видны модели в следующем запросе — иначе она соврёт человеку.
+  const lastStrictBody = requests[requests.length - 1] && requests[requests.length - 1].body;
+  const strictTools = (lastStrictBody && lastStrictBody.messages ? lastStrictBody.messages : []).filter(
+    (m) => m.role === "tool" && /^call_(d1|d2|q1)/.test(String(m.tool_call_id || ""))
+  );
+  ok(strictTools.length === 3, "результаты всех трёх вызовов вернулись модели: " + strictTools.length);
+  ok(
+    strictTools.some((m) => /НЕ выполнена/.test(String(m.content || ""))),
+    "в контексте модели есть отказ человека"
+  );
+  ok(
+    strictTools.some((m) => String(m.content || "").indexOf("порт 8080") >= 0),
+    "ответ человека на вопрос дошёл до модели"
+  );
+
+  console.log("\n[9] Завершение прогона");
   ok(events.some((e) => e.ev && e.ev.type === "done"), "прогон сообщил о завершении");
   ok(fs.existsSync(path.join(workDir, "round-live.txt")), "инструмент раунда выполнился: файл создан");
 

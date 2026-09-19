@@ -559,13 +559,16 @@ const onlyMission = (dir) => {
       "mission.afterBatch()",
       "mission.canNudge()",
       "mission.nudge(finalText)",
-      "mission.noteCall(c.name, c.args)",
       "mission.trackProgress(calls)",
       'mission.emitState("end")',
       "mission.recordError(e)",
     ]) {
       assert.ok(MAIN_SRC.includes(used), "в ядре чата не используется: " + used);
     }
+    // Запись вызова в журнал миссии живёт в модуле строгой очереди (часть 19а):
+    // туда попадает каждый выполненный вызов, а не только прошедший пачку.
+    const strictSrc = read("src", "run-strict.js");
+    assert.ok(strictSrc.includes("mission.noteCall(c.name, c.args)"), "миссия не видит вызовы очереди");
     assert.ok(/const stopForPause = \(\) => \{\n    const paused = mission\.pause\(\);/.test(MAIN_SRC), "пауза по кнопке потеряла свою часть работы");
     // Цена работы в миссии считается в теле раунда: с части 17 оно живёт в
     // src/run-round.js, куда расход и сжатия приходят живыми значениями.

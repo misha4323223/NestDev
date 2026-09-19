@@ -87,6 +87,7 @@ const { createRunTools } = require("./run-tools.js"); // роутер инстр
 const { createRunRetry } = require("./run-retry.js"); // восстановление прогона после отказа запроса: лимиты, сбои пула, переполнение контекста
 const { createRunRound } = require("./run-round.js"); // один раунд прогона: сборка запроса, поток ответа, метрики
 const { createRunCalls } = require("./run-calls.js"); // вызовы раунда: текстовые, нормализация, история, пачка read-only
+const { createRunStrict } = require("./run-strict.js"); // строгая очередь вызовов: подтверждения, чекпоинт, аудит, журнал миссии
 const unifiedPatch = require("./unified-patch.js"); // применение unified diff (applyPatch)
 const codeIndex = require("./code-index.js"); // семантический индекс кода (BM25 + стемминг)
 const yandexCloud = require("./yandex-cloud.js"); // Yandex Cloud REST API: авторизация, дашборд, создание ресурсов
@@ -1654,6 +1655,24 @@ async function runAi(settings, messages, win, opts) {
     PARALLEL_SAFE_TOOLS,
   });
 
+  // Строгая очередь вызовов: подтверждения человеком, чекпоинты отката, журнал
+  // действий и журнал миссии — своим модулем (src/run-strict.js). Источник
+  // действия меняется на каждый прогон, поэтому уходит функцией.
+  const strict = createRunStrict({
+    settings,
+    emit,
+    askUserWait,
+    toolPolicy,
+    describeToolArgs,
+    executeTool,
+    truncateText,
+    audit,
+    mission,
+    snapshotFileForUndo,
+    resolvePath,
+    getRunOrigin: () => activeRunOrigin,
+  });
+
   const maxRounds = planMode ? 3 : 25;
   let finalText = "";
 
@@ -1822,70 +1841,10 @@ async function runAi(settings, messages, win, opts) {
       continue;
     }
 
-    for (const c of calls) {
-      // План-режим: выполняем только todoWrite. Если модель по привычке вызвала
-      // другой инструмент — не выполняем его и говорим об этом прямо.
-      if (planMode && c.name !== "todoWrite") {
-        const blocked =
-          "Режим плана: инструменты не выполняются. Составь план через todoWrite и дождись команды пользователя.";
-        canonical.push({ role: "tool", tool_call_id: c.id, content: blocked });
-        continue;
-      }
-      emit({ type: "tool_start", name: c.name, args: c.args });
-      let result;
-      // Как обошлось действие: auto — без вопросов, approved/denied — решал пользователь.
-      // Нужно журналу действий: подтверждения и отказы пишутся всегда.
-      let decision = "auto";
-      const confirmYes = (answer) =>
-        /^(да|yes|y|ok|го|ага|точно|конечно|давай|выполн)/i.test(String(answer || "").trim());
-      if (c.name === "askUser") {
-        const question = (c.args && c.args.question) || "Уточни, пожалуйста";
-        const answer = await askUserWait(question);
-        result = answer && String(answer).trim() ? String(answer).trim() : "(пользователь не дал ответ)";
-      } else if (c.name === "runCommand" && toolPolicy.isDangerousCommand((c.args && c.args.command) || "")) {
-        // Потенциально опасные команды выполняем только после явного подтверждения
-        // (что считать опасным — решает политика: src/tool-policy.js).
-        const cmd = String((c.args && c.args.command) || "");
-        const answer = await askUserWait(
-          "⚠️ Команда потенциально опасна: «" + cmd.slice(0, 160) + "»\nВыполнить? (да / нет)"
-        );
-        if (confirmYes(answer)) {
-          decision = "approved";
-          result = await executeTool(c.name, c.args, settings);
-        } else {
-          decision = "denied";
-          result =
-            "Команда НЕ выполнена: пользователь не подтвердил опасную операцию. Сообщи, что действие пропущено, и предложи безопасную альтернативу.";
-        }
-      } else if (toolPolicy.needsConfirm(c.name)) {
-        // Инструмент с высоким риском и без своей защиты — спрашиваем пользователя.
-        const desc = describeToolArgs(c.name, c.args);
-        const answer = await askUserWait("⚠️ Действие потенциально опасно: " + desc + "\nВыполнить? (да / нет)");
-        if (confirmYes(answer)) {
-          decision = "approved";
-          result = await executeTool(c.name, c.args, settings);
-        } else {
-          decision = "denied";
-          result = "Действие НЕ выполнено: пользователь не подтвердил. Сообщи, что действие пропущено, и предложи безопасную альтернативу.";
-        }
-      } else {
-        // Чекпоинт: до правки файла запоминаем его состояние (для отката изменений агента)
-        if (c.name === "writeFile" || c.name === "editFile") {
-          try { snapshotFileForUndo(resolvePath(c.args && c.args.path, settings)); } catch {}
-        }
-        result = await executeTool(c.name, c.args, settings);
-      }
-      // Журнал действий: подтверждения, отказы, риск medium/high и незнакомые
-      // инструменты. Секреты в журнал не попадают (редакция в tool-policy.js).
-      audit.record({ tool: c.name, args: c.args, decision, result, source: activeRunOrigin });
-      // Миссия: журнал по значимым действиям (в журнале видно, чем агент занят) и
-      // счётчик повторов одного и того же вызова — по нему ловится цикл.
-      mission.noteCall(c.name, c.args);
-      // Держим контекст в рамках бюджета: длинный вывод инструмента ужимаем
-      const capped = truncateText(result, 8000);
-      emit({ type: "tool_result", name: c.name, result: capped });
-      canonical.push({ role: "tool", tool_call_id: c.id, content: capped });
-    }
+    // Строгая очередь (подтверждения, чекпоинт, аудит, журнал миссии) — в
+    // src/run-strict.js. Сюда приходят вызовы, которые НЕЛЬЗЯ гнать пачкой:
+    // запись, вопрос человеку, потенциально опасное. Остановка — за прогоном.
+    await strict.runStrict(calls, { planMode: planMode, history: canonical });
     // Остановка во время выполнения инструментов — завершаем без нового раунда.
     if (global.__agentStopRequested) return stopGraceful();
     mission.trackProgress(calls);
