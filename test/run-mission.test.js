@@ -561,13 +561,17 @@ const onlyMission = (dir) => {
       "mission.nudge(finalText)",
       "mission.noteCall(c.name, c.args)",
       "mission.trackProgress(calls)",
-      "mission.cost(roundUsage, ctxManager.compactions())",
       'mission.emitState("end")',
       "mission.recordError(e)",
     ]) {
       assert.ok(MAIN_SRC.includes(used), "в ядре чата не используется: " + used);
     }
     assert.ok(/const stopForPause = \(\) => \{\n    const paused = mission\.pause\(\);/.test(MAIN_SRC), "пауза по кнопке потеряла свою часть работы");
+    // Цена работы в миссии считается в теле раунда: с части 17 оно живёт в
+    // src/run-round.js, куда расход и сжатия приходят живыми значениями.
+    const roundSrc = read("src", "run-round.js");
+    assert.ok(roundSrc.includes("mission.cost(usage, getCompactions())"), "миссия не получает цену работы");
+    assert.ok(MAIN_SRC.includes("getCompactions: () => ctxManager.compactions()"), "сжатия не переданы модулю раунда");
   });
 
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");

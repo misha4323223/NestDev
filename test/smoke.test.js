@@ -89,7 +89,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js"]
+  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -9947,12 +9947,15 @@ async function testPromptCacheAndUsage() {
   });
 
   await test("метрики: цифры уходят в «Консоль», откат без stream_options на месте", () => {
-    assert.ok(/onUsage: \(u\) => \{/.test(mainSrc), "usage ответа не принимается");
-    assert.ok(/roundUsage\.cached = Math\.max\(roundUsage\.cached, u\.cached \|\| 0\)/.test(mainSrc), "кэш не собирается по раунду");
-    assert.ok(/termEmit\(\{[\s\S]{0,80}?type: "metrics"/.test(mainSrc), "строка метрик не отправляется");
-    assert.ok(/staticSystem: SYSTEM_PROMPT/.test(mainSrc), "граница статичного промпта не передана в запрос");
-    assert.ok(/includeUsage: retry\.state\.includeUsage/.test(mainSrc), "флаг токен-отчёта не передаётся в запрос");
-    assert.ok(/roundTtfbMs = Date\.now\(\) - roundStartedAt/.test(mainSrc), "нет замера времени до первого байта");
+    // Тело раунда живёт в src/run-round.js (часть 17): приём usage, строка метрик,
+    // граница статичного промпта и замер первого байта уехали туда.
+    const roundSrc = fs.readFileSync(path.join(ROOT, "src", "run-round.js"), "utf8");
+    assert.ok(/onUsage: \(u\) => \{/.test(roundSrc), "usage ответа не принимается");
+    assert.ok(/usage\.cached = Math\.max\(usage\.cached, u\.cached \|\| 0\)/.test(roundSrc), "кэш не собирается по раунду");
+    assert.ok(/termEmit\(\{[\s\S]{0,200}?type: "metrics"/.test(roundSrc), "строка метрик не отправляется");
+    assert.ok(/staticSystem: SYSTEM_PROMPT/.test(roundSrc), "граница статичного промпта не передана в запрос");
+    assert.ok(/includeUsage: retry\.state\.includeUsage/.test(roundSrc), "флаг токен-отчёта не передаётся в запрос");
+    assert.ok(/ttfbMs = Date\.now\(\) - startedAt/.test(roundSrc), "нет замера времени до первого байта");
     // Строгий сервер без stream_options: выключаем и повторяем раунд, а не падаем.
     assert.ok(
       /state\.includeUsage &&\s*\(status === 400 \|\| status === 422\)/.test(mainSrc),
@@ -10295,10 +10298,16 @@ async function testOllamaWindow() {
     await test("ollama: бюджет не может оказаться больше реального окна модели", () => {
       assert.ok(/let modelWin = 0;/.test(mainSrc), "окно модели не сохраняется для запроса");
       assert.ok(/Math\.min\(3000, modelWin\)/.test(mainSrc), "нижний предел бюджета не ограничен окном");
-      assert.ok(/numCtxBudget: budget,/.test(mainSrc), "бюджет не передан в buildChatRequest");
-      assert.ok(/modelWindow: modelWin,/.test(mainSrc), "окно не передано в buildChatRequest");
+      // Запрос собирается в src/run-round.js (часть 17), и бюджет с окном модели
+      // берутся там ЖИВЫМИ значениями: копия застыла бы на старом числе, и после
+      // переполнения контекста история резалась бы по прежнему бюджету.
+      const roundSrc = fs.readFileSync(path.join(ROOT, "src", "run-round.js"), "utf8");
+      assert.ok(/numCtxBudget: getBudget\(\)/.test(roundSrc), "бюджет не передан в buildChatRequest");
+      assert.ok(/modelWindow: getModelWindow\(\)/.test(roundSrc), "окно не передано в buildChatRequest");
+      assert.ok(/getBudget: \(\) => budget/.test(mainSrc) && /getModelWindow: \(\) => modelWin/.test(mainSrc),
+        "прогон не отдаёт бюджет и окно модели живыми значениями");
       assert.ok(/ollamaInfo\.known && !ollamaInfo\.tools/.test(mainSrc), "нет проверки поддержки инструментов у модели");
-      assert.ok(/noTools: noTools,/.test(mainSrc), "флаг noTools не доходит до сборки запроса");
+      assert.ok(/noTools: noTools,/.test(roundSrc), "флаг noTools не доходит до сборки запроса");
       assert.ok(
         /budget = windowBudget\(provider, budget, modelWin, \{ local: localEndpoint \}\);/.test(mainSrc),
         "бюджет не считается от окна модели"
@@ -14146,7 +14155,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14156,7 +14165,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));

@@ -260,9 +260,13 @@ const RESP_429 = (detail) => ({ status: 429, headers: { get: () => null }, detai
       assert.ok(mainSrc.indexOf(gone) < 0, "в main.js осталось состояние повторов: " + gone);
     }
     assert.ok(/const retry = createRunRetry\(\{/.test(mainSrc), "модуль не собран в прогоне");
-    assert.ok(/await retry\.pace\(\);/.test(mainSrc), "темп провайдера не спрашивается через модуль");
-    assert.ok(/if \(verdict\.kind === "repeat"\) \{/.test(mainSrc), "решение модуля не применяется к раунду");
-    assert.ok(/includeUsage: retry\.state\.includeUsage/.test(mainSrc), "флаг метрик не берётся из модуля");
+    // Темп, флаг метрик и применение решения о повторе живут в теле раунда:
+    // с части 17 оно в src/run-round.js, а хозяином цикла остаётся прогон.
+    const roundSrc = fs.readFileSync(path.join(ROOT, "src", "run-round.js"), "utf8");
+    assert.ok(/await retry\.pace\(\);/.test(roundSrc), "темп провайдера не спрашивается через модуль");
+    assert.ok(/if \(verdict\.kind === "repeat"\) return \{ kind: "repeat" \};/.test(roundSrc), "решение модуля не отдаётся прогону");
+    assert.ok(/includeUsage: retry\.state\.includeUsage/.test(roundSrc), "флаг метрик не берётся из модуля");
+    assert.ok(/if \(roundOut\.kind === "repeat"\) \{/.test(mainSrc), "повтор раунда перестал применяться в прогоне");
     assert.ok(!/app\.getPath|__dirname|require\(/.test(src), "модуль сам достаёт состояние вместо внедрения");
   });
 

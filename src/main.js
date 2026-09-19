@@ -85,6 +85,7 @@ const missionGuard = require("./mission-guard.js"); // сторож миссий
 const { createRunMission } = require("./run-mission.js"); // миссия прогона: батчи, журнал, цикл, призывы (своим модулем)
 const { createRunTools } = require("./run-tools.js"); // роутер инструментов и справочники прогона: группы, предохранители, вес схем, гайды
 const { createRunRetry } = require("./run-retry.js"); // восстановление прогона после отказа запроса: лимиты, сбои пула, переполнение контекста
+const { createRunRound } = require("./run-round.js"); // один раунд прогона: сборка запроса, поток ответа, метрики
 const unifiedPatch = require("./unified-patch.js"); // применение unified diff (applyPatch)
 const codeIndex = require("./code-index.js"); // семантический индекс кода (BM25 + стемминг)
 const yandexCloud = require("./yandex-cloud.js"); // Yandex Cloud REST API: авторизация, дашборд, создание ресурсов
@@ -1611,6 +1612,32 @@ async function runAi(settings, messages, win, opts) {
     UNAVAILABLE_MAX,
   });
 
+  // Один раунд общения с провайдером (запрос, поток ответа, метрики) — своим модулем
+  // (src/run-round.js). Бюджет и окно модели идут функциями: их меняет ужатие
+  // контекста, и копия застыла бы на старом числе.
+  const roundRunner = createRunRound({
+    settings,
+    provider,
+    emit,
+    termEmit,
+    emitThink,
+    getBudget: () => budget,
+    getModelWindow: () => modelWin,
+    getCompactions: () => ctxManager.compactions(),
+    noTools: noTools,
+    localEndpoint: localEndpoint,
+    tools: tools,
+    retry: retry,
+    mission: mission,
+    abort: abort,
+    SYSTEM_PROMPT,
+    buildChatRequest,
+    consumeProviderStream,
+    createThinkingStripper,
+    readApiError,
+    estimateTokens,
+  });
+
   const maxRounds = planMode ? 3 : 25;
   let finalText = "";
 
@@ -1629,7 +1656,6 @@ async function runAi(settings, messages, win, opts) {
   // Авто-повтор после сбоя: при любой ошибке (сеть/API/провайдер/инструмент) делаем ещё
   // попытку с продолжением контекста (история canonical сохраняется) — до AUTO_RETRY_LIMIT повторов.
   const AUTO_RETRY_LIMIT = 2;
-  let roundUsage = null; // { prompt, completion, cached } текущего раунда
   for (let attemptNum = 1; ; attemptNum++) {
   try {
   // Батчи: 25 раундов работы, затем проверка «миссия жива? лимиты? был ли прогресс?»
@@ -1637,9 +1663,6 @@ async function runAi(settings, messages, win, opts) {
   // длинной попыткой, которую обрывает счётчик раундов.
   for (let batch = 1; ; batch++) {
   for (let round = 0; round < maxRounds; round++) {
-    roundUsage = null; // аккумулятор токенов текущего раунда
-    const roundStartedAt = Date.now();
-    let roundTtfbMs = 0;
     mission.state.rounds++;
     // Незакрытая миссия (в том числе с прошлого запуска приложения) — продолжаем её,
     // а не начинаем работу заново: файлы и журнал лежат на диске.
@@ -1659,10 +1682,6 @@ async function runAi(settings, messages, win, opts) {
     if (global.__agentStopRequested) return stopGraceful();
     // Роутер: пересобираем набор схем (группы могли добавиться в прошлом раунде).
     tools.refresh();
-    let collected = "";
-    const toolCalls = [];
-    const stripper = createThinkingStripper({ onHidden: emitThink });
-
     // Контекст-менеджмент: между раундами держим историю в рамках бюджета токенов.
     // Хвост (текущий виток с tool-результатами) сохраняется целиком.
     if (canonical.length > 1) {
@@ -1677,125 +1696,17 @@ async function runAi(settings, messages, win, opts) {
       canonical = [sys, ...sanitizeToolPairs(canonical.slice(1))];
     }
 
-    const req = buildChatRequest(settings, {
-      model: settings.model,
-      messages: tools.state.guideNotes.length ? [canonical[0], ...tools.state.guideNotes, ...canonical.slice(1)] : canonical,
-      tools: tools.state.active,
-      // Статичный префикс промпта: до этой границы ставится точка кэша, чтобы
-      // динамический «паспорт проекта» не обнулял кэш на каждом витке.
-      staticSystem: SYSTEM_PROMPT,
-      includeUsage: retry.state.includeUsage,
-      // Ollama: сколько контекста выделить (num_ctx) — считает agent-core из бюджета
-      // и реального окна модели, чтобы сервер не резал запрос молча.
-      numCtxBudget: budget,
-      modelWindow: modelWin,
-      // Модель без инструментов: схемы не отправляем, вместо них текстовый каталог.
-      noTools: noTools,
-    });
-    // Темп провайдера: пауза выдерживается ЗАРАНЕЕ, если лимит уже известен (429 —
-    // потерянный раунд). Решение и текст — в src/run-retry.js.
-    await retry.pace();
-    let res;
-    try {
-      res = await fetch(req.url, {
-        method: "POST",
-        headers: req.headers,
-        body: req.body,
-        signal: abort.signal,
-      });
-    } catch (e) {
-      if (e.name === "AbortError") throw e;
-      throw new Error("Сетевая ошибка при запросе к " + provider + ": " + e.message);
+    // Один раунд (запрос, поток ответа, метрики) живёт в src/run-round.js: там же
+    // объяснено, почему состав схем, бюджет и usage ошибаются тихо. Хозяином цикла
+    // остаётся прогон: и повтор раунда, и фатальная ошибка — его решение.
+    const roundOut = await roundRunner.run({ n: round, maxRounds: maxRounds, messages: canonical });
+    if (roundOut.kind === "repeat") {
+      round--;
+      continue;
     }
-    roundTtfbMs = Date.now() - roundStartedAt; // заголовки ответа = первый байт
-    if (res.ok) retry.noteSuccess();
-    if (!res.ok) {
-      const detail = await readApiError(res);
-      // Повтор со паузой, отключение метрик, ужатие контекста или честная ошибка —
-      // решает src/run-retry.js; ожидание оно делает само, а раунд повторяем здесь.
-      const verdict = await retry.plan({ status: res.status, headers: res.headers, detail: detail });
-      if (verdict.kind === "repeat") {
-        round--;
-        continue;
-      }
-      throw verdict.error;
-    }
-
-    let truncated = false;
-    await consumeProviderStream({
-      response: res,
-      provider,
-      // Локальный сервер (в т.ч. LM Studio/vLLM на localhost) — свои таймауты:
-      // загрузка и чтение промпта на CPU не укладываются в облачные 90 с.
-      local: localEndpoint,
-      onText: (text) => {
-        const vis = stripper.push(text);
-        if (vis) {
-          collected += vis;
-          emit({ type: "chunk", text: vis });
-        }
-      },
-      onToolCall: (tc) => toolCalls.push(tc),
-      onThinking: emitThink,
-      // Локальная модель, упёршаяся в лимит вывода, обрывает ответ на полуслове.
-      // Раньше это выглядело как законченный ответ — теперь помечаем.
-      onTruncated: () => {
-        truncated = true;
-      },
-      onUsage: (u) => {
-        if (!u) return;
-        roundUsage = roundUsage || { prompt: 0, completion: 0, cached: 0 };
-        // Провайдеры шлют usage частями (Anthropic: вход в message_start, выход в
-        // message_delta) — по каждому полю берём максимум.
-        roundUsage.prompt = Math.max(roundUsage.prompt, u.prompt || 0);
-        roundUsage.completion = Math.max(roundUsage.completion, u.completion || 0);
-        roundUsage.cached = Math.max(roundUsage.cached, u.cached || 0);
-      },
-    });
-
-    if (truncated) {
-      emit({
-        type: "notice",
-        text: "⚠ Ответ модели оборван лимитом вывода (done_reason «length»). Напиши «продолжай», если нужен остаток.",
-      });
-    }
-
-    // Метрики раунда в «Консоль» (вкладка «Консоль» правой панели): без цифр
-    // любая оптимизация контекста — гадание.
-    {
-      const estPrompt = tools.state.weight + estimateTokens(JSON.stringify(canonical));
-      const totalMs = Date.now() - roundStartedAt;
-      const tokens =
-        roundUsage && roundUsage.prompt
-          ? roundUsage.prompt + "→" + roundUsage.completion
-          : "≈" + estPrompt + " (провайдер не прислал)";
-      const cache =
-        roundUsage && roundUsage.prompt
-          ? roundUsage.cached + " (" + Math.round((roundUsage.cached / roundUsage.prompt) * 100) + "%)"
-          : "нет данных";
-      termEmit({
-        type: "metrics",
-        text:
-          "раунд " + (round + 1) + "/" + maxRounds +
-          " · схем " + tools.state.active.length + " (~" + tools.state.weight + " т.)" +
-          (tools.state.route && tools.state.route.groups.length ? " · групп " + tools.state.route.groups.length : "") +
-          (tools.state.route && tools.state.route.dropped.length ? " · срезано: " + tools.state.route.dropped.join(",") : "") +
-          " · токены " + tokens +
-          " · кэш " + cache +
-          " · TTFB " + (roundTtfbMs / 1000).toFixed(1) + " с" +
-          " · всего " + (totalMs / 1000).toFixed(1) + " с",
-      });
-      // Цена работы в миссии: панель показывает токены и сжатия, чтобы «работает
-      // часами» не превращалось в невидимый расход.
-      mission.cost(roundUsage, ctxManager.compactions());
-    }
-
-    const tail = stripper.finish();
-    if (tail) {
-      collected += tail;
-      emit({ type: "chunk", text: tail });
-    }
-    finalText = collected;
+    if (roundOut.kind === "error") throw roundOut.error;
+    const toolCalls = roundOut.toolCalls;
+    finalText = roundOut.text;
 
     // Запасной способ: модель могла напечатать JSON-вызов инструмента текстом,
     // а не через tool_calls. Находим такие вызовы и выполняем их.
