@@ -89,7 +89,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js"]
+  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -14146,7 +14146,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14156,7 +14156,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
@@ -15449,14 +15449,18 @@ async function testMissionGuard() {
 
   await test("сторож миссий: оболочка спрашивает сторожа, а не решает сама", () => {
     assert.ok(/require\("\.\/mission-guard\.js"\)/.test(mainSrc), "main.js не подключил сторожа миссий");
-    const readStart = mainSrc.indexOf("const missionRead = () => {");
-    assert.ok(readStart > 0, "не нашёл выбор миссии прогона в main.js");
-    const readBody = mainSrc.slice(readStart, mainSrc.indexOf("\n  };", readStart));
+    // Миссия прогона вынесена в src/run-mission.js (этап B, часть 14): сторожа
+    // спрашиваем у модуля, а у оболочки — только то, что она его не забыла.
+    const missionRunSrc = fs.readFileSync(path.join(ROOT, "src", "run-mission.js"), "utf8");
+    const readStart = missionRunSrc.indexOf("const read = () => {");
+    assert.ok(readStart > 0, "не нашёл выбор миссии прогона в src/run-mission.js");
+    const readBody = missionRunSrc.slice(readStart, missionRunSrc.indexOf("\n  };", readStart));
     assert.ok(readBody.indexOf("missionGuard.pickAdopted") > 0, "выбор миссии идёт мимо сторожа");
     assert.ok(readBody.indexOf("missionStore.missionActive") === -1, "прогон по-прежнему подхватывает любую незакрытую миссию (включая паузы)");
     assert.ok(readBody.indexOf("missionClaim") > 0, "просьба человека «Продолжить» не учитывается при выборе миссии");
-    assert.ok(mainSrc.indexOf("missionGuard.nudgeStep(") > 0, "решение о призыве принимается мимо сторожа");
-    assert.ok(mainSrc.indexOf("missionGuard.nudgeText(") > 0, "текст призыва собирается мимо сторожа");
+    assert.ok(missionRunSrc.indexOf("missionGuard.nudgeStep(") > 0, "решение о призыве принимается мимо сторожа");
+    assert.ok(missionRunSrc.indexOf("missionGuard.nudgeText(") > 0, "текст призыва собирается мимо сторожа");
+    assert.ok(/missionGuard,\n/.test(mainSrc), "оболочка не передала сторожа в миссию прогона");
     assert.ok(
       mainSrc.indexOf('(mission.status === "active" || mission.status === "paused")') === -1,
       "призывы по-прежнему бьют по миссии на паузе"
@@ -15816,15 +15820,19 @@ async function testMissions() {
     const store = fs.readFileSync(path.join(ROOT, "src", "settings-store.js"), "utf8");
     // Часть долгой работы (каналы дел и миссий) вынесена в src/mission-ipc.js.
     const missionIpc = fs.readFileSync(path.join(ROOT, "src", "mission-ipc.js"), "utf8");
+    // Правила батчей, журнала и предохранителей живут в src/run-mission.js
+    // (этап B, часть 14): спрашиваем модуль, а у оболочки — границу батча.
+    const missionRun = fs.readFileSync(path.join(ROOT, "src", "run-mission.js"), "utf8");
     assert.ok(main.indexOf("for (let batch = 1; ; batch++)") >= 0, "нет внешнего цикла батчей");
-    assert.ok(/const afterBatch = await missionAfterBatch\(\);/.test(main), "граница батча не считается");
+    assert.ok(/const afterBatch = await mission\.afterBatch\(\);/.test(main), "граница батча не считается");
     assert.ok(/if \(!afterBatch\.continue\) \{/.test(main), "конец батча не продолжает и не завершает работу");
     assert.ok(main.indexOf("if (afterBatch.closed)") >= 0, "закрытая миссия рвётся ошибкой счётчика раундов");
-    assert.ok(/missionErrorContinues < missionLimits\.autoContinues/.test(main), "сбой провайдера обрывает долгую работу");
-    assert.ok(main.indexOf("longWorkAutoContinue") >= 0, "нет запаса авто-продолжений");
-    assert.ok(main.indexOf("MISSION_AUTO_ROUND") >= 0, "миссия не заводится сама на длинной работе");
-    assert.ok(main.indexOf("missionSignatures") >= 0, "нет защиты от зацикливания на одном вызове");
-    assert.ok(main.indexOf("MISSION_JOURNAL_PER_BATCH") >= 0, "журнал может превратиться в поток");
+    assert.ok(missionRun.indexOf('if (r.status !== "active") return { continue: false, closed: true };') >= 0, "модуль не различает закрытую миссию");
+    assert.ok(/state\.errorContinues < state\.limits\.autoContinues/.test(missionRun), "сбой провайдера обрывает долгую работу");
+    assert.ok(missionRun.indexOf("longWorkAutoContinue") >= 0, "нет запаса авто-продолжений");
+    assert.ok(missionRun.indexOf("MISSION_AUTO_ROUND") >= 0, "миссия не заводится сама на длинной работе");
+    assert.ok(missionRun.indexOf("signatures") >= 0, "нет защиты от зацикливания на одном вызове");
+    assert.ok(missionRun.indexOf("MISSION_JOURNAL_PER_BATCH") >= 0, "журнал может превратиться в поток");
     assert.ok(/longWork: true/.test(store), "долгая работа выключена по умолчанию");
     assert.ok(/longWorkHours: 8/.test(store), "рабочий день по умолчанию не 8 часов");
     // Текст продолжения собирает канал mission:resume, а он живёт в src/mission-ipc.js.

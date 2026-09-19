@@ -194,7 +194,7 @@
 
 | Файл | Роль |
 |---|---|
-| `src/main.js` | главный процесс: окно, IPC, чат-цикл, инструменты (40 обработчиков) |
+| `src/main.js` | главный процесс: окно, IPC, чат-цикл, инструменты (39 обработчиков) |
 | `src/agent-tools.js` | 159 обработчиков инструментов агента (один `createAgentTools(deps)`) |
 | `src/browser-tools.js` | браузер агента: карта страницы, действия, replay, догрузка |
 | `src/agent-store.js` | заметки, чекпоинты, памятки, дела, повторы (папка `.agent/`) |
@@ -213,6 +213,7 @@
 | `src/tool-helpers.js` | помощники инструментов: пакетный менеджер по lockfile (`detectPackageManager`/`hasLock`), сводка итога тестов (`summarizeTestOutput`), unified-дифф через git (`unifiedDiff`) |
 | `src/app-window.js` | главное окно: параметры и preload, прокси событий в мобильный мост, метка запуска у `ai:event`, ссылки в браузере пользователя, напоминания о делах, обнуление окна при закрытии (`createWindow`) |
 | `src/terminal-panel.js` | пользовательский терминал (нижняя панель): постоянная оболочка рабочей папки, дублирование команд и вывода агента, автодополнение (`termStart`/`termInput`/`termStop`/`termStatus`/`termShutdown`/`termComplete`) |
+| `src/run-mission.js` | миссия прогона агента (долгая работа): авто-миссия на шестом раунде, журнал по действиям, защита от цикла и стояния на месте, граница батча (25 раундов), призывы сторожа и пауза с сохранением работы (`createRunMission`, состояние — один объект `state`) |
 | `src/site-guides.js` | справочники агента по сайтам и темам: встроенные (`src/agent-guides/*.md`) и выученные в папке приложения, подхват по адресу (`guideForUrl`) и действия инструмента `agentGuide` (`list`/`match`/`read`/`save`) |
 | `src/paths-git.js` | пути и git для всего бэкенда: `resolvePath`/`sanitizeDir`/`sanitizePath`, `gitDirOrHome`/`agentWorkDir`, `repoNameFromUrl`/`stripUrlCreds`, `runGit` (окружение по назначению + Basic-авторизация) |
 | `src/app-ui-tools.js`, `tool-policy.js` | интерфейсные инструменты, разрешения |
