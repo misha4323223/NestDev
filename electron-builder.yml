@@ -1,7 +1,7 @@
 publish:
   provider: github
-  owner: booom
-  repo: local-ai-agent
+  owner: misha4323223
+  repo: NestDev
   releaseType: release
 
 appId: com.local.aiagent
