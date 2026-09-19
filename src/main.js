@@ -88,6 +88,7 @@ const { createRunRetry } = require("./run-retry.js"); // восстановле�
 const { createRunRound } = require("./run-round.js"); // один раунд прогона: сборка запроса, поток ответа, метрики
 const { createRunCalls } = require("./run-calls.js"); // вызовы раунда: текстовые, нормализация, история, пачка read-only
 const { createRunStrict } = require("./run-strict.js"); // строгая очередь вызовов: подтверждения, чекпоинт, аудит, журнал миссии
+const { createRunBatch } = require("./run-batch.js"); // решения после раунда: пустой отчёт, граница батча, закрытие работы
 const unifiedPatch = require("./unified-patch.js"); // применение unified diff (applyPatch)
 const codeIndex = require("./code-index.js"); // семантический индекс кода (BM25 + стемминг)
 const yandexCloud = require("./yandex-cloud.js"); // Yandex Cloud REST API: авторизация, дашборд, создание ресурсов
@@ -1673,6 +1674,12 @@ async function runAi(settings, messages, win, opts) {
     getRunOrigin: () => activeRunOrigin,
   });
 
+  // Решения после раунда (пустой отчёт, граница батча, закрытие миссии) —
+  // своим модулем (src/run-batch.js). Пауза между батчами — аргументом.
+  // ВНИМАНИЕ: имя НЕ `batch` — внутри внешнего цикла так называется его счётчик,
+  // и модуль был бы перекрыт числом (живой прогон ловит это сразу).
+  const batchCtl = createRunBatch({ emit, mission, pauseMs: 1500 });
+
   const maxRounds = planMode ? 3 : 25;
   let finalText = "";
 
@@ -1800,14 +1807,18 @@ async function runAi(settings, messages, win, opts) {
       }
     }
 
-    // Пустой финальный ответ — не молчим. Один раз просим итоговый отчёт.
-    if (toolCalls.length === 0 && !planMode && !reportRetried && !String(finalText || "").trim() && !abort.signal.aborted) {
+    // Пустой финальный ответ: один раз просим итоговый отчёт — решение в
+    // src/run-batch.js, повтор раунда и флаг остаются за прогоном.
+    if (
+      batchCtl.askForReport(canonical, {
+        toolCalls: toolCalls,
+        planMode: planMode,
+        text: finalText,
+        reportRetried: reportRetried,
+        aborted: abort.signal.aborted,
+      })
+    ) {
       reportRetried = true;
-      canonical.push({
-        role: "user",
-        content:
-          "Ты завершил действия, но итоговый ответ получился пустым. Напиши структурированный итоговый отчёт: что сделано, какие файлы созданы/изменены, какие команды выполнялись, как проверить результат.",
-      });
       continue;
     }
 
@@ -1849,32 +1860,11 @@ async function runAi(settings, messages, win, opts) {
     if (global.__agentStopRequested) return stopGraceful();
     mission.trackProgress(calls);
   }
-  // Конец батча: миссия жива — продолжаем следующим батчом (тот же контекст),
-  // лимиты/зацикливание — мягкая остановка с сохранением работы, без ошибки в чате.
-  const afterBatch = await mission.afterBatch();
-  if (afterBatch.finish) {
-    mission.emitState(afterBatch.phase);
-    return await endRun(afterBatch.message);
-  }
-  if (!afterBatch.continue) {
-    // Миссия закрыта — это НЕ исчерпание счётчика раундов: завершаем обычным
-    // финалом. Иначе успешная работа обрывалась бы грозным «превышено число
-    // раундов», и это выглядело бы как «агент ни с того ни с сего отвалился».
-    if (afterBatch.closed) {
-      const mDone = mission.refresh();
-      return await endRun(
-        "🏁 Работа закончена" + (mDone ? " — миссия «" + mDone.title + "» закрыта" : "") +
-          ". Цель, план, журнал и отчёт: .agent/missions/."
-      );
-    }
-    break;
-  }
-  // Продолжаем батч: напоминание в чат и в историю, событие миссии — и короткая
-  // пауза, чтобы провайдер и интерфейс вздохнули (история при этом не меняется).
-  emit({ type: "notice", text: afterBatch.notice });
-  mission.emitState(afterBatch.phase);
-  canonical.push({ role: "user", content: afterBatch.historyMessage });
-  await new Promise((r) => setTimeout(r, 1500));
+  // Конец батча: граница батча, закрытие миссии и напоминание живут в
+  // src/run-batch.js. Завершение и выход из цикла — решение прогона.
+  const after = await batchCtl.afterRound(canonical);
+  if (after.kind === "end") return await endRun(after.message);
+  if (after.kind === "break") break;
   }
   throw Object.assign(
     new Error(

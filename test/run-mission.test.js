@@ -556,7 +556,6 @@ const onlyMission = (dir) => {
       "mission.state.rounds++",
       "mission.autoStart()",
       "mission.resume()",
-      "mission.afterBatch()",
       "mission.canNudge()",
       "mission.nudge(finalText)",
       "mission.trackProgress(calls)",
@@ -569,6 +568,10 @@ const onlyMission = (dir) => {
     // туда попадает каждый выполненный вызов, а не только прошедший пачку.
     const strictSrc = read("src", "run-strict.js");
     assert.ok(strictSrc.includes("mission.noteCall(c.name, c.args)"), "миссия не видит вызовы очереди");
+    // Граница батча живёт в модуле решений после раунда (часть 19б).
+    const batchSrc = read("src", "run-batch.js");
+    assert.ok(batchSrc.includes("mission.afterBatch()"), "миссия не спрашивает границу батча");
+    assert.ok(/const after = await batchCtl\.afterRound\(canonical\)/.test(MAIN_SRC), "прогон не спрашивает границу батча");
     assert.ok(/const stopForPause = \(\) => \{\n    const paused = mission\.pause\(\);/.test(MAIN_SRC), "пауза по кнопке потеряла свою часть работы");
     // Цена работы в миссии считается в теле раунда: с части 17 оно живёт в
     // src/run-round.js, куда расход и сжатия приходят живыми значениями.

@@ -82,6 +82,13 @@ const BREAKS = {
     "",
   ],
   strictask: ["src/run-strict.js", '      if (c.name === "askUser") {\n', "      if (false) {\n"],
+  // ── решения после раунда (часть 19б) ──
+  batchreport: ["src/run-batch.js", "      o.toolCalls.length === 0 &&\n", "      false &&\n"],
+  batchfake: [
+    "src/run-batch.js",
+    '      return { kind: "break" };\n',
+    '      return { kind: "end", message: "🏁 Работа закончена. Цель, план, журнал и отчёт: .agent/missions/." };\n',
+  ],
 };
 let brokenFile = null;
 if (BREAK) {
@@ -272,6 +279,47 @@ const answerFor = (n) => {
     return sse([
       { choices: [{ index: 0, delta: { role: "assistant", content: "Готово: очередь пройдена." } }] },
       { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ]);
+  }
+  // Пятый прогон: пустой итоговый ответ — прогон обязан ОДИН раз попросить
+  // итоговый отчёт (решение в src/run-batch.js, часть 19б).
+  if (n === 12) {
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Смотрю файлы.\n" } }] },
+      { choices: [{ index: 0, delta: { tool_calls: [call(0, "call_l1", "listFiles", { path: "." })] } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    ]);
+  }
+  if (n === 13) {
+    // Пустой ответ БЕЗ вызовов инструментов — ровно то, на что отвечает просьба об отчёте.
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "" } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ]);
+  }
+  if (n === 14) {
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Отчёт: файлы просмотрены." } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ]);
+  }
+  // Шестой прогон: план-режим (3 раунда) — граница батча и честный финал.
+  if (n >= 15) {
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "План работ.\n" } }] },
+      {
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                call(0, "call_p" + n, "todoWrite", { todos: [{ text: "Шаг " + n, status: "pending" }] }),
+              ],
+            },
+          },
+        ],
+      },
+      { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
     ]);
   }
   return sse([
@@ -578,7 +626,57 @@ const callIpc = (channel, ...args) => {
     "ответ человека на вопрос дошёл до модели"
   );
 
-  console.log("\n[9] Завершение прогона");
+  console.log("\n[9] Пустой ответ: просьба об итоговом отчёте ровно одна");
+  const ev5 = events.length;
+  const served5 = served;
+  const run5 = await callIpc("ai:send", [{ role: "user", content: "Посмотри файлы и отчитайся" }], {
+    chatId: "chat-live-round-empty",
+    role: "developer",
+  });
+  ok(run5 && run5.ok === true, "прогон с пустым ответом завершился без ошибки: " + JSON.stringify(run5 && run5.error));
+  ok(served - served5 === 3, "провайдер получил 3 запроса (работа, пустой ответ, отчёт): " + (served - served5));
+  const emptyBody = requests[served5 + 2] && requests[served5 + 2].body;
+  const emptyAsks = (emptyBody && emptyBody.messages ? emptyBody.messages : []).filter(
+    (m) => m.role === "user" && /итоговый ответ получился пустым/.test(String(m.content || ""))
+  );
+  ok(emptyAsks.length === 1, "просьба об итоговом отчёте ушла модели ровно один раз: " + emptyAsks.length);
+  ok(
+    !/итоговый ответ получился пустым/.test(JSON.stringify((requests[served5 + 1] || {}).body || {})),
+    "просьба отправлена не в том же раунде, что пустой ответ"
+  );
+  const emptyText = events
+    .slice(ev5)
+    .filter((e) => e.ev && e.ev.type === "chunk")
+    .map((e) => e.ev.text)
+    .join("");
+  ok(/Отчёт: файлы просмотрены/.test(emptyText), "итоговый отчёт дошёл до окна: " + JSON.stringify(emptyText));
+
+  console.log("\n[10] Конец батча: раунды кончились — честное сообщение, а не молчание");
+  const ev6 = events.length;
+  const served6 = served;
+  // Режим плана приходит опцией прогона (opts.planMode), а не настройкой: в нём
+  // раундов всего 3, и граница батча достигается быстро — без 25 запросов.
+  const run6 = await callIpc("ai:send", [{ role: "user", content: "Составь план работ" }], {
+    chatId: "chat-live-round-batch",
+    role: "developer",
+    planMode: true,
+  });
+  const planText = events
+    .slice(ev6)
+    .filter((e) => e.ev && e.ev.type === "chunk")
+    .map((e) => e.ev.text)
+    .join("");
+  const run6text = String((run6 && run6.error) || "") + " " + planText;
+  ok(run6 && run6.ok === false, "прогон честно сообщил, что раунды кончились: " + JSON.stringify(run6 && run6.ok));
+  ok(served - served6 === 3, "в плане ровно 3 раунда (граница батча): " + (served - served6));
+  ok(/Превышено максимальное число раундов/.test(run6text), "человеку объяснено, что случилось: " + JSON.stringify(run6text.slice(0, 140)));
+  ok(/продолжай/.test(run6text), "человеку сказано, как продолжить работу");
+  ok(
+    !/Работа закончена/.test(run6text),
+    "без миссии прогон не выдаёт себя за закрытую миссию: " + JSON.stringify(run6text.slice(0, 140))
+  );
+
+  console.log("\n[11] Завершение прогона");
   ok(events.some((e) => e.ev && e.ev.type === "done"), "прогон сообщил о завершении");
   ok(fs.existsSync(path.join(workDir, "round-live.txt")), "инструмент раунда выполнился: файл создан");
 
