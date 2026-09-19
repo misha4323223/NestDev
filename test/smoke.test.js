@@ -89,7 +89,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js"]
+  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -7227,10 +7227,10 @@ async function testPlanPanel() {
     assert.strictEqual(AgentCore.PLAN_MODE_TOOL_DEFINITIONS[0].function.name, "todoWrite", "в План-режиме нет todoWrite");
     // Набор схем теперь собирает роутер: в План-режиме — ровно PLAN_MODE_TOOL_DEFINITIONS,
     // в обычном — routeTools (база + липкие группы).
-    assert.ok(/activeTools = PLAN_MODE_TOOL_DEFINITIONS;/.test(mainSrc), "План-режим не получает набор с todoWrite");
-    assert.ok(/routeInfo = routeTools\(\{ text: routerTask, sticky: \[\.\.\.stickyGroups\]/.test(mainSrc), "выбор схем не идёт через роутер");
+    assert.ok(/state\.active = PLAN_MODE_TOOL_DEFINITIONS;/.test(mainSrc), "План-режим не получает набор с todoWrite");
+    assert.ok(/state\.route = routeTools\(\{ text: routerTask, sticky: \[\.\.\.state\.sticky\]/.test(mainSrc), "выбор схем не идёт через роутер");
     assert.ok(/const forceAllTools = !!settings\.sendAllTools;/.test(mainSrc), "нет предохранителя C (все инструменты)");
-    assert.ok(/tools: activeTools,/.test(mainSrc), "в запрос уходит не activeTools");
+    assert.ok(/tools: tools\.state\.active,/.test(mainSrc), "в запрос уходит не activeTools");
     assert.ok(mainSrc.indexOf("tools: planMode ? [] : activeTools") === -1, "осталось старое обнуление инструментов");
     // Исполнение: в этом режиме выполняется только todoWrite, остальное — честный отказ.
     assert.ok(/if \(planMode && c\.name !== "todoWrite"\)/.test(mainSrc), "нет запрета выполнять инструменты в План-режиме");
@@ -8064,9 +8064,9 @@ async function testAgentSpeedups() {
 
   await test("компакция: сжатие с резервом 15% до переполнения", () => {
     // Резерв 15% + честное вычитание схем и системного промпта (иначе индикатор врёт).
-    assert.ok(/Math\.floor\(\(budget - toolsWeight - systemWeight\) \* 0\.85\)/.test(mainSrc), "нет резерва 15% в бюджете истории");
-    assert.ok(/const systemWeight = estimateTokens\(SYSTEM_PROMPT\);/.test(mainSrc), "системный промпт не вычитается из бюджета");
-    assert.ok(/const used = histTokens \+ toolsWeight \+ systemWeight;/.test(mainSrc), "индикатор контекста не учитывает промпт");
+    assert.ok(/Math\.floor\(\(budget - state\.weight - systemWeight\) \* 0\.85\)/.test(mainSrc), "нет резерва 15% в бюджете истории");
+    assert.ok(/const systemWeight = estimateTokens\(systemPrompt\);/.test(mainSrc), "системный промпт не вычитается из бюджета");
+    assert.ok(/const used = histTokens \+ tools\.state\.weight \+ tools\.state\.systemWeight;/.test(mainSrc), "индикатор контекста не учитывает промпт");
   });
   await test("кэш промпта: Claude получает точки кэша, OpenAI-совместимым поле не шлём", () => {
     const tools = [
@@ -10179,14 +10179,14 @@ async function testToolRouter() {
     const coreSrc = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
     // A: реальный вызов вне набора дотягивает группу и повторяет раунд со схемой.
     assert.ok(/const gid = groupOfTool\(c\.name\);/.test(mainSrc), "нет предохранителя A");
-    assert.ok(/stickyGroups\.add\(gid\);\s*\n\s*fresh\.push\(gid\);/.test(mainSrc), "группа вызова не добавляется на ходу");
-    assert.ok(/if \(fresh\.length\) \{\s*\n\s*refreshTools\(\);/.test(mainSrc), "набор схем не пересобирается после включения группы");
+    assert.ok(/state\.sticky\.add\(gid\);\s*\n\s*fresh\.push\(gid\);/.test(mainSrc), "группа вызова не добавляется на ходу");
+    assert.ok(/if \(fresh\.length\) \{\s*\n\s*refresh\(\);/.test(mainSrc), "набор схем не пересобирается после включения группы");
     // Группа могла не поместиться в окно: обещать «схем станет больше» нельзя.
     assert.ok(mainSrc.indexOf("не влезают в окно модели") !== -1, "отчёт о включении группы не сверяется с фактом");
     // B: findTools исполняется и включает группы текущей задачи.
     assert.ok(hasTool(mainSrc, "findTools"), "findTools не исполняется");
     assert.ok(/activeToolRouter\.addGroups\(groups\)/.test(mainSrc), "findTools не включает группы");
-    assert.ok(/activeToolRouter = \{/.test(mainSrc), "нет роутера текущего запуска");
+    assert.ok(/activeToolRouter = tools\.router;/.test(mainSrc), "нет роутера текущего запуска");
     // C: чекбокс «Отправить все инструменты» + полный набор без роутера.
     assert.ok(/const forceAllTools = !!settings\.sendAllTools;/.test(mainSrc), "настройка не читается агентом");
     assert.ok(/if \(o\.forceAll\)/.test(coreSrc), "forceAll не поддерживается роутером");
@@ -10194,8 +10194,8 @@ async function testToolRouter() {
     assert.ok(/getSettings\(\)\.sendAllTools = !!\$\("s-send-all-tools"\)\.checked;/.test(uiFile("settings-panel.js")), "чекбокс не сохраняется");
     assert.ok(/\$\("s-send-all-tools"\)\.checked = !!getSettings\(\)\.sendAllTools;/.test(uiFile("settings-panel.js")), "чекбокс не восстанавливается");
     // Метрика раунда говорит, сколько групп ушло и что срезано.
-    assert.ok(/· групп " \+ routeInfo\.groups\.length/.test(mainSrc), "метрика без числа групп");
-    assert.ok(/срезано: " \+ routeInfo\.dropped\.join/.test(mainSrc), "метрика молчит о срезанных группах");
+    assert.ok(/· групп " \+ tools\.state\.route\.groups\.length/.test(mainSrc), "метрика без числа групп");
+    assert.ok(/срезано: " \+ tools\.state\.route\.dropped\.join/.test(mainSrc), "метрика молчит о срезанных группах");
   });
 }
 

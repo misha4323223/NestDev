@@ -83,6 +83,7 @@ const agentStore = require("./agent-store.js"); // память проекта (
 const missionStore = require("./mission-store.js"); // миссии: цель, план, журнал и отчёт файлами в .agent/
 const missionGuard = require("./mission-guard.js"); // сторож миссий: кого продолжать и когда перестать приставать
 const { createRunMission } = require("./run-mission.js"); // миссия прогона: батчи, журнал, цикл, призывы (своим модулем)
+const { createRunTools } = require("./run-tools.js"); // роутер инструментов и справочники прогона: группы, предохранители, вес схем, гайды
 const unifiedPatch = require("./unified-patch.js"); // применение unified diff (applyPatch)
 const codeIndex = require("./code-index.js"); // семантический индекс кода (BM25 + стемминг)
 const yandexCloud = require("./yandex-cloud.js"); // Yandex Cloud REST API: авторизация, дашборд, создание ресурсов
@@ -1363,7 +1364,7 @@ async function runAi(settings, messages, win, opts) {
     // Потолок бюджета. У облака это «сколько не жалко токенов», у локальной модели —
     // её окно: локальные токены бесплатны, платим памятью (KV-кэш) и временем. Прежний
     // общий потолок 14 000 душил локальную модель с окном 40–130k, а вместе с ним
-    // выключался и роутер инструментов (см. refreshTools).
+    // выключался и роутер инструментов (см. tools.refresh).
     if (modelWin > 0) budget = windowBudget(provider, budget, modelWin, { local: localEndpoint });
     // Нижний предел — 3000 токенов, но НИКОГДА больше реального окна: у модели с
     // окном 2048 «пол» в 3000 гарантировал переполнение на каждом запросе.
@@ -1413,103 +1414,32 @@ async function runAi(settings, messages, win, opts) {
   let reportRetried = false; // пустой финальный текст — один раз просим итоговый отчёт
   let planNudges = 0; // «план не закрыт, а модель замолчала» — просим продолжить делом (макс. 2)
   activePlanSummary = null; // план прошлого прогона не должен влиять на этот
-  // ── Роутер инструментов ──────────────────────────────────────────────────
-  // Вместо «все 146 схем в каждом раунде» шлём базу + группы, нужные этой задаче
-  // (routeTools из agent-core). Состав ЛИПКИЙ на всю задачу: группа, однажды
-  // включённая, не исчезает на середине работы. Порядок схем всегда канонический —
-  // иначе промахивается кэш префикса промпта (см. 1.5.46).
-  // Роутер видит не одну последнюю фразу, а историю работы (см. 1.5.63): в «продолжай»
-  // ключевых слов нет вовсе, и раньше группа прошлой задачи выпадала — набор схем
-  // менялся на ходу, префикс запроса ломался и провайдер отвечал 503 cache_only_cold.
-  const routerTask = routerTaskText(messages);
-  // Группа → справочник агента: подключается сам, когда группа активна. Так «диета»
-  // промпта ничего не теряет: длинные правила живут в гайдах и приходят ровно тогда,
-  // когда нужны (браузер, система, окно приложения, облако).
-  const GROUP_GUIDES = { browser: "browser", system: "system", app: "app", cloud: "yc" };
-  const injectedGuides = new Set();
-  const guideNotes = []; // system-сообщения с текстом гайдов (стабильный префикс)
-  const stickyGroups = new Set(); // id групп, включённых в этой задаче
-  const forceAllTools = !!settings.sendAllTools; // предохранитель C: «отправлять все инструменты»
-  let routeInfo = null; // последний результат routeTools (метрики + предохранители)
-  let activeTools = [];
-  let toolsWeight = 0;
-  let histBudget = 1500;
-  let budgetWarned = false; // предупреждаем один раз за запуск, а не каждый раунд
-  // Вес системного промпта (~8k токенов) — раньше в бюджет не входил, поэтому индикатор
-  // контекста занижал заполнение и сжатие срабатывало позже, чем нужно.
-  const systemWeight = estimateTokens(SYSTEM_PROMPT);
-  // Объект для executeTool (findTools): включить группу на лету и посмотреть состав.
-  activeToolRouter = {
-    addGroups(ids) {
-      let changed = false;
-      for (const id of ids || []) {
-        if (!id || stickyGroups.has(id)) continue;
-        stickyGroups.add(id);
-        changed = true;
-      }
-      if (changed) refreshTools();
-    },
-    has(id) {
-      return stickyGroups.has(id);
-    },
-    names() {
-      return activeTools.map((t) => t.function && t.function.name).filter(Boolean);
-    },
-    groups() {
-      return [...stickyGroups];
-    },
-  };
-  const refreshTools = () => {
-    if (planMode) {
-      routeInfo = null;
-      activeTools = PLAN_MODE_TOOL_DEFINITIONS;
-    } else {
-      const baseWeight = routeTools({ text: "" }).tokens;
-      // Потолок схем: не больше ROUTER_MAX_TOKENS и не больше того, что реально остаётся
-      // от окна после системного промпта и минимальной истории. Сама формула живёт в
-      // ядре (routerMaxTokens) — здесь только вызов.
-      const maxTokens = routerMaxTokens(budget, systemWeight, baseWeight);
-      routeInfo = routeTools({ text: routerTask, sticky: [...stickyGroups], roleGroups: role.groups, forceAll: forceAllTools, maxTokens: maxTokens });
-      for (const id of routeInfo.groups) stickyGroups.add(id);
-      activeTools = routeInfo.tools;
-    }
-    // Вес того, что РЕАЛЬНО уйдёт в запрос. Без поддержки инструментов схемы не
-    // отправляются — вместо них текстовый каталог, и он вчетверо легче: считать по JSON
-    // значило бы сжимать историю раньше времени и зря пугать тесным окном.
-    toolsWeight = activeTools.length
-      ? estimateTokens(noTools ? toolsAsText(activeTools) : JSON.stringify(activeTools))
-      : 0;
-    // Тесное окно: схемы + промпт уже занимают почти всё. Честно говорим об этом
-    // один раз — иначе агент «тупеет» без объяснений (модель видит обрезанный хвост).
-    if (!budgetWarned && !planMode && budget > 0 && toolsWeight + systemWeight > budget * 0.9) {
-      budgetWarned = true;
-      const narrowNote =
-        "⚠ Окно модели мало: инструменты (~" + Math.round(toolsWeight / 1000) + "k) + системный промпт (~" +
-        Math.round(systemWeight / 1000) + "k) занимают почти всё окно (" + budget + " т.). " +
-        "Возьми модель с окном побольше — иначе агент видит обрезанный контекст и работает вслепую.";
-      termEmit({ type: "metrics", text: narrowNote });
-      // То же сообщение — в чат: в «Консоли» его не видит тот, кто просто пишет задачу.
-      emit({ type: "notice", text: narrowNote });
-    }
-    histBudget = Math.max(1500, Math.floor((budget - toolsWeight - systemWeight) * 0.85)); // история + резерв 15%: сжатие успевает до переполнения
-    // Справочник группы: подключаем один раз за задачу, дальше он просто едет в запросе.
-    if (!planMode && routeInfo) {
-      for (const gid of routeInfo.groups) {
-        const gname = GROUP_GUIDES[gid];
-        if (!gname || injectedGuides.has(gname)) continue;
-        const text = guideReadText(gname);
-        if (!text.trim()) continue;
-        injectedGuides.add(gname);
-        guideNotes.push({
-          role: "system",
-          content:
-            "=== СПРАВОЧНИК АГЕНТА: \"" + gname + "\" (группа \"" + gid + "\") — следуй ему в этой задаче ===\n" + text,
-        });
-        termEmit({ type: "metrics", text: "📘 Подключён справочник «" + gname + "» (группа «" + gid + "»)." });
-      }
-    }
-  };
-  refreshTools();
+  // ── Роутер инструментов и справочники ──────────────────────────────────────
+  // Состав схем, липкость групп, предохранители A и C, вес схем и автоподключение
+  // справочников живут в src/run-tools.js — там же объяснено, почему группа не
+  // гаснет на середине задачи и почему вес считается по тому, что РЕАЛЬНО уйдёт в
+  // запрос. Здесь — только сборка и чтение состояния прогона.
+  const tools = createRunTools({
+    settings,
+    planMode,
+    messages,
+    role,
+    noTools,
+    emit,
+    termEmit,
+    getBudget: () => budget, // бюджет пересчитывается при переполнении — считаем по живому
+    systemPrompt: SYSTEM_PROMPT,
+    routeTools,
+    routerMaxTokens,
+    routerTaskText,
+    estimateTokens,
+    toolsAsText,
+    guideReadText,
+    groupOfTool,
+    PLAN_MODE_TOOL_DEFINITIONS,
+  });
+  activeToolRouter = tools.router;
+  tools.refresh();
   const ctxManager = createContextManager({
     settings,
     emit,
@@ -1527,9 +1457,9 @@ async function runAi(settings, messages, win, opts) {
   const emitContext = (hist) => {
     try {
       const histTokens = hist && hist.length ? estimateTokens(JSON.stringify(hist)) : 0;
-      const used = histTokens + toolsWeight + systemWeight;
+      const used = histTokens + tools.state.weight + tools.state.systemWeight;
       const percent = budget > 0 ? Math.max(0, Math.min(100, Math.round((used / budget) * 100))) : 0;
-      emit({ type: "context", used, budget, percent, history: histTokens, tools: toolsWeight, system: systemWeight });
+      emit({ type: "context", used, budget, percent, history: histTokens, tools: tools.state.weight, system: tools.state.systemWeight });
     } catch {}
   };
 
@@ -1591,7 +1521,7 @@ async function runAi(settings, messages, win, opts) {
       }, 300000);
     });
   };
-  const trimmedHistory = await ctxManager.manage(messages, histBudget);
+  const trimmedHistory = await ctxManager.manage(messages, tools.state.histBudget);
   emitContext(trimmedHistory);
   // Авто-разбор присланных картинок вспомогательной vision-моделью (второй ключ):
   // скриншот → описание → кодер работает с текстом (его модель может не видеть картинки).
@@ -1706,7 +1636,7 @@ async function runAi(settings, messages, win, opts) {
     // Пользователь остановил агента (Esc/Стоп) — не начинаем новый раунд.
     if (global.__agentStopRequested) return stopGraceful();
     // Роутер: пересобираем набор схем (группы могли добавиться в прошлом раунде).
-    refreshTools();
+    tools.refresh();
     let collected = "";
     const toolCalls = [];
     const stripper = createThinkingStripper({ onHidden: emitThink });
@@ -1715,7 +1645,7 @@ async function runAi(settings, messages, win, opts) {
     // Хвост (текущий виток с tool-результатами) сохраняется целиком.
     if (canonical.length > 1) {
       const sys = canonical[0];
-      canonical = [sys, ...(await ctxManager.manage(canonical.slice(1), histBudget))];
+      canonical = [sys, ...(await ctxManager.manage(canonical.slice(1), tools.state.histBudget))];
       emitContext(canonical);
     }
     // Финальный предохранитель перед отправкой: осиротевшие tool-сообщения
@@ -1727,8 +1657,8 @@ async function runAi(settings, messages, win, opts) {
 
     const req = buildChatRequest(settings, {
       model: settings.model,
-      messages: guideNotes.length ? [canonical[0], ...guideNotes, ...canonical.slice(1)] : canonical,
-      tools: activeTools,
+      messages: tools.state.guideNotes.length ? [canonical[0], ...tools.state.guideNotes, ...canonical.slice(1)] : canonical,
+      tools: tools.state.active,
       // Статичный префикс промпта: до этой границы ставится точка кэша, чтобы
       // динамический «паспорт проекта» не обнулял кэш на каждом витке.
       staticSystem: SYSTEM_PROMPT,
@@ -1852,10 +1782,10 @@ async function runAi(settings, messages, win, opts) {
       ) {
         contextRetried = true;
         budget = Math.max(3000, Math.floor(budget * 0.4));
-        histBudget = Math.max(1500, budget - toolsWeight - systemWeight);
+        tools.state.histBudget = tools.histBudgetAfterOverflow();
         if (canonical.length > 1) {
           const sys = canonical[0];
-          canonical = [sys, ...(await ctxManager.manage(canonical.slice(1), histBudget))];
+          canonical = [sys, ...(await ctxManager.manage(canonical.slice(1), tools.state.histBudget))];
           emitContext(canonical);
         }
         if (canonical.length > 1) {
@@ -1916,7 +1846,7 @@ async function runAi(settings, messages, win, opts) {
     // Метрики раунда в «Консоль» (вкладка «Консоль» правой панели): без цифр
     // любая оптимизация контекста — гадание.
     {
-      const estPrompt = toolsWeight + estimateTokens(JSON.stringify(canonical));
+      const estPrompt = tools.state.weight + estimateTokens(JSON.stringify(canonical));
       const totalMs = Date.now() - roundStartedAt;
       const tokens =
         roundUsage && roundUsage.prompt
@@ -1930,9 +1860,9 @@ async function runAi(settings, messages, win, opts) {
         type: "metrics",
         text:
           "раунд " + (round + 1) + "/" + maxRounds +
-          " · схем " + activeTools.length + " (~" + toolsWeight + " т.)" +
-          (routeInfo && routeInfo.groups.length ? " · групп " + routeInfo.groups.length : "") +
-          (routeInfo && routeInfo.dropped.length ? " · срезано: " + routeInfo.dropped.join(",") : "") +
+          " · схем " + tools.state.active.length + " (~" + tools.state.weight + " т.)" +
+          (tools.state.route && tools.state.route.groups.length ? " · групп " + tools.state.route.groups.length : "") +
+          (tools.state.route && tools.state.route.dropped.length ? " · срезано: " + tools.state.route.dropped.join(",") : "") +
           " · токены " + tokens +
           " · кэш " + cache +
           " · TTFB " + (roundTtfbMs / 1000).toFixed(1) + " с" +
@@ -2055,27 +1985,7 @@ async function runAi(settings, messages, win, opts) {
     // Предохранитель A: модель вызвала реальный инструмент, которого нет в текущем
     // наборе схем (группа не была активирована). Дотягиваем его группу — в этом и
     // следующих раундах схема будет на месте; сам вызов выполняем как обычно.
-    if (!planMode && routeInfo) {
-      const fresh = [];
-      for (const c of calls) {
-        const gid = groupOfTool(c.name);
-        if (!gid || stickyGroups.has(gid)) continue;
-        stickyGroups.add(gid);
-        fresh.push(gid);
-      }
-      if (fresh.length) {
-        refreshTools();
-        // Группа могла не поместиться в окно: обещать «схем станет больше», когда их не
-        // стало, — врать в глаза. Говорим результат, а не намерение.
-        const fits = fresh.filter((g) => routeInfo.groups.indexOf(g) >= 0);
-        termEmit({
-          type: "metrics",
-          text: fits.length
-            ? "🔧 «" + calls[0].name + "» вне набора схем — включаю группу «" + fits.join(", ") + "» (схем теперь " + activeTools.length + ")."
-            : "🔧 «" + calls[0].name + "» вне набора схем: группа «" + fresh.join(", ") + "» включена, но её схемы не влезают в окно модели (схем " + activeTools.length + "). Вызов выполняю как обычно.",
-        });
-      }
-    }
+    tools.ensureGroupsFor(calls);
 
     // Все вызовы раунда оказались дублями — завершаем без «пустых» tool_calls.
     if (!calls.length) {

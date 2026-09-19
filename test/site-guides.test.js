@@ -48,6 +48,9 @@ const read = (...p) => fs.readFileSync(path.join(ROOT, ...p), "utf8");
 const MODULE_SRC = read("src", "site-guides.js");
 // Единственное прямое чтение main.js — проверка «этого в оболочке больше нет».
 const MAIN_SRC = read("src", "main.js");
+// Автоподключение справочника группы (guideReadText(gname)) уехало вместе с роутером
+// инструментов в src/run-tools.js (этап B, часть 15) — ищем там, где оно живёт.
+const TOOLS_SRC = read("src", "run-tools.js");
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "site-guides-"));
 const learnedDir = path.join(root, "agent-guides");
@@ -253,7 +256,10 @@ const real = createSiteGuides({
       /guideSafeName,\n  guideFilePath,\n  guideIndex,\n  guideForUrl,\n  agentGuideCall,/.test(MAIN_SRC),
       "инструменты больше не получают справочники"
     );
-    assert.ok(MAIN_SRC.includes("guideReadText(gname)"), "readFile(\"agent-guide:…\") потерял чтение справочника");
+    assert.ok(
+      MAIN_SRC.includes("guideReadText") && TOOLS_SRC.includes("guideReadText(gname)"),
+      "readFile(\"agent-guide:…\") потерял чтение справочника"
+    );
     // Папка приложения и встроенный набор приходят снаружи — модуль их не вычисляет сам.
     assert.ok(!/app\.getPath|__dirname/.test(MODULE_SRC), "модуль сам догадывается о путях приложения");
   });
