@@ -104,6 +104,8 @@ const BREAKS = {
     '        text: "📋 План не закрыт — осталось " + left + " из " + plan.total + " пунктов, прошу агента продолжить делом (попытка " + planNudges + "/2).",',
     '        text: "📋 План не закрыт (" + left + " из " + plan.total + " пунктов) — прошу агента продолжить делом (попытка " + planNudges + "/2).",',
   ],
+  // ── перенос помощников чтения (часть 21) ──
+  readwhole: ["src/agent-tools.js", "        if (lines.length > 800) {", "        if (lines.length > 100000) {"],
 };
 let brokenFile = null;
 if (BREAK) {
@@ -158,6 +160,9 @@ let served = 0;
 let missionBase = -1;
 // Какой запрос (по общему счёту) должен получить 429: -1 — никакой.
 let rateLimitAt = -1;
+// Тринадцатый прогон (чтение большого файла): база запросов этого прогона.
+// -1 — сценарий выключен.
+let readBase = -1;
 const sse = (chunks) => chunks.map((c) => "data: " + JSON.stringify(c) + "\n\n").join("") + "data: [DONE]\n\n";
 const call = (index, id, name, args) => ({ index: index, id: id, type: "function", function: { name: name, arguments: JSON.stringify(args) } });
 
@@ -298,6 +303,23 @@ const answerFor = (n) => {
   if (n === 11) {
     return sse([
       { choices: [{ index: 0, delta: { role: "assistant", content: "Готово: очередь пройдена." } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ]);
+  }
+  // Тринадцатый прогон: чтение большого файла. Помощники чтения (нумерация строк,
+  // язык, карта определений) переехали в src/project-analysis.js (часть 21) — здесь
+  // проверяется, что они доехали до НАСТОЯЩЕГО инструмента, а не только до модуля.
+  if (readBase >= 0 && served > readBase) {
+    const rel = served - readBase;
+    if (rel === 1) {
+      return sse([
+        { choices: [{ index: 0, delta: { role: "assistant", content: "Читаю большой файл.\n" } }] },
+        { choices: [{ index: 0, delta: { tool_calls: [call(0, "call_big", "readFile", { path: "big-live.js" })] } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+      ]);
+    }
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Большой файл прочитан обзором.\n" } }] },
       { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
     ]);
   }
@@ -852,7 +874,47 @@ const callIpc = (channel, ...args) => {
   ok(resumeNotices.length === 1, "«продолжаю миссию» сказано ровно один раз: " + JSON.stringify(resumeNotices));
   await callIpc("settings:set", { longWork: false, agentWorkFiles: false });
 
-  console.log("\n[13] Завершение прогона");
+  console.log("\n[13] Большой файл: структура и края вместо выгрузки целиком");
+  // Файл в 886 строк: помощники чтения переехали в src/project-analysis.js (часть 21).
+  // Проверяем не модуль, а инструмент в НАСТОЯЩЕМ прогоне: доехали ли к нему
+  // нумерация строк, язык файла и карта определений.
+  const bigLines = [
+    "// большой файл живой проверки",
+    "function firstHelper(x) {",
+    "  return x + 1;",
+    "}",
+  ];
+  for (let i = 5; i <= 880; i++) bigLines.push("// наполнение " + i);
+  bigLines.push("class DeepBox {", "  openDeep() {", "    return 42;", "  }", "}", "// последняя строка файла");
+  fs.writeFileSync(path.join(workDir, "big-live.js"), bigLines.join("\n"));
+  const served9 = served;
+  readBase = served;
+  let run9;
+  try {
+    run9 = await callIpc("ai:send", [{ role: "user", content: "Прочитай big-live.js" }], {
+      chatId: "chat-live-round-big",
+      role: "developer",
+    });
+  } finally {
+    readBase = -1;
+  }
+  ok(run9 && run9.ok === true, "прогон с большим файлом завершился без ошибки: " + JSON.stringify(run9 && run9.error));
+  // Результат инструмента лежит в телах запросов — их и читаем (экранирование JSON
+  // не мешает: все искомые куски — внутри одной строки).
+  const bigSeen = requests
+    .slice(served9)
+    .map((r) => JSON.stringify(r.body || {}))
+    .join("\n");
+  ok(/Файл большой: 886 строк/.test(bigSeen), "большой файл прочитан обзором, а не целиком: " + bigSeen.length + " знаков тел запросов");
+  ok(/\(JavaScript\)/.test(bigSeen), "язык файла назван инструментом (помощник langFromExt доехал)");
+  ok(/СТРУКТУРА/.test(bigSeen) && /DeepBox/.test(bigSeen) && /openDeep/.test(bigSeen),
+    "карта определений в обзоре: класс и метод найдены (помощник buildFileOutline доехал)");
+  ok(/НАЧАЛО ФАЙЛА/.test(bigSeen) && /  1 \| \/\/ большой файл живой проверки/.test(bigSeen),
+    "строки в обзоре пронумерованы (помощник numberedLines доехал)");
+  ok(/последняя строка файла/.test(bigSeen), "конец файла в обзоре показан");
+  ok(!/наполнение 500/.test(bigSeen), "середина файла в контекст не вывалена: показан обзор, а не 886 строк");
+
+  console.log("\n[14] Завершение прогона");
   ok(events.some((e) => e.ev && e.ev.type === "done"), "прогон сообщил о завершении");
   ok(fs.existsSync(path.join(workDir, "round-live.txt")), "инструмент раунда выполнился: файл создан");
 

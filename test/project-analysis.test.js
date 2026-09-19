@@ -273,6 +273,119 @@ write(".env.local", "SECRET=2\n");
     assert.strictEqual(big.truncated, true, "обрезанный ответ не помечен");
   });
 
+  // ── Чтение файлов инструментами (этап B, часть 21) ─────────────────────────
+  // Нумерация, язык, карта определений и диапазоны блоков. Ошибка здесь тихая:
+  // сбитое число уводит правку на чужую строку, потерянный предел раздувает
+  // ответ, а сломанный фильтр заставляет агента «не видеть» нужный метод.
+  await test("нумерация строк: числа настоящие, за концом файла строк не выдумывают", () => {
+    const all = ["a", "b", "c", "d"];
+    assert.strictEqual(analysis.numberedLines(all, 1, 2, all.length), "1 | a\n2 | b", "нумерация поехала");
+    // pad считается по числу строк ВСЕГО файла: иначе «9» и «10» встают по-разному
+    const wide = Array.from({ length: 12 }, (_, i) => "s" + i);
+    assert.strictEqual(
+      analysis.numberedLines(wide, 10, 12, wide.length),
+      "10 | s9\n11 | s10\n12 | s11",
+      "числа не выровнены или хвост потерян: " + JSON.stringify(analysis.numberedLines(wide, 10, 12, wide.length))
+    );
+    assert.strictEqual(analysis.numberedLines(all, 3, 99, all.length), "3 | c\n4 | d", "чтение за концом файла выдумало строки");
+    assert.strictEqual(analysis.numberedLines(all, 9, 10, all.length), "", "за концом файла вернулась выдуманная строка");
+  });
+
+  await test("язык файла: по расширению, незнакомый — просто «текст»", () => {
+    assert.strictEqual(analysis.langFromExt("src/a.tsx"), "TypeScript/React", "TSX не узнан");
+    assert.strictEqual(analysis.langFromExt("C:/проект/УТИЛИТЫ.PY"), "Python", "верхний регистр расширения не учтён");
+    assert.strictEqual(analysis.langFromExt("notes.md"), "Markdown", "Markdown не узнан");
+    assert.strictEqual(analysis.langFromExt("data.bin"), "текст", "незнакомое расширение названо языком");
+    assert.strictEqual(analysis.langFromExt(""), "текст", "пустой путь не обработан");
+    assert.strictEqual(analysis.langFromExt(undefined), "текст", "отсутствие пути роняет помощник");
+  });
+
+  // В теле есть управляющие строки (if / for): по форме они похожи на метод
+  // («имя(...) {»), и карта файла не имеет права принимать их за определения.
+  const SAMPLE = [
+    "// шапка файла",
+    "export function doWork(x) {",
+    "  if (x > 0) {",
+    "    return x;",
+    "  }",
+    "  for (const y of x) {",
+    "    log(y);",
+    "  }",
+    "}",
+    "class Box {",
+    "  open() {",
+    "    return 1;",
+    "  }",
+    "}",
+    "# Заголовок",
+    ".btn {",
+    '<div id="app" class="wrap main">',
+  ].join("\n");
+
+  await test("карта файла: функции, классы, методы, заголовки, css и html с настоящими строками", () => {
+    const { entries, text } = analysis.buildFileOutline(SAMPLE, null, 300);
+    assert.strictEqual(entries.length, 6, "распознано не то число определений: " + JSON.stringify(entries));
+    assert.deepStrictEqual(
+      entries[0],
+      { line: 2, kind: "функция", name: "doWork" },
+      "функция найдена не на своей строке: " + JSON.stringify(entries[0])
+    );
+    assert.deepStrictEqual(
+      entries.slice(1, 3),
+      [
+        { line: 10, kind: "класс", name: "Box" },
+        { line: 11, kind: "метод", name: "open" },
+      ],
+      "класс и метод распознаны неверно: " + JSON.stringify(entries.slice(1, 3))
+    );
+    // Управляющие строки и тело метода определениями не считаются: иначе карта
+    // файла забита мусором («if», «for», «return») и агент не видит настоящих имён.
+    const junk = entries.filter((e) => ["if", "for", "while", "switch", "catch", "return", "log"].includes(e.name));
+    assert.deepStrictEqual(junk, [], "управляющая строка попала в карту как определение: " + JSON.stringify(junk));
+    const html = entries[entries.length - 1];
+    assert.ok(html && html.kind === "html" && /#app/.test(html.name) && /\.wrap/.test(html.name),
+      "html-тег с id/классом не распознан: " + JSON.stringify(html));
+    // Номера выровнены по числу строк файла (12 → два знака), иначе карта «плывёт».
+    assert.ok(/^ 2 \| функция/.test(text), "номера строк в тексте карты не выровнены: " + JSON.stringify(text.split("\n")[0]));
+  });
+
+  await test("карта файла: предел записей и обрезка длинного имени", () => {
+    assert.strictEqual(analysis.buildFileOutline(SAMPLE, null, 3).entries.length, 3, "предел записей карты не соблюдён");
+    // Имя обрезается по 90 знакам: иначе одна длинная строка ломает ответ.
+    const long = analysis.buildFileOutline("function " + "a".repeat(200) + "() {\n}", null, 300).entries;
+    assert.ok(long[0] && long[0].name.length <= 90, "длинное имя не обрезано: " + (long[0] && long[0].name.length));
+  });
+
+  await test("карта файла: фильтр по имени и виду, мусорный фильтр не роняет", () => {
+    const byName = analysis.buildFileOutline(SAMPLE, "Box", 300).entries;
+    assert.deepStrictEqual(byName.map((e) => e.name), ["Box"], "фильтр по имени вернул не то: " + JSON.stringify(byName));
+    const byKind = analysis.buildFileOutline(SAMPLE, "класс", 300).entries;
+    assert.deepStrictEqual(byKind.map((e) => e.name), ["Box"], "фильтр по виду определения не работает: " + JSON.stringify(byKind));
+    // Негодное регулярное выражение — фильтра нет, а не исключение: агент не должен
+    // получать отказ инструмента из-за одной скобки в запросе.
+    assert.strictEqual(analysis.buildFileOutline(SAMPLE, "[", 300).entries.length, 6, "мусорный фильтр съел карту файла");
+  });
+
+  await test("диапазоны блоков: конец — строка перед следующим определением", () => {
+    const ranges = analysis.buildBlockRanges(SAMPLE.split("\n"));
+    assert.strictEqual(ranges.length, 6, "диапазонов не столько, сколько определений: " + ranges.length);
+    assert.deepStrictEqual(
+      ranges[0],
+      { start: 2, kind: "функция", name: "doWork", end: 9 },
+      "границы первого блока неверны: " + JSON.stringify(ranges[0])
+    );
+    assert.strictEqual(ranges[1].start, 10, "второй блок начинается не на своём определении");
+    assert.strictEqual(ranges[1].end, 10, "блок класса не кончается перед методом: " + ranges[1].end);
+    assert.strictEqual(ranges[2].name, "open", "метод внутри класса потерян");
+    assert.strictEqual(ranges[2].end, 14, "тело метода обрезано не по следующему определению: " + ranges[2].end);
+    // Последний блок доходит до конца файла — иначе агент не увидит хвост.
+    const last = ranges[ranges.length - 1];
+    assert.strictEqual(last.start, 17, "последний блок начинается не там: " + last.start);
+    assert.strictEqual(last.end, 17, "последний блок не доходит до конца файла: " + last.end);
+    assert.deepStrictEqual(analysis.buildBlockRanges([]), [], "пустой файл дал блоки");
+    assert.deepStrictEqual(analysis.buildBlockRanges(["просто текст"]), [], "текст без определений дал блоки");
+  });
+
   await test("в оболочке этого больше нет, а модуль собран на своём месте", () => {
     for (const gone of [
       "function projectSourceFiles(",
@@ -280,14 +393,30 @@ write(".env.local", "SECRET=2\n");
       "function refactorRenameFiles(",
       "function findSymbolReferences(",
       "const escRe = (s) => String(s).replace",
+      "function numberedLines(",
+      "function langFromExt(",
+      "const OUTLINE_RULES = [",
+      "function buildFileOutline(",
+      "function buildBlockRanges(",
     ]) {
       assert.ok(MAIN_SRC.indexOf(gone) < 0, "в main.js осталось: " + gone);
     }
     assert.ok(/const \{ createProjectAnalysis \} = require\("\.\/project-analysis\.js"\)/.test(MAIN_SRC), "модуль не подключён");
     assert.ok(/createProjectAnalysis\(\{ fs, path \}\)/.test(MAIN_SRC), "модуль собран не на своём месте или без fs/path");
-    for (const use of ["projectSourceFiles,", "buildFileStructure,", "refactorRenameFiles,", "findSymbolReferences,", "argsPathIsFile,", "escRe }"]) {
+    for (const use of ["projectSourceFiles,", "buildFileStructure,", "refactorRenameFiles,", "findSymbolReferences,", "argsPathIsFile,", "escRe,",
+      "numberedLines, langFromExt, buildFileOutline, buildBlockRanges }"]) {
       assert.ok(MAIN_SRC.includes(use), "оболочка перестала отдавать инструментам: " + use);
     }
+    // Инструменты получают помощников чтения прежним списком аргументов — без этого
+    // «структура файла» и чтение куска файла падают у пользователя. Сверяем именно
+    // место в списке (после snapshotFileForUndo): по одному имени проверка проходила
+    // бы и после вычёркивания из списка, потому что перенос строки тот же.
+    const deps = ["  snapshotFileForUndo,", "  numberedLines,", "  langFromExt,", "  buildFileOutline,", "  buildBlockRanges,", "  stageAllSafe,"].join("\n");
+    assert.ok(MAIN_SRC.includes(deps), "помощники чтения не переданы инструментам поимённо");
+    assert.ok(
+      MODULE_SRC.includes("numberedLines, langFromExt, buildFileOutline, buildBlockRanges }"),
+      "модуль не отдаёт помощников чтения"
+    );
     assert.ok(MODULE_SRC.includes("3000") && MODULE_SRC.includes("400") && MODULE_SRC.includes("100"), "пределы пропали из модуля");
     assert.ok(!/require\("(?!\.\/)/.test(MODULE_SRC), "модуль тянет зависимости со стороны");
   });

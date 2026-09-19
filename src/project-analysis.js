@@ -156,7 +156,100 @@ function findSymbolReferences(root, symbol) {
   }
   return { error: null, hits, truncated: hits.length >= 100 };
 }
-  return { projectSourceFiles, buildFileStructure, refactorRenameFiles, findSymbolReferences, argsPathIsFile, escRe };
+// ── Чтение файлов: нумерация строк, язык, структура ──────────────────────────
+// Вынесено из main.js (этап B, часть 21). На этих помощниках стоят инструменты
+// чтения файла и «структура файла»: без нумерации агент не может сослаться на
+// строку, а без карты определений — осмотреть большой файл, не читая его целиком.
+// Ошибка здесь тихая и дорогая: сбитая нумерация уводит правку на чужую строку,
+// а потерянный предел раздувает ответ так, что агент его не прочтёт.
+
+// Строки файла с номерами (pad по числу строк всего файла): « 12 | код».
+function numberedLines(all, fromLine, toLine, total) {
+  const pad = String(total).length;
+  const out = [];
+  for (let i = fromLine - 1; i < Math.min(toLine, all.length); i++) {
+    out.push(String(i + 1).padStart(pad, " ") + " | " + all[i]);
+  }
+  return out.join("\n");
+}
+
+function langFromExt(p) {
+  const ext = path.extname(p || "").toLowerCase();
+  const map = {
+    ".js": "JavaScript", ".jsx": "JavaScript/React", ".ts": "TypeScript", ".tsx": "TypeScript/React",
+    ".py": "Python", ".go": "Go", ".rs": "Rust", ".java": "Java", ".kt": "Kotlin", ".c": "C",
+    ".cpp": "C++", ".h": "C/C++ header", ".cs": "C#", ".rb": "Ruby", ".php": "PHP", ".swift": "Swift",
+    ".html": "HTML", ".htm": "HTML", ".css": "CSS", ".scss": "SCSS", ".vue": "Vue", ".svelte": "Svelte",
+    ".json": "JSON", ".yaml": "YAML", ".yml": "YAML", ".toml": "TOML", ".md": "Markdown",
+    ".sh": "Shell", ".bash": "Bash", ".sql": "SQL", ".dart": "Dart", ".lua": "Lua",
+  };
+  return map[ext] || "текст";
+}
+
+// Карта структуры файла: определения с номерами строк (языконезависимые эвристики)
+const OUTLINE_RULES = [
+  { kind: "функция", re: /^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/ },
+  { kind: "функция", re: /^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\(|function)/ },
+  { kind: "класс", re: /^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)/ },
+  { kind: "класс", re: /^\s*(?:export\s+)?interface\s+([A-Za-z_$][\w$]*)/ },
+  { kind: "метод", re: /^\s{2,}(?:async\s+)?(?:get|set\s+)?(?!(?:for|while|if|switch|catch|return)\b)([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/ },
+  { kind: "функция", re: /^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)/ },
+  { kind: "класс", re: /^\s*class\s+([A-Za-z_]\w*)/ },
+  { kind: "функция", re: /^\s*func\s+([A-Za-z_]\w*)/ },
+  { kind: "функция", re: /^\s*(?:public|private|protected|internal)?\s*(?:static\s+)?(?:async\s+)?(?:fn|function)\s+([A-Za-z_$][\w$]*)/ },
+  { kind: "функция", re: /^\s*(?:def|pub\s+fn)\s+([A-Za-z_]\w*)/ },
+  { kind: "заголовок", re: /^(#{1,4})\s+(.*)$/, nameOf: (m) => "#".repeat(m[1].length) + " " + m[2].slice(0, 80) },
+  { kind: "css", re: /^([.#][\w-]+)\s*\{/ },
+  { kind: "html", re: /^\s*<([a-zA-Z][\w-]*)([^>]*)>/, nameOf: (m) => {
+      const id = /id=["']([^"']+)["']/.exec(m[2]);
+      const cls = /class=["']([^"']+)["']/.exec(m[2]);
+      return "<" + m[1] + (id ? " #" + id[1] : "") + (cls ? " ." + cls[1].split(/\s+/)[0] : "") + ">";
+    } },
+];
+
+function buildFileOutline(content, filter, cap) {
+  const all = content.split("\n");
+  const entries = [];
+  const filterRe = filter ? (() => { try { return new RegExp(filter, "i"); } catch { return null; } })() : null;
+  const pad = String(all.length).length;
+  for (let i = 0; i < all.length; i++) {
+    const line = all[i];
+    for (const rule of OUTLINE_RULES) {
+      const m = rule.re.exec(line);
+      if (!m) continue;
+      const name = rule.nameOf ? rule.nameOf(m) : m[1];
+      if (filterRe && !filterRe.test(name) && !filterRe.test(rule.kind)) continue;
+      entries.push({ line: i + 1, kind: rule.kind, name: String(name).slice(0, 90) });
+      break; // одна запись на строку
+    }
+    if (entries.length >= cap) break;
+  }
+  const text = entries.map((e) => String(e.line).padStart(pad, " ") + " | " + e.kind.padEnd(8, " ") + " | " + e.name).join("\n");
+  return { entries, text };
+}
+
+// Диапазоны определений файла (start..end) по тем же правилам, что и fileOutline.
+// end = строка перед началом следующего определения (или последняя строка файла) —
+// приблизительные, но достаточные границы «блока» для режима searchFile blocks:true.
+function buildBlockRanges(all) {
+  const ranges = [];
+  for (let i = 0; i < all.length; i++) {
+    const line = all[i];
+    for (const rule of OUTLINE_RULES) {
+      const m = rule.re.exec(line);
+      if (!m) continue;
+      const name = rule.nameOf ? rule.nameOf(m) : m[1];
+      ranges.push({ start: i + 1, kind: rule.kind, name: String(name).slice(0, 90) });
+      break; // одна запись на строку
+    }
+  }
+  for (let i = 0; i < ranges.length; i++) {
+    ranges[i].end = i + 1 < ranges.length ? ranges[i + 1].start - 1 : all.length;
+  }
+  return ranges;
+}
+
+  return { projectSourceFiles, buildFileStructure, refactorRenameFiles, findSymbolReferences, argsPathIsFile, escRe, numberedLines, langFromExt, buildFileOutline, buildBlockRanges };
 }
 
 module.exports = { createProjectAnalysis };
