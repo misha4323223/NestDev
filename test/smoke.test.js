@@ -9968,7 +9968,10 @@ async function testPromptCacheAndUsage() {
       "нет отката, если провайдер отверг stream_options внутри ответа"
     );
     assert.ok(/includeUsage = false;/.test(mainSrc), "флаг не выключается после отказа");
-    assert.ok(/round--;\s*continue;/.test(mainSrc), "раунд не повторяется после отказа");
+    assert.ok(
+      /if \(roundOut\.kind === "repeat"\) \{[\s\S]{0,220}round--;[\s\S]{0,220}continue;/.test(mainSrc),
+      "раунд не повторяется после отказа"
+    );
     // Интерфейс
     // Строка метрик живёт в приёмнике событий терминала (side-panel.js).
     const metricsUi = uiFind('ev.type === "metrics"');
@@ -12315,7 +12318,13 @@ async function testSandboxObstacles() {
     // Предела «не больше 3 попыток» больше нет: именно он заставлял пользователя
     // писать «продолжай» руками при лимите «8 запросов в минуту».
     assert.ok(!/rateRetries < 3/.test(mainSrc), "вернулся жёсткий предел в 3 попытки");
-    assert.ok(/state\.rateRetries\+\+;/.test(mainSrc) && /round--;\s*\n\s*continue;/.test(mainSrc), "повтор не возвращает раунд на перезапуск");
+    assert.ok(/state\.rateRetries\+\+;/.test(mainSrc), "лимит раунда не отмечается");
+    // Повтор раунда: с правки 1.5.173 между `round--` и `continue` стоит пометка
+    // «это та же попытка» — условный ход остаётся тем же.
+    assert.ok(
+      /if \(roundOut\.kind === "repeat"\) \{[\s\S]{0,220}round--;[\s\S]{0,220}continue;/.test(mainSrc),
+      "повтор не возвращает раунд на перезапуск"
+    );
     assert.ok(
       /const noteSuccess = \(\) => \{\s*state\.rateRetries = 0;\s*state\.unavailableRetries = 0;/.test(mainSrc),
       "счётчики повторов не сбрасываются на успехе"

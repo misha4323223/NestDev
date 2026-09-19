@@ -572,6 +572,14 @@ const onlyMission = (dir) => {
     assert.ok(/const after = await batchCtl\.afterRound\(canonical\)/.test(MAIN_SRC), "прогон не спрашивает границу батча");
     // Призывы по текстовому ответу живут в модуле призывов (часть 20) —
     // сторож миссии спрашивают там.
+    // Правка 1.5.173: повтор раунда (лимит/сбой) — та же попытка, а не новый раунд.
+    assert.ok(
+      /if \(!repeatAttempt\) mission\.state\.rounds\+\+;/.test(MAIN_SRC),
+      "повтор раунда тратит второй раунд миссии — её пределы срабатывают раньше времени"
+    );
+    assert.ok(/repeatAttempt = true;/.test(MAIN_SRC), "повтор не помечается как та же попытка");
+    assert.ok(/if \(!firstRoundHandled\) \{/.test(MAIN_SRC), "«продолжаю миссию» может объявляться дважды за прогон");
+    assert.ok(/mission\.resume\(\)/.test(MAIN_SRC), "продолжение миссии потерялось");
     const nudgeSrc = read("src", "run-nudge.js");
     assert.ok(nudgeSrc.includes("mission.canNudge()"), "сторож миссии не спрашивают при текстовом ответе");
     assert.ok(nudgeSrc.includes("mission.nudge(o.text)"), "призыв не получает ответ модели");

@@ -88,7 +88,8 @@ const plan = (done, total, failedCount) => ({ done: done, total: total, failed: 
     assert.ok(/сбоев: 1/.test(history[0].content), "сбои не названы — модель не поймёт про failed");
     assert.ok(/ВЫПОЛНЯЙ/.test(history[0].content), "просьба не говорит «делай, а не описывай»");
     assert.strictEqual(env.seen.metrics.length, 1, "человеку не сказано, что план не закрыт");
-    assert.ok(/План не закрыт \(2 из 4 пунктов\)/.test(env.seen.metrics[0].text), "неверный текст метрики: " + env.seen.metrics[0].text);
+    assert.ok(/План не закрыт — осталось 2 из 4 пунктов/.test(env.seen.metrics[0].text), "неверный текст метрики: " + env.seen.metrics[0].text);
+    assert.ok(!/\(2 из 4 пунктов\)/.test(env.seen.metrics[0].text), "старая подпись «(2 из 4 пунктов)» читается наоборот");
     assert.ok(/попытка 1\/2/.test(env.seen.metrics[0].text), "не показано, какая это попытка");
     assert.strictEqual(history[0].role, "user", "просьба ушла не как реплика человека");
   });

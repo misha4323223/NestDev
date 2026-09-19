@@ -96,6 +96,14 @@ const BREAKS = {
     '    if (o.toolCalls.length || o.planMode || o.aborted) return { action: "none" };\n',
     '    if (o.toolCalls.length || o.planMode || o.aborted) return { action: "none" };\n    if (true) return { action: "none" };\n',
   ],
+  // ── правки старых ошибок (1.5.173) ──
+  missionround: ["src/main.js", "    if (!repeatAttempt) mission.state.rounds++;\n", "    mission.state.rounds++;\n"],
+  resumeonce: ["src/main.js", "    if (!firstRoundHandled) {\n", "    if (true) {\n"],
+  nudgetext: [
+    "src/run-nudge.js",
+    '        text: "📋 План не закрыт — осталось " + left + " из " + plan.total + " пунктов, прошу агента продолжить делом (попытка " + planNudges + "/2).",',
+    '        text: "📋 План не закрыт (" + left + " из " + plan.total + " пунктов) — прошу агента продолжить делом (попытка " + planNudges + "/2).",',
+  ],
 };
 let brokenFile = null;
 if (BREAK) {
@@ -145,6 +153,11 @@ function FakeWindow() {
 // ── Подменённый провайдер ───────────────────────────────────────────────────
 const requests = []; // { body (объект), stream_options }
 let served = 0;
+// Восьмой прогон (миссия + повтор раунда): база запросов этого прогона.
+// -1 — сценарий выключен. Включается только на время проверки раундов миссии.
+let missionBase = -1;
+// Какой запрос (по общему счёту) должен получить 429: -1 — никакой.
+let rateLimitAt = -1;
 const sse = (chunks) => chunks.map((c) => "data: " + JSON.stringify(c) + "\n\n").join("") + "data: [DONE]\n\n";
 const call = (index, id, name, args) => ({ index: index, id: id, type: "function", function: { name: name, arguments: JSON.stringify(args) } });
 
@@ -288,6 +301,23 @@ const answerFor = (n) => {
       { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
     ]);
   }
+  // Восьмой прогон: активная миссия + повтор раунда после лимита (правка 1.5.173).
+  // Первый запрос — 429, значит прогон повторит ТОТ ЖЕ раунд; счётчик раундов
+  // миссии не должен вырасти дважды на одну и ту же попытку.
+  if (missionBase >= 0 && served > missionBase) {
+    const rel = served - missionBase;
+    if (rel === 2 || rel === 3) {
+      return sse([
+        { choices: [{ index: 0, delta: { role: "assistant", content: "Смотрю файлы.\n" } }] },
+        { choices: [{ index: 0, delta: { tool_calls: [call(0, "call_m" + rel, "listFiles", { path: "." })] } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+      ]);
+    }
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Миссия выполнена.\n" } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ]);
+  }
   // Пятый прогон: пустой итоговый ответ — прогон обязан ОДИН раз попросить
   // итоговый отчёт (решение в src/run-batch.js, часть 19б).
   if (n === 12) {
@@ -391,8 +421,9 @@ const provider = http.createServer((req, res) => {
       served++;
       requests.push({ body: parsed || {}, streamOptions: (parsed && parsed.stream_options) || null });
       // Первый запрос раунда — лимит провайдера: прогон обязан подождать и повторить
-      // ТОТ ЖЕ раунд, ничего не спрашивая у человека.
-      if (served === 1) {
+      // ТОТ ЖЕ раунд, ничего не спрашивая у человека. Второй такой запрос задаёт
+      // сценарий миссии (rateLimitAt) — он ставит лимит посреди работы.
+      if (served === 1 || served === rateLimitAt) {
         res.writeHead(429, { "Content-Type": "application/json", "retry-after": "1" });
         return res.end(JSON.stringify({ error: { message: "rate limit exceeded" } }));
       }
@@ -742,7 +773,7 @@ const callIpc = (channel, ...args) => {
     "попытки пронумерованы верно: " + JSON.stringify(planNudgeMetrics)
   );
   ok(
-    planNudgeMetrics.length > 0 && /3 из 3 пунктов/.test(planNudgeMetrics[0]),
+    planNudgeMetrics.length > 0 && /осталось 3 из 3 пунктов/.test(planNudgeMetrics[0]),
     "число незакрытых пунктов названо верно: " + JSON.stringify(planNudgeMetrics[0])
   );
   // Просьба уходит МОДЕЛИ (а не только человеку): считаем её в телах запросов.
@@ -762,7 +793,66 @@ const callIpc = (channel, ...args) => {
     .join("");
   ok(/Готово окончательно/.test(nudgeText), "работа закончилась нормальным финалом: " + JSON.stringify(nudgeText));
 
-  console.log("\n[12] Завершение прогона");
+  console.log("\n[12] Раунды миссии: повтор после лимита не тратит второй раунд");
+  const missionStore = require(path.join(ROOT, "src", "mission-store.js"));
+  const missionChatId = "chat-live-round-mission-rounds";
+  // Миссию заводим настоящим хранилищем: она лежит папкой в рабочей папке
+  // проекта (.agent/missions/<id>), и прогон подхватывает её по chatId.
+  await callIpc("settings:set", { longWork: true, agentWorkFiles: true });
+  const createdMission = missionStore.missionCreate(workDir, {
+    goal: "Разобрать входящие и ответить",
+    title: "Раунды миссии",
+    role: "manager",
+    chatId: missionChatId,
+    steps: [{ title: "прочитать" }, { title: "ответить" }],
+  });
+  ok(createdMission.ok === true, "миссия заведена на диске: " + JSON.stringify(createdMission.error || ""));
+  const missionId = createdMission.mission.id;
+
+  const ev8 = events.length;
+  const served8 = served;
+  missionBase = served; // с этого момента провайдер играет сценарий миссии
+  rateLimitAt = served + 1; // лимит на самом первом запросе прогона — повтор раунда
+  let run8;
+  try {
+    run8 = await callIpc("ai:send", [{ role: "user", content: "Работай по миссии" }], {
+      chatId: missionChatId,
+      role: "manager",
+    });
+  } finally {
+    missionBase = -1;
+    rateLimitAt = -1;
+  }
+  ok(run8 && run8.ok === true, "прогон по миссии завершился без ошибки: " + JSON.stringify(run8 && run8.error));
+
+  const missionEvents = events
+    .slice(ev8)
+    .filter((e) => e.ev && e.ev.type === "mission")
+    .map((e) => e.ev);
+  ok(missionEvents.length > 0, "прогон отдаёт состояние миссии панели: " + missionEvents.length);
+  ok(
+    missionEvents.some((e) => e.id === missionId),
+    "подхвачена именно заведённая миссия (" + missionId + "): " + JSON.stringify(missionEvents.map((e) => e.id)[0])
+  );
+
+  const attempts = served - served8;
+  const repeats = 1; // один 429 в начале сценария
+  const roundsSeen = Math.max.apply(null, missionEvents.map((e) => Number(e.rounds) || 0).concat([0]));
+  ok(attempts >= 4, "сценарий правда прогнал несколько раундов с повтором: " + attempts);
+  ok(
+    roundsSeen === attempts - repeats,
+    "раунд миссии не тратится на повтор: попыток " + attempts + ", повторов " + repeats +
+      ", ожидали раундов " + (attempts - repeats) + ", а прогон насчитал " + roundsSeen
+  );
+  // И «продолжаю миссию с места остановки» объявлено ровно один раз, несмотря на повтор.
+  const resumeNotices = events
+    .slice(ev8)
+    .filter((e) => e.ev && e.ev.type === "notice" && /продолжаю с места остановки/i.test(String(e.ev.text || "")))
+    .map((e) => e.ev.text);
+  ok(resumeNotices.length === 1, "«продолжаю миссию» сказано ровно один раз: " + JSON.stringify(resumeNotices));
+  await callIpc("settings:set", { longWork: false, agentWorkFiles: false });
+
+  console.log("\n[13] Завершение прогона");
   ok(events.some((e) => e.ev && e.ev.type === "done"), "прогон сообщил о завершении");
   ok(fs.existsSync(path.join(workDir, "round-live.txt")), "инструмент раунда выполнился: файл создан");
 

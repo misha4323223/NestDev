@@ -1712,12 +1712,21 @@ async function runAi(settings, messages, win, opts) {
   // Батчи: 25 раундов работы, затем проверка «миссия жива? лимиты? был ли прогресс?»
   // и следующий батч с тем же контекстом. Долгая работа перестаёт быть одной
   // длинной попыткой, которую обрывает счётчик раундов.
+  // Повтор раунда после лимита/сбоя — это ТА ЖЕ попытка, а не новый раунд: иначе
+  // счётчик раундов миссии растёт вдвое под лимитами провайдера, и её пределы
+  // (а также порог авто-миссии на 6-м раунде) наступают раньше настоящего времени.
+  // Флаг заодно не даёт второй раз объявить «продолжаю миссию с места остановки»:
+  // без него повтор первого раунда писал бы в журнал миссии лишнюю строку.
+  let repeatAttempt = false;
+  let firstRoundHandled = false;
   for (let batch = 1; ; batch++) {
   for (let round = 0; round < maxRounds; round++) {
-    mission.state.rounds++;
+    if (!repeatAttempt) mission.state.rounds++;
+    repeatAttempt = false;
     // Незакрытая миссия (в том числе с прошлого запуска приложения) — продолжаем её,
     // а не начинаем работу заново: файлы и журнал лежат на диске.
-    if (mission.state.rounds === 1) {
+    if (!firstRoundHandled) {
+      firstRoundHandled = true;
       const resumed = mission.resume();
       if (resumed) {
         emit({ type: "notice", text: resumed.notice });
@@ -1752,7 +1761,8 @@ async function runAi(settings, messages, win, opts) {
     // остаётся прогон: и повтор раунда, и фатальная ошибка — его решение.
     const roundOut = await roundRunner.run({ n: round, maxRounds: maxRounds, messages: canonical });
     if (roundOut.kind === "repeat") {
-      round--;
+      round--; // тот же логический раунд: номер не тратится
+      repeatAttempt = true; // и раунд миссии не тратится тоже
       continue;
     }
     if (roundOut.kind === "error") throw roundOut.error;

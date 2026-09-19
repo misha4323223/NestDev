@@ -1,6 +1,6 @@
 {
   "name": "ai-agent",
-  "version": "1.5.172",
+  "version": "1.5.173",
   "private": true,
   "description": "AI Developer Agent — чат с AI-агентом (Ollama / Groq / внешние API), файловые операции и git",
   "author": "AI Developer Agent",

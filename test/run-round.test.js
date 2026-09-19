@@ -450,8 +450,12 @@ const RUN = { n: 2, maxRounds: 25, messages: HISTORY };
     assert.ok(/const roundRunner = createRunRound\(\{/.test(mainSrc), "модуль не собран в прогоне");
     assert.ok(/await roundRunner\.run\(\{ n: round, maxRounds: maxRounds, messages: canonical \}\)/.test(mainSrc),
       "раунд не идёт через модуль");
-    assert.ok(/if \(roundOut\.kind === "repeat"\) \{[\s\S]{0,60}round--;[\s\S]{0,20}continue;/.test(mainSrc),
-      "повтор раунда перестал быть решением прогона");
+    // С правки 1.5.173 между `round--` и `continue` стоит пометка «это та же попытка»
+    // (повтор не тратит ни номер раунда, ни раунд миссии).
+    assert.ok(
+      /if \(roundOut\.kind === "repeat"\) \{[\s\S]{0,240}round--;[\s\S]{0,240}continue;/.test(mainSrc),
+      "повтор раунда перестал быть решением прогона"
+    );
     assert.ok(/getBudget: \(\) => budget/.test(mainSrc) && /getModelWindow: \(\) => modelWin/.test(mainSrc),
       "живые значения переданы копией");
     assert.ok(!/app\.getPath|__dirname|require\(/.test(src), "модуль сам достаёт состояние вместо внедрения");

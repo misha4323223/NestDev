@@ -56,7 +56,7 @@ function createRunNudge(deps) {
       const left = plan.total - plan.done - plan.failed;
       termEmit({
         type: "metrics",
-        text: "📋 План не закрыт (" + left + " из " + plan.total + " пунктов) — прошу агента продолжить делом (попытка " + planNudges + "/2).",
+        text: "📋 План не закрыт — осталось " + left + " из " + plan.total + " пунктов, прошу агента продолжить делом (попытка " + planNudges + "/2).",
       });
       history.push({
         role: "user",
