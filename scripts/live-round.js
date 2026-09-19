@@ -58,6 +58,18 @@ const BREAKS = {
     '      if (verdict.kind === "repeat") return { kind: "repeat" };\n',
     '      if (verdict.kind === "repeat") return { kind: "ok", text: "", toolCalls: [] };\n',
   ],
+  textcalls: [
+    "src/run-calls.js",
+    "    const fallbackCalls = extractToolCallsFromText(round.text);\n",
+    "    const fallbackCalls = [];\n",
+  ],
+  dedup: ["src/run-calls.js", "      if (seenCalls.has(sig)) continue;\n", ""],
+  extra: ["src/run-calls.js", "        if (c.extraContent) call.extra_content = c.extraContent;\n", ""],
+  parallel: [
+    "src/run-calls.js",
+    "  const canRunParallel = (calls, planMode) =>\n    !planMode && calls.length > 1 && calls.every((c) => PARALLEL_SAFE_TOOLS.has(c.name));\n",
+    "  const canRunParallel = (calls, planMode) => false;\n",
+  ],
 };
 let brokenFile = null;
 if (BREAK) {
@@ -129,6 +141,60 @@ const answerFor = (n) => {
       { choices: [{ index: 0, delta: { role: "assistant", content: "Начало ответа, который " } }] },
       { choices: [{ index: 0, delta: { content: "оборвался" } }] },
       { choices: [{ index: 0, delta: {}, finish_reason: "length" }] },
+    ]);
+  }
+  // Третий прогон: модель печатает вызов инструмента ТЕКСТОМ (запасной способ),
+  // затем присылает дубль вызова и подпись мысли (Gemini) — все три вещи живут
+  // в src/run-calls.js (часть 18).
+  if (n === 5) {
+    return sse([
+      {
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: "assistant",
+              content:
+                'Пишу файл, вызываю инструмент: {"name":"writeFile","arguments":{"path":"from-text.txt","content":"из текста"}}\n',
+            },
+          },
+        ],
+      },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ]);
+  }
+  if (n === 6) {
+    // Индекс отличает вызовы в одном ответе (транспорт складывает их по index),
+    // поэтому три вызова идут одним чанком с индексами 0, 1, 2.
+    const read = (index, id, path, extra) => {
+      const tc = { index: index, id: id, type: "function", function: { name: "readFile", arguments: JSON.stringify({ path: path }) } };
+      if (extra) tc.extra_content = extra;
+      return tc;
+    };
+    const sig = { google: { thought_signature: "SIG-LIVE-1==" } };
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Читаю оба файла.\n" } }] },
+      {
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                read(0, "call_r1", "from-text.txt", sig),
+                read(1, "call_r2", "from-text.txt"),
+                read(2, "call_r3", "round-live.txt"),
+              ],
+            },
+          },
+        ],
+      },
+      { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    ]);
+  }
+  if (n === 7) {
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Готово." } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
     ]);
   }
   return sse([
@@ -304,7 +370,57 @@ const callIpc = (channel, ...args) => {
   ok(cutNotices.some((t) => /продолжай/.test(t)), "человеку сказано, что делать с оборванным ответом: " + JSON.stringify(cutNotices));
   ok(/Начало ответа, который оборвался/.test(cutText), "текст второго прогона дошёл целиком: " + JSON.stringify(cutText));
 
-  console.log("\n[7] Завершение прогона");
+  console.log("\n[7] Вызовы раунда: текстовый вызов, дубль, подпись мысли, пачка");
+  const evBefore3 = events.length;
+  const run3 = await callIpc("ai:send", [{ role: "user", content: "Прочитай файлы" }], { chatId: "chat-live-round-calls", role: "developer" });
+  ok(run3 && run3.ok === true, "прогон с вызовами завершился без ошибки: " + JSON.stringify(run3 && run3.error));
+  ok(served === 7, "провайдер получил ровно 7 запросов за три прогона: " + served);
+
+  const overrides = events.slice(evBefore3).filter((e) => e.ev && e.ev.type === "text_override").map((e) => e.ev.text);
+  ok(overrides.length === 1, "показанный текст переписан ровно один раз: " + JSON.stringify(overrides));
+  ok(
+    overrides.length === 1 && /Пишу файл/.test(overrides[0]) && !/writeFile/.test(overrides[0]) && !/```/.test(overrides[0]),
+    "из показанного текста убран JSON-вызов: " + JSON.stringify(overrides)
+  );
+  const fromTextFile = path.join(workDir, "from-text.txt");
+  ok(fs.existsSync(fromTextFile), "вызов, напечатанный текстом, выполнен — файл на диске");
+  ok(
+    fs.existsSync(fromTextFile) && /из текста/.test(fs.readFileSync(fromTextFile, "utf8")),
+    "вызов из текста выполнен с теми же аргументами"
+  );
+
+  const order = events
+    .slice(evBefore3)
+    .filter((e) => e.ev && (e.ev.type === "tool_start" || e.ev.type === "tool_result") && e.ev.name === "readFile")
+    .map((e) => e.ev.type);
+  ok(
+    order.join(",") === "tool_start,tool_start,tool_result,tool_result",
+    "read-only вызовы идут параллельно (сначала оба запуска, потом оба результата): " + order.join(",")
+  );
+  const starts = events.slice(evBefore3).filter((e) => e.ev && e.ev.type === "tool_start" && e.ev.name === "readFile");
+  ok(starts.length === 2, "выполнено ровно два разных вызова (дубль не пошёл в работу): " + starts.length);
+
+  // Подпись мысли ищем во ВСЕХ assistant-сообщениях истории: вызовов за прогон
+  // несколько, и первый из них — запись файла, у которой подписи нет.
+  const lastBody = requests[6] && requests[6].body;
+  const allCalls = [].concat(
+    ...(lastBody && lastBody.messages ? lastBody.messages : [])
+      .filter((m) => m.role === "assistant" && m.tool_calls && m.tool_calls.length)
+      .map((m) => m.tool_calls)
+  );
+  const echoed = allCalls.filter((c) => c.extra_content && c.extra_content.google);
+  ok(
+    echoed.length === 1 && echoed[0].extra_content.google.thought_signature === "SIG-LIVE-1==",
+    "подпись мысли (extra_content) вернулась провайдеру — следующий раунд не упадёт с 400"
+  );
+  // Результаты чтения — по идентификаторам вызовов этого раунда: в истории лежат
+  // ещё и результаты прошлого раунда, и они тут ни при чём.
+  const readResults = (lastBody ? lastBody.messages || [] : []).filter(
+    (m) => m.role === "tool" && /^call_r/.test(String(m.tool_call_id || ""))
+  );
+  ok(readResults.length === 2, "в историю записаны результаты обоих прочитанных файлов: " + readResults.length);
+
+  console.log("\n[8] Завершение прогона");
   ok(events.some((e) => e.ev && e.ev.type === "done"), "прогон сообщил о завершении");
   ok(fs.existsSync(path.join(workDir, "round-live.txt")), "инструмент раунда выполнился: файл создан");
 

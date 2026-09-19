@@ -86,6 +86,7 @@ const { createRunMission } = require("./run-mission.js"); // миссия про
 const { createRunTools } = require("./run-tools.js"); // роутер инструментов и справочники прогона: группы, предохранители, вес схем, гайды
 const { createRunRetry } = require("./run-retry.js"); // восстановление прогона после отказа запроса: лимиты, сбои пула, переполнение контекста
 const { createRunRound } = require("./run-round.js"); // один раунд прогона: сборка запроса, поток ответа, метрики
+const { createRunCalls } = require("./run-calls.js"); // вызовы раунда: текстовые, нормализация, история, пачка read-only
 const unifiedPatch = require("./unified-patch.js"); // применение unified diff (applyPatch)
 const codeIndex = require("./code-index.js"); // семантический индекс кода (BM25 + стемминг)
 const yandexCloud = require("./yandex-cloud.js"); // Yandex Cloud REST API: авторизация, дашборд, создание ресурсов
@@ -1638,6 +1639,21 @@ async function runAi(settings, messages, win, opts) {
     estimateTokens,
   });
 
+  // Вызовы раунда (текстовые, нормализация, история, параллельная пачка) — своим
+  // модулем (src/run-calls.js). Список безопасных для параллели инструментов
+  // остаётся здесь: он собран из инструментов всего приложения.
+  const callPrep = createRunCalls({
+    settings,
+    emit,
+    extractToolCallsFromText,
+    genCallId,
+    normalizeToolName,
+    executeTool,
+    truncateText,
+    fmtError,
+    PARALLEL_SAFE_TOOLS,
+  });
+
   const maxRounds = planMode ? 3 : 25;
   let finalText = "";
 
@@ -1708,24 +1724,10 @@ async function runAi(settings, messages, win, opts) {
     const toolCalls = roundOut.toolCalls;
     finalText = roundOut.text;
 
-    // Запасной способ: модель могла напечатать JSON-вызов инструмента текстом,
-    // а не через tool_calls. Находим такие вызовы и выполняем их.
-    // В режиме плана инструменты не выполняются вовсе — план только составляется.
-    if (toolCalls.length === 0 && !planMode) {
-      const fallbackCalls = extractToolCallsFromText(finalText);
-      if (fallbackCalls.length) {
-        for (const fc of fallbackCalls) {
-          toolCalls.push({ id: genCallId(), name: fc.name, args: fc.args });
-        }
-        // Убираем JSON-мусор из показанного пользователю текста
-        let cleaned = finalText;
-        for (const fc of fallbackCalls) {
-          cleaned = cleaned.split(fc.raw).join("");
-        }
-        cleaned = cleaned.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
-        if (cleaned) emit({ type: "text_override", text: cleaned });
-      }
-    }
+    // Запасной способ живёт в src/run-calls.js. Он стоит здесь, ДО призывов и
+    // «пустого отчёта»: найденный в тексте вызов обязан выполниться, а не уйти
+    // в призыв «план не закрыт».
+    callPrep.fromText({ toolCalls: toolCalls, text: finalText, planMode: planMode });
 
     // Модель ответила текстом без вызова инструментов, но план работ не закрыт —
     // это обрыв, а не финал. На выросшем/сжатом контексте слабые модели (особенно
@@ -1792,24 +1794,10 @@ async function runAi(settings, messages, win, opts) {
 
     if (toolCalls.length === 0) return await endRun("");
 
-    // Нормализуем имена, назначаем стабильные id (нужны для tool-сообщений)
-    // и убираем дубли: одинаковый вызов в одном раунде выполняется один раз.
-    const seenCalls = new Set();
-    const calls = [];
-    for (const tc of toolCalls) {
-      const norm = {
-        id: tc.id || genCallId(),
-        name: normalizeToolName(tc.name),
-        args: tc.args && typeof tc.args === "object" ? tc.args : {},
-        // Gemini 3.x: extra_content с thought signature нужно вернуть дословно,
-        // иначе следующий раунд упадёт с 400 (missing thought_signature).
-        ...(tc.extraContent ? { extraContent: tc.extraContent } : {}),
-      };
-      const sig = norm.name + "|" + JSON.stringify(norm.args);
-      if (seenCalls.has(sig)) continue;
-      seenCalls.add(sig);
-      calls.push(norm);
-    }
+    // Нормализация имён, стабильные id, дедупликация и запись в историю —
+    // в src/run-calls.js: там же объяснено, почему дубль вызова и потерянная
+    // подпись мысли (Gemini) стоят дорого.
+    const calls = callPrep.normalize(toolCalls);
     // Предохранитель A: модель вызвала реальный инструмент, которого нет в текущем
     // наборе схем (группа не была активирована). Дотягиваем его группу — в этом и
     // следующих раундах схема будет на месте; сам вызов выполняем как обычно.
@@ -1823,35 +1811,13 @@ async function runAi(settings, messages, win, opts) {
       return { ok: true, text: finalText };
     }
 
-    canonical.push({
-      role: "assistant",
-      content: finalText || null,
-      tool_calls: calls.map((c) => {
-        const call = {
-          id: c.id,
-          type: "function",
-          function: { name: c.name, arguments: JSON.stringify(c.args || {}) },
-        };
-        if (c.extraContent) call.extra_content = c.extraContent;
-        return call;
-      }),
-    });
+    callPrep.recordAssistant(canonical, finalText, calls);
 
-    // Батчинг: если раунд целиком состоит из независимых read-only вызовов —
-    // выполняем их параллельно (экономит по раунду на каждый вызов). Любой
-    // пишущий/интерактивный инструмент в раунде возвращает строгую очередь.
-    if (!planMode && calls.length > 1 && calls.every((c) => PARALLEL_SAFE_TOOLS.has(c.name))) {
-      for (const c of calls) emit({ type: "tool_start", name: c.name, args: c.args });
-      const results = await Promise.all(
-        calls.map((c) =>
-          executeTool(c.name, c.args, settings).catch((e) => "Ошибка инструмента " + c.name + ": " + fmtError(e))
-        )
-      );
-      calls.forEach((c, i) => {
-        const capped = truncateText(results[i], 8000);
-        emit({ type: "tool_result", name: c.name, result: capped });
-        canonical.push({ role: "tool", tool_call_id: c.id, content: capped });
-      });
+    // Батчинг (правило 35 промпта): read-only вызовы раунда идут параллельно,
+    // любая запись или вопрос человеку возвращает строгую очередь. Решение и
+    // порядок событий — в src/run-calls.js, остановка остаётся за прогоном.
+    if (callPrep.canRunParallel(calls, planMode)) {
+      await callPrep.runParallel(calls, canonical);
       if (global.__agentStopRequested) return stopGraceful();
       continue;
     }
