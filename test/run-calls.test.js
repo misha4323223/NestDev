@@ -267,8 +267,10 @@ const TEXT_CALL =
     assert.ok(mainSrc.indexOf("tools.ensureGroupsFor(calls);") > 0, "предохранитель A потерялся");
     assert.ok(mainSrc.indexOf("const PARALLEL_SAFE_TOOLS = new Set([") > 0, "список безопасных для параллели инструментов потерялся");
     assert.ok(mainSrc.indexOf("callPrep.fromText(") > 0 && mainSrc.indexOf("callPrep.normalize(toolCalls)") > 0, "раунд не ходит в модуль");
+    // Призывы по текстовому ответу с части 20 живут в src/run-nudge.js, поэтому
+    // порядок проверяем по ВЫЗОВУ модуля призывов: разбор текста обязан быть раньше.
     assert.ok(
-      mainSrc.indexOf("callPrep.fromText(") < mainSrc.indexOf("planNudges < 2"),
+      mainSrc.indexOf("callPrep.fromText(") < mainSrc.indexOf("nudge.decide(canonical, {"),
       "разбор текстовых вызовов уехал после призывов — найденный вызов потеряется"
     );
     assert.ok(!/app\.getPath|__dirname|require\(/.test(src), "модуль сам достаёт состояние вместо внедрения");

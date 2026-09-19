@@ -89,7 +89,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js"]
+  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -10607,25 +10607,31 @@ async function testChatContextTransfer() {
 async function testLongChatRecovery() {
   const core = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
   const mainSrc = backendSrc();
-  const GUARD_START = "// Модель ответила текстом без вызова инструментов, но план работ не закрыт";
-  const GUARD_END = "// Пустой финальный ответ — не молчим";
+  // Предохранитель «план не закрыт» с части 20 живёт в src/run-nudge.js,
+  // а пустой ответ — в src/run-batch.js. Обе части читаем напрямую.
+  const guardSrc = fs.readFileSync(path.join(ROOT, "src", "run-nudge.js"), "utf8");
+  const GUARD_START = "  const decide = (history, o) => {";
+  const GUARD_END = "    return { action: \"none\" };\n  };\n";
 
   await test("выросший чат: незакрытый план не даёт прогону закончиться текстом", () => {
-    const i = mainSrc.indexOf(GUARD_START);
-    const j = mainSrc.indexOf(GUARD_END);
+    const i = guardSrc.indexOf(GUARD_START);
+    const j = guardSrc.indexOf(GUARD_END);
     assert.ok(i > 0 && j > i, "нет предохранителя «план не закрыт»");
-    const block = mainSrc.slice(i, j);
-    assert.ok(block.includes("toolCalls.length === 0"), "предохранитель не привязан к «нет вызовов инструментов»");
+    const block = guardSrc.slice(i, j);
+    assert.ok(block.includes("o.toolCalls.length"), "предохранитель не привязан к «нет вызовов инструментов»");
     assert.ok(
-      block.includes("activePlanSummary.done + activePlanSummary.failed < activePlanSummary.total"),
+      block.includes("plan.done + plan.failed < plan.total"),
       "не проверяется, что пункты плана закрыты не все"
     );
     assert.ok(block.includes("planNudges < 2"), "нет ограничения повторов — возможен бесконечный цикл");
-    assert.ok(block.includes("canonical.push"), "просьба продолжить не уходит модели");
-    assert.ok(block.includes("continue;"), "прогон всё равно завершается");
+    assert.ok(block.includes("history.push("), "просьба продолжить не уходит модели");
+    assert.ok(block.includes('return { action: "repeat" };'), "прогон всё равно завершается");
     assert.ok(/failed/.test(block), "нет выхода для невыполнимого пункта (failed)");
-    assert.ok(mainSrc.includes("let planNudges = 0;"), "нет счётчика повторов");
+    assert.ok(guardSrc.includes("let planNudges = 0;"), "нет счётчика повторов");
+    // Именно оболочка (main.js), а не backendSrc: модуль призывов в него входит.
+    assert.ok(mainOnlySrc().includes("planNudges") === false, "счётчик призывов остался в оболочке");
     assert.ok(mainSrc.includes("activePlanSummary = null; // план прошлого прогона"), "сводка плана не сбрасывается между прогонами");
+    assert.ok(/if \(nudged.action === "repeat"\) continue;/.test(mainSrc), "прогон не повторяет раунд по решению модуля");
   });
 
   await test("выросший чат: todoWrite отдаёт сводку плана предохранителю", () => {
@@ -10637,8 +10643,8 @@ async function testLongChatRecovery() {
   });
 
   await test("выросший чат: в режиме плана предохранитель выключен", () => {
-    const block = mainSrc.slice(mainSrc.indexOf(GUARD_START), mainSrc.indexOf(GUARD_END));
-    assert.ok(block.includes("!planMode"), "в режиме плана агент будет «продолжать делом» вместо ожидания команды");
+    const block = guardSrc.slice(guardSrc.indexOf(GUARD_START), guardSrc.indexOf(GUARD_END));
+    assert.ok(block.includes("o.planMode"), "в режиме плана агент будет «продолжать делом» вместо ожидания команды");
   });
 
   await test("лимит раундов объясняет, как продолжить, а не просто падает", () => {
@@ -14157,7 +14163,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14167,7 +14173,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));

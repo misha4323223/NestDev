@@ -89,6 +89,7 @@ const { createRunRound } = require("./run-round.js"); // один раунд п�
 const { createRunCalls } = require("./run-calls.js"); // вызовы раунда: текстовые, нормализация, история, пачка read-only
 const { createRunStrict } = require("./run-strict.js"); // строгая очередь вызовов: подтверждения, чекпоинт, аудит, журнал миссии
 const { createRunBatch } = require("./run-batch.js"); // решения после раунда: пустой отчёт, граница батча, закрытие работы
+const { createRunNudge } = require("./run-nudge.js"); // призывы по текстовому ответу: план не закрыт, сторож миссии
 const unifiedPatch = require("./unified-patch.js"); // применение unified diff (applyPatch)
 const codeIndex = require("./code-index.js"); // семантический индекс кода (BM25 + стемминг)
 const yandexCloud = require("./yandex-cloud.js"); // Yandex Cloud REST API: авторизация, дашборд, создание ресурсов
@@ -1408,7 +1409,6 @@ async function runAi(settings, messages, win, opts) {
   // Счётчики повторов, ожидание лимита и лимитер провайдера живут в src/run-retry.js,
   // который собирается ниже (после истории: ему нужно уметь ужимать контекст).
   let reportRetried = false; // пустой финальный текст — один раз просим итоговый отчёт
-  let planNudges = 0; // «план не закрыт, а модель замолчала» — просим продолжить делом (макс. 2)
   activePlanSummary = null; // план прошлого прогона не должен влиять на этот
   // ── Роутер инструментов и справочники ──────────────────────────────────────
   // Состав схем, липкость групп, предохранители A и C, вес схем и автоподключение
@@ -1680,6 +1680,15 @@ async function runAi(settings, messages, win, opts) {
   // и модуль был бы перекрыт числом (живой прогон ловит это сразу).
   const batchCtl = createRunBatch({ emit, mission, pauseMs: 1500 });
 
+  // Призывы по текстовому ответу: счётчик «план не закрыт» живёт внутри модуля
+  // (он собирается один раз на прогон), сводка плана — живым значением.
+  const nudge = createRunNudge({
+    emit,
+    termEmit,
+    mission,
+    getPlanSummary: () => activePlanSummary,
+  });
+
   const maxRounds = planMode ? 3 : 25;
   let finalText = "";
 
@@ -1755,57 +1764,15 @@ async function runAi(settings, messages, win, opts) {
     // в призыв «план не закрыт».
     callPrep.fromText({ toolCalls: toolCalls, text: finalText, planMode: planMode });
 
-    // Модель ответила текстом без вызова инструментов, но план работ не закрыт —
-    // это обрыв, а не финал. На выросшем/сжатом контексте слабые модели (особенно
-    // локальные) «забывают» вызвать инструмент и просто описывают, что осталось, —
-    // раньше прогон на этом заканчивался, и агент выглядел отключившимся.
-    if (
-      toolCalls.length === 0 &&
-      !planMode &&
-      !abort.signal.aborted &&
-      planNudges < 2 &&
-      activePlanSummary &&
-      activePlanSummary.total > 0 &&
-      activePlanSummary.done + activePlanSummary.failed < activePlanSummary.total
-    ) {
-      planNudges++;
-      const left = activePlanSummary.total - activePlanSummary.done - activePlanSummary.failed;
-      termEmit({
-        type: "metrics",
-        text: "📋 План не закрыт (" + left + " из " + activePlanSummary.total + " пунктов) — прошу агента продолжить делом (попытка " + planNudges + "/2).",
-      });
-      canonical.push({
-        role: "user",
-        content:
-          "Ты ответил текстом, но план работ не закрыт: " + activePlanSummary.done + " из " + activePlanSummary.total + " готово" +
-          (activePlanSummary.failed ? ", сбоев: " + activePlanSummary.failed : "") +
-          ". Работа не окончена — не описывай, что осталось, а ВЫПОЛНЯЙ: вызови следующий инструмент. " +
-          "Если пункт выполнить нельзя — отметь его failed через todoWrite (с причиной в note) и переходи к следующему. " +
-          "После каждого шага присылай todoWrite с ПОЛНЫМ списком.",
-      });
-      continue;
-    }
-
-    // Миссия не закрыта, а модель ответила текстом. Призывать ли дальше — решает
-    // сторож (src/mission-guard.js): один призыв на первый текстовый ответ, дальше —
-    // только если работа сдвинулась. Повтор того же ответа или стояние на месте
-    // прекращает призывы и уводит миссию в паузу: раньше приложение подталкивало
-    // модель трижды подряд, и человек получал три одинаковых отчёта по кругу.
-    if (toolCalls.length === 0 && !planMode && !abort.signal.aborted && mission.canNudge()) {
-      const nudge = mission.nudge(finalText);
-      if (nudge.action === "nudge") {
-        emit({ type: "notice", text: nudge.notice });
-        canonical.push({ role: "user", content: nudge.historyMessage });
-        continue;
-      }
-      if (nudge.action === "pause") {
-        // Призывы прекращены: миссия встаёт на паузу и ждёт человека. Пауза сама
-        // не подхватывается следующим прогоном — на этом петля и кончается.
-        emit({ type: "notice", text: nudge.notice });
-        mission.emitState(nudge.phase);
-        mission.refresh(); // пауза не подхватывается сама: дальше работа идёт как обычная
-      }
-    }
+    // Призывы по текстовому ответу (план не закрыт, сторож миссии) живут в
+    // src/run-nudge.js. Повтор раунда и финал — решение прогона.
+    const nudged = nudge.decide(canonical, {
+      toolCalls: toolCalls,
+      planMode: planMode,
+      text: finalText,
+      aborted: abort.signal.aborted,
+    });
+    if (nudged.action === "repeat") continue;
 
     // Пустой финальный ответ: один раз просим итоговый отчёт — решение в
     // src/run-batch.js, повтор раунда и флаг остаются за прогоном.

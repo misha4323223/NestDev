@@ -556,8 +556,6 @@ const onlyMission = (dir) => {
       "mission.state.rounds++",
       "mission.autoStart()",
       "mission.resume()",
-      "mission.canNudge()",
-      "mission.nudge(finalText)",
       "mission.trackProgress(calls)",
       'mission.emitState("end")',
       "mission.recordError(e)",
@@ -572,6 +570,11 @@ const onlyMission = (dir) => {
     const batchSrc = read("src", "run-batch.js");
     assert.ok(batchSrc.includes("mission.afterBatch()"), "миссия не спрашивает границу батча");
     assert.ok(/const after = await batchCtl\.afterRound\(canonical\)/.test(MAIN_SRC), "прогон не спрашивает границу батча");
+    // Призывы по текстовому ответу живут в модуле призывов (часть 20) —
+    // сторож миссии спрашивают там.
+    const nudgeSrc = read("src", "run-nudge.js");
+    assert.ok(nudgeSrc.includes("mission.canNudge()"), "сторож миссии не спрашивают при текстовом ответе");
+    assert.ok(nudgeSrc.includes("mission.nudge(o.text)"), "призыв не получает ответ модели");
     assert.ok(/const stopForPause = \(\) => \{\n    const paused = mission\.pause\(\);/.test(MAIN_SRC), "пауза по кнопке потеряла свою часть работы");
     // Цена работы в миссии считается в теле раунда: с части 17 оно живёт в
     // src/run-round.js, куда расход и сжатия приходят живыми значениями.

@@ -89,6 +89,13 @@ const BREAKS = {
     '      return { kind: "break" };\n',
     '      return { kind: "end", message: "🏁 Работа закончена. Цель, план, журнал и отчёт: .agent/missions/." };\n',
   ],
+  // ── призывы по текстовому ответу (часть 20) ──
+  nudgecap: ["src/run-nudge.js", "      planNudges < 2 &&\n", "      true &&\n"],
+  nudgeoff: [
+    "src/run-nudge.js",
+    '    if (o.toolCalls.length || o.planMode || o.aborted) return { action: "none" };\n',
+    '    if (o.toolCalls.length || o.planMode || o.aborted) return { action: "none" };\n    if (true) return { action: "none" };\n',
+  ],
 };
 let brokenFile = null;
 if (BREAK) {
@@ -304,7 +311,8 @@ const answerFor = (n) => {
     ]);
   }
   // Шестой прогон: план-режим (3 раунда) — граница батча и честный финал.
-  if (n >= 15) {
+  // Аргумент именно `tasks`: так его читает сам инструмент todoWrite.
+  if (n >= 15 && n <= 17) {
     return sse([
       { choices: [{ index: 0, delta: { role: "assistant", content: "План работ.\n" } }] },
       {
@@ -313,13 +321,52 @@ const answerFor = (n) => {
             index: 0,
             delta: {
               tool_calls: [
-                call(0, "call_p" + n, "todoWrite", { todos: [{ text: "Шаг " + n, status: "pending" }] }),
+                call(0, "call_p" + n, "todoWrite", { tasks: [{ text: "Шаг " + n, status: "pending" }] }),
               ],
             },
           },
         ],
       },
       { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    ]);
+  }
+  // Седьмой прогон: незакрытый план — призывы «продолжай делом» (часть 20).
+  if (n === 18) {
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "План:\n" } }] },
+      {
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                call(0, "call_t1", "todoWrite", {
+                  tasks: [
+                    { text: "Шаг первый", status: "pending" },
+                    { text: "Шаг второй", status: "pending" },
+                    { text: "Шаг третий", status: "pending" },
+                  ],
+                }),
+              ],
+            },
+          },
+        ],
+      },
+      { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    ]);
+  }
+  // Два текстовых ответа подряд — на каждый прогон обязан призвать (макс. 2 раза),
+  // затем третий текст заканчивает работу обычным финалом.
+  if (n === 19 || n === 20) {
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Всё сделано.\n" } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ]);
+  }
+  if (n === 21) {
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Готово окончательно." } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
     ]);
   }
   return sse([
@@ -676,7 +723,46 @@ const callIpc = (channel, ...args) => {
     "без миссии прогон не выдаёт себя за закрытую миссию: " + JSON.stringify(run6text.slice(0, 140))
   );
 
-  console.log("\n[11] Завершение прогона");
+  console.log("\n[11] Призывы: незакрытый план дважды просит продолжить делом");
+  const ev7 = events.length;
+  const served7 = served;
+  const run7 = await callIpc("ai:send", [{ role: "user", content: "Сделай работу по плану" }], {
+    chatId: "chat-live-round-nudge",
+    role: "developer",
+  });
+  ok(run7 && run7.ok === true, "прогон с призывами завершился без ошибки: " + JSON.stringify(run7 && run7.error));
+  ok(served - served7 === 4, "4 запроса (план, призыв, призыв, финал): " + (served - served7));
+  const planNudgeMetrics = events
+    .slice(ev7)
+    .filter((e) => e.ev && e.ev.type === "metrics" && /План не закрыт/.test(String(e.ev.text || "")))
+    .map((e) => e.ev.text);
+  ok(planNudgeMetrics.length === 2, "призывов ровно два (третий был бы циклом): " + JSON.stringify(planNudgeMetrics));
+  ok(
+    planNudgeMetrics.length === 2 && /попытка 1\/2/.test(planNudgeMetrics[0]) && /попытка 2\/2/.test(planNudgeMetrics[1]),
+    "попытки пронумерованы верно: " + JSON.stringify(planNudgeMetrics)
+  );
+  ok(
+    planNudgeMetrics.length > 0 && /3 из 3 пунктов/.test(planNudgeMetrics[0]),
+    "число незакрытых пунктов названо верно: " + JSON.stringify(planNudgeMetrics[0])
+  );
+  // Просьба уходит МОДЕЛИ (а не только человеку): считаем её в телах запросов.
+  const seedIn = (i) => {
+    const body = requests[i] && requests[i].body;
+    return ((body && body.messages) || []).filter(
+      (m) => m.role === "user" && /план работ не закрыт/.test(String(m.content || ""))
+    ).length;
+  };
+  ok(seedIn(served7 + 1) === 0, "до призыва просьбы в запросе не было: " + seedIn(served7 + 1));
+  ok(seedIn(served7 + 2) === 1, "первая просьба ушла модели: " + seedIn(served7 + 2));
+  ok(seedIn(served7 + 3) === 2, "вторая просьба ушла модели и не задублировалась: " + seedIn(served7 + 3));
+  const nudgeText = events
+    .slice(ev7)
+    .filter((e) => e.ev && e.ev.type === "chunk")
+    .map((e) => e.ev.text)
+    .join("");
+  ok(/Готово окончательно/.test(nudgeText), "работа закончилась нормальным финалом: " + JSON.stringify(nudgeText));
+
+  console.log("\n[12] Завершение прогона");
   ok(events.some((e) => e.ev && e.ev.type === "done"), "прогон сообщил о завершении");
   ok(fs.existsSync(path.join(workDir, "round-live.txt")), "инструмент раунда выполнился: файл создан");
 
