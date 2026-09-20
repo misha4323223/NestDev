@@ -260,17 +260,20 @@ const TEXT_CALL =
   await test("тело вызовов ушло из оболочки, а предохранитель A остался в прогоне", () => {
     const src = fs.readFileSync(path.join(ROOT, "src", "run-calls.js"), "utf8");
     const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    // Цикл прогона с части 25 живёт в src/run-ai.js: спрашиваем его, а у оболочки —
+    // только то, что осталось её (отсутствие кода, подключение модуля, живые значения).
+    const runSrc = fs.readFileSync(path.join(ROOT, "src", "run-ai.js"), "utf8");
     for (const gone of ["const seenCalls = new Set()", "extractToolCallsFromText(finalText)", 'role: "assistant"', "await Promise.all("]) {
       assert.ok(mainSrc.indexOf(gone) < 0, "в main.js остались вызовы раунда: " + gone);
     }
-    assert.ok(/const callPrep = createRunCalls\(\{/.test(mainSrc), "модуль не собран в прогоне");
-    assert.ok(mainSrc.indexOf("tools.ensureGroupsFor(calls);") > 0, "предохранитель A потерялся");
+    assert.ok(/const callPrep = createRunCalls\(\{/.test(runSrc), "модуль не собран в прогоне");
+    assert.ok(runSrc.indexOf("tools.ensureGroupsFor(calls);") > 0, "предохранитель A потерялся");
     assert.ok(mainSrc.indexOf("const PARALLEL_SAFE_TOOLS = new Set([") > 0, "список безопасных для параллели инструментов потерялся");
-    assert.ok(mainSrc.indexOf("callPrep.fromText(") > 0 && mainSrc.indexOf("callPrep.normalize(toolCalls)") > 0, "раунд не ходит в модуль");
+    assert.ok(runSrc.indexOf("callPrep.fromText(") > 0 && runSrc.indexOf("callPrep.normalize(toolCalls)") > 0, "раунд не ходит в модуль");
     // Призывы по текстовому ответу с части 20 живут в src/run-nudge.js, поэтому
     // порядок проверяем по ВЫЗОВУ модуля призывов: разбор текста обязан быть раньше.
     assert.ok(
-      mainSrc.indexOf("callPrep.fromText(") < mainSrc.indexOf("nudge.decide(canonical, {"),
+      runSrc.indexOf("callPrep.fromText(") < runSrc.indexOf("nudge.decide(canonical, {"),
       "разбор текстовых вызовов уехал после призывов — найденный вызов потеряется"
     );
     assert.ok(!/app\.getPath|__dirname|require\(/.test(src), "модуль сам достаёт состояние вместо внедрения");

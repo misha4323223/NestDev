@@ -444,19 +444,22 @@ const RUN = { n: 2, maxRounds: 25, messages: HISTORY };
   await test("модуль берёт только внедрённое состояние — в main.js этого больше нет", () => {
     const src = fs.readFileSync(path.join(ROOT, "src", "run-round.js"), "utf8");
     const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    // Цикл прогона с части 25 живёт в src/run-ai.js: спрашиваем его, а у оболочки —
+    // только то, что осталось её (отсутствие кода, подключение модуля, живые значения).
+    const runSrc = fs.readFileSync(path.join(ROOT, "src", "run-ai.js"), "utf8");
     for (const gone of ["let collected", "const stripper", "roundTtfbMs", "roundUsage", "const req = buildChatRequest"]) {
       assert.ok(mainSrc.indexOf(gone) < 0, "в main.js осталось тело раунда: " + gone);
     }
-    assert.ok(/const roundRunner = createRunRound\(\{/.test(mainSrc), "модуль не собран в прогоне");
-    assert.ok(/await roundRunner\.run\(\{ n: round, maxRounds: maxRounds, messages: canonical \}\)/.test(mainSrc),
+    assert.ok(/const roundRunner = createRunRound\(\{/.test(runSrc), "модуль не собран в прогоне");
+    assert.ok(/await roundRunner\.run\(\{ n: round, maxRounds: maxRounds, messages: canonical \}\)/.test(runSrc),
       "раунд не идёт через модуль");
     // С правки 1.5.173 между `round--` и `continue` стоит пометка «это та же попытка»
     // (повтор не тратит ни номер раунда, ни раунд миссии).
     assert.ok(
-      /if \(roundOut\.kind === "repeat"\) \{[\s\S]{0,240}round--;[\s\S]{0,240}continue;/.test(mainSrc),
+      /if \(roundOut\.kind === "repeat"\) \{[\s\S]{0,240}round--;[\s\S]{0,240}continue;/.test(runSrc),
       "повтор раунда перестал быть решением прогона"
     );
-    assert.ok(/getBudget: \(\) => budget/.test(mainSrc) && /getModelWindow: \(\) => modelWin/.test(mainSrc),
+    assert.ok(/getBudget: \(\) => budget/.test(runSrc) && /getModelWindow: \(\) => modelWin/.test(runSrc),
       "живые значения переданы копией");
     assert.ok(!/app\.getPath|__dirname|require\(/.test(src), "модуль сам достаёт состояние вместо внедрения");
   });

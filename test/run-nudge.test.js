@@ -187,13 +187,16 @@ const plan = (done, total, failedCount) => ({ done: done, total: total, failed: 
 
   await test("призывы ушли из оболочки, а повтор раунда остался за прогоном", () => {
     const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    // Цикл прогона с части 25 живёт в src/run-ai.js: спрашиваем его, а у оболочки —
+    // только то, что осталось её (отсутствие кода, подключение модуля, живые значения).
+    const runSrc = fs.readFileSync(path.join(ROOT, "src", "run-ai.js"), "utf8");
     for (const gone of ["planNudges", "activePlanSummary.total", "mission.nudge(finalText)"]) {
       assert.ok(mainSrc.indexOf(gone) < 0, "в main.js остались призывы: " + gone);
     }
-    assert.ok(/const nudge = createRunNudge\(\{/.test(mainSrc), "модуль не собран в прогоне");
-    assert.ok(mainSrc.indexOf("nudge.decide(canonical, {") > 0, "раунд не спрашивает модуль призывов");
-    assert.ok(mainSrc.indexOf('if (nudged.action === "repeat") continue;') > 0, "повтор раунда потерялся");
-    assert.ok(mainSrc.indexOf("activePlanSummary = null; // план прошлого прогона") > 0, "сброс сводки плана потерялся");
+    assert.ok(/const nudge = createRunNudge\(\{/.test(runSrc), "модуль не собран в прогоне");
+    assert.ok(runSrc.indexOf("nudge.decide(canonical, {") > 0, "раунд не спрашивает модуль призывов");
+    assert.ok(runSrc.indexOf('if (nudged.action === "repeat") continue;') > 0, "повтор раунда потерялся");
+    assert.ok(runSrc.indexOf("live.activePlanSummary = null; // план прошлого прогона") > 0, "сброс сводки плана потерялся");
     assert.ok(mainSrc.indexOf("let activePlanSummary = null;") > 0, "живое значение сводки плана потерялось");
   });
 

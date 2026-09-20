@@ -529,6 +529,8 @@ const onlyMission = (dir) => {
   });
 
   await test("23. в оболочке этого больше нет, а модуль собран на своём месте", () => {
+    // Цикл прогона с части 25 живёт в src/run-ai.js: собирает и зовёт модули он.
+    const runAiSrc = read("src", "run-ai.js");
     for (const gone of [
       "MISSION_AUTO_ROUND",
       "MISSION_AUTO_JOURNAL",
@@ -546,12 +548,15 @@ const onlyMission = (dir) => {
       assert.ok(MAIN_SRC.indexOf(gone) < 0, "в main.js осталось: " + gone);
     }
     assert.ok(MAIN_SRC.includes('const { createRunMission } = require("./run-mission.js")'), "модуль не подключён");
-    assert.ok(/const mission = createRunMission\(\{/.test(MAIN_SRC), "миссия прогона больше не берётся из модуля");
-    for (const dep of ["    settings,", "    planMode,", "    messages,", "    roleId: role.id,", "    dir: agentWorkDir(settings),", "    chatId: activeRunChatId,", "    emit,", "    missionStore,", "    missionGuard,"]) {
-      assert.ok(MAIN_SRC.includes(dep), "в проводку не передано: " + dep);
+    assert.ok(/const mission = createRunMission\(\{/.test(runAiSrc), "миссия прогона больше не берётся из модуля");
+    for (const dep of ["    settings,", "    planMode,", "    messages,", "    roleId: role.id,", "    dir: agentWorkDir(settings),", "    chatId: live.activeRunChatId,", "    emit,", "    missionStore,", "    missionGuard,"]) {
+      assert.ok(runAiSrc.includes(dep), "в проводку не передано: " + dep);
     }
+    // Мост для живого состояния держит оболочка (часть 25), а прогон отдаёт миссии
+    // ТОТ ЖЕ мост: отдельный объект разошёлся бы с ним на первом же значении.
     assert.ok(MAIN_SRC.includes("get missionClaim()"), "модуль не видит просьбу «▶ Продолжить»");
-    assert.ok(MAIN_SRC.includes("runMissionId = v;"), "модуль не отдаёт миссию прогона инструментам");
+    assert.ok(/set missionId\(v\) \{ runMissionId = v; \}/.test(MAIN_SRC), "модуль не отдаёт миссию прогона инструментам");
+    assert.ok(/live: live,/.test(runAiSrc), "миссия получает не тот мост, что прогон");
     for (const used of [
       "mission.state.rounds++",
       "mission.autoStart()",
@@ -560,7 +565,7 @@ const onlyMission = (dir) => {
       'mission.emitState("end")',
       "mission.recordError(e)",
     ]) {
-      assert.ok(MAIN_SRC.includes(used), "в ядре чата не используется: " + used);
+      assert.ok(runAiSrc.includes(used), "в ядре чата не используется: " + used);
     }
     // Запись вызова в журнал миссии живёт в модуле строгой очереди (часть 19а):
     // туда попадает каждый выполненный вызов, а не только прошедший пачку.
@@ -569,26 +574,26 @@ const onlyMission = (dir) => {
     // Граница батча живёт в модуле решений после раунда (часть 19б).
     const batchSrc = read("src", "run-batch.js");
     assert.ok(batchSrc.includes("mission.afterBatch()"), "миссия не спрашивает границу батча");
-    assert.ok(/const after = await batchCtl\.afterRound\(canonical\)/.test(MAIN_SRC), "прогон не спрашивает границу батча");
+    assert.ok(/const after = await batchCtl\.afterRound\(canonical\)/.test(runAiSrc), "прогон не спрашивает границу батча");
     // Призывы по текстовому ответу живут в модуле призывов (часть 20) —
     // сторож миссии спрашивают там.
     // Правка 1.5.173: повтор раунда (лимит/сбой) — та же попытка, а не новый раунд.
     assert.ok(
-      /if \(!repeatAttempt\) mission\.state\.rounds\+\+;/.test(MAIN_SRC),
+      /if \(!repeatAttempt\) mission\.state\.rounds\+\+;/.test(runAiSrc),
       "повтор раунда тратит второй раунд миссии — её пределы срабатывают раньше времени"
     );
-    assert.ok(/repeatAttempt = true;/.test(MAIN_SRC), "повтор не помечается как та же попытка");
-    assert.ok(/if \(!firstRoundHandled\) \{/.test(MAIN_SRC), "«продолжаю миссию» может объявляться дважды за прогон");
-    assert.ok(/mission\.resume\(\)/.test(MAIN_SRC), "продолжение миссии потерялось");
+    assert.ok(/repeatAttempt = true;/.test(runAiSrc), "повтор не помечается как та же попытка");
+    assert.ok(/if \(!firstRoundHandled\) \{/.test(runAiSrc), "«продолжаю миссию» может объявляться дважды за прогон");
+    assert.ok(/mission\.resume\(\)/.test(runAiSrc), "продолжение миссии потерялось");
     const nudgeSrc = read("src", "run-nudge.js");
     assert.ok(nudgeSrc.includes("mission.canNudge()"), "сторож миссии не спрашивают при текстовом ответе");
     assert.ok(nudgeSrc.includes("mission.nudge(o.text)"), "призыв не получает ответ модели");
-    assert.ok(/const stopForPause = \(\) => \{\n    const paused = mission\.pause\(\);/.test(MAIN_SRC), "пауза по кнопке потеряла свою часть работы");
+    assert.ok(/const stopForPause = \(\) => \{\n    const paused = mission\.pause\(\);/.test(runAiSrc), "пауза по кнопке потеряла свою часть работы");
     // Цена работы в миссии считается в теле раунда: с части 17 оно живёт в
     // src/run-round.js, куда расход и сжатия приходят живыми значениями.
     const roundSrc = read("src", "run-round.js");
     assert.ok(roundSrc.includes("mission.cost(usage, getCompactions())"), "миссия не получает цену работы");
-    assert.ok(MAIN_SRC.includes("getCompactions: () => ctxManager.compactions()"), "сжатия не переданы модулю раунда");
+    assert.ok(runAiSrc.includes("getCompactions: () => ctxManager.compactions()"), "сжатия не переданы модулю раунда");
   });
 
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");

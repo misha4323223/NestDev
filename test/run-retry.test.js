@@ -256,17 +256,20 @@ const RESP_429 = (detail) => ({ status: 429, headers: { get: () => null }, detai
   await test("модуль берёт только внедрённое состояние — в main.js этого больше нет", () => {
     const src = fs.readFileSync(path.join(ROOT, "src", "run-retry.js"), "utf8");
     const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    // Цикл прогона с части 25 живёт в src/run-ai.js: спрашиваем его, а у оболочки —
+    // только то, что осталось её (отсутствие кода, подключение модуля, живые значения).
+    const runSrc = fs.readFileSync(path.join(ROOT, "src", "run-ai.js"), "utf8");
     for (const gone of ["rateWaitedMs", "unavailableRetries", "contextRetried", "let includeUsage", "RATE_WAIT_BUDGET_MS"]) {
       assert.ok(mainSrc.indexOf(gone) < 0, "в main.js осталось состояние повторов: " + gone);
     }
-    assert.ok(/const retry = createRunRetry\(\{/.test(mainSrc), "модуль не собран в прогоне");
+    assert.ok(/const retry = createRunRetry\(\{/.test(runSrc), "модуль не собран в прогоне");
     // Темп, флаг метрик и применение решения о повторе живут в теле раунда:
     // с части 17 оно в src/run-round.js, а хозяином цикла остаётся прогон.
     const roundSrc = fs.readFileSync(path.join(ROOT, "src", "run-round.js"), "utf8");
     assert.ok(/await retry\.pace\(\);/.test(roundSrc), "темп провайдера не спрашивается через модуль");
     assert.ok(/if \(verdict\.kind === "repeat"\) return \{ kind: "repeat" \};/.test(roundSrc), "решение модуля не отдаётся прогону");
     assert.ok(/includeUsage: retry\.state\.includeUsage/.test(roundSrc), "флаг метрик не берётся из модуля");
-    assert.ok(/if \(roundOut\.kind === "repeat"\) \{/.test(mainSrc), "повтор раунда перестал применяться в прогоне");
+    assert.ok(/if \(roundOut\.kind === "repeat"\) \{/.test(runSrc), "повтор раунда перестал применяться в прогоне");
     assert.ok(!/app\.getPath|__dirname|require\(/.test(src), "модуль сам достаёт состояние вместо внедрения");
   });
 

@@ -89,7 +89,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js"]
+  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -14233,7 +14233,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14243,7 +14243,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
@@ -15928,12 +15928,14 @@ async function testMissions() {
     const missionRun = fs.readFileSync(path.join(ROOT, "src", "run-mission.js"), "utf8");
     // Граница батча и закрытие миссии с части 19б живут в src/run-batch.js.
     const batchRun = fs.readFileSync(path.join(ROOT, "src", "run-batch.js"), "utf8");
-    assert.ok(main.indexOf("for (let batch = 1; ; batch++)") >= 0, "нет внешнего цикла батчей");
+    // Сам цикл прогона (батчи, раунды, пауза) с части 25 живёт в src/run-ai.js.
+    const chatSrc = fs.readFileSync(path.join(ROOT, "src", "run-ai.js"), "utf8");
+    assert.ok(chatSrc.indexOf("for (let batch = 1; ; batch++)") >= 0, "нет внешнего цикла батчей");
     assert.ok(/const afterBatch = await mission\.afterBatch\(\);/.test(batchRun), "граница батча не считается");
     assert.ok(/if \(!afterBatch\.continue\) \{/.test(batchRun), "конец батча не продолжает и не завершает работу");
     assert.ok(batchRun.indexOf("if (afterBatch.closed)") >= 0, "закрытая миссия рвётся ошибкой счётчика раундов");
-    assert.ok(/const after = await batchCtl\.afterRound\(canonical\);/.test(main), "прогон не спрашивает границу батча");
-    assert.ok(main.indexOf("if (after.kind === \"break\") break;") >= 0, "выход из цикла батчей потерялся");
+    assert.ok(/const after = await batchCtl\.afterRound\(canonical\);/.test(chatSrc), "прогон не спрашивает границу батча");
+    assert.ok(chatSrc.indexOf("if (after.kind === \"break\") break;") >= 0, "выход из цикла батчей потерялся");
     assert.ok(missionRun.indexOf('if (r.status !== "active") return { continue: false, closed: true };') >= 0, "модуль не различает закрытую миссию");
     assert.ok(/state\.errorContinues < state\.limits\.autoContinues/.test(missionRun), "сбой провайдера обрывает долгую работу");
     assert.ok(missionRun.indexOf("longWorkAutoContinue") >= 0, "нет запаса авто-продолжений");
@@ -15944,9 +15946,11 @@ async function testMissions() {
     assert.ok(/longWorkHours: 8/.test(store), "рабочий день по умолчанию не 8 часов");
     // Текст продолжения собирает канал mission:resume, а он живёт в src/mission-ipc.js.
     assert.ok(missionIpc.indexOf("missionResumeText") >= 0, "нет продолжения миссии с места остановки");
-    assert.ok(main.indexOf("global.__agentPauseRequested") >= 0, "нет паузы у долгой работы");
+    assert.ok(chatSrc.indexOf("global.__agentPauseRequested") >= 0, "нет паузы у долгой работы");
     // Жёсткий лимит раундов остался только для короткой работы и режима плана.
-    assert.ok(/const maxRounds = planMode \? 3 : 25;/.test(main), "лимит раундов отрезка изменился");
+    assert.ok(/const maxRounds = planMode \? 3 : 25;/.test(chatSrc), "лимит раундов отрезка изменился");
+    // Оболочка цикл раундов больше не держит: он переехал целиком.
+    assert.strictEqual(main.indexOf("for (let round = 0; round < maxRounds; round++)"), -1, "цикл раундов остался в оболочке");
   });
 
   await test("миссии: инструменты, панель, настройки и мост на месте", () => {

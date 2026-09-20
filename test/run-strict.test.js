@@ -319,17 +319,20 @@ const file = ROOT + "/src/run-strict.js";
 
   await test("тело очереди ушло из оболочки, а предохранители прогона остались", () => {
     const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    // Цикл прогона с части 25 живёт в src/run-ai.js: спрашиваем его, а у оболочки —
+    // только то, что осталось её (отсутствие кода, подключение модуля, живые значения).
+    const runSrc = fs.readFileSync(path.join(ROOT, "src", "run-ai.js"), "utf8");
     for (const gone of ["toolPolicy.isDangerousCommand(", "snapshotFileForUndo(resolvePath("]) {
       assert.ok(mainSrc.indexOf(gone) < 0, "в main.js осталась строгая очередь: " + gone);
     }
-    assert.ok(/const strict = createRunStrict\(\{/.test(mainSrc), "модуль не собран в прогоне");
-    assert.ok(/await strict\.runStrict\(calls, \{ planMode: planMode, history: canonical \}\)/.test(mainSrc), "раунд не ходит в модуль");
+    assert.ok(/const strict = createRunStrict\(\{/.test(runSrc), "модуль не собран в прогоне");
+    assert.ok(/await strict\.runStrict\(calls, \{ planMode: planMode, history: canonical \}\)/.test(runSrc), "раунд не ходит в модуль");
     assert.ok(mainSrc.indexOf('require("./run-strict.js")') > 0, "модуль не подключён");
-    assert.ok(mainSrc.indexOf("mission.trackProgress(calls);") > 0, "счётчик прогресса миссии потерялся");
+    assert.ok(runSrc.indexOf("mission.trackProgress(calls);") > 0, "счётчик прогресса миссии потерялся");
     // Остановка обязана идти ПОСЛЕ очереди: ищем первое вхождение начиная с вызова
     // модуля (раньше по тексту есть такая же проверка после параллельной пачки).
-    const fromStrict = mainSrc.indexOf("await strict.runStrict(");
-    const stopAfter = mainSrc.indexOf("if (global.__agentStopRequested) return stopGraceful();", fromStrict);
+    const fromStrict = runSrc.indexOf("await strict.runStrict(");
+    const stopAfter = runSrc.indexOf("if (global.__agentStopRequested) return stopGraceful();", fromStrict);
     assert.ok(stopAfter > fromStrict, "остановка по «Стоп» потеряла очередь");
   });
 

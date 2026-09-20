@@ -324,9 +324,10 @@ const MODULE_SRC = fs.readFileSync(path.join(ROOT, "src", "run-tools.js"), "utf8
   ok(planRequests.every((req) => guideHits(req) === 0), "в План-режим справочники не приезжают");
   ok(global.__agentRunning === false, "признак прогона снят после План-режима");
   ok(global.__agentStopRequested === false && global.__agentPauseRequested === false, "флаги остановки сняты");
+  // Цикл прогона с части 25 живёт в src/run-ai.js: там его собирают и зовут.
   ok(
-    /createRunTools/.test(MODULE_SRC) && /tools\.ensureGroupsFor/.test(fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8")),
-    "модуль роутера и предохранитель A подключены в оболочке"
+    /createRunTools/.test(MODULE_SRC) && /tools\.ensureGroupsFor/.test(fs.readFileSync(path.join(ROOT, "src", "run-ai.js"), "utf8")),
+    "модуль роутера и предохранитель A подключены в прогоне"
   );
 
   try {

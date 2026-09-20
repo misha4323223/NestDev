@@ -279,11 +279,14 @@ function makeRun(opts) {
   await test("модуль берёт только внедрённое состояние — в main.js роутера больше нет", () => {
     const src = fs.readFileSync(path.join(ROOT, "src", "run-tools.js"), "utf8");
     const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    // Цикл прогона с части 25 живёт в src/run-ai.js: спрашиваем его, а у оболочки —
+    // только то, что осталось её (отсутствие кода, подключение модуля, живые значения).
+    const runSrc = fs.readFileSync(path.join(ROOT, "src", "run-ai.js"), "utf8");
     for (const gone of ["stickyGroups", "budgetWarned", "injectedGuides", "let routeInfo", "let activeTools", "let toolsWeight"]) {
       assert.ok(mainSrc.indexOf(gone) < 0, "в main.js осталось состояние роутера: " + gone);
     }
-    assert.ok(/const tools = createRunTools\(\{/.test(mainSrc), "модуль не собран в прогоне");
-    assert.ok(/activeToolRouter = tools\.router;/.test(mainSrc), "мост для findTools не подключён");
+    assert.ok(/const tools = createRunTools\(\{/.test(runSrc), "модуль не собран в прогоне");
+    assert.ok(/live\.activeToolRouter = tools\.router;/.test(runSrc), "мост для findTools не подключён");
     assert.ok(!/app\.getPath|__dirname|require\(/.test(src), "модуль сам достаёт состояние вместо внедрения");
   });
 

@@ -185,17 +185,20 @@ const file = ROOT + "/src/run-batch.js";
 
   await test("решения после раунда ушли из оболочки, а цикл раундов остался в прогоне", () => {
     const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    // Цикл прогона с части 25 живёт в src/run-ai.js: спрашиваем его, а у оболочки —
+    // только то, что осталось её (отсутствие кода, подключение модуля, живые значения).
+    const runSrc = fs.readFileSync(path.join(ROOT, "src", "run-ai.js"), "utf8");
     for (const gone of ["mission.afterBatch()", "afterBatch.historyMessage", "Ты завершил действия, но итоговый ответ получился пустым"]) {
       assert.ok(mainSrc.indexOf(gone) < 0, "в main.js осталось решение после раунда: " + gone);
     }
-    assert.ok(/const batchCtl = createRunBatch\(\{ emit, mission, pauseMs: 1500 \}\)/.test(mainSrc), "модуль не собран в прогоне");
-    assert.ok(mainSrc.indexOf("batchCtl.askForReport(canonical, {") > 0, "пустой ответ не спрашивает модуль");
-    assert.ok(/const after = await batchCtl\.afterRound\(canonical\)/.test(mainSrc), "граница батча не спрашивает модуль");
-    assert.ok(mainSrc.indexOf('if (after.kind === "end") return await endRun(after.message);') > 0, "финал потерял текст модуля");
-    assert.ok(mainSrc.indexOf("reportRetried = true;") > 0, "флаг повторного отчёта потерялся");
-    assert.ok(mainSrc.indexOf("for (let batch = 1; ; batch++)") > 0, "внешний цикл батчей потерялся");
+    assert.ok(/const batchCtl = createRunBatch\(\{ emit, mission, pauseMs: 1500 \}\)/.test(runSrc), "модуль не собран в прогоне");
+    assert.ok(runSrc.indexOf("batchCtl.askForReport(canonical, {") > 0, "пустой ответ не спрашивает модуль");
+    assert.ok(/const after = await batchCtl\.afterRound\(canonical\)/.test(runSrc), "граница батча не спрашивает модуль");
+    assert.ok(runSrc.indexOf('if (after.kind === "end") return await endRun(after.message);') > 0, "финал потерял текст модуля");
+    assert.ok(runSrc.indexOf("reportRetried = true;") > 0, "флаг повторного отчёта потерялся");
+    assert.ok(runSrc.indexOf("for (let batch = 1; ; batch++)") > 0, "внешний цикл батчей потерялся");
     assert.ok(mainSrc.indexOf("const batch = createRunBatch") < 0, "проводка названа batch — её перекрыл бы счётчик цикла");
-    assert.ok(mainSrc.indexOf("Превышено максимальное число раундов") > 0, "жёсткий предел раундов потерялся");
+    assert.ok(runSrc.indexOf("Превышено максимальное число раундов") > 0, "жёсткий предел раундов потерялся");
   });
 
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");
