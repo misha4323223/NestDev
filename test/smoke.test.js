@@ -89,7 +89,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js"]
+  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -5907,16 +5907,34 @@ async function testShellAndCdp() {
   const html2 = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
   const app2 = fs.readFileSync(path.join(ROOT, "src", "renderer", "app.js"), "utf8");
 
-  // ── Реальный срез main.js: выбор оболочки и PowerShell-кодирование ────────
-  const h0 = mainFull.indexOf("function shellArgsFor(command) {");
-  const h1 = mainFull.indexOf("// Запуск произвольной команды в терминале");
-  assert.ok(h0 > 0 && h1 > h0, "не нашёл блок оболочек в main.js");
-  const helpers = mainFull.slice(h0, h1);
+  // ── Оболочки: берём ЖИВОЙ модуль (src/shell-tools.js, часть 23) ──────────
+  // Раньше здесь был срез текста main.js и new Function по нему. После выноса
+  // такой срез проверял бы код, которого в main.js уже нет, и «зеленел» впустую:
+  // настоящий модуль никто бы не тронул.
+  const shellSrc = fs.readFileSync(path.join(ROOT, "src", "shell-tools.js"), "utf8");
   const mkHelpers = (findProgram, fsImpl) =>
-    new Function("fs", "path", "process", "findProgram", helpers + "; return { normalizeShell, powershellArgs, resolveShell, findGitShell, shellsStatus, shellsBrief };")(
-      fsImpl || fs, path, process, findProgram
-    );
+    require(path.join(ROOT, "src", "shell-tools.js")).createShellTools({
+      fs: fsImpl || fs,
+      path,
+      execFile: require("child_process").execFile,
+      commandEnv: () => ({}),
+      findProgram,
+    });
   const H = mkHelpers((name) => ({ found: true, path: "/usr/bin/" + name }));
+
+  await test("shell: код оболочек живёт в модуле, а не в main.js", () => {
+    const shellOnly = mainOnlySrc();
+    for (const gone of ["function resolveShell", "function shellsStatus", "function shellsBrief",
+      "function shellArgsFor", "function findGitShell", "function runTerminalCommand",
+      "const SHELL_KINDS = {", "const PS_PRELUDE =", "function stripAnsi"]) {
+      assert.ok(shellOnly.indexOf(gone) === -1, "код оболочек остался в main.js: " + gone);
+    }
+    assert.ok(/createShellTools\(\{/.test(shellOnly), "оболочки не собираются из модуля");
+    assert.ok(/require\("\.\/shell-tools\.js"\)/.test(shellOnly), "нет подключения модуля оболочек");
+    assert.ok(/findProgram: \(name\) => findProgram\(name\)/.test(shellOnly),
+      "системный раздел собирается ниже — без отложенной стрелки оболочки упали бы на сборке");
+    assert.ok(/shellArgsFor\(command\)/.test(shellOnly), "оболочка запускается без хелпера кодировки");
+  });
 
   await test("shell: псевдонимы оболочек и команда PowerShell без искажений", () => {
     assert.strictEqual(H.normalizeShell("PS"), "powershell");
@@ -5938,7 +5956,7 @@ async function testShellAndCdp() {
     const noPs = mkHelpers(() => ({ found: false, reason: "нет" }));
     assert.ok(/installSystemPackage/.test(noPs.resolveShell("x", "powershell").shellHint), "нет подсказки про установку PowerShell");
     assert.ok(/shell: "cmd"/.test(noPs.resolveShell("x", "powershell").shellHint), "нет альтернативы cmd");
-    const cmdCode = mainFull.slice(mainFull.indexOf("function runTerminalCommand(command, cwd, timeoutMs, shellName)"));
+    const cmdCode = shellSrc;
     assert.ok(/sh\.shellHint/.test(cmdCode), "подсказка оболочки не попадает в ответ");
     assert.ok(/const sh = resolveShell\(command, shellName\)/.test(cmdCode), "runTerminalCommand не использует выбор оболочки");
     const rc = toolBody(mainFull, "runCommand", "startBackground");
@@ -6023,7 +6041,7 @@ async function testShellAndCdp() {
     assert.ok(/фоновый процесс НЕ запущен/.test(bg), "нет понятного текста отказа");
     assert.ok(bg.indexOf("bgShell.missing") < bg.indexOf("bgSpawn("), "предпроверка должна идти до запуска процесса");
     assert.ok(/shellsStatus/.test(bg), "отказ не подсказывает shellsStatus");
-    assert.ok(/sh\.missing === true/.test(mainFull), "runTerminalCommand игнорирует флаг missing");
+    assert.ok(/sh\.missing === true/.test(shellSrc), "runTerminalCommand игнорирует флаг missing");
     const H = mkHelpers(() => ({ found: false, reason: "нет" }), { existsSync: () => false });
     assert.strictEqual(H.resolveShell("x", "bash").missing, true, "bash без Git не помечен отсутствующим");
     assert.strictEqual(H.resolveShell("x", "sh").missing, true, "sh без Git не помечен отсутствующим");
@@ -14210,7 +14228,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14220,7 +14238,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
