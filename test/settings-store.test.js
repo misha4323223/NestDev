@@ -331,9 +331,16 @@ const readRaw = (file) => (fs.existsSync(file) ? fs.readFileSync(file, "utf8") :
       "applyAgentEnv,", "applyBrowserSettings,"]) {
       assert.ok(wiring.includes(dep), "в проводку не передан " + dep);
     }
-    // Прежние вызовы на месте: это переезд, а не переписывание.
-    const calls = MAIN_SRC.match(/(^|[^.\w$])loadSettings\(\)/g) || [];
-    assert.ok(calls.length >= 20, "вызовы loadSettings() в оболочке переписаны: " + calls.length);
+    // Прежние вызовы на месте: это переезд, а не переписывание. Часть вызовов
+    // уехала вместе со своими каналами (память диалогов — src/memory-ipc.js,
+    // часть 29), поэтому считаем оболочку и модули, которым настройки переданы
+    // значением: там они читаются в момент вызова, как и раньше.
+    const MEM_SRC = read("src", "memory-ipc.js");
+    const calls =
+      (MAIN_SRC.match(/(^|[^.\w$])loadSettings\(\)/g) || []).length +
+      (MEM_SRC.match(/(^|[^.\w$])loadSettings\(\)/g) || []).length;
+    assert.ok(calls >= 20, "вызовы loadSettings() в оболочке переписаны: " + calls);
+    assert.ok(/const \{[^}]*\bloadSettings\b[^}]*\} = deps;/.test(MEM_SRC), "канал памяти не получает свежие настройки");
     assert.ok(/^\s+loadSettings,$/m.test(MAIN_SRC), "модули больше не получают свежие настройки");
   });
 

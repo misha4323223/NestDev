@@ -20,6 +20,10 @@
    Больше одной подстановки в одной строке аудит не разбирает намеренно: он должен
    ошибаться в сторону «покажи человеку», а не «объясню сам».
 
+   С 1.5.184 аудит умеет и бэкенд-модули (этап B): если модуль лежит в `src/`, а не
+   в `src/renderer/`, оболочкой считается `src/main.js`. Смешивать окно и бэкенд в
+   одном вызове нельзя — это две разные оболочки.
+
    Запуск:  node scripts/audit-extractions.js <до> <после> <модуль.js> [модуль.js ...]
    Пример:  node scripts/audit-extractions.js 1fc073e^ 1fc073e chat-feed.js chat-render.js
    Вместо ревизии «после» можно указать WORKTREE — тогда берётся файл с диска
@@ -38,11 +42,48 @@ if (!before || !after || !modules.length) {
   process.exit(2);
 }
 
+
 // WORKTREE — текущее содержимое файла на диске: аудит можно гнать до коммита.
 const show = (rev, file) =>
   rev === "WORKTREE"
     ? fs.readFileSync(path.join(__dirname, "..", file), "utf8")
     : execSync("git show " + rev + ":" + file, { encoding: "utf8", maxBuffer: 1 << 28 });
+
+/* Модуль лежит либо в окне (`src/renderer/`), либо в главном процессе (`src/`).
+   До 1.5.184 аудит знал только окно и на бэкенд-модуле падал с ENOENT — то есть
+   правило «перенос проверяется аудитом» для этапа B выполнить было нечем.
+   Оболочку берём по месту модуля: app.js для окна, main.js для бэкенда.
+
+   ВАЖНО: этот блок обязан стоять ПОСЛЕ объявления `show`. На первой попытке он стоял
+   выше, ошибка «Cannot access before initialization» попала в `catch` и выглядела как
+   «модуль не найден» — то есть проверка тихо обвинила невиновного. Поэтому ловим
+   строго ошибки файловой системы и git, а не что попало. */
+const fileMissing = (e) => {
+  const msg = String((e && (e.stderr || e.message)) || e);
+  return /ENOENT|could not|bad revision|exists on disk, but not in|did not match|fatal: path/i.test(msg);
+};
+const has = (rev, file) => {
+  try {
+    show(rev, file);
+    return true;
+  } catch (e) {
+    if (!fileMissing(e)) throw e;
+    return false;
+  }
+};
+const moduleRel = (m) => {
+  if (has(after, "src/renderer/" + m)) return "src/renderer/" + m;
+  if (has(after, "src/" + m)) return "src/" + m;
+  console.error("Модуль не найден ни в src/renderer/, ни в src/: " + m);
+  process.exit(2);
+};
+const moduleRels = modules.map(moduleRel);
+const SHELLS = [...new Set(moduleRels.map((rel) => (rel.startsWith("src/renderer/") ? "src/renderer/app.js" : "src/main.js")))];
+if (SHELLS.length !== 1) {
+  console.error("Модули из разных оболочек (окно и главный процесс) — аудит ведётся по одной за раз: " + SHELLS.join(" + "));
+  process.exit(2);
+}
+const SHELL = SHELLS[0];
 const lines = (t) => t.split("\n").map((l) => l.trim()).filter(Boolean);
 const countMap = (arr) => {
   const m = new Map();
@@ -115,11 +156,11 @@ const canon = (line) =>
     .replace(/\bgetProjectPanel\(\)\./g, "@proj@.")
     .replace(/\bsettings\b/g, "@cfg@");
 
-const beforeMap = countMap(lines(show(before, "src/renderer/app.js")));
-const afterLines = lines(show(after, "src/renderer/app.js"));
+const beforeMap = countMap(lines(show(before, SHELL)));
+const afterLines = lines(show(after, SHELL));
 const afterMap = countMap(afterLines);
 const afterCanon = countMap(afterLines.map(canon));
-const moduleText = modules.map((m) => show(after, "src/renderer/" + m)).join("\n");
+const moduleText = moduleRels.map((rel) => show(after, rel)).join("\n");
 const moduleLines = lines(moduleText);
 const moduleMap = countMap(moduleLines);
 const moduleCanon = countMap(moduleLines.map(canon));
@@ -150,7 +191,8 @@ for (const line of gone) {
 }
 
 console.log("Аудит выноса " + before + " → " + after);
-console.log("  модули: " + modules.join(", "));
+console.log("  оболочка: " + SHELL);
+console.log("  модули: " + moduleRels.join(", "));
 console.log("  ушло из оболочки: " + gone.length);
 console.log("  перенесено как есть: " + moved.length);
 console.log("  перенесено с живым доступом: " + liveAccess.length);

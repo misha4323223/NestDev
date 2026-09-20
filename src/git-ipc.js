@@ -13,6 +13,29 @@
    pull/push, индексация и отмена, откат файла и всего коммита, diff, коммит и
    клон репозитория. Каждый путь проходит через sanitizeDir. */
 
+/* Отказ git по-человечески. `runGit` на любом отказе ЗАПОЛНЯЕТ `err`, и обычно это
+   сырое «Command failed: git …» — то есть все понятные запасные тексты в каналах
+   (`r.err || "Не удалось подтянуть изменения"`) были недостижимы: до человека
+   доходил английский текст команды (найдено живым прогоном в 1.5.183).
+
+   Здесь причина вытаскивается из вывода git и объясняется. Незнакомый отказ
+   отдаётся КАК ЕСТЬ: выдумывать объяснение хуже, чем показать настоящий текст. */
+function gitFailReason(r, fallback) {
+  const raw = String((r && r.err) || "") + " " + String((r && r.out) || "");
+  if (/nothing to commit|no changes added to commit|nothing added to commit/i.test(raw)) {
+    return "Коммитить нечего: изменений нет. Файлы секретов (.env и имена вида *.env) в коммит не берутся — если менялись только они, коммитить действительно нечего.";
+  }
+  if (/CONFLICT \(|Automatic merge failed|fix conflicts/i.test(raw)) {
+    return "Конфликт: правки пересеклись. Разреши конфликт в файлах (git status покажет список) и повтори — или отмени слияние.";
+  }
+  if (/would be overwritten by merge|commit your changes or stash|Please commit your changes/i.test(raw)) {
+    return "Сначала сохрани свои правки коммитом (или отложи их), иначе git откажется: изменения в файлах будут потеряны.";
+  }
+  if (/not a git repository/i.test(raw)) return "Это не git-репозиторий (нет папки .git).";
+  if (/pathspec .* did not match/i.test(raw)) return "Такого файла в репозитории нет.";
+  return (r && r.err) || fallback;
+}
+
 function registerGitIpc(deps) {
   const {
     ipcMain,
@@ -164,7 +187,7 @@ ipcMain.handle("git:pull", async (_e, dir) => {
   const d = sanitizeDir(dir);
   if (!d) return { ok: false, error: "Папка не найдена" };
   const r = await runGit(d, ["pull", "--ff-only"], loadSettings(), "git.clone");
-  return r.ok ? { ok: true, out: r.out || "Изменения подтянуты." } : { ok: false, error: r.err || "Не удалось подтянуть изменения" };
+  return r.ok ? { ok: true, out: r.out || "Изменения подтянуты." } : { ok: false, error: gitFailReason(r, "Не удалось подтянуть изменения") };
 });
 
 // Убрать файл из индекса (кнопка «Убрать из staged»): git reset HEAD -- <файл>.
@@ -197,7 +220,7 @@ ipcMain.handle("git:revert", async (_e, dir, hash) => {
   const d = sanitizeDir(dir);
   if (!d) return { ok: false, error: "Папка не найдена" };
   const r = await runGit(d, ["revert", "--no-edit", String(hash)], loadSettings(), "git.commit");
-  return r.ok ? { ok: true, out: r.out || "Коммит отменён." } : { ok: false, error: r.err || "Не удалось откатить (возможен конфликт)" };
+  return r.ok ? { ok: true, out: r.out || "Коммит отменён." } : { ok: false, error: gitFailReason(r, "Не удалось откатить (возможен конфликт)") };
 });
 
 ipcMain.handle("git:resetHard", async (_e, dir, hash) => {
@@ -225,7 +248,7 @@ ipcMain.handle("git:undoLastCommit", async (_e, dir) => {
     return { ok: false, error: "В истории нет коммитов для отмены" };
   }
   const r = await runGit(d, ["reset", "--soft", "HEAD~1"], s, "git.commit");
-  if (!r.ok) return { ok: false, error: r.err || "Не удалось отменить коммит" };
+  if (!r.ok) return { ok: false, error: gitFailReason(r, "Не удалось отменить коммит") };
   return { ok: true, out: "Последний коммит " + String(log.out).trim() + " отменён (reset --soft): его изменения вернулись как незакоммиченные, ничего не потеряно." };
 });
 
@@ -263,7 +286,7 @@ ipcMain.handle("git:commit", async (_e, dir, message) => {
     s,
     "git.commit"
   );
-  if (!commit.ok) return { ok: false, error: commit.err || "Коммит не создан (нет изменений?)" };
+  if (!commit.ok) return { ok: false, error: gitFailReason(commit, "Коммит не создан (нет изменений?)") };
   return { ok: true, out: commit.out || "Коммит создан." };
 });
 
@@ -294,4 +317,4 @@ ipcMain.handle("git:clone", async (_e, base, url) => {
   return { gitRelFile };
 }
 
-module.exports = { registerGitIpc };
+module.exports = { registerGitIpc, gitFailReason };

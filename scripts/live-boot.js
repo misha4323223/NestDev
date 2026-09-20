@@ -411,7 +411,24 @@ async function liveAnswerCycle() {
   ok(eSend.classList.contains("hidden") === false, "после ошибки провайдера «Отправить» вернулась — можно повторить запрос");
   ok(eStop.classList.contains("hidden") === true, "после ошибки «Стоп» убран из шапки");
   const errSaved = String(errWin.localStorage.getItem("chats") || "");
-  ok(/API error 500|server exploded|ошиб/i.test(errSaved), "ошибка провайдера объяснена в чате: " + JSON.stringify(errSaved.slice(0, 90)));
+  // Ошибку ищем в самих полях error сообщений, а не в тексте всего файла: поиск
+  // по всему файлу проходил бы на любом упоминании «ошиб» (например, в заголовке
+  // чата) и молча перестал бы ловить пропавшее объяснение. Заодно в отчёт идёт
+  // сам текст ошибки, а не начало файла — иначе по выводу не понять, что нашли.
+  const errTexts = [];
+  const collectErrors = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) return node.forEach(collectErrors);
+    for (const [key, val] of Object.entries(node)) {
+      if (key === "error" && typeof val === "string" && val) errTexts.push(val);
+      else collectErrors(val);
+    }
+  };
+  try {
+    collectErrors(JSON.parse(errSaved));
+  } catch {}
+  const errFound = errTexts.find((t) => /API error 500|server exploded|ошиб/i.test(t)) || "";
+  ok(!!errFound, "ошибка провайдера объяснена в чате: " + (errFound || JSON.stringify(errTexts).slice(0, 120)));
 }
 
 (async () => {

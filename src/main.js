@@ -586,24 +586,17 @@ const {
   runAsAdmin,
 } = systemStack;
 
-// git add -A, но БЕЗ файлов секретов (env-файлы вида DOTENV*): агент
-// (авто-чекпоинт, gitCommit, публикация) не должен закоммитить ключи в git.
-async function stageAllSafe(dir, settings) {
-  const r = await runGit(dir, ["add", "-A", "--", ".", ":(exclude,glob)**/" + ".env" + "*"], settings);
-  if (!r.ok) return r;
-  // Страховка: снимаем с индекса всё, что всё же проскочило (имя с DOTENV).
-  try {
-    const cached = await runGit(dir, ["diff", "--cached", "--name-only"], settings);
-    if (cached.ok && cached.out) {
-      const secret = cached.out.split("\n").map((l) => l.trim()).filter((l) => {
-        const base = l.split("/").pop() || l;
-        return /^\.env(\..*)?$/i.test(base) || /\.env$/i.test(base);
-      });
-      if (secret.length) await runGit(dir, ["restore", "--staged", "--", ...secret], settings);
-    }
-  } catch {}
-  return r;
-}
+// git add -A, но БЕЗ файлов секретов — код в src/git-stage.js (часть 28).
+// Имена те же: их зовут инструмент gitCommit (agent-tools), публикация и «Изменения»
+// (git-ipc, github-ipc) и авто-чекпоинт прогона (run-ai) — дословно. Сборка стоит на
+// прежнем месте куска и ВЫШЕ всех потребителей: проводки панелей и прогона читают эти
+// имена значениями, поэтому отложенная стрелка здесь была бы подменой вызова.
+const { createGitStage } = require("./git-stage.js");
+const { stageAllSafe, autoCheckpointCommit } = createGitStage({
+  fs,
+  runGit,
+  agentWorkDir,
+});
 
 // ── Дела: зеркало, напоминания и точный будильник — код в src/tasks-reminders.js ──
 // Имена те же: панели, инструменты, миссия и окно зовут их дословно. Окно приходит
@@ -668,44 +661,6 @@ let activeEmit = null; // отправка ai:event из executeTool (showImage 
 let activePlanSummary = null;
 // Роутер инструментов текущего запуска: findTools по нему включает группы на лету.
 let activeToolRouter = null;
-
-// Авто-чекпоинт (как в Replit): после завершённого задания агента, если он менял файлы
-// в git-репозитории — создаём один локальный коммит-точку возврата. Никогда не пушит.
-async function autoCheckpointCommit(settings, messages) {
-  try {
-    if (settings && settings.agentAutoCommit === false) return { committed: false };
-    const dir = agentWorkDir(settings);
-    if (!dir || !fs.existsSync(dir)) return { committed: false };
-    // Не git-репозиторий или нет изменений — пропускаем тихо.
-    const st = await runGit(dir, ["status", "--porcelain"], settings);
-    if (!st.ok || !st.out.trim()) return { committed: false };
-    // Заголовок коммита — из последнего сообщения пользователя (первая строка).
-    let title = "";
-    if (Array.isArray(messages)) {
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const m = messages[i];
-        if (m && m.role === "user" && typeof m.content === "string" && m.content.trim()) {
-          const lines = m.content.replace(/```[\s\S]*?```/g, " ").split("\n");
-          title = lines.find(function (l) { return l.trim(); }) || "";
-          break;
-        }
-      }
-    }
-    title = String(title).replace(/\s+/g, " ").trim().slice(0, 70);
-    if (!title) title = "Работа агента";
-    const add = await stageAllSafe(dir, settings);
-    if (!add.ok) return { committed: false };
-    const commit = await runGit(
-      dir,
-      ["-c", "user.name=AI Agent", "-c", "user.email=ai-agent@local", "commit", "-m", "Авто-коммит агента: " + title],
-      settings
-    );
-    if (!commit.ok) return { committed: false };
-    return { committed: true, message: "💾 Авто-коммит агента: " + title };
-  } catch (e) {
-    return { committed: false };
-  }
-}
 
 // Память диалогов: сохраняем сжатую памятку в локальный дневник по датам, но
 // ТОЛЬКО если пользователь включил галочку «Память диалогов» (иначе — тишина).
@@ -1164,31 +1119,8 @@ ipcMain.handle("ota:rollback", () => ota.rollback());
 ipcMain.handle("ota:openDir", () => ota.openDir());
 ipcMain.handle("ota:reset", (_e, removeSource) => ota.reset(!!removeSource, loadSettings()));
 
-ipcMain.handle("chats:load", () => loadChats());
-ipcMain.handle("chats:save", (e, d) => {
-  saveChats(d);
-  notifyChatsSaved(e);
-  return true;
-});
-
-// История чатов — ОДИН файл на всех клиентов (окно на ПК + телефоны). Раньше, когда
-// историю сохранял телефон, окно на ПК продолжало показывать свою копию: ответ,
-// написанный с телефона, появлялся на ПК только после перезапуска окна.
-// Просим остальные клиенты перечитать файл; тому, кто сохранил, сигнал не шлём.
-// Клиент мобильного моста приходит с фиктивным sender (id = 0) — это и есть «не ПК».
-function notifyChatsSaved(e) {
-  try {
-    const senderId = e && e.sender && typeof e.sender.id === "number" ? e.sender.id : 0;
-    if (senderId && mainWindow && senderId === mainWindow.webContents.id) return;
-    if (mainWindow) mainWindow.webContents.send("chats:reload", { at: Date.now() });
-  } catch {}
-}
-
-// Синхронное сохранение при закрытии окна: renderer успевает записать данные на диск.
-ipcMain.on("chats:saveSync", (e, d) => {
-  try { saveChats(d); } catch {}
-  e.returnValue = true;
-});
+const { registerChatsIpc } = require("./chats-ipc.js"); // история чатов: каналы и сигнал «перечитай файл»
+registerChatsIpc({ ipcMain, loadChats, saveChats, getWindow: () => mainWindow });
 
 ipcMain.handle("ai:send", async (e, messages, opts) => {
   const settings = loadSettings();
@@ -1412,43 +1344,8 @@ const {
 } = ycService;
 registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, loadSettings, saveSettings, svc: ycService });
 
-// ── 🧠 Память диалогов: локальный дневник сжатых памяток (папка по датам) ──────
-ipcMain.handle("memory:stats", () => {
-  const s = loadSettings();
-  const st = agentStore.contextMemoryStats(app.getPath("userData"));
-  return {
-    ...st,
-    enabled: !!s.contextMemory,
-    keepDays: Number(s.contextMemoryDays) || agentStore.CTX_MEMO_DAY_KEEP,
-  };
-});
-
-ipcMain.handle("memory:days", () => {
-  const s = loadSettings();
-  if (!s.contextMemory) return { ok: false, error: "Память диалогов выключена." };
-  const days = agentStore.contextMemoryDays(app.getPath("userData"));
-  return { ok: true, days, dir: agentStore.contextMemoryDir(app.getPath("userData")) };
-});
-
-ipcMain.handle("memory:openDir", async () => {
-  const dir = agentStore.contextMemoryDir(app.getPath("userData"));
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-  } catch {}
-  const err = await shell.openPath(dir);
-  return { ok: !err, dir, error: err || "" };
-});
-
-ipcMain.handle("memory:clear", (_e, date) => {
-  const d = String(date || "").trim();
-  const r = agentStore.contextMemoryClear(app.getPath("userData"), d);
-  return {
-    ...r,
-    message: r.ok
-      ? "Удалено дней: " + r.removedDays + ", памяток: " + r.removedMemos + "."
-      : "Ошибка: " + r.error,
-  };
-});
+const { registerMemoryIpc } = require("./memory-ipc.js"); // память диалогов: каналы дневника памяток
+registerMemoryIpc({ ipcMain, app, fs, shell, agentStore, loadSettings });
 
 // ───────────────────── Деплой: рецепты, состояние, конвейер ─────────────────────
 // Мост деплоя вынесен в src/deploy-ipc.js (1.5.75): конвейер остаётся чистым в
