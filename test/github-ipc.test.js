@@ -739,6 +739,22 @@ function fakeTimers() {
     assert.ok(/github:event/.test(PRELOAD_SRC) && /github:event/.test(MOBILE_SRC), "событие входа по коду не проброшено в окно");
   });
 
+  await test("наружу отдаются все три функции: клон, папка клона и публикация", () => {
+    // Публикация — НАСТОЯЩАЯ находка части 35: инструмент агента gitPublish звал
+    // publishLocalToGithub, а наружу функция не отдавалась и в проводку реестра не
+    // попадала — «создай репозиторий и выложи проект» падало с «is not defined».
+    // Страж связи такое не видит: имени нет ни в main.js, ни в распаковке — искать
+    // нечего. Здесь проверяем и отдачу наружу, и то, что в проводку ушла ТА ЖЕ
+    // функция, что у канала github:publish.
+    const env = build({});
+    for (const name of ["cloneRepoTo", "pickCloneBase", "publishLocalToGithub"]) {
+      assert.strictEqual(typeof env.mod[name], "function", "github-ipc не отдал наружу: " + name);
+    }
+    const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    assert.ok(/publishLocalToGithub: githubIpc\.publishLocalToGithub/.test(mainSrc), "публикация не уехала в проводку реестра инструментов");
+    assert.ok(fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8").includes("publishLocalToGithub"), "инструмент публикации перестал пользоваться общей функцией");
+  });
+
   global.fetch = realFetch;
 
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");

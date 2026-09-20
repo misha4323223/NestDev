@@ -623,7 +623,15 @@ ipcMain.handle("github:deviceStart", async () => {
 
   // Клон-помощники нужны и агентским инструментам (gitClone): отдаём их наружу,
   // чтобы main.js передал дальше те же функции.
-  return { cloneRepoTo, pickCloneBase };
+  // Публикация — тем же путём, и это была НАСТОЯЩАЯ дыра (найдена частью 35):
+  // агентский инструмент gitPublish звал publishLocalToGithub, а наружу функция не
+  // отдавалась и в проводке реестра её не было — вызов падал с «is not defined»,
+  // то есть «создай репозиторий и выложи проект» не работало вовсе. Страж связи
+  // такую ошибку не видит: имени нет ни в main.js, ни в распаковке — искать нечего.
+  // Теперь её ловит обратная проверка (test/tool-registry.test.js) и живой прогон
+  // (scripts/live-tool-registry.js): каждое имя из распаковки инструментов обязано
+  // быть в проводке реестра и иметь значение.
+  return { cloneRepoTo, pickCloneBase, publishLocalToGithub };
 }
 
 module.exports = { registerGithubIpc };

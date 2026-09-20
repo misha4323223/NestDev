@@ -486,7 +486,7 @@ const systemOf = (m) => String((m.calls.rounds[0] || {}).messages && (m.calls.ro
     }
     const wiring = /const \{ createRunAi \} = require\("\.\/run-ai\.js"\);[\s\S]*?\n\}\);/.exec(MAIN_SRC);
     assert.ok(wiring, "не нашёл проводку прогона");
-    for (const dep of ["  createRunRound,", "  createRunMission,", "  executeTool,", "  SYSTEM_PROMPT,", "  live: {"]) {
+    for (const dep of ["  createRunRound,", "  createRunMission,", "  executeTool:", "  SYSTEM_PROMPT,", "  live: {"]) {
       assert.ok(wiring[0].includes(dep), "в проводку не передано: " + dep.trim());
     }
     // Живое состояние оболочки держится сеттерами: часть его пишет и прогон.
@@ -496,6 +496,7 @@ const systemOf = (m) => String((m.calls.rounds[0] || {}).messages && (m.calls.ro
     }
     // Панель терминала собирается ниже — значит, передавать её можно только отложенно.
     assert.ok(/termEmit: \(\.\.\.termArgs\) => termEmit\(\.\.\.termArgs\)/.test(MAIN_SRC), "termEmit передан значением до объявления");
+    assert.ok(MAIN_SRC.includes("executeTool: (...toolArgs) => executeTool(...toolArgs)"), "executeTool передан значением до сборки реестра");
     // Модуль ничего не достаёт сам: ни путей, ни require.
     assert.ok(!/app\.getPath|__dirname|require\(/.test(MODULE_SRC), "модуль сам достаёт состояние вместо внедрения");
     assert.ok(!/^let |^var /m.test(MODULE_SRC), "в модуле завелось состояние уровня файла");

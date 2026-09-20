@@ -253,8 +253,14 @@ const cfg = { oauth: "OAUTH-SECRET", cloudId: "b1g", folderId: "f1" };
     // команды падали с «rm: not found»). Поймал живой прогон раунда; теперь и здесь.
     assert.ok(/envPathInfo: \(\) => envPathInfo\(\),/.test(mainSrc), "мост пути отдаёт функцию вместо результата");
     assert.strictEqual(mainSrc.indexOf("envPathInfo: () => envPathInfo,"), -1, "мост вернулся к передаче самой функции");
-    assert.ok(/setCapability\(toolPolicy\.capabilityOf\(name\)\)/.test(mainSrc), "инструмент в работе не объявляет назначение");
-    assert.ok(/setCapability\(prevCapability\);/.test(mainSrc), "назначение не возвращается после инструмента");
+    // Объявление и возврат назначения уехали вместе с реестром инструментов (этап B,
+    // часть 35): спрашиваем модуль, а у оболочки — что назначение приходит ЖИВЫМ
+    // (экземпляр agent-env выше по файлу; копия дала бы пустое назначение и голый env
+    // команд). Стоп-флаг — тот же живой признак, его ставит канал ai:stop.
+    const registrySrc = fs.readFileSync(path.join(ROOT, "src", "tool-registry.js"), "utf8");
+    assert.ok(/setCapability\(toolPolicy\.capabilityOf\(name\)\)/.test(registrySrc), "инструмент в работе не объявляет назначение");
+    assert.ok(/setCapability\(prevCapability\);/.test(registrySrc), "назначение не возвращается после инструмента");
+    assert.ok(mainSrc.indexOf("\n  getCapability,\n") >= 0 && mainSrc.indexOf("\n  setCapability,\n") >= 0, "реестр инструментов не получил живое назначение окружения");
     // Прямых обращений к перенесённому состоянию в оболочке быть не должно.
     assert.ok(!/\bagentEnv\b\s*=/.test(mainSrc), "оболочка пишет в перенесённое состояние");
   });

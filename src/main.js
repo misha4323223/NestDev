@@ -277,12 +277,6 @@ const PARALLEL_SAFE_TOOLS = new Set([
   "noteRead", "noteList", "checkpointList", "agentGuide", "vaultList",
 ]);
 
-// Короткое описание аргументов для подтверждения опасного действия.
-// Тексты живут в политике (tool-policy.js) — здесь только обёртка.
-function describeToolArgs(name, a) {
-  return toolPolicy.describe(name, a);
-}
-
 // ── Оболочки и запуск команд — код в src/shell-tools.js ──
 // Имена те же: инструменты, фоновые процессы, терминал и САММАРИ проекта зовут
 // их дословно. findProgram приходит стрелкой: системный раздел (system-stack.js)
@@ -624,30 +618,6 @@ const { guideSafeName, guideFilePath, guideIndex, guideForUrl, guideReadText, ag
   builtinDir: path.join(__dirname, "agent-guides"),
 });
 
-async function executeTool(name, args, settings) {
-  args = args || {};
-  // Инструмент в работе: его capability решает, какие переменные агента дойдут до
-  // команд внутри него. Вызовы инструментов идут по очереди (цикл runAi), поэтому
-  // одного «текущего назначения» достаточно; вложенный вызов вернёт своё.
-  const prevCapability = getCapability();
-  setCapability(toolPolicy.capabilityOf(name));
-  try {
-    // Пользователь нажал Esc/«Стоп» — агент должен немедленно остановиться.
-    if (global.__agentStopRequested) {
-      return "⏹ Остановлено пользователем (Esc / Стоп). Немедленно прекрати вызовы инструментов и заверши ответ КРАТКИМ итогом: что успел сделать и что осталось.";
-    }
-    // Обработчики вынесены в src/agent-tools.js (1.5.77): здесь только выбор
-    // инструмента и единая обработка ошибок — как и раньше.
-    const handler = agentToolHandlers[name];
-    if (!handler) return "Ошибка: неизвестный инструмент " + name;
-    return await handler(args, settings);
-  } catch (e) {
-    return "Ошибка: " + fmtError(e);
-  } finally {
-    setCapability(prevCapability);
-  }
-}
-
 // ─────────────────────────── AI: список моделей ───────────────────────────
 async function fetchModels(settings) {
   return listModels(settings);
@@ -698,6 +668,14 @@ function saveContextMemo(settings, entry, emit) {
   }
 }
 
+// ── Реестр агентских инструментов и вызов инструмента — код в src/tool-registry.js ──
+// Модуль берём ЗДЕСЬ, а собираем ниже (в конце файла): его обработчики живут всем,
+// что построено в оболочке, а прогону уже сейчас нужны описание аргументов
+// (describeToolArgs) и сам вызов инструмента. Поэтому require стоит до прогона, а
+// createToolRegistry({...}) — после всей сборки; executeTool уходит прогону
+// отложенной стрелкой, как termEmit у панели терминала.
+const { createToolRegistry, describeToolArgs } = require("./tool-registry.js");
+
 // ── Прогон агента: цикл раундов, миссия и восстановление — код в src/run-ai.js ──
 // Модули частей 14–20 (миссия, роутер, повтор, раунд, вызовы, строгая очередь, батч,
 // призывы) прогон собирает сам — они переданы ему готовыми.
@@ -735,7 +713,9 @@ const { runAi } = createRunAi({
   describeImageRemote,
   describeToolArgs,
   estimateTokens,
-  executeTool,
+  // Сам вызов инструмента собирается НИЖЕ (весь реестр — в конце файла), поэтому
+  // уходит отложенной стрелкой: к первому вызову прогона он уже готов.
+  executeTool: (...toolArgs) => executeTool(...toolArgs),
   extractToolCallsFromText,
   fmtError,
   friendlyRateLimitError,
@@ -1217,7 +1197,15 @@ app.on("before-quit", () => {
 // Собираем обработчики один раз при загрузке: к этому месту все константы уже
 // инициализированы, а функции поднимаются объявлениями. Вызов инструментов идёт
 // только после старта приложения, поэтому порядок безопасен.
-const agentToolHandlers = createAgentTools({
+// Весь список имён уходит в src/tool-registry.js тем же плоским объектом, что и
+// раньше: модуль сам передаёт его в createAgentTools, а для себя берёт четыре
+// значения — сборщик обработчиков, обёртку ошибки fmtError и живое назначение
+// окружения (get/setCapability принадлежат экземпляру src/agent-env.js выше).
+const { executeTool } = createToolRegistry({
+  createAgentTools,
+  fmtError,
+  getCapability,
+  setCapability,
   shell,
   path,
   fs,
@@ -1243,6 +1231,9 @@ const agentToolHandlers = createAgentTools({
   agentWorkDir,
   repoNameFromUrl,
   stripUrlCreds,
+  // Публикация проекта в GitHub — ТА ЖЕ функция, что зовёт канал github:publish:
+  // без неё инструмент gitPublish падал с «is not defined» (находка части 35).
+  publishLocalToGithub: githubIpc.publishLocalToGithub,
   normalizeShell,
   resolveShell,
   shellsStatus,
