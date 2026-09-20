@@ -23,12 +23,27 @@
    Ошибки запуска (ENOENT/EACCES/EINVAL) не пишут в stderr — они попадают в
    ответ отдельно, иначе агент видел пустой вывод и не понимал причину.
 
+     • **вывод команды уехал в контекст целиком.** Сборка или тесты печатают
+       мегабайты, и без обрезки они вытесняют всю переписку. Режем тем же правилом,
+       что и остальные инструменты (`truncateText`), и ЧЕСТНО говорим, сколько было:
+       молчаливо обрезанный вывод модель читает как закончившийся на середине.
+       Раньше это правило стояло только в ветке ошибки — успешный вывод уходил
+       целиком (исправлено 1.5.178, отдельным решением, не за выносом).
+
    findProgram приходит функцией-обёрткой: системный раздел (system-stack.js)
    собирается НИЖЕ по файлу оболочки, а оболочки нужны уже здесь — модулю их
    берёг tool-helpers, фоновые процессы и САММАРИ проекта. */
 
 function createShellTools(deps) {
-  const { fs, path, execFile, commandEnv, findProgram } = deps;
+  const { fs, path, execFile, commandEnv, findProgram, truncateText } = deps;
+
+// Предел вывода, который уезжает в контекст. Правило то же, что у инструментов
+// (truncateText из ядра): обрезать и назвать, сколько символов было всего.
+// Обрезаем НЕ склейку, а каждый поток отдельно: иначе длинный stdout съел бы
+// stderr, а ошибка сборки как раз там, и модель увидела бы только прогресс.
+const MAX_OUT = 6000;
+const PART_OUT = 3000;
+const clip = (text, cap) => truncateText(text, cap || MAX_OUT);
 
 // Чистит ANSI-escape-последовательности (цвета npm-сборок и т.п.) из вывода терминала.
 function stripAnsi(s) {
@@ -215,19 +230,23 @@ function runTerminalCommand(command, cwd, timeoutMs, shellName) {
       const out = stripAnsi(stdout || "").trim();
       const errText = stripAnsi(stderr || "").trim();
       if (!err) {
-        if (out && errText) resolve(out + "\n\n[stderr]\n" + errText + timeNote);
-        else resolve((out || errText || "Готово (без вывода).") + timeNote);
+        // Обрезка — ДО времени: отметка «(0.4 с)» обязана остаться видимой,
+        // иначе по ответу не понять, сколько команда работала.
+        if (out && errText) resolve(clip(out, PART_OUT) + "\n\n[stderr]\n" + clip(errText, PART_OUT) + timeNote);
+        else resolve(clip(out || errText || "Готово (без вывода).") + timeNote);
       } else {
         const code = err.killed ? "таймаут" : err.code == null ? 1 : err.code;
         const parts = [];
-        if (out) parts.push(out);
-        if (errText) parts.push(errText);
+        if (out) parts.push(clip(out, PART_OUT));
+        if (errText) parts.push(clip(errText, PART_OUT));
         // Ошибки запуска (ENOENT/EACCES/EINVAL) не пишут в stderr — без этого
         // агент видел пустой вывод и не мог понять причину.
         if (!errText && err.message) parts.push(String(err.message));
         if (!parts.length) parts.push(err.message || String(err));
         const shHint = (err.code === "ENOENT" || sh.missing === true) && sh.shellHint ? "\n\n" + sh.shellHint : "";
-        resolve("Команда завершилась с кодом " + code + timeNote + ":\n" + parts.join("\n").slice(0, 6000) + shHint);
+        // Части уже обрезаны по отдельности (см. выше) — здесь только склейка:
+        // второй обрезки нет, иначе хвост терял бы пометку о своей длине.
+        resolve("Команда завершилась с кодом " + code + timeNote + ":\n" + parts.join("\n") + shHint);
       }
     });
   });

@@ -5919,6 +5919,7 @@ async function testShellAndCdp() {
       execFile: require("child_process").execFile,
       commandEnv: () => ({}),
       findProgram,
+      truncateText: require(path.join(ROOT, "src", "renderer", "agent-core.js")).truncateText,
     });
   const H = mkHelpers((name) => ({ found: true, path: "/usr/bin/" + name }));
 

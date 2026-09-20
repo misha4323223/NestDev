@@ -279,6 +279,7 @@ const { stripAnsi, shellArgsFor, normalizeShell, powershellArgs, findGitShell, s
   execFile,
   commandEnv,
   findProgram: (name) => findProgram(name),
+  truncateText,
 });
 // Строка про Yandex Cloud для САММАРИ ПРОЕКТА: агент всегда видит АКТУАЛЬНЫЙ
 // каталог и разрешения, а не полагается на устаревшие результаты инструментов

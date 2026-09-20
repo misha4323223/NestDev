@@ -22,6 +22,9 @@ const { execFile } = require("child_process");
 
 const ROOT = path.join(__dirname, "..");
 const { createShellTools } = require(path.join(ROOT, "src", "shell-tools.js"));
+// Обрезка вывода — общее правило проекта: берём НАСТОЯЩУЮ функцию ядра, чтобы
+// проверка падала и на чужом пределе, и на переписанном тексте пометки.
+const { truncateText } = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
 const MAIN_SRC = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
 let passed = 0;
 let failed = 0;
@@ -60,6 +63,7 @@ function mk(over) {
     },
     commandEnv: o.commandEnv || (() => ({})),
     findProgram: o.findProgram || ((name) => ({ found: true, path: "/usr/bin/" + name })),
+    truncateText,
   });
   return { ...tools, calls };
 }
@@ -72,6 +76,7 @@ function mkReal(over) {
     execFile,
     commandEnv: (over && over.commandEnv) || (() => ({})),
     findProgram: (over && over.findProgram) || (() => ({ found: false, reason: "нет" })),
+    truncateText,
   });
 }
 
@@ -260,20 +265,57 @@ function mkReal(over) {
       execFile: (s, a, o, cb) => { const e = new Error("spawn bash ENOENT"); e.code = "ENOENT"; cb(e, "", ""); },
       commandEnv: () => ({}),
       findProgram: () => ({ found: false, reason: "нет" }),
+      truncateText,
     });
     const r5 = await noShell.runTerminalCommand("x", "/tmp", 1000, "bash");
     assert.ok(r5.includes("bash не найден"), "нет подсказки про отсутствующую оболочку: " + r5);
     assert.ok(/installSystemPackage/.test(r5), "подсказка не говорит, что делать: " + r5);
 
-    // Граница обрезки: у ОШИБКИ вывод режется (6000 символов), у успеха — нет.
-    // Это прежнее поведение, а не следствие выноса: записываем как есть, чтобы
-    // правка обрезки была отдельным решением, а не проехала молча.
+    // Обрезка — общее правило проекта (truncateText), и оно одинаково для успеха и
+    // ошибки: предел 6000 символов ПЛЮС честная пометка, сколько было всего.
+    // Молчаливо обрезанный вывод модель читает как закончившийся на середине.
     const long = mk({ execFile: (s, a, o, cb) => cb(null, "я".repeat(20000), "") });
     const r6 = await long.runTerminalCommand("x", "/tmp");
-    assert.ok(r6.length > 6000, "успех начал обрезаться — это уже другое поведение: " + r6.length);
+    assert.ok(r6.length < 6200, "длинный успешный вывод уедет в контекст целиком: " + r6.length);
+    assert.ok(/… \(обрезано: 20000 символов\)/.test(r6), "обрезка не названа честно: " + r6.slice(-90));
+    assert.ok(/^я/.test(r6), "начало вывода потеряно: " + r6.slice(0, 40));
+    assert.ok(/\(\d+\.\d с\)$/.test(r6), "время выполнения потерялось при обрезке: " + r6.slice(-40));
+
+    const shortOut = mk({ execFile: (s, a, o, cb) => cb(null, "короткий вывод\n", "") });
+    const rShort = await shortOut.runTerminalCommand("x", "/tmp");
+    assert.ok(!/обрезано/.test(rShort), "короткий вывод помечен обрезанным: " + rShort);
+
+    // Длинный stdout ВМЕСТЕ с длинным stderr: обрезка идёт по каждому потоку
+    // отдельно, иначе stdout съел бы stderr — а ошибка сборки как раз там.
+    const bothLong = mk({ execFile: (s, a, o, cb) => cb(null, "в".repeat(9000), "о".repeat(9000)) });
+    const rBoth = await bothLong.runTerminalCommand("x", "/tmp");
+    assert.ok(rBoth.length < 6300, "вывод со stderr уехал целиком: " + rBoth.length);
+    assert.ok(/\[stderr\]/.test(rBoth), "раздел stderr пропал при обрезке: " + rBoth.slice(-90));
+    assert.ok(/в{5}[\s\S]*… \(обрезано: 9000 символов\)[\s\S]*\n\n\[stderr\]\n[\s\S]*о{5}/.test(rBoth),
+      "порядок «stdout → пометка → [stderr] → stderr» нарушен: " + rBoth.slice(0, 120) + " … " + rBoth.slice(-120));
+    assert.ok((rBoth.match(/… \(обрезано: 9000 символов\)/g) || []).length === 2, "пометки есть не у обоих потоков");
+    assert.ok(/\(\d+\.\d с\)$/.test(rBoth), "время выполнения потерялось: " + rBoth.slice(-40));
+
+    // Ошибка: вывод обрезан, а текст исключения и код возврата на месте.
     const longErr = mk({ execFile: (s, a, o, cb) => { const e = new Error("провал"); e.code = 1; cb(e, "я".repeat(20000), ""); } });
     const r7 = await longErr.runTerminalCommand("x", "/tmp");
-    assert.ok(r7.length < 7000, "длинный вывод ошибки не обрезан: " + r7.length);
+    assert.ok(r7.length < 4000, "длинный вывод ошибки не обрезан: " + r7.length);
+    assert.ok(/… \(обрезано: 20000 символов\)/.test(r7), "обрезка ошибки не названа честно: " + r7.slice(-90));
+    assert.ok(/^Команда завершилась с кодом 1/.test(r7), "код возврата потерялся при обрезке: " + r7.slice(0, 60));
+    assert.ok(r7.includes("провал"), "причина отказа потерялась при обрезке: " + r7.slice(-120));
+
+    // Ошибка со stderr: в отказ обязан доехать именно stderr (там текст ошибки),
+    // даже если stdout в десять раз длиннее.
+    const errBoth = mk({ execFile: (s, a, o, cb) => { const e = new Error("код 2"); e.code = 2; cb(e, "п".repeat(20000), "ОШИБКА КОМПИЛЯЦИИ"); } });
+    const r8 = await errBoth.runTerminalCommand("x", "/tmp");
+    assert.ok(r8.includes("ОШИБКА КОМПИЛЯЦИИ"), "stderr потерялся в отказе: " + r8.slice(-160));
+    assert.ok(r8.length < 4000, "отказ со stderr уехал целиком: " + r8.length);
+
+    // Длинный stderr в ветке ошибки режется так же, и пометка называет его длину.
+    const errLong = mk({ execFile: (s, a, o, cb) => { const e = new Error("код 3"); e.code = 3; cb(e, "кратко", "е".repeat(20000)); } });
+    const r9 = await errLong.runTerminalCommand("x", "/tmp");
+    assert.ok(r9.length < 4000, "длинный stderr в отказе уехал целиком: " + r9.length);
+    assert.ok(/… \(обрезано: 20000 символов\)/.test(r9), "обрезка stderr в отказе не названа: " + r9.slice(-90));
   });
 
   await test("runTerminalCommand: настоящие процессы — успех, отказ и время", async () => {
@@ -316,7 +358,7 @@ function mkReal(over) {
     );
     const wiring = /const \{ createShellTools \} = require\("\.\/shell-tools\.js"\);[\s\S]*?\n\}\);/.exec(MAIN_SRC);
     assert.ok(wiring, "не нашёл проводку модуля оболочек");
-    for (const dep of ["  fs,", "  path,", "  execFile,", "  commandEnv,", "  findProgram: (name) => findProgram(name),"]) {
+    for (const dep of ["  fs,", "  path,", "  execFile,", "  commandEnv,", "  findProgram: (name) => findProgram(name),", "  truncateText,"]) {
       assert.ok(wiring[0].includes(dep), "в проводку не передано: " + dep);
     }
     assert.ok(/findProgram: \(name\) => findProgram\(name\)/.test(MAIN_SRC),

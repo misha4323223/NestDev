@@ -47,6 +47,8 @@ const BREAKS = {
   shellshim: ["src/main.js", "  findProgram: (name) => findProgram(name),\n", '  findProgram: () => ({ found: true, path: "/нет/такой/оболочки/sh" }),\n'],
   // Мусорное имя оболочки перестаёт распознаваться как ошибка.
   nonormalize: ["src/shell-tools.js", '  return SHELL_KINDS[key] || "";', '  return SHELL_KINDS[key] || "sh";'],
+  // Успешный вывод перестаёт обрезаться — в контекст уедут все 9000 знаков.
+  noclip: ["src/shell-tools.js", 'else resolve(clip(out || errText || "Готово (без вывода).") + timeNote);', 'else resolve((out || errText || "Готово (без вывода).") + timeNote);'],
 };
 let brokenFile = null;
 if (BREAK) {
@@ -103,11 +105,13 @@ const call = (index, id, name, args) => ({ index: index, id: id, type: "function
    1) runCommand с мусорным именем оболочки: агент обязан получить понятную ошибку;
    2) runCommand с настоящей командой: вывод живого процесса и время выполнения;
    3) shellsStatus: отчёт о машине;
-   4) финальный текст — прогон заканчивается сам. */
+   4) runCommand с огромным выводом: обрезка и честная пометка (не 9000 символов в контекст);
+   5) финальный текст — прогон заканчивается сам. */
 const SCRIPT = [
   { text: "Раунд 1: пробую неизвестную оболочку.\n", call: { name: "runCommand", args: { command: "echo привет", shell: "calc.exe" } } },
   { text: "Раунд 2: настоящая команда.\n", call: { name: "runCommand", args: { command: 'node -e "console.log(6*7)"' } } },
   { text: "Раунд 3: смотрю оболочки.\n", call: { name: "shellsStatus", args: {} } },
+  { text: "Раунд 4: длинный вывод.\n", call: { name: "runCommand", args: { command: 'node -e "console.log(\'я\'.repeat(9000))"' } } },
   { text: "Проверка оболочек закончена." },
 ];
 
@@ -234,15 +238,16 @@ const evOf = (type) => events.filter((e) => e.ch === "ai:event" && e.ev && e.ev.
   });
   ok(saved && saved.model === "test-model", "настройки приняты: " + (saved && saved.model));
 
-  console.log("\n[2] Прогон: три инструмента подряд, затем финальный текст");
+  console.log("\n[2] Прогон: четыре инструмента подряд, затем финальный текст");
   const run = await callIpc("ai:send", [{ role: "user", content: "Проверь оболочки" }], { chatId: "chat-live-shell", role: "developer" });
   ok(run && run.ok === true, "прогон завершился без ошибки: " + JSON.stringify(run && run.error));
-  ok(served === 4, "провайдер отдал ровно 4 ответа чата: " + served);
-  ok(requests.length === 4, "тел запросов сохранено: " + requests.length);
+  ok(served === 5, "провайдер отдал ровно 5 ответов чата: " + served);
+  ok(requests.length === 5, "тел запросов сохранено: " + requests.length);
 
   const r2 = requests[1];
   const r3 = requests[2];
   const r4 = requests[3];
+  const r5 = requests[4];
 
   console.log("\n[3] Мусорное имя оболочки: агент получает ошибку, а не молчаливый запуск");
   const bad = toolResults(r2).find((t) => /неизвестная оболочка/.test(t));
@@ -274,7 +279,17 @@ const evOf = (type) => events.filter((e) => e.ch === "ai:event" && e.ev && e.ev.
   ok(/[✅❌] (sh|cmd|powershell|pwsh|bash)/.test(text), "в отчёте нет ни одной строки о найденной оболочке: " + text);
   ok(process.platform !== "win32" || /powershell/.test(text), "на Windows в отчёте нет powershell");
 
-  console.log("\n[6] Прогон закончился чисто");
+  console.log("\n[6] Огромный вывод команды: обрезка и честная пометка");
+  const big = toolResults(r5).find((t) => /обрезано:/.test(String(t)));
+  ok(!!big, "пометки об обрезке нет — 9000 символов уехали в контекст: " + JSON.stringify(toolResults(r5).map((t) => t.length)));
+  const bigText = String(big || "");
+  ok(bigText.length < 6300, "в контекст ушло " + bigText.length + " символов вместо предела: " + bigText.length);
+  // Команда печатает 9000 знаков, хвостовой перевод строки срезается — длина ровно 9000.
+  ok(/… \(обрезано: 9000 символов\)/.test(bigText), "пометка не называет настоящую длину (нужно 9000): " + bigText.slice(-90));
+  ok(/^я/.test(bigText.replace(/^\$ node -e[^\n]*\n\(каталог:[^\n]*\)\n\n/, "")), "начало вывода потеряно: " + bigText.slice(0, 60));
+  ok(/\(\d+\.\d с\)$/.test(bigText.trim()), "время выполнения потерялось при обрезке: " + bigText.slice(-40));
+
+  console.log("\n[7] Прогон закончился чисто");
   ok(evOf("error").length === 0, "ошибок в чат не пришло: " + JSON.stringify(evOf("error").map((e) => e.ev.message)));
   ok(global.__agentRunning === false, "признак прогона снят");
 
