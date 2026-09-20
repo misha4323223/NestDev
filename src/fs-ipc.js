@@ -18,7 +18,7 @@
    файл (main.js использует тот же список, чтобы не держать копию). */
 
 function registerFsIpc(deps) {
-  const { ipcMain, shell, path, fs, sanitizeDir, sanitizePath } = deps;
+  const { ipcMain, shell, path, fs, sanitizeDir, sanitizePath, ipcGuard, getWindow } = deps;
 
 // ─────────────────────────── Файлы (панель проекта) ───────────────────────────
 const BINARY_EXT = new Set([
@@ -148,7 +148,11 @@ ipcMain.handle("fs:writeFile", (_e, p, content) => {
   }
 });
 
-ipcMain.handle("fs:delete", (_e, p) => {
+ipcMain.handle("fs:delete", (e, p) => {
+  // Удаление — разрушительный канал: сначала проверяем, кто позвал
+  // (см. src/ipc-guard.js). Раньше здесь не было проверки отправителя вообще.
+  const bad = ipcGuard.denyReason(e, { window: getWindow ? getWindow() : null, channel: "fs:delete" });
+  if (bad) return { ok: false, error: bad };
   const abs = sanitizePath(p);
   if (!abs) return { ok: false, error: "Путь не найден" };
   try {

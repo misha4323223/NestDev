@@ -104,6 +104,14 @@ const toolPolicy = require("./tool-policy.js"); // политика инстру
 const { createAgentTools } = require("./agent-tools.js"); // агентские инструменты: 154 обработчиков своим модулем
 
 const audit = require("./audit-log.js");
+// Куда главному процессу можно ходить по адресу, который назвал интерфейс
+// (ai:test, ai:models, g4f:*): одна точка правды против SSRF в метаданные облака.
+const netGuard = require("./net-guard.js");
+// Кто имеет право звать разрушительный канал: окно приложения, телефон или
+// никто. До этого модуля проверки отправителя не было ни у одного канала.
+const ipcGuard = require("./ipc-guard.js");
+// Секреты в настройках: окну — значения, телефону — заглушки (settings:get).
+const secretMask = require("./secret-mask.js");
 const deployRecipes = require("./deploy-recipes.js"); // рецепты сборки: тип проекта → Dockerfile, порт, путь проверки
 const cloudState = require("./cloud-state.js"); // состояние облака проекта: .cloud/project.json, infrastructure.json, deployments.json
 const { createDeployEngine } = require("./deploy-engine.js"); // конвейер деплоя: стадии, проверка после выката, откат // журнал действий агента (JSONL, без секретов)
@@ -817,6 +825,7 @@ const { termEmit, termAgentEcho, termStart, termInput, termStop, termStatus, ter
   agentWorkDir,
   loadSettings,
   getWindow: () => mainWindow,
+  ipcGuard,
 });
 // ── Каналы панели терминала (term:start/input/stop/status/complete) ──
 // Раньше стояли в main.js (часть 32). Рабочую папку и настройки модуль уже получил
@@ -846,6 +855,10 @@ registerSettingsIpc({
   // приложения: спрашиваем его в момент вызова, оно могло быть закрыто или пересоздано.
   dialog,
   getWindow: () => mainWindow,
+  // Настройки — это ключи, пароли и PIN: кто позвал (и можно ли отдавать
+  // значения) решает проверка отправителя, а не состав канала.
+  ipcGuard,
+  secretMask,
   live: {
     setLastAgentRepoDir: (v) => {
       lastAgentRepoDir = v;
@@ -864,7 +877,16 @@ const { mailConfig } = registerMailIpc({ ipcMain, mail, loadSettings });
 // Смена PIN обязана быть применена к ЖИВОМУ мосту: иначе окно показало бы новый PIN,
 // а телефон остался бы подключён по старому — и «сменить PIN» молча ничего не менял.
 const { registerMobileIpc } = require("./mobile-ipc.js");
-registerMobileIpc({ ipcMain, mobileBridge, loadSettings, saveSettings });
+registerMobileIpc({
+  ipcMain,
+  mobileBridge,
+  loadSettings,
+  saveSettings,
+  // Статус моста содержит PIN и токен пары: окно на ПК (в нём QR-код) получает
+  // их, телефон — нет. Кто позвал, решает та же проверка отправителя.
+  ipcGuard,
+  getWindow: () => mainWindow,
+});
 
 // ─── Дела, миссии и файлы работы агента — код в src/mission-ipc.js ───────────
 // Модуль собирается на прежнем месте куска и регистрирует каналы tasks:*,
@@ -969,6 +991,8 @@ registerRunIpc({
   persistUndo,
   loadPersistedUndo,
   undoFile,
+  netGuard,
+  ipcGuard,
   live: {
     get mainWindow() { return mainWindow; },
     get activeAbort() { return activeAbort; },
@@ -1006,6 +1030,7 @@ registerModelIpc({
   ollamaNumCtx,
   isLocalEndpoint,
   probeLocalModel,
+  netGuard,
 });
 
 // ─────────────────────────── GitHub OAuth (device flow) + repo picker ───────────────────────────
@@ -1139,7 +1164,18 @@ const { runCloudDeploy, cloudDeployBrief } = registerDeployIpc({
 // Каналы файловой панели вынесены в src/fs-ipc.js (1.5.76). Список бинарных
 // расширений оттуда же — чтобы не держать вторую копию (её использует агент).
 const { registerFsIpc } = require("./fs-ipc.js");
-const { BINARY_EXT } = registerFsIpc({ ipcMain, shell, path, fs, sanitizeDir, sanitizePath });
+const { BINARY_EXT } = registerFsIpc({
+  ipcMain,
+  shell,
+  path,
+  fs,
+  sanitizeDir,
+  sanitizePath,
+  // Разрушительный fs:delete проверяет отправителя — окно приходит функцией:
+  // оно создаётся позже сборки модуля и может быть закрыто.
+  ipcGuard,
+  getWindow: () => mainWindow,
+});
 // ─────────────────────────── Git (панель проекта) ───────────────────────────
 // Каналы git-панели вынесены в src/git-ipc.js (1.5.76). Состояние агента (папка
 // последнего клона и флаг «после клона») остаётся здесь — модуль пишет в него

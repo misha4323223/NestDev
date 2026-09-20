@@ -51,6 +51,8 @@ function mk(over) {
   let current = { ...(o.current || { mobileEnabled: false, mobilePin: "111111" }) };
   const saved = [];
   const applied = [];
+  const rotated = [];
+  const win = { isDestroyed: () => false, webContents: { id: 11, send() {} } };
 
   const deps = {
     ipcMain: {
@@ -63,13 +65,25 @@ function mk(over) {
         applied.push(s);
         current = { ...current, mobilePin: s.mobilePin };
       },
-      status: () => ({ enabled: !!current.mobileEnabled, pin: current.mobilePin, port: 9090 }),
+      // Контракт статуса как у настоящего моста (src/mobile-bridge.js):
+      // телефону — без PIN и токена пары, окну — с ними (в окне рисуется QR-код).
+      status: (opts) =>
+        opts && opts.client
+          ? { enabled: !!current.mobileEnabled, running: true, port: 9090, ips: [], urls: [] }
+          : { enabled: !!current.mobileEnabled, running: true, port: 9090, pin: current.mobilePin, pair: "a1b2c3", pairUsed: false, sessions: 0, ips: [], urls: [] },
+      // «Сменить PIN» гасит подключённые телефоны: новый токен пары, сеансы в сброс.
+      rotate: () => {
+        rotated.push(Date.now());
+        return "новый-токен";
+      },
     },
     loadSettings: () => ({ ...current }),
     saveSettings: (s) => {
       saved.push(s);
       current = s;
     },
+    ipcGuard: require(path.join(ROOT, "src", "ipc-guard.js")),
+    getWindow: () => win,
   };
   registerMobileIpc(deps);
   return {
@@ -77,11 +91,19 @@ function mk(over) {
     listeners,
     saved,
     applied,
+    rotated,
+    win,
     get current() {
       return current;
     },
   };
 }
+
+// События клиентов: окно на ПК, телефон (мост собирает событие сам, id 0) и чужой
+// рендерер внутри приложения.
+const fromWindow = (h) => ({ sender: h.win.webContents, senderFrame: { parent: null } });
+const fromPhone = () => ({ sender: { send() {}, id: 0 } });
+const fromAlien = () => ({ sender: { send() {}, id: 99 }, senderFrame: { parent: null } });
 
 const PRELOAD = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
 const MOBILE = fs.readFileSync(path.join(ROOT, "src", "renderer", "mobile-api.js"), "utf8");
@@ -103,14 +125,38 @@ const MAIN_SRC = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
 
   await test("mobile:status отдаёт статус живого моста, а не снимок", () => {
     const h = mk();
-    assert.strictEqual(h.handlers.get("mobile:status")().pin, "111111");
-    h.handlers.get("mobile:pinRegen")();
-    assert.notStrictEqual(h.handlers.get("mobile:status")().pin, "111111", "статус берётся снимком");
+    assert.strictEqual(h.handlers.get("mobile:status")(fromWindow(h)).pin, "111111");
+    h.handlers.get("mobile:pinRegen")(fromWindow(h));
+    assert.notStrictEqual(h.handlers.get("mobile:status")(fromWindow(h)).pin, "111111", "статус берётся снимком");
+  });
+
+  await test("статус моста: окну — PIN и токен пары, телефону — ни того, ни другого", () => {
+    // PIN и токен пары — это ровно те секреты, по которым телефон и подключается.
+    // Окну они нужны (в нём QR-код), телефону — нет: он за ними и пришёл бы.
+    const h = mk();
+    const win = h.handlers.get("mobile:status")(fromWindow(h));
+    assert.ok(win.pin && win.pair, "окно не получило данные для QR-кода: " + JSON.stringify(win).slice(0, 120));
+
+    const phone = h.handlers.get("mobile:status")(fromPhone());
+    assert.strictEqual(phone.pin, undefined, "телефону ушёл PIN");
+    assert.strictEqual(phone.pair, undefined, "телефону ушёл токен пары");
+    assert.ok(phone.port === 9090 && Array.isArray(phone.urls), "телефону не отдан рабочий статус моста");
+  });
+
+  await test("чужой рендерер внутри приложения не читает статус и не меняет PIN", () => {
+    const h = mk();
+    const st = h.handlers.get("mobile:status")(fromAlien());
+    assert.ok(st.error && /не из окна/.test(st.error), "отказ не объяснён: " + JSON.stringify(st));
+    assert.strictEqual(st.pin, undefined, "в отказе всё равно уехал PIN");
+    const again = h.handlers.get("mobile:pinRegen")(fromAlien());
+    assert.ok(again.error, "чужой рендерер сменил PIN: " + JSON.stringify(again));
+    assert.deepStrictEqual(h.saved, [], "чужой вызов дошёл до сохранения настроек");
+    assert.deepStrictEqual(h.rotated, [], "чужой вызов перевернул токен пары");
   });
 
   await test("смена PIN: новый PIN записан, применён к мосту и возвращён окну", () => {
     const h = mk();
-    const st = h.handlers.get("mobile:pinRegen")();
+    const st = h.handlers.get("mobile:pinRegen")(fromWindow(h));
     assert.strictEqual(h.saved.length, 1, "новый PIN не сохранён");
     assert.ok(/^\d{6}$/.test(String(h.saved[0].mobilePin)), "PIN не шестизначный: " + h.saved[0].mobilePin);
     assert.strictEqual(h.applied.length, 1, "мост не получил новые настройки");
@@ -119,16 +165,24 @@ const MAIN_SRC = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
     assert.strictEqual(h.current.mobilePin, h.saved[0].mobilePin, "PIN не доехал до диска");
   });
 
+  await test("смена PIN выкидывает подключённые телефоны: новый токен пары и сброс сеансов", () => {
+    // Иначе старый сеанс (и снимок старого QR-кода) продолжали бы пускать в
+    // приложение, хотя человек только что сменил вход.
+    const h = mk();
+    h.handlers.get("mobile:pinRegen")(fromWindow(h));
+    assert.strictEqual(h.rotated.length, 1, "токен пары не сменён вместе с PIN");
+  });
+
   await test("PIN берётся из свежих настроек, а не из копии времени сборки", () => {
     const h = mk({ current: { mobileEnabled: true, mobilePin: "222222" } });
-    h.handlers.get("mobile:pinRegen")();
+    h.handlers.get("mobile:pinRegen")(fromWindow(h));
     assert.strictEqual(h.saved[0].mobileEnabled, true, "остальные настройки потеряны при смене PIN");
     assert.strictEqual(h.saved[0].mobilePin, h.applied[0].mobilePin);
   });
 
   await test("смена PIN не трогает остальные поля настроек", () => {
     const h = mk({ current: { mobileEnabled: true, mobilePin: "333333", model: "qwen3:8b", workingDir: "/proj" } });
-    h.handlers.get("mobile:pinRegen")();
+    h.handlers.get("mobile:pinRegen")(fromWindow(h));
     assert.strictEqual(h.saved[0].model, "qwen3:8b", "модель потеряна");
     assert.strictEqual(h.saved[0].workingDir, "/proj", "рабочая папка потеряна");
   });
@@ -141,10 +195,9 @@ const MAIN_SRC = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
   await test("проводка в main.js: зависимости на месте, каналов в оболочке нет", () => {
     assert.ok(MAIN_SRC.includes('require("./mobile-ipc.js")'), "main.js не собирает модуль мобильного доступа");
     const wiring = MAIN_SRC.slice(MAIN_SRC.indexOf('require("./mobile-ipc.js")'));
-    assert.ok(
-      wiring.includes("registerMobileIpc({ ipcMain, mobileBridge, loadSettings, saveSettings });"),
-      "проводка модуля не передаёт мост и настройки"
-    );
+    for (const dep of ["ipcMain,", "mobileBridge,", "loadSettings,", "saveSettings,", "ipcGuard,", "getWindow: () => mainWindow,"]) {
+      assert.ok(wiring.includes(dep), "в проводку не передано: " + dep);
+    }
     assert.ok(!/ipcMain\.(handle|on)\("mobile:/.test(MAIN_SRC), "в main.js остались мобильные каналы");
   });
 

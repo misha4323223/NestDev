@@ -213,10 +213,17 @@ const watchdog = setTimeout(() => {
 }, 150000);
 watchdog.unref();
 
+// Вызов канала «из окна». У настоящего вызова из рендерера Electron сам
+// подставляет И отправителя (webContents окна), И кадр вызова. Здесь стояло
+// «sender: { id: 1 }» — чужой номер у окна этого прогона (оно создано с id 11),
+// и проверка отправителя (src/ipc-guard.js) справедливо сочла бы вызов чужим:
+// поддельное событие обязано быть таким же, как настоящее.
+let liveWin = null;
 const callIpc = (channel, ...args) => {
   const fn = handlers.get(channel);
   if (!fn) return Promise.resolve({ ok: false, error: "нет канала " + channel });
-  return Promise.resolve(fn({ sender: { id: 1 } }, ...args));
+  const ev = liveWin ? { sender: liveWin.webContents, senderFrame: { parent: null } } : null;
+  return Promise.resolve(fn(ev, ...args));
 };
 
 (async () => {
@@ -230,6 +237,7 @@ const callIpc = (channel, ...args) => {
   console.log("Живой прогон каналов прогона и отката (настоящий main.js без окна)");
   await sleep(400);
   const win = windows[0];
+  liveWin = win; // дальше каналы зовём от имени ЭТОГО окна
 
   console.log("\n[1] настоящий main.js сам собрал модуль — и с рабочими зависимостями");
   ok(seen.run === 1, "registerRunIpc вызван main.js " + seen.run + " раз(а)");

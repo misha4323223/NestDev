@@ -106,6 +106,8 @@ function build(o) {
   const { registerModelIpc } = require(path.join(ROOT, "src", "model-ipc.js"));
   const mod = registerModelIpc({
     ipcMain: { handle: (ch, fn) => handlers.set(ch, fn) },
+    // Проверка адреса перед запросом — та же, что в main.js (src/net-guard.js).
+    netGuard: require(path.join(ROOT, "src", "net-guard.js")),
     loadSettings: () => {
       seen.load++;
       return opts.saved || { provider: "openai", model: "старая", openaiUrl: "http://localhost:8080/v1" };

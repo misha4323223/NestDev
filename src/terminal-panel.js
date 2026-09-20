@@ -16,7 +16,7 @@
    уже закрыто, поэтому приходит ФУНКЦИЕЙ (getWindow), а не значением. */
 
 function createTerminalPanel(deps) {
-  const { fs, path, os, spawn, stripAnsi, envFor, bgKill, agentWorkDir, loadSettings, getWindow } = deps;
+  const { fs, path, os, spawn, stripAnsi, envFor, bgKill, agentWorkDir, loadSettings, getWindow, ipcGuard } = deps;
 
 let userTerm = null; // { child, buf, exited, startedAt }
 
@@ -157,11 +157,30 @@ function termComplete(line) {
    рабочую папку В МОМЕНТ вызова: человек мог переключить проект, пока панель была
    закрыта, и терминал обязан открыться в нынешней папке, а не в прежней. */
 function registerTermIpc(ipcMain) {
-  ipcMain.handle("term:start", () => termStart(agentWorkDir(loadSettings())));
-  ipcMain.handle("term:input", (_e, text) => termInput(text));
-  ipcMain.handle("term:stop", () => termStop());
-  ipcMain.handle("term:status", () => termStatus());
-  ipcMain.handle("term:complete", (_e, line) => termComplete(line));
+  // Терминал — самый разрушительный канал приложения: здесь выполняется любая
+  // команда от имени человека. Проверяем отправителя на каждом входе
+  // (см. src/ipc-guard.js): раньше проверки не было ни на одном канале.
+  const deny = (e, channel) => ipcGuard.denyReason(e, { window: getWindow(), channel });
+  ipcMain.handle("term:start", (e) => {
+    const bad = deny(e, "term:start");
+    return bad ? { ok: false, error: bad } : termStart(agentWorkDir(loadSettings()));
+  });
+  ipcMain.handle("term:input", (e, text) => {
+    const bad = deny(e, "term:input");
+    return bad ? { ok: false, error: bad } : termInput(text);
+  });
+  ipcMain.handle("term:stop", (e) => {
+    const bad = deny(e, "term:stop");
+    return bad ? { ok: false, error: bad } : termStop();
+  });
+  ipcMain.handle("term:status", (e) => {
+    const bad = deny(e, "term:status");
+    return bad ? { ok: false, error: bad } : termStatus();
+  });
+  ipcMain.handle("term:complete", (e, line) => {
+    const bad = deny(e, "term:complete");
+    return bad ? { ok: false, error: bad } : termComplete(line);
+  });
 }
 
   return { termEmit, termAgentEcho, termStart, termInput, termStop, termStatus, termShutdown, termComplete, registerTermIpc };

@@ -1,7 +1,10 @@
 "use strict";
 /* Мобильный мост: доступ к ядру приложения с телефона/планшета по LAN.
    - HTTP-сервер отдаёт интерфейс (src/renderer) + PWA (manifest, service worker, иконка).
-   - WebSocket-сервер (/ws) дублирует IPC: те же каналы, что у ipcMain, с защитой PIN-кодом.
+   - WebSocket-сервер (/ws) дублирует IPC: те же каналы, что у ipcMain, но только
+     те, что перечислены в списке разрешённого (ALLOW ниже), и с защитой входом.
+   - Вход: одноразовый токен пары из QR-кода → свой сеанс устройства, либо PIN,
+     который человек вводит руками (запасной путь).
    - События (ai:event, term:event, dev:event, github:event) транслируются всем клиентам.
    Без зависимостей: серверная часть WebSocket (RFC 6455) реализована вручную. */
 
@@ -19,6 +22,90 @@ const AUTH_MAX_FAILS = 10;
 const AUTH_FAIL_WINDOW_MS = 60000;
 const AUTH_LOCK_MS = 5 * 60 * 1000;
 const RENDERER_DIR = path.join(__dirname, "renderer");
+
+// ─── Что телефону МОЖНО ──────────────────────────────────────────────────────
+// Раньше здесь был список ровно из одного запрещённого канала (dialog:pickDir):
+// телефону было доступно всё остальное — включая каналы, которых в его
+// интерфейсе нет вовсе (деплой, консоль Yandex Cloud, удаление миссий).
+// Достаточно было назвать канал в ws-сообщении, и он выполнялся.
+//
+// Теперь наоборот: перечислено то, что можно, а всё прочее закрыто по умолчанию.
+// Состав списка — ровно то, что объявляет мобильный интерфейс
+// (src/renderer/mobile-api.js); разъезжаться им не даёт проверка
+// test/mobile-allow.test.js (она же ловит опечатки в именах каналов).
+// Новый канал поэтому надо открыть сознательно — «само появится у телефона»
+// больше не работает.
+const ALLOW = new Set([
+  // Прогон агента и откат правок
+  "ai:answer", "ai:models", "ai:probeLocal", "ai:send", "ai:stop", "ai:test",
+  "undo:rollback", "undo:status",
+  // Настройки (значения секретов телефону не отдаются — см. src/secret-mask.js)
+  "settings:get", "settings:set", "policy:groups",
+  // История чатов и дела
+  "chats:load", "chats:save",
+  "tasks:add", "tasks:auto-ack", "tasks:auto-rearm", "tasks:board", "tasks:delete", "tasks:done", "tasks:list", "tasks:update",
+  "agentfiles:status",
+  // Проекты и миссии
+  "projects:activate", "projects:create", "projects:list", "projects:remove",
+  "mission:finish", "mission:open", "mission:pause", "mission:resume", "mission:state", "mission:stop",
+  // Файлы рабочей папки
+  "fs:createFile", "fs:createFolder", "fs:delete", "fs:importDropped", "fs:listTree", "fs:openInExplorer",
+  "fs:readFile", "fs:readImage", "fs:writeFile",
+  // Git и GitHub
+  "git:clone", "git:commit", "git:commitDetail", "git:diff", "git:log", "git:pull", "git:push", "git:repoInfo",
+  "git:resetHard", "git:restore", "git:revert", "git:rm", "git:status", "git:undoLastCommit", "git:unstage",
+  "github:deviceCancel", "github:deviceStart", "github:disconnect", "github:pickRepo", "github:publish", "github:repos",
+  "github:selectRepo", "github:selectedRepo", "github:unselectRepo", "github:user",
+  // Терминал, запуск проекта, ссылки
+  "term:complete", "term:input", "term:start", "term:status", "term:stop",
+  "dev:start", "dev:status", "dev:stop", "shell:openExternal",
+  // Локальные шлюзы, почта, память, браузер агента
+  "g4f:probe", "g4f:test",
+  "mail:recent", "mail:test", "mail:testSend",
+  "memory:clear", "memory:days", "memory:openDir", "memory:stats",
+  "browser:clearProfile", "browser:connect", "browser:connectInfo", "browser:profileInfo",
+  // Yandex Cloud (дашборд и работа с ресурсами)
+  "yc:cliStatus", "yc:costs", "yc:create", "yc:delete", "yc:deploy", "yc:folders", "yc:installCli",
+  "yc:logout", "yc:logs", "yc:resources", "yc:setFolder", "yc:setPermissions", "yc:setToken", "yc:status",
+  // Сам мост и обновление кода
+  "mobile:status", "mobile:pinRegen",
+  "ota:check", "ota:openDir", "ota:reset", "ota:rollback", "ota:status",
+]);
+
+// Каналы, закрытые сознательно, — с причиной: отказ должен объяснять себя
+// (в интерфейсе телефона он показывается как есть). Всё, чего нет ни здесь,
+// ни в ALLOW, закрыто по умолчанию — такие каналы просто перечислять нельзя.
+const NOT_FOR_PHONE = new Map([
+  ["dialog:pickDir", "системный диалог выбора папки открывается на ПК"],
+  ["chats:saveSync", "синхронная запись истории — только окно на ПК"],
+  ["mission:delete", "удаление миссии вместе с папкой — только с ПК"],
+  ["agentfiles:openDir", "папку работы агента открывает ПК"],
+  ["agentfiles:clear", "чистка файлов работы агента — только с ПК"],
+  ["deploy:state", "выкат проекта идёт с ПК (на телефоне этой панели нет)"],
+  ["deploy:run", "выкат проекта идёт с ПК (на телефоне этой панели нет)"],
+  ["deploy:rollback", "откат выката делается с ПК"],
+  ["deploy:health", "проверка адреса выката делается с ПК"],
+  ["yc:console:overview", "консоль Yandex Cloud есть только в окне на ПК"],
+  ["yc:console:list", "консоль Yandex Cloud есть только в окне на ПК"],
+  ["yc:console:rollback", "откат через консоль Yandex Cloud делается с ПК"],
+]);
+
+// Одноразовый токен пары и сеансы устройств. Токен пары живёт в QR-коде на
+// экране ПК и гаснет после первого использования: пересланный скриншот кода
+// больше никого не пустит. Телефон после обмена получает свой сеанс и
+// переподключается по нему, не спрашивая человека.
+function randomToken() {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+// Сравнение секретов, не зависящее от времени ответа (PIN — шесть цифр, но
+// правило одно для PIN, токена пары и сеанса).
+function sameSecret(a, b) {
+  const x = Buffer.from(String(a === undefined || a === null ? "" : a), "utf8");
+  const y = Buffer.from(String(b === undefined || b === null ? "" : b), "utf8");
+  if (!x.length || x.length !== y.length) return false;
+  return crypto.timingSafeEqual(x, y);
+}
 
 // Версия приложения попадает в имя кэша service worker. Раньше имя было неизменным
 // ("ai-agent-mobile-v1"), и телефон мог неделями работать на СТАРОМ app.js из кэша:
@@ -311,7 +398,12 @@ class MobileBridge {
     this.server = null;
     this.clients = new Set();
     this.pingTimer = null;
-    this.deny = new Set(["dialog:pickDir"]); // нативные диалоги недоступны с телефона
+    this.allow = ALLOW; // что телефону можно (см. список выше)
+    this.notForPhone = NOT_FOR_PHONE; // что закрыто сознательно — и почему
+    // Вход: одноразовый токен пары (в QR-коде) + сеансы подключённых устройств.
+    this.pair = "";
+    this.pairUsed = false;
+    this.sessions = new Set();
     // Глобальный rate-limit аутентификации (перебор PIN):
     this.authFailCount = 0;
     this.authFailWindowStart = 0;
@@ -329,8 +421,38 @@ class MobileBridge {
     this.enabled = enabled;
     this.port = port;
     this.pin = pin;
+    // Токен пары НЕ меняется на каждое сохранение настроек: иначе QR-код на
+    // экране гас бы от любой галочки. Его выдают один раз и меняют только
+    // кнопкой «сменить PIN» (mobile:pinRegen → rotate).
+    this.ensurePair();
     if (enabled && !this.server) this.start();
     if (!enabled && this.server) this.stop();
+  }
+
+  // Токен пары есть? (создаётся при первом обращении и при включении моста)
+  ensurePair() {
+    if (!this.pair) {
+      this.pair = randomToken();
+      this.pairUsed = false;
+    }
+    return this.pair;
+  }
+
+  // Новый токен пары и сброс сеансов: так с ПК можно «выкинуть» все телефоны
+  // разом — старые подключения потребуют нового кода.
+  rotate() {
+    this.pair = randomToken();
+    this.pairUsed = false;
+    this.sessions.clear();
+    for (const c of this.clients) {
+      try {
+        c.sendText(JSON.stringify({ t: "auth_err", needPin: true }));
+        c.authed = false;
+        c.session = "";
+      } catch {}
+    }
+    this.clients.clear();
+    return this.pair;
   }
 
   start() {
@@ -389,7 +511,11 @@ class MobileBridge {
       .map((it) => it.ip);
   }
 
-  status() {
+  // Статус моста. opts.client === true — это ответ ТЕЛЕФОНУ: PIN и токен пары
+  // ему не нужны, а знать их (и тем более показывать) он не должен. На ПК, где
+  // рисуется QR-код, значения нужны — там opts пустой.
+  status(opts) {
+    const forClient = !!(opts && opts.client);
     const ips = this.lanIps();
     // Предпочитаемый адрес из настроек («Адрес для телефона»). Если такого адреса на
     // этой машине нет (сменилась сеть) — показывать его нельзя: телефон уйдёт в
@@ -397,11 +523,18 @@ class MobileBridge {
     const want = String(this.host || "").trim();
     const active = !!want && ips.indexOf(want) >= 0;
     const order = active ? [want].concat(ips.filter((ip) => ip !== want)) : ips;
+    if (forClient) {
+      return { enabled: this.enabled, running: !!this.server, port: this.port, ips, url: order.length ? "http://" + order[0] + ":" + this.port : "", urls: order.map((ip) => ({ ip, url: "http://" + ip + ":" + this.port })) };
+    }
     return {
       enabled: this.enabled,
       running: !!this.server,
       port: this.port,
       pin: this.pin || "",
+      // Токен пары — для QR-кода на экране ПК (одноразовый, см. rotate).
+      pair: this.ensurePair(),
+      pairUsed: this.pairUsed,
+      sessions: this.sessions.size, // сколько устройств подключено по своим сеансам
       ips,
       host: want,
       hostActive: active,
@@ -498,47 +631,20 @@ class MobileBridge {
       return;
     }
     if (!conn.authed) {
-      if (msg && msg.t === "auth") {
-        const now = Date.now();
-        // Глобальная блокировка после серии неудач: не считаем попытки, просто отказываем.
-        if (now < this.authLockedUntil) {
-          conn.sendText(JSON.stringify({ t: "auth_err", lock: true }));
-          return;
-        }
-        if (this.pin && String(msg.pin) === String(this.pin)) {
-          conn.authed = true;
-          this.authFailCount = 0; // успешный вход — сбрасываем счётчик перебора
-          this.authFailWindowStart = 0;
-          this.clients.add(conn);
-          conn.sendText(JSON.stringify({ t: "auth_ok", v: this.status() }));
-        } else {
-          conn.authTries++;
-          // Неудача считается в глобальном окне (переподключение не обнуляет счётчик).
-          if (now - this.authFailWindowStart > AUTH_FAIL_WINDOW_MS) {
-            this.authFailWindowStart = now;
-            this.authFailCount = 0;
-          }
-          this.authFailCount++;
-          let locked = false;
-          if (this.authFailCount >= AUTH_MAX_FAILS) {
-            this.authLockedUntil = now + AUTH_LOCK_MS;
-            this.authFailCount = 0;
-            locked = true;
-          }
-          conn.sendText(JSON.stringify({ t: "auth_err", lock: locked }));
-          if (conn.authTries >= 5) {
-            conn.sendText(JSON.stringify({ t: "auth_lock" }));
-            conn.destroy();
-          }
-        }
-      }
+      if (msg && msg.t === "auth") this.authAttempt(conn, msg);
       return;
     }
     if (!msg || msg.t !== "call" || !msg.ch) return;
     const { id, ch, args } = msg;
-    if (this.deny.has(ch)) {
+    if (!this.allow.has(ch)) {
+      const why = this.notForPhone.get(ch);
       conn.sendText(
-        JSON.stringify({ t: "res", id, ok: false, e: "Действие недоступно с телефона: " + ch })
+        JSON.stringify({
+          t: "res",
+          id,
+          ok: false,
+          e: "Действие недоступно с телефона: " + ch + (why ? " — " + why + "." : ". Оно есть только в окне на ПК."),
+        })
       );
       return;
     }
@@ -558,6 +664,101 @@ class MobileBridge {
             JSON.stringify({ t: "res", id, ok: false, e: (err && err.message) || String(err) })
           )
       );
+  }
+
+  // ─── Вход телефона ───
+  /* Три способа, по порядку от «не спрашивает человека» к «спрашивает»:
+
+       1. ТОКЕН ПАРЫ из QR-кода. Одноразовый: обменяли — гаснет, а телефон
+          получает свой СЕАНС. Именно это заменяет PIN в адресной строке: код
+          на экране нельзя переслать другу и нельзя подсмотреть в истории
+          браузера телефона — он уже погашен.
+       2. СЕАНС устройства: переподключение после смены Wi-Fi или перезагрузки
+          страницы. Ничего вводить не надо, и PIN по сети не ходит.
+       3. PIN, который человек ввёл руками: запасной путь, если код с ПК
+          потерян или сеансы сброшены («сменить PIN» на ПК).
+
+     Неудачная попытка считается так же, как раньше неудачный PIN: глобальное
+     окно AUTH_FAIL_WINDOW_MS, после AUTH_MAX_FAILS — блокировка на AUTH_LOCK_MS,
+     после пяти попыток на соединении — разрыв. */
+  authAttempt(conn, msg) {
+    const now = Date.now();
+    // Глобальная блокировка после серии неудач: не считаем попытки, просто отказываем.
+    if (now < this.authLockedUntil) {
+      conn.sendText(JSON.stringify({ t: "auth_err", lock: true }));
+      return;
+    }
+    if (msg.pair !== undefined) {
+      if (!this.pairUsed && sameSecret(msg.pair, this.ensurePair())) {
+        this.pairUsed = true; // одноразовый: этим кодом больше не войти
+        const session = randomToken();
+        this.sessions.add(session);
+        conn.session = session;
+        this.welcome(conn, { session });
+        return;
+      }
+      // Код не подошёл или уже погашен: телефон должен показать вход по PIN,
+      // а не пустой экран (auth_err с признаком needPin).
+      this.failAuth(conn, { needPin: true, badPair: true });
+      return;
+    }
+    if (msg.session !== undefined) {
+      const s = String(msg.session || "");
+      if (s && this.sessions.has(s)) {
+        conn.session = s;
+        this.welcome(conn, {});
+        return;
+      }
+      // Сеанс устарел (на ПК нажали «сменить PIN»): просим PIN, но панику не
+      // устраиваем — это штатная ситуация, а не подбор.
+      conn.sendText(JSON.stringify({ t: "auth_err", lock: false, needPin: true, staleSession: true }));
+      return;
+    }
+    if (msg.pin !== undefined && this.pin && sameSecret(msg.pin, this.pin)) {
+      this.welcome(conn, {});
+      return;
+    }
+    this.failAuth(conn, {});
+  }
+
+  // Успешный вход: снимаем счётчик перебора и отдаём статус БЕЗ своих секретов
+  // (телефону PIN и токен пары знать незачем — см. status).
+  welcome(conn, opts) {
+    conn.authed = true;
+    this.authFailCount = 0;
+    this.authFailWindowStart = 0;
+    this.clients.add(conn);
+    const payload = { t: "auth_ok", v: this.status({ client: true }) };
+    if (opts && opts.session) payload.session = opts.session;
+    conn.sendText(JSON.stringify(payload));
+  }
+
+  failAuth(conn, extra) {
+    const now = Date.now();
+    conn.authTries++;
+    // Неудача считается в глобальном окне (переподключение не обнуляет счётчик).
+    if (now - this.authFailWindowStart > AUTH_FAIL_WINDOW_MS) {
+      this.authFailWindowStart = now;
+      this.authFailCount = 0;
+    }
+    this.authFailCount++;
+    let locked = false;
+    if (this.authFailCount >= AUTH_MAX_FAILS) {
+      this.authLockedUntil = now + AUTH_LOCK_MS;
+      this.authFailCount = 0;
+      locked = true;
+    }
+    const err = { t: "auth_err", lock: locked };
+    if (extra) {
+      for (const k of Object.keys(extra)) {
+        if (extra[k] !== undefined) err[k] = extra[k];
+      }
+    }
+    conn.sendText(JSON.stringify(err));
+    if (conn.authTries >= 5) {
+      conn.sendText(JSON.stringify({ t: "auth_lock" }));
+      conn.destroy();
+    }
   }
 
   broadcast(channel, ev) {

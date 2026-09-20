@@ -51,6 +51,8 @@ function registerRunIpc(deps) {
     loadPersistedUndo,
     undoFile,
     live,
+    netGuard,
+    ipcGuard,
   } = deps;
 
   // Окно спрашиваем в момент события: оно создаётся позже сборки модуля и может
@@ -62,8 +64,17 @@ function registerRunIpc(deps) {
   };
 
 ipcMain.handle("ai:send", async (e, messages, opts) => {
+  // Разрушительный канал: сначала проверяем, кто позвал (см. src/ipc-guard.js).
+  // Раньше здесь не было никакой проверки отправителя — хватало изоляции рендерера.
+  const kind = ipcGuard.senderKind(e, live.mainWindow);
+  const bad = ipcGuard.denyReason(e, { window: live.mainWindow, channel: "ai:send" });
+  if (bad) return { ok: false, error: bad };
   const settings = loadSettings();
-  live.activeRunOrigin = e && e.sender && e.sender.id ? "desktop" : "mobile";
+  // Кто запустил прогон — тот же ответ, что и у проверки: «с ПК» только живое окно,
+  // всё остальное — телефон (мост) и внутренние вызовы. Раньше здесь стояла своя
+  // копия проверки (e.sender.id) и расходилась с ней: событие из окна без id
+  // считалось телефоном, и в журнал уходил неверный источник.
+  live.activeRunOrigin = kind === "desktop" ? "desktop" : "mobile";
   live.activeRunRole = String((opts && opts.role) || "") || live.activeRunRole;
   live.activeRunChatId = String((opts && opts.chatId) || "");
   live.runMissionId = ""; // прогон начинается с чистого листа: миссию выберет missionRead
@@ -112,7 +123,9 @@ ipcMain.handle("undo:status", () => {
   };
 });
 
-ipcMain.handle("undo:rollback", () => {
+ipcMain.handle("undo:rollback", (e) => {
+  const bad = ipcGuard.denyReason(e, { window: live.mainWindow, channel: "undo:rollback" });
+  if (bad) return { ok: false, error: bad };
   loadPersistedUndo();
   const restored = [];
   for (let i = live.lastUndoLog.length - 1; i >= 0; i--) {
@@ -148,6 +161,11 @@ ipcMain.handle("ai:stop", () => {
 
 ipcMain.handle("ai:test", async (_e, ui) => {
   const s = normalizeSettings({ ...loadSettings(), ...(ui || {}) });
+  // Адрес приходит от интерфейса, а запрос делает ГЛАВНЫЙ процесс: без проверки
+  // цели этот канал был маленьким SSRF — окно просило сходить на метаданные
+  // облака и читало ответ. См. src/net-guard.js.
+  const target = netGuard.checkSettingsUrls(s);
+  if (!target.ok) return { ok: false, message: target.error, models: [] };
   try {
     const models = await fetchModels(s);
     return { ok: true, message: "Подключено! Найдено моделей: " + models.length, models };

@@ -24,6 +24,7 @@ const path = require("path");
 const ROOT = path.join(__dirname, "..");
 const core = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
 const { registerModelIpc } = require(path.join(ROOT, "src", "model-ipc.js"));
+const netGuard = require(path.join(ROOT, "src", "net-guard.js")); // проверка адреса перед запросом
 
 let failures = 0;
 const ok = (cond, msg) => {
@@ -39,6 +40,7 @@ function build(saved, models) {
   const seen = { normalized: null, modelsAsked: null };
   registerModelIpc({
     ipcMain: { handle: (ch, fn) => handlers.set(ch, fn) },
+    netGuard,
     loadSettings: () => saved,
     normalizeSettings: (s) => {
       seen.normalized = s;
@@ -232,6 +234,7 @@ async function liveModels() {
   const seen = { normalized: null };
   registerModelIpc({
     ipcMain: { handle: (ch, fn) => handlers.set(ch, fn) },
+    netGuard,
     loadSettings: () => saved,
     normalizeSettings: (s) => {
       seen.normalized = s;
@@ -254,6 +257,7 @@ async function liveModels() {
   const deadHandlers = new Map();
   registerModelIpc({
     ipcMain: { handle: (ch, fn) => deadHandlers.set(ch, fn) },
+    netGuard,
     loadSettings: () => ({ provider: "ollama", ollamaUrl: "http://127.0.0.1:9", model: "qwen3:8b" }),
     normalizeSettings: (s) => s,
     fetchModels: (s) => core.listModels(s),

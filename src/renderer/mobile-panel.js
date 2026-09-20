@@ -21,22 +21,30 @@
   const { $, api, isElectron, getSettings, setSettingsMsg } = MobilePanelDeps || {};
 
   // ── Мобильный доступ: QR-код «наведи камеру телефона» ──
-  // В коде — адрес моста и PIN: телефон подключается одним наведением камеры,
-  // без ручного ввода адреса и шести цифр. Код остаётся светлым даже в тёмной
-  // теме (QR.toSvg рисует белое поле): на тёмном фоне камера его не видит.
+  // В коде — адрес моста и ОДНОРАЗОВЫЙ токен пары: телефон подключается одним
+  // наведением камеры, без ручного ввода адреса и шести цифр. Токен (а не PIN)
+  // нужен потому, что код на экране легко переснять или переслать: гаснет после
+  // первого использования, и скриншот больше никого не пустит. Если токена нет
+  // (старый мост), ссылка строится как раньше — с PIN, чтобы подключение не
+  // пропало вовсе. Код остаётся светлым даже в тёмной теме (QR.toSvg рисует
+  // белое поле): на тёмном фоне камера его не видит.
   function renderMobileQr(st) {
     const block = $("mobile-qr-block");
     const host = $("mobile-qr");
     if (!block || !host) return;
     const urls = (st && st.urls) || [];
     const pin = String((st && st.pin) || "");
-    if (!(st && st.enabled && st.running) || !urls.length || !pin || !window.QR) {
+    const pair = String((st && st.pair) || "");
+    if (!(st && st.enabled && st.running) || !urls.length || !(pair || pin) || !window.QR) {
       block.classList.add("hidden");
       host.innerHTML = "";
       return;
     }
     try {
-      host.innerHTML = window.QR.toSvg(urls[0].url + "/#pin=" + pin, { ecc: "M" });
+      host.innerHTML = window.QR.toSvg(
+        pair ? urls[0].url + "/#pair=" + pair : urls[0].url + "/#pin=" + pin,
+        { ecc: "M" }
+      );
       block.classList.remove("hidden");
     } catch (e) {
       // Лучше показать адреса и PIN текстом, чем пустое место с чужой ошибкой.
@@ -89,6 +97,15 @@
         err.className = "mobile-url-none";
         err.textContent = "⚠ Мост не запустился (порт занят?). Попробуй другой порт.";
         urls.appendChild(err);
+      }
+      // Токен пары одноразовый: если им уже воспользовались, старый QR-код
+      // больше не работает — об этом надо сказать, а не оставлять мёртвый код
+      // на экране (человек будет водить камерой и не понимать, почему тишина).
+      if (st.enabled && st.running && st.pairUsed) {
+        const note = document.createElement("div");
+        note.className = "mobile-url-none";
+        note.textContent = "ℹ Код подключения использован. Для нового телефона нажми «Сменить PIN» — появится свежий QR-код.";
+        urls.appendChild(note);
       }
     } catch (e) {
       urls.innerHTML = "";

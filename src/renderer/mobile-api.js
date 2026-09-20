@@ -15,6 +15,11 @@
   var WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
   var ws = null;
   var authed = false;
+  // Приоритет входа: свой СЕАНС (переподключение) → одноразовый ТОКЕН ПАРЫ
+  // из QR-кода → PIN, который ввёл человек. PIN остаётся запасным путём: если
+  // код с ПК потерян или на ПК нажали «сменить PIN», вход всегда возможен.
+  var SESSION_KEY = "ai-agent-device-session";
+  var authSecret = null; // { kind: "session" | "pair" | "pin", value: "..." }
   var enteredPin = "";
   var seq = 0;
   var pending = new Map(); // id → {resolve, reject}
@@ -32,23 +37,69 @@
   var gateViewportBound = false;
   var gateHost = location.host || "";
 
-  // ─── PIN из адреса: подключение по QR-коду с экрана ПК ───
+  // ─── Что пришло из адреса: токен пары или PIN (QR-код с экрана ПК) ───
   // На экране ПК (Настройки → «Мобильный доступ») есть QR-код с адресом вида
-  // http://192.168.1.42:9090/#pin=482913. Камера телефона открывает такую ссылку —
-  // и вводить PIN не надо: он уже в адресе. Из адресной строки PIN сразу убираем
-  // (history.replaceState), чтобы он не остался в истории браузера и не попал
-  // в скриншот экрана.
+  // http://192.168.1.42:9090/#pair=<одноразовый токен>. Камера телефона открывает
+  // такую ссылку — и доказывать ничего не надо: токен уже в адресе, а после
+  // первого обмена он гаснет (мост гасит его у себя). Ссылка со старым форматом
+  // (#pin=482913) тоже работает: PIN ушёл из QR-кодов, но не из приложения.
+  // Из адресной строки секрет сразу убираем (history.replaceState), чтобы он не
+  // остался в истории браузера и не попал в скриншот экрана.
+  function pairFromLocation() {
+    var raw = String(location.hash || "") + "&" + String(location.search || "");
+    var m = /(?:^|[#?&])(?:pair|token)=(\w{16,64})(?:&|$)/i.exec(raw);
+    return m ? m[1] : "";
+  }
   function pinFromLocation() {
     var raw = String(location.hash || "") + "&" + String(location.search || "");
     var m = /(?:^|[#?&])(?:pin|p)=(\d{4,6})(?:&|$)/i.exec(raw);
     return m ? m[1] : "";
   }
+  var urlPair = pairFromLocation();
   var urlPin = pinFromLocation();
-  if (urlPin) {
+  if (urlPair) authSecret = { kind: "pair", value: urlPair };
+  else if (urlPin) {
     enteredPin = urlPin;
+    authSecret = { kind: "pin", value: urlPin };
+  }
+  if (urlPair || urlPin) {
     try {
       history.replaceState(null, "", location.pathname + (location.search || ""));
     } catch (e) {}
+  }
+
+  // ─── Свой сеанс устройства: помним между перезагрузками страницы ───
+  // Сеанс выдаёт ПК при успешной паре (auth_ok + session). С ним телефон
+  // переподключается сам — заново сканировать код не надо.
+  function readStoredSession() {
+    try {
+      return String(localStorage.getItem(SESSION_KEY) || "");
+    } catch (e) {
+      return "";
+    }
+  }
+  function storeSession(v) {
+    try {
+      if (v) localStorage.setItem(SESSION_KEY, v);
+      else localStorage.removeItem(SESSION_KEY);
+    } catch (e) {}
+  }
+
+  // Отправка доказательства: одно и то же сообщение t:"auth", но с разным полем.
+  function sendAuth() {
+    if (!authSecret) return false;
+    var msg =
+      authSecret.kind === "pin"
+        ? { t: "auth", pin: authSecret.value }
+        : authSecret.kind === "pair"
+          ? { t: "auth", pair: authSecret.value }
+          : { t: "auth", session: authSecret.value };
+    try {
+      ws.send(JSON.stringify(msg));
+      return true;
+    } catch (e) {
+      return false;
+    }
   }
 
   // ─── Вызов канала (очередь до авторизации) ───
@@ -401,9 +452,8 @@
       }
       setGateBusy(true, "Проверяю PIN…");
       gateStatus("");
-      try {
-        ws.send(JSON.stringify({ t: "auth", pin: v }));
-      } catch (e) {
+      authSecret = { kind: "pin", value: v };
+      if (!sendAuth()) {
         setGateBusy(false);
         gateStatus("Соединение не установлено. Пробую снова…");
       }
@@ -499,11 +549,15 @@
     }
     ws.onopen = function () {
       everOpened = true;
-      if (enteredPin) {
-        setGateBusy(true, "Проверяю PIN…");
-        try {
-          ws.send(JSON.stringify({ t: "auth", pin: enteredPin }));
-        } catch {}
+      // Свой сеанс — раньше PIN и токена: переподключение не должно ничего
+      // спрашивать у человека (и слать секреты, которые уже не нужны).
+      if (!authSecret) {
+        var sess = readStoredSession();
+        if (sess) authSecret = { kind: "session", value: sess };
+      }
+      if (authSecret) {
+        setGateBusy(true, authSecret.kind === "pin" ? "Проверяю PIN…" : "Подключаюсь…");
+        sendAuth();
       } else {
         showGate();
         setGateBusy(false);
@@ -520,6 +574,12 @@
       if (!m) return;
       if (m.t === "auth_ok") {
         authed = true;
+        // Мост отдаёт сеанс только тому, кто пришёл с токеном пары: дальше
+        // телефон переподключается по нему, а не по PIN.
+        if (m.session) {
+          storeSession(m.session);
+          authSecret = { kind: "session", value: m.session };
+        }
         window.mobileApi.connected = true;
         hideGate();
         flushQueue();
@@ -527,12 +587,31 @@
       } else if (m.t === "auth_err") {
         authed = false;
         setGateBusy(false);
-        // Галочку в адресе мог принести QR-код, а PIN на ПК уже сменили: гейта могло
-        // ещё не быть — тогда ошибка оставалась невидимой (пустой экран без объяснений).
+        // Что именно устарело — от этого зависит текст. Сеанс гаснет при смене
+        // входа на ПК, токен пары — после первого использования: перепутать их
+        // значит показать человеку неверную подсказку.
+        var wasSession = m.staleSession || (authSecret && authSecret.kind === "session");
+        var wasPair = m.badPair || (authSecret && authSecret.kind === "pair");
+        if (wasSession) {
+          storeSession(""); // сеанс больше не годится — не повторяем его молча
+          authSecret = null;
+        } else if (wasPair) {
+          authSecret = null;
+        }
+        // Галочку в адресе мог принести QR-код, а вход на ПК уже сменили: гейта
+        // могло ещё не быть — тогда ошибка оставалась невидимой (пустой экран).
         if (!gateEl) showGate();
         if (gateEl) {
           resetPinField();
-          gateError(m.lock ? "Слишком много попыток. Вход заблокирован на 5 минут." : "Неверный PIN. Попробуй ещё раз.");
+          gateError(
+            m.lock
+              ? "Слишком много попыток. Вход заблокирован на 5 минут."
+              : wasSession
+                ? "Подключение устарело — введи PIN с ПК (Настройки → Мобильный доступ)."
+                : wasPair
+                  ? "Код из QR-кода уже использован — отсканируй новый или введи PIN."
+                  : "Неверный PIN. Попробуй ещё раз."
+          );
         }
       } else if (m.t === "auth_lock") {
         authed = false;

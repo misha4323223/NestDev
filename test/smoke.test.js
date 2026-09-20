@@ -4426,7 +4426,10 @@ const skip = new Set(["anthropic", "cerebras", "cloud", "deepseek", "groq", "mis
     assert.ok(/getChatsSavePending,/.test(uiFile("chat-store.js")), "хранилище не отвечает, есть ли несохранённые правки");
     // Прогон, запущенный телефоном, помечается в событиях и не подмешивается в чужой чат.
     assert.ok(/let activeRunOrigin = "desktop";/.test(main), "нет признака «кто запустил прогон»");
-    assert.ok(/live\.activeRunOrigin = e && e\.sender && e\.sender\.id \? "desktop" : "mobile";/.test(main), "ai:send не отмечает источник прогона");
+    // Источник прогона теперь берётся из проверки отправителя (src/ipc-guard.js):
+    // своя копия правила (e.sender.id) расходилась с ней и путала журнал.
+    assert.ok(/const kind = ipcGuard\.senderKind\(e, live\.mainWindow\);/.test(main), "источник прогона определяется не проверкой отправителя");
+    assert.ok(/live\.activeRunOrigin = kind === "desktop" \? "desktop" : "mobile";/.test(main), "ai:send не отмечает источник прогона");
     assert.ok(/set activeRunOrigin\(v\)/.test(main), "метка источника прогона не связана с оболочкой");
     // Сама метка ставится в модуле окна (этап B, часть 13), а признак «кто запустил
     // прогон» остаётся в main.js — проверяем и то, и другое, и их связь.
@@ -6636,10 +6639,13 @@ async function testYcFolderPersistence() {
   const uiSrc = appSrc + "\n" + fs.readFileSync(path.join(ROOT, "src", "renderer", "yc-panel.js"), "utf8");
 
   const a = mainSrc.indexOf('ipcMain.handle("settings:set"');
-  const endMark = "  saveSettings(merged);\n  mobileBridge.applySettings(merged);\n  return merged;\n});";
-  const e = a < 0 ? -1 : mainSrc.indexOf(endMark, a);
+  // Границы среза — сам обработчик до следующего канала: раньше конец искали
+  // дословной строкой, и любая правка в теле (маска секретов, проверка
+  // отправителя) ломала проверку не по делу.
+  const b = a < 0 ? -1 : mainSrc.indexOf('ipcMain.handle("', a + 10);
+  const e = b < 0 ? mainSrc.length : b;
   assert.ok(a > 0 && e > a, "не нашёл обработчик settings:set в main.js");
-  const code = mainSrc.slice(a, e + endMark.length);
+  const code = mainSrc.slice(a, e);
 
   const prevSettings = {
     workingDir: "/proj",
@@ -6654,9 +6660,17 @@ async function testYcFolderPersistence() {
   let handle = null;
   const saved = [];
   let repoDirReset = 0;
+  // Рядом с обработчиком в модуле стоят ещё две вещи: отказ чужому рендереру и
+  // маска секретов (src/settings-ipc.js, src/secret-mask.js). В этом стенде
+  // клиент — окно на ПК, поэтому отказов нет и маски нет; сама маска проверяется
+  // отдельно (test/secret-mask.test.js).
+  const deniedFor = () => null;
+  const maskedFor = () => false;
+  const secretMask = require(path.join(ROOT, "src", "secret-mask.js"));
   new Function(
     "ipcMain", "loadSettings", "normalizeSettings", "applyAgentEnv",
     "applyBrowserSettings", "saveSettings", "mobileBridge", "live",
+    "deniedFor", "maskedFor", "secretMask",
     code
   )(
     { handle: (ch, cb) => { handle = cb; } },
@@ -6670,7 +6684,10 @@ async function testYcFolderPersistence() {
     // src/settings-ipc.js (часть 30) и делает это СЕТТЕРОМ моста — переменная
     // принадлежит оболочке (её читают пути-и-git, GitHub-каналы и инструменты),
     // и копия значения «застыла» бы.
-    { setLastAgentRepoDir: () => { repoDirReset++; } }
+    { setLastAgentRepoDir: () => { repoDirReset++; } },
+    deniedFor,
+    maskedFor,
+    secretMask
   );
   assert.strictEqual(typeof handle, "function", "обработчик settings:set не зарегистрировался");
 
@@ -14319,6 +14336,8 @@ async function testFsGitIpc() {
       fs,
       sanitizeDir: inside,
       sanitizePath: inside,
+      // Проверка отправителя у разрушительных каналов — та же, что в main.js.
+      ipcGuard: require(path.join(ROOT, "src", "ipc-guard.js")),
     });
     const call = (ch, ...args) => handlers.get(ch)(null, ...args);
     assert.strictEqual(api.BINARY_EXT.has("png"), true, "список бинарных расширений отдаётся наружу");
@@ -14338,6 +14357,16 @@ async function testFsGitIpc() {
     assert.strictEqual(fs.readFileSync(path.join(root, "new.txt"), "utf8"), "обновлено", "содержимое обновилось");
     assert.strictEqual(call("fs:delete", path.join(root, "new.txt")).ok, true, "файл удалён");
     assert.strictEqual(fs.existsSync(path.join(root, "new.txt")), false, "файла больше нет");
+    // Удаление — разрушительный канал, и он обязан спросить, кто позвал
+    // (src/ipc-guard.js). Чужой рендерер внутри приложения — не человек за окном.
+    fs.writeFileSync(path.join(root, "не-трогать.txt"), "чужое");
+    const alien = handlers.get("fs:delete")(
+      { sender: { id: 999, send() {} }, senderFrame: { parent: null } },
+      path.join(root, "не-трогать.txt")
+    );
+    assert.strictEqual(alien.ok, false, "чужой рендерер удалил файл: " + JSON.stringify(alien));
+    assert.ok(/не из окна/.test(alien.error), "отказ не объяснён: " + alien.error);
+    assert.ok(fs.existsSync(path.join(root, "не-трогать.txt")), "файл всё-таки удалён чужим вызовом");
     call("fs:openInExplorer", path.join(outside, "secret.txt"));
     assert.strictEqual(opened.length, 0, "проводник не открывается на путь вне рабочей папки");
     call("fs:openInExplorer", path.join(root, "note.txt"));

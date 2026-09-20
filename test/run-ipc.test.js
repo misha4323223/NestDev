@@ -66,7 +66,9 @@ function mkRun(over) {
   const o = over || {};
   const handlers = new Map();
   const box = {
-    mainWindow: o.noWindow ? null : { destroyed: false, isDestroyed() { return this.destroyed; }, webContents: { sent: [], send(ch, ev) { this.sent.push({ ch, ev }); } } },
+    // У настоящего webContents всегда есть id (им же зовут живые прогоны) —
+    // поддельное окно обязано иметь всё, что имеет настоящее (см. HANDOFF §4).
+    mainWindow: o.noWindow ? null : { destroyed: false, isDestroyed() { return this.destroyed; }, webContents: { id: 11, sent: [], send(ch, ev) { this.sent.push({ ch, ev }); } } },
     activeAbort: null,
     activeRunOrigin: "desktop",
     activeRunRole: "",
@@ -110,6 +112,10 @@ function mkRun(over) {
       if (o.loadedLog) box.lastUndoLog = o.loadedLog;
     },
     undoFile: () => undoFile,
+    // Проверка адреса перед запросом — та же, что в main.js (src/net-guard.js).
+    netGuard: require(path.join(ROOT, "src", "net-guard.js")),
+    // Проверка отправителя у разрушительных каналов (src/ipc-guard.js).
+    ipcGuard: require(path.join(ROOT, "src", "ipc-guard.js")),
     live: {
       get mainWindow() { return box.mainWindow; },
       get activeAbort() { return box.activeAbort; },
@@ -140,6 +146,16 @@ function mkRun(over) {
   };
 }
 
+/* Событие НАСТОЯЩЕГО окна: у вызова из рендерера Electron сам подставляет и
+   отправителя (webContents живого окна), и кадр вызова. Наборы раньше писали
+   «sender: { id: 1 }» — по такому событию своего окна не видно, и проверка
+   отправителя (src/ipc-guard.js) справедливо отказывает: это признак чужого
+   рендерера. Поддельные события обязаны быть такими же, как настоящие. */
+const fromWindow = (h) => ({ sender: h.box.mainWindow.webContents, senderFrame: { parent: null } });
+// Чужой рендерер внутри приложения (второе окно, встроенный просмотр): свой
+// webContents, свой id, и он НЕ окно приложения.
+const fromAlien = () => ({ sender: { id: 999, send() {} }, senderFrame: { parent: null } });
+
 (async () => {
   console.log("Прогон агента и откат правок: каналы ai:* и undo:*");
 
@@ -157,7 +173,7 @@ function mkRun(over) {
 
   await test("ai:send: отметки прогона уходят в ЖИВОЕ состояние оболочки", async () => {
     const h = mkRun();
-    await h.handlers.get("ai:send")({ sender: { id: 7 } }, [{ role: "user", content: "привет" }], { role: "developer", chatId: "chat-1" });
+    await h.handlers.get("ai:send")(fromWindow(h), [{ role: "user", content: "привет" }], { role: "developer", chatId: "chat-1" });
     assert.strictEqual(h.box.activeRunOrigin, "desktop", "прогон с окна помечен не как «с ПК»");
     assert.strictEqual(h.box.activeRunRole, "developer", "роль прогона не записана в оболочку");
     assert.strictEqual(h.box.activeRunChatId, "chat-1", "чат прогона не записан в оболочку");
@@ -172,15 +188,26 @@ function mkRun(over) {
     // Роль не пришла — прежняя обязана остаться: иначе журнал миссии потерял бы её.
     assert.strictEqual(h.box.activeRunRole, "developer", "пустая роль стёрла прежнюю");
 
-    // Живое окно: закрытое окно не должно ронять прогон и получать события.
+    // Окно закрыто: единственный законный клиент в этот момент — телефон, и он
+    // зовёт канал без отправителя. Прогон обязан пройти и никому не слать событий.
     const h2 = mkRun({ noWindow: true });
-    const r = await h2.handlers.get("ai:send")({ sender: { id: 1 } }, [], {});
-    assert.strictEqual(r.ok, true, "прогон без окна сломался: " + JSON.stringify(r));
+    const r = await h2.handlers.get("ai:send")({ sender: { send() {}, id: 0 } }, [], {});
+    assert.strictEqual(r.ok, true, "прогон с телефона без окна сломался: " + JSON.stringify(r));
+    assert.strictEqual(h2.box.activeRunOrigin, "mobile", "прогон без окна помечен как «с ПК»");
+
+    // Чужой рендерер внутри приложения — не человек за окном: отказать и НЕ
+    // запускать прогон. До проверки отправителя такой вызов проходил молча.
+    const h3 = mkRun();
+    const alien = await h3.handlers.get("ai:send")(fromAlien(), [], {});
+    assert.strictEqual(alien.ok, false, "чужой рендерер запустил прогон агента");
+    assert.ok(/не из окна/.test(alien.error), "отказ не объяснён: " + alien.error);
+    assert.strictEqual(h3.calls.runAi.length, 0, "чужой вызов всё-таки доехал до runAi");
+    assert.strictEqual(h3.box.mainWindow.webContents.sent.length, 0, "чужому рендереру ушли события прогона");
   });
 
   await test("ai:send: сбой прогона — это {ok:false}, событие окну и откат сделанных правок", async () => {
     const h = mkRun({ runThrows: new Error("провайдер отвалился"), activeRunUndo: [{ path: "/a.js", content: "старое", ts: 1 }, { path: "/b.js", content: null, ts: 2 }] });
-    const r = await h.handlers.get("ai:send")({ sender: { id: 1 } }, [], {});
+    const r = await h.handlers.get("ai:send")(fromWindow(h), [], {});
     assert.strictEqual(r.ok, false, "сбой прогона выдан за успех");
     assert.ok(/провайдер отвалился/.test(r.error), "причина сбоя потерялась: " + r.error);
     assert.strictEqual(h.box.lastUndoLog.length, 2, "снимки правок не попали в журнал отката");
@@ -192,14 +219,14 @@ function mkRun(over) {
 
     // Остановка человеком — понятный текст, а не «aborted».
     const h2 = mkRun({ runAborts: true, activeRunUndo: [{ path: "/c.js", content: "x", ts: 1 }] });
-    const r2 = await h2.handlers.get("ai:send")({ sender: { id: 1 } }, [], {});
+    const r2 = await h2.handlers.get("ai:send")(fromWindow(h2), [], {});
     assert.strictEqual(r2.ok, false, "остановка выданa за успех");
     assert.ok(/Генерация остановлена/.test(r2.error), "остановка показана сырым текстом: " + r2.error);
     assert.strictEqual(h2.box.lastUndoLog.length, 1, "правки до остановки не откатываются");
 
     // Правок не было — журнал не трогаем и чекпоинт не пишем.
     const h3 = mkRun({ runThrows: new Error("нет") });
-    await h3.handlers.get("ai:send")({ sender: { id: 1 } }, [], {});
+    await h3.handlers.get("ai:send")(fromWindow(h3), [], {});
     assert.strictEqual(h3.calls.persistUndo, 0, "пустой журнал записан на диск");
   });
 
@@ -208,13 +235,13 @@ function mkRun(over) {
       assert.strictEqual(global.__agentRunning, true, "во время прогона агент не помечен работающим");
       assert.strictEqual(global.__agentStopRequested, false, "флаг остановки стоит на старте прогона");
     } });
-    await h.handlers.get("ai:send")({ sender: { id: 1 } }, [], {});
+    await h.handlers.get("ai:send")(fromWindow(h), [], {});
     assert.strictEqual(global.__agentRunning, false, "успешный прогон оставил агента «работающим»");
     assert.strictEqual(global.__agentStopRequested, false, "после успеха остался флаг остановки");
     assert.strictEqual(global.__agentPauseRequested, false, "после успеха осталась пауза");
 
     const h2 = mkRun({ runThrows: new Error("сбой") });
-    await h2.handlers.get("ai:send")({ sender: { id: 1 } }, [], {});
+    await h2.handlers.get("ai:send")(fromWindow(h2), [], {});
     assert.strictEqual(global.__agentRunning, false, "сбой оставил агента «работающим»");
     assert.strictEqual(global.__agentStopRequested, false, "сбой оставил флаг остановки");
 
@@ -224,7 +251,7 @@ function mkRun(over) {
     const h3 = mkRun({ onRun: () => {
       assert.strictEqual(global.__agentStopRequested, false, "новый прогон начался с чужого флага остановки");
     } });
-    await h3.handlers.get("ai:send")({ sender: { id: 1 } }, [], {});
+    await h3.handlers.get("ai:send")(fromWindow(h3), [], {});
   });
 
   await test("ai:answer: отдаёт ответ прогону и не выдумывает ответ без вопроса", async () => {
@@ -330,6 +357,24 @@ function mkRun(over) {
     assert.ok(r.restored.some((p) => p === good), "успешный файл потерялся в отчёте: " + JSON.stringify(r.restored));
   });
 
+  await test("undo:rollback: чужой рендерер не трогает файлы проекта", () => {
+    // Откат возвращает файлы к прежнему содержимому и удаляет созданное агентом.
+    // Из чужого рендерера это способ стереть чужую работу — до проверки
+    // отправителя вызов проходил молча (см. src/ipc-guard.js).
+    const dir = tmpDir();
+    const kept = path.join(dir, "keep.txt");
+    fs.writeFileSync(kept, "испорчено", "utf8");
+    const undoFile = path.join(dir, "undo.json");
+    fs.writeFileSync(undoFile, JSON.stringify([{ path: kept, content: "прежнее", ts: 1 }]), "utf8");
+    const h = mkRun({ undoFile, lastUndoLog: [{ path: kept, content: "прежнее", ts: 1 }] });
+    const r = h.handlers.get("undo:rollback")(fromAlien());
+    assert.strictEqual(r.ok, false, "чужой рендерер откатил правки: " + JSON.stringify(r));
+    assert.ok(/не из окна/.test(r.error), "отказ не объяснён: " + r.error);
+    assert.strictEqual(fs.readFileSync(kept, "utf8"), "испорчено", "файл всё-таки вернулся к прежнему содержимому");
+    assert.ok(fs.existsSync(undoFile), "чекпоинт отката израсходован чужим вызовом");
+    assert.strictEqual(h.calls.loadPersistedUndo, 0, "чужой вызов дошёл до чтения чекпоинта");
+  });
+
   await test("в оболочке этого больше нет, а модуль собран на своём месте с мостом", () => {
     for (const gone of ['ipcMain.handle("ai:send"', 'ipcMain.handle("ai:answer"', 'ipcMain.handle("ai:stop"', 'ipcMain.handle("ai:test"', 'ipcMain.handle("undo:status"', 'ipcMain.handle("undo:rollback"']) {
       assert.ok(MAIN_SRC.indexOf(gone) < 0, "канал остался в оболочке: " + gone);
@@ -357,9 +402,15 @@ function mkRun(over) {
       assert.ok(MAIN_SRC.includes(pair[0]), pair[1]);
     }
     // Помощники переданы значениями, а не потеряны по дороге.
-    for (const dep of ["runAi,", "persistUndo,", "loadPersistedUndo,", "undoFile,", "fetchModels,", "normalizeSettings,"]) {
+    for (const dep of ["runAi,", "persistUndo,", "loadPersistedUndo,", "undoFile,", "fetchModels,", "normalizeSettings,", "netGuard,", "ipcGuard,"]) {
       assert.ok(MAIN_SRC.includes(dep), "в проводке нет зависимости: " + dep);
     }
+    // Разрушительные каналы модуля спрашивают проверку отправителя.
+    for (const ch of ["ai:send", "undo:rollback"]) {
+      assert.ok(MODULE_SRC.indexOf('channel: "' + ch + '"') >= 0, "канал " + ch + " не проверяет отправителя");
+    }
+    // А адрес провайдера из интерфейса проходит проверку адреса (src/net-guard.js).
+    assert.ok(/netGuard\.checkSettingsUrls\(s\)/.test(MODULE_SRC), "адрес провайдера не проверяется перед запросом");
     // Модуль не заводит своих копий живого состояния.
     for (const own of ["let activeRunOrigin", "let lastUndoLog", "let pendingAsk", "let mainWindow", "let activeAbort"]) {
       assert.ok(MODULE_SRC.indexOf(own) < 0, "модуль завёл свою копию состояния: " + own);

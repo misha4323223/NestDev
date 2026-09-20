@@ -31,6 +31,7 @@ function registerModelIpc(deps) {
     ollamaNumCtx,
     isLocalEndpoint,
     probeLocalModel,
+    netGuard,
   } = deps;
 
 // ── G4F: поиск живого инстанса — указанный URL, затем типовые порты 1337 / 8080 ──
@@ -68,6 +69,12 @@ async function probeG4fBase(configuredBase, timeoutMs) {
 }
 
 ipcMain.handle("g4f:probe", async (_e, opts) => {
+  // Адрес назвал интерфейс — цель запроса проверяем (см. src/net-guard.js).
+  const want = String((opts && opts.url) || "").trim();
+  if (want) {
+    const target = netGuard.checkUrl(want);
+    if (!target.ok) return { ok: false, error: target.error };
+  }
   const found = await probeG4fBase(opts && opts.url);
   return found ? { ok: true, ...found } : { ok: false };
 });
@@ -88,6 +95,15 @@ ipcMain.handle("g4f:test", async (_e, opts) => {
   };
   const textT = (res) => res.text().catch(() => "");
   push("info", "Проверка G4F: провайдер «" + (provider || "?") + "» → " + (base || "URL пуст"));
+  // Адрес назвал интерфейс, а запрос делает главный процесс: цель проверяем
+  // ДО первой попытки — иначе через метаданные облака читался бы ответ (SSRF).
+  if (base) {
+    const target = netGuard.checkUrl(base);
+    if (!target.ok) {
+      push("err", target.error);
+      return { ok: false, log };
+    }
+  }
   if (!/^https?:\/\//i.test(base)) {
     push("err", "Базовый URL не заполнен или не похож на http://localhost:1337/v1 — поправь поле URL.");
     return { ok: false, log };
@@ -167,6 +183,9 @@ ipcMain.handle("g4f:test", async (_e, opts) => {
 
 ipcMain.handle("ai:models", async (_e, ui) => {
   const s = normalizeSettings({ ...loadSettings(), ...(ui || {}) });
+  // Адрес может прийти от интерфейса — цель запроса проверяем (см. src/net-guard.js).
+  const target = netGuard.checkSettingsUrls(s);
+  if (!target.ok) return { ok: false, message: target.error, models: [] };
   try {
     return { ok: true, models: await fetchModels(s) };
   } catch (e) {
@@ -181,6 +200,8 @@ ipcMain.handle("ai:models", async (_e, ui) => {
 // Ollama перезагрузить модель прямо перед следующим ответом.
 ipcMain.handle("ai:probeLocal", async (_e, ui) => {
   const s = normalizeSettings({ ...loadSettings(), ...(ui || {}) });
+  const target = netGuard.checkSettingsUrls(s);
+  if (!target.ok) return { ok: false, message: target.error };
   try {
     const provider = s.provider || "openai";
     let win = 0;

@@ -52,10 +52,14 @@ const SOURCE = fs.readFileSync(path.join(ROOT, "src", "renderer", "mobile-api.js
 // ── Игрушечное окно ────────────────────────────────────────────────────────
 // Нужен ровно тот минимум, который трогает скрипт телефона: сборка окна ввода PIN
 // (именно её отсутствие/наличие и есть предмет проверки).
-function makeEnv(hash) {
+function makeEnv(hash, store) {
   const byId = {};
   const stripped = [];
   const sent = [];
+  // Память устройства (в браузере — localStorage): сеанс, выданный ПК при паре,
+  // переживает перезагрузку страницы. Передаём один объект в два стенда — так
+  // проверяется именно переподключение, а не «значение в одной вкладке».
+  const memory = store || {};
 
   function makeElement(tag) {
     const el = {
@@ -161,6 +165,15 @@ function makeEnv(hash) {
   const sandbox = {
     window: windowObj,
     document,
+    localStorage: {
+      getItem: (k) => (k in memory ? memory[k] : null),
+      setItem: (k, v) => {
+        memory[k] = String(v);
+      },
+      removeItem: (k) => {
+        delete memory[k];
+      },
+    },
     location: {
       protocol: "http:",
       host: "192.168.1.42:9090",
@@ -264,13 +277,17 @@ function authPayloads(env) {
   });
 
   await test("ссылка с ПК и разбор на телефоне — один формат", () => {
-    // Что строит ПК в Настройках: адрес моста + «/#pin=» + PIN. Панель подключения
-    // телефона вынесена из app.js в src/renderer/mobile-panel.js (этап 3.6) —
-    // спрашиваем модуль, а не адрес кода: формат ссылки от переезда не меняется.
+    // Что строит ПК в Настройках: адрес моста + «/#pair=» + одноразовый токен.
+    // Панель подключения телефона вынесена из app.js в src/renderer/mobile-panel.js
+    // (этап 3.6) — спрашиваем модуль, а не адрес кода.
     const app = fs.readFileSync(path.join(ROOT, "src", "renderer", "mobile-panel.js"), "utf8");
     assert.ok(
+      /urls\[0\]\.url\s*\+\s*"\/#pair="\s*\+\s*pair/.test(app),
+      "ПК должен строить ссылку вида <адрес>/#pair=<токен>"
+    );
+    assert.ok(
       /urls\[0\]\.url\s*\+\s*"\/#pin="\s*\+\s*pin/.test(app),
-      "ПК должен строить ссылку вида <адрес>/#pin=<PIN>"
+      "нет запаса на случай моста без токена пары: ссылка с PIN"
     );
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     assert.ok(html.indexOf('id="mobile-qr"') > 0, "в настройках нет места под QR-код");
@@ -281,6 +298,62 @@ function authPayloads(env) {
     const env = makeEnv("#" + link.split("#")[1]);
     env.socket.onopen();
     assert.strictEqual(authPayloads(env)[0].pin, "482913", "ссылка с ПК не подключает телефон");
+  });
+
+  await test("токен пары из адреса: телефон входит сам и не показывает окно ввода", () => {
+    const token = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+    const env = makeEnv("#pair=" + token);
+    assert.ok(env.socket, "скрипт не поднял соединение с ПК");
+    assert.ok(!env.byId["mobile-gate"], "окно ввода PIN не должно появляться, когда есть токен пары");
+    assert.strictEqual(env.stripped.length, 1, "адресную строку надо почистить ровно один раз");
+    assert.strictEqual(env.stripped[0].indexOf("pair"), -1, "токен пары остался в адресе: " + env.stripped[0]);
+
+    env.socket.onopen();
+    const auth = authPayloads(env);
+    assert.strictEqual(auth.length, 1, "токен пары должен уйти на ПК сразу после соединения");
+    assert.strictEqual(auth[0].pair, token, "уехал не тот токен пары");
+    assert.strictEqual(auth[0].pin, undefined, "вместе с токеном уехал PIN");
+    assert.ok(!env.byId["mobile-gate"], "окно ввода всё-таки появилось");
+  });
+
+  await test("сеанс устройства: выданный при паре, переживает перезагрузку страницы", () => {
+    const token = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+    const memory = {};
+    const first = makeEnv("#pair=" + token, memory);
+    first.socket.onopen();
+    first.socket.onmessage({ data: JSON.stringify({ t: "auth_ok", session: "sess-1" }) });
+    assert.ok(memory["ai-agent-device-session"] === "sess-1", "телефон не запомнил выданный сеанс");
+
+    // Новая вкладка (нет ни PIN, ни токена в адресе) — но сеанс уже есть.
+    const second = makeEnv("", memory);
+    second.socket.onopen();
+    const auth = authPayloads(second);
+    assert.strictEqual(auth.length, 1, "переподключение должно идти по сеансу, а не молчать");
+    assert.strictEqual(auth[0].session, "sess-1", "уехал не сеанс: " + JSON.stringify(auth[0]));
+    assert.ok(!second.byId["mobile-gate"], "человека спрашивают PIN, хотя сеанс уже есть");
+  });
+
+  await test("устаревший сеанс: окно ввода с понятным объяснением, сеанс забыт", () => {
+    const memory = { "ai-agent-device-session": "sess-старый" };
+    const env = makeEnv("", memory);
+    env.socket.onopen();
+    assert.strictEqual(authPayloads(env)[0].session, "sess-старый", "сеанс не отправлен");
+    env.socket.onmessage({ data: JSON.stringify({ t: "auth_err", needPin: true, staleSession: true, lock: false }) });
+    const gate = env.byId["mobile-gate"];
+    assert.ok(gate, "после устаревшего сеанса окно ввода обязательно — иначе пустой экран");
+    const err = gate.querySelector("#mobile-gate-err");
+    assert.ok(/устарело/.test(String(err.textContent)), "неверная подсказка: " + err.textContent);
+    assert.strictEqual(memory["ai-agent-device-session"], undefined, "негодный сеанс остался в памяти и будет отправляться снова");
+  });
+
+  await test("погашенный токен пары: окно ввода и подсказка про новый QR-код", () => {
+    const env = makeEnv("#pair=" + "b1b2c3d4e5f60718293a4b5c6d7e8f90");
+    env.socket.onopen();
+    env.socket.onmessage({ data: JSON.stringify({ t: "auth_err", badPair: true, needPin: true, lock: false }) });
+    const gate = env.byId["mobile-gate"];
+    assert.ok(gate, "после отказа по токену окно ввода обязательно");
+    const err = gate.querySelector("#mobile-gate-err");
+    assert.ok(/QR/.test(String(err.textContent)), "не сказано, что нужен новый код: " + err.textContent);
   });
 
   await test("мост отдаёт телефону все скрипты страницы (иначе часть работает молча)", () => {

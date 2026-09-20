@@ -70,6 +70,7 @@ function mk(over) {
     githubRepoDir: "/proj/clone",
   };
 
+  const win = o.win === undefined ? { isDestroyed: () => false, webContents: { id: 11, send() {} } } : o.win;
   const saved = [];
   const opened = [];
   const envApplied = [];
@@ -107,7 +108,12 @@ function mk(over) {
         return o.canceled ? { canceled: true, filePaths: [] } : { canceled: false, filePaths: [o.pick || "/picked/dir"] };
       },
     },
-    getWindow: () => (o.win === undefined ? { isDestroyed: () => false } : o.win),
+    // Живое окно: у настоящего есть webContents — по нему и отличают вызов из
+    // окна от вызова с телефона и от чужого рендерера (src/ipc-guard.js).
+    getWindow: () => win,
+    // Проверки, которые модуль получает собранными (как в main.js).
+    ipcGuard: require(path.join(ROOT, "src", "ipc-guard.js")),
+    secretMask: require(path.join(ROOT, "src", "secret-mask.js")),
     live: {
       // Мост: значение принадлежит оболочке, поэтому пишем именно вызовом.
       setLastAgentRepoDir: (v) => repoDirResets.push(v),
@@ -124,12 +130,39 @@ function mk(over) {
     bridgeApplied,
     repoDirResets,
     groups,
+    win,
     get current() {
       return current;
     },
     patch: (s) => handlers.get("settings:set")(null, s),
+    // Вызов от конкретного клиента: окно, телефон или чужой рендерер.
+    get: (ev) => handlers.get("settings:get")(ev),
+    set: (ev, s) => handlers.get("settings:set")(ev, s),
   };
 }
+
+// События клиентов. У вызова из окна Electron сам подставляет и отправителя
+// (webContents живого окна), и кадр — подделка обязана быть такой же.
+const fromWindow = (h) => ({ sender: h.win.webContents, senderFrame: { parent: null } });
+// Мост телефона собирает событие сам: sender.id = 0 (см. src/mobile-bridge.js).
+const fromPhone = () => ({ sender: { send() {}, id: 0 } });
+// Чужой рендерер внутри приложения: свой webContents, своё окно.
+const fromAlien = () => ({ sender: { send() {}, id: 99 }, senderFrame: { parent: null } });
+
+// Секреты, которые лежат в настройках: ключи, токены, PIN, переменные агента,
+// пароли сайтов и ключи внутри сохранённых подключений.
+const SECRETS = {
+  workingDir: "/proj",
+  model: "qwen3:8b",
+  openaiApiKey: "sk-очень-секретный",
+  anthropicApiKey: "sk-ant-секрет",
+  githubToken: "ghp-секрет",
+  mobilePin: "482913",
+  mailPassword: "пароль-почты",
+  agentEnv: { TOKEN: "секрет-переменной", CITY: "Москва" },
+  openaiProfiles: [{ id: "p1", name: "своё", url: "http://localhost:1/v1", apiKey: "ключ-профиля" }],
+  sitePasswords: [{ id: "v1", name: "банк", login: "я", password: "пароль-сайта" }],
+};
 
 const PRELOAD = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
 const MOBILE = fs.readFileSync(path.join(ROOT, "src", "renderer", "mobile-api.js"), "utf8");
@@ -268,6 +301,75 @@ const MAIN_SRC = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
     assert.strictEqual(noWin.opened[0].parent, undefined, "закрытое окно ушло родителем диалога");
   });
 
+  // ── Секреты в настройках: окну — значения, телефону — заглушки ──────────────
+  // До этой проверки settings:get отдавал ключи, токены, PIN и переменные агента
+  // любому, кто мог позвать канал. Каналы подняты по LAN, поэтому телефон должен
+  // получать то же меню, но без значений.
+
+  await test("settings:get: телефону — заглушки вместо секретов, окну — настоящие значения", () => {
+    const h = mk({ current: { ...SECRETS } });
+    const mask = require(path.join(ROOT, "src", "secret-mask.js"));
+
+    const phone = h.get(fromPhone());
+    for (const k of ["openaiApiKey", "anthropicApiKey", "githubToken", "mobilePin", "mailPassword"]) {
+      assert.strictEqual(phone[k], mask.MASK, "телефону ушёл секрет " + k + ": " + JSON.stringify(phone[k]));
+    }
+    assert.strictEqual(phone.agentEnv.TOKEN, mask.MASK, "телефону ушли значения переменных агента");
+    assert.strictEqual(phone.sitePasswords[0].password, mask.MASK, "телефону ушёл пароль сайта");
+    assert.strictEqual(phone.openaiProfiles[0].apiKey, mask.MASK, "телефону ушёл ключ подключения");
+    // А то, чем интерфейс живёт, остаётся: иначе на телефоне ничего не нарисуется.
+    assert.strictEqual(phone.workingDir, "/proj", "телефону не отдана рабочая папка");
+    assert.strictEqual(phone.model, "qwen3:8b", "телефону не отдана модель");
+    assert.deepStrictEqual(Object.keys(phone.agentEnv).sort(), ["CITY", "TOKEN"], "пропали имена переменных агента");
+    assert.strictEqual(phone.sitePasswords[0].name, "банк", "пропали подписи записей паролей");
+    assert.strictEqual(phone.openaiProfiles[0].url, "http://localhost:1/v1", "пропал адрес подключения");
+
+    // Окно на ПК — доверенный клиент: оно само ходит к провайдеру, ему ключи нужны.
+    const win = h.get(fromWindow(h));
+    assert.strictEqual(win.openaiApiKey, "sk-очень-секретный");
+    assert.strictEqual(win.agentEnv.TOKEN, "секрет-переменной");
+    assert.strictEqual(win.sitePasswords[0].password, "пароль-сайта");
+    // И внутренний вызов (наборы, живые прогоны) — тоже не телефон.
+    assert.strictEqual(h.get(null).openaiApiKey, "sk-очень-секретный");
+  });
+
+  await test("settings:set: сохранение с телефона не стирает секреты заглушками", () => {
+    const h = mk({ current: { ...SECRETS } });
+    // Телефон присылает ровно то, что сам получил (с заглушками), плюс свои правки.
+    const patch = h.get(fromPhone());
+    patch.model = "llama3";
+    patch.agentEnv.CITY = "Казань"; // одну переменную человек поменял, вторую нет
+    const answer = h.set(fromPhone(), patch);
+
+    assert.strictEqual(h.current.openaiApiKey, "sk-очень-секретный", "ключ стёрт сохранением с телефона");
+    assert.strictEqual(h.current.githubToken, "ghp-секрет", "токен GitHub стёрт");
+    assert.strictEqual(h.current.mobilePin, "482913", "PIN стёрт");
+    assert.strictEqual(h.current.sitePasswords[0].password, "пароль-сайта", "пароль сайта стёрт");
+    assert.strictEqual(h.current.openaiProfiles[0].apiKey, "ключ-профиля", "ключ подключения стёрт");
+    assert.strictEqual(h.current.agentEnv.TOKEN, "секрет-переменной", "значение нетронутой переменной стёрто");
+    assert.strictEqual(h.current.agentEnv.CITY, "Казань", "новая правка переменной не сохранилась");
+    assert.strictEqual(h.current.model, "llama3", "обычное поле не сохранилось");
+    // Ответ телефону — снова без секретов: иначе они вернулись бы тем же путём.
+    assert.strictEqual(answer.openaiApiKey, require(path.join(ROOT, "src", "secret-mask.js")).MASK, "в ответе телефону ушли ключи");
+  });
+
+  await test("чужой рендерер внутри приложения не получает ни ключей, ни сохранения", async () => {
+    const h = mk({ current: { ...SECRETS } });
+    const got = h.get(fromAlien());
+    assert.strictEqual(got.ok, false, "чужому рендереру отданы настройки: " + JSON.stringify(got));
+    assert.ok(/не из окна/.test(got.error), "отказ не объяснён: " + got.error);
+    assert.strictEqual(got.openaiApiKey, undefined, "в отказе всё равно уехал ключ");
+
+    const put = h.set(fromAlien(), { model: "чужое" });
+    assert.strictEqual(put.ok, false, "чужой рендерер сохранил настройки: " + JSON.stringify(put));
+    assert.deepStrictEqual(h.saved, [], "чужое сохранение дошло до хранилища");
+    assert.strictEqual(h.current.model, "qwen3:8b", "настройки всё-таки изменились");
+
+    assert.deepStrictEqual(h.handlers.get("policy:groups")(fromAlien()), [], "чужому рендереру отданы группы выдачи");
+    assert.strictEqual(await h.handlers.get("dialog:pickDir")(fromAlien()), null, "чужой рендерер открыл системный диалог");
+    assert.strictEqual(h.opened.length, 0, "диалог всё-таки открылся");
+  });
+
   await test("модуль без состояния: нет своей копии папки агента и нет чтения main.js", () => {
     assert.ok(/live\.setLastAgentRepoDir\(null\)/.test(MODULE_SRC), "сброс папки идёт не через мост");
     assert.ok(!/^\s*lastAgentRepoDir\s*=/m.test(MODULE_SRC), "модуль присваивает чужому имени сам");
@@ -280,7 +382,7 @@ const MAIN_SRC = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
     const wiring = MAIN_SRC.slice(at, MAIN_SRC.indexOf("\n});", at));
     for (const dep of ["ipcMain,", "loadSettings,", "saveSettings,", "normalizeSettings,",
       "applyAgentEnv,", "applyBrowserSettings,", "mobileBridge,", "toolPolicy,",
-      "dialog,", "getWindow: () => mainWindow,"]) {
+      "dialog,", "getWindow: () => mainWindow,", "ipcGuard,", "secretMask,"]) {
       assert.ok(wiring.includes(dep), "в проводку не передан " + dep);
     }
     assert.ok(wiring.includes("setLastAgentRepoDir:"), "папка агента не передана мостом");

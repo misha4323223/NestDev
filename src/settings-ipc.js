@@ -43,14 +43,46 @@ function registerSettingsIpc(deps) {
     live,
     dialog,
     getWindow,
+    ipcGuard,
+    secretMask,
   } = deps;
 
-ipcMain.handle("settings:get", () => loadSettings());
+// Кому отдаём настоящие значения секретов, а кому заглушки.
+//
+// Окно на ПК — доверенный клиент: оно само ходит к провайдеру (окно контекста,
+// проверка ключа), поэтому ключи ему нужны настоящими. Так же и внутренние
+// вызовы (наборы, живые прогоны): рендерера за ними нет.
+//
+// Телефон подключается по LAN и открытому ws://, и значения ему не нужны: прогон
+// агента и запросы делает главный процесс. Из настроек ему выдают заглушки
+// (см. src/secret-mask.js). Кто позвал — решает та же проверка отправителя, что
+// стоит на разрушительных каналах (src/ipc-guard.js).
+const maskedFor = (e) => ipcGuard.senderKind(e, getWindow ? getWindow() : null) === "mobile";
+// Отказ чужому рендереру внутри приложения: настройки — это ключи, пароли и PIN,
+// а второго окна приложению никто не обещал.
+const deniedFor = (e, channel) => ipcGuard.denyReason(e, { window: getWindow ? getWindow() : null, channel });
+
+ipcMain.handle("settings:get", (e) => {
+  const bad = deniedFor(e, "settings:get");
+  if (bad) return { ok: false, error: bad };
+  const s = loadSettings();
+  return maskedFor(e) ? secretMask.maskSecrets(s) : s;
+});
 // Группы выдачи секретов (terminal, git, cloud …) для настроек: собираются из
 // таблицы прав (tool-policy.js) — рендерер ничего не дублирует у себя.
-ipcMain.handle("policy:groups", () => toolPolicy.scopeGroups());
-ipcMain.handle("settings:set", (_e, s) => {
+ipcMain.handle("policy:groups", (e) => {
+  const bad = deniedFor(e, "policy:groups");
+  if (bad) return [];
+  return toolPolicy.scopeGroups();
+});
+ipcMain.handle("settings:set", (e, s0) => {
+  const bad = deniedFor(e, "settings:set");
+  if (bad) return { ok: false, error: bad };
+  // Заглушки из настроек, присланных телефоном, — это «поле не трогали»:
+  // разворачиваем их в прежние значения ДО слияния (src/secret-mask.js).
+  // Иначе сохранение любого другого параметра с телефона стёрло бы ключи.
   const prev = loadSettings();
+  const s = secretMask.restoreMasked(s0, prev);
   if (s && s.workingDir && prev.workingDir !== s.workingDir) {
     live.setLastAgentRepoDir(null); // рабочая папка сменилась — сбрасываем «активный репозиторий»
   }
@@ -90,19 +122,27 @@ ipcMain.handle("settings:set", (_e, s) => {
   applyBrowserSettings(merged);
   saveSettings(merged);
   mobileBridge.applySettings(merged);
-  return merged;
+  // Ответ уходит тому же клиенту — значит и состав у него должен быть тот же.
+  // Иначе телефон, сохранив галочку, получил бы в ответ настоящие ключи.
+  return maskedFor(e) ? secretMask.maskSecrets(merged) : merged;
 });
 
 // Выбор рабочей папки: окно спрашиваем в момент вызова — оно могло быть закрыто или
 // пересоздано. Без живого окна диалог всё равно открывается, просто без родителя
 // (иначе на закрытом окне Electron бросил бы ошибку и выбор папки не работал бы вовсе).
-ipcMain.handle("dialog:pickDir", async () => {
+ipcMain.handle("dialog:pickDir", async (e) => {
+  const bad = deniedFor(e, "dialog:pickDir");
+  if (bad) return null;
   const w = getWindow ? getWindow() : null;
   const parent = w && !w.isDestroyed() ? w : undefined;
-  const r = await dialog.showOpenDialog(parent, {
-    properties: ["openDirectory"],
-    title: "Выберите рабочую директорию",
-  });
+  // Electron 43 перестал запоминать последнюю папку и открывает диалог в «Загрузках»
+  // (это в его breaking changes). Раньше папку помнила сама система, и выбор начинался
+  // там, где человек остановился. Теперь называем папку явно — текущую рабочую:
+  // иначе каждый выбор начинался бы с «Загрузок».
+  const cur = loadSettings() || {};
+  const opts = { properties: ["openDirectory"], title: "Выберите рабочую директорию" };
+  if (cur.workingDir) opts.defaultPath = cur.workingDir;
+  const r = await dialog.showOpenDialog(parent, opts);
   return r.canceled ? null : r.filePaths[0];
 });
 }

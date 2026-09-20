@@ -114,6 +114,8 @@ function makePanel(over) {
     agentWorkDir: (s) => s.workingDir,
     loadSettings: () => state.settings,
     getWindow: () => win,
+    // Проверка отправителя у каналов терминала — та же, что в main.js.
+    ipcGuard: require(path.join(ROOT, "src", "ipc-guard.js")),
   }, over || {}));
 }
 
@@ -301,6 +303,18 @@ const last = (type) => [...events].reverse().find((e) => e.ev && e.ev.type === t
     const comp = await handlers.get("term:complete")(null, "alph");
     assert.ok(comp.matches.indexOf("alpha.txt") >= 0 || comp.tokenLen === 4, "term:complete отвечает не как модуль: " + JSON.stringify(comp));
 
+    // Терминал выполняет любую команду от имени человека, поэтому канал обязан
+    // спросить, кто позвал (src/ipc-guard.js). Чужой рендерер внутри приложения —
+    // не человек за окном: ему отказ, и оболочка не поднимается вовсе.
+    const foreign = { sender: { id: 999, send() {} }, senderFrame: { parent: null } };
+    const denied = await handlers.get("term:start")(foreign);
+    assert.strictEqual(denied.ok, false, "чужой рендерер поднял оболочку: " + JSON.stringify(denied));
+    assert.ok(/не из окна/.test(denied.error), "отказ не объяснён: " + denied.error);
+    const deniedStatus = await handlers.get("term:status")({ sender: { id: 999, send() {} } });
+    assert.strictEqual(deniedStatus.ok, false, "чужой рендерер читает состояние терминала: " + JSON.stringify(deniedStatus));
+    assert.ok(/не из окна/.test(deniedStatus.error), "отказ не объяснён: " + deniedStatus.error);
+    assert.deepStrictEqual(await handlers.get("term:status")(null), { running: false }, "отказ всё-таки запустил терминал");
+
     // Проект переключили, пока панель была закрыта: терминал обязан открыться
     // в НЫНЕШНЕЙ папке. Иначе команды человека уходят в папку прошлого проекта.
     const other = fs.mkdtempSync(path.join(os.tmpdir(), "term-panel-other-"));
@@ -337,14 +351,21 @@ const last = (type) => [...events].reverse().find((e) => e.ev && e.ev.type === t
       /const \{ termEmit, termAgentEcho, termStart, termInput, termStop, termStatus, termShutdown, termComplete, registerTermIpc \} = createTerminalPanel\(\{/.test(MAIN_SRC),
       "состав имён в проводке модуля изменился"
     );
-    for (const dep of ["fs,", "path,", "os,", "spawn,", "stripAnsi,", "envFor,", "bgKill,", "agentWorkDir,", "loadSettings,", "getWindow: () => mainWindow,"]) {
+    for (const dep of ["fs,", "path,", "os,", "spawn,", "stripAnsi,", "envFor,", "bgKill,", "agentWorkDir,", "loadSettings,", "getWindow: () => mainWindow,", "ipcGuard,"]) {
       assert.ok(MAIN_SRC.includes(dep), "в проводку не передано: " + dep);
     }
     // Каналы и выход приложения зовут модуль, а не держат кусок его состояния.
     // С части 32 каналы регистрирует сам модуль — в оболочке остаётся один вызов.
     assert.ok(MAIN_SRC.includes("registerTermIpc(ipcMain);"), "оболочка не передаёт каналы модулю");
     assert.ok(!/ipcMain\.(handle|on)\("term:/.test(MAIN_SRC), "в main.js остались каналы терминала");
-    assert.ok(/ipcMain\.handle\("term:start", \(\) => termStart\(agentWorkDir\(loadSettings\(\)\)\)\);/.test(MODULE_SRC), "модуль не регистрирует term:start");
+    // Раньше здесь проверялась форма одной строки регистрации. Теперь важнее
+    // другое: КАЖДЫЙ канал терминала сначала спрашивает, кто позвал, и только
+    // потом работает (см. src/ipc-guard.js) — иначе дыра вернётся незаметно.
+    assert.ok(/ipcMain\.handle\("term:start", \(e\) => \{/.test(MODULE_SRC), "модуль не регистрирует term:start");
+    assert.ok(MODULE_SRC.includes('termStart(agentWorkDir(loadSettings()))'), "старт потерял текущую рабочую папку");
+    for (const ch of ["term:start", "term:input", "term:stop", "term:status", "term:complete"]) {
+      assert.ok(MODULE_SRC.indexOf('deny(e, "' + ch + '")') >= 0, "канал " + ch + " не проверяет отправителя");
+    }
     assert.ok(MAIN_SRC.includes("termShutdown();"), "выход приложения не гасит терминал модулем");
     assert.ok(!/userTerm/.test(MAIN_SRC), "в оболочке осталось чужое состояние: userTerm");
     assert.ok(/termAgentEcho,\n  mailConfig,/.test(MAIN_SRC), "инструменты больше не получают терминал агента");

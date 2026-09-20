@@ -1892,10 +1892,14 @@ function createAgentTools(deps) {
         const failed = /не найден|ERROR|not found|No matching|No processes|кодом (1|128)/i.test(out);
         return (failed ? "Возможно, процесс уже завершён или не найден:\n" : "OK — процесс " + label + " завершён.\n") + "$ " + cmd + "\n\n" + out;
     },
+    // Буфер обмена: в Electron 44 модуль переделали под W3C — readText и
+    // writeText теперь возвращают Promise. Без await инструмент отдал бы модели
+    // "[object Promise]" вместо текста, а отказ записи улетел бы в необработанный
+    // reject вместо честной ошибки: обе ветки обязаны ЖДАТЬ результат.
     "clipboardWrite": async (args, settings) => {
         const text = String(args.text == null ? "" : args.text);
         try {
-          clipboard.writeText(text);
+          await clipboard.writeText(text);
         } catch (e) {
           return "Ошибка: не удалось записать в буфер обмена: " + (e.message || String(e));
         }
@@ -1904,7 +1908,7 @@ function createAgentTools(deps) {
     "clipboardRead": async (args, settings) => {
         let text = "";
         try {
-          text = clipboard.readText() || "";
+          text = String((await clipboard.readText()) || "");
         } catch (e) {
           return "Ошибка: не удалось прочитать буфер обмена: " + (e.message || String(e));
         }
