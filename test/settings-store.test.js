@@ -337,14 +337,16 @@ const readRaw = (file) => (fs.existsSync(file) ? fs.readFileSync(file, "utf8") :
     assert.ok(/^\s+loadSettings,$/m.test(MAIN_SRC), "модули больше не получают свежие настройки");
   });
 
-  await test("применение настроек живое: окружение в модуле, профиль браузера в оболочке", () => {
-    // Окружение агента применяет модуль src/agent-env.js (часть 22): он отдаёт
-    // applyAgentEnv в проводку, а состояние держит у себя. Профиль браузера остаётся
-    // объявлением функции в оболочке — подъём работает, поэтому мост не нужен.
+  await test("применение настроек живое: окружение и профиль браузера — своими модулями", () => {
+    // Окружение агента применяет модуль src/agent-env.js (часть 22), профиль браузера —
+    // src/browser-ipc.js (часть 26): каждый отдаёт свою функцию в проводку, поэтому
+    // порядок сборки не зависит от подъёма объявлений.
     const ENV_SRC = read("src", "agent-env.js");
+    const BROWSER_SRC = read("src", "browser-ipc.js");
     assert.ok(ENV_SRC.indexOf("function applyAgentEnv(s) {") >= 0, "применение окружения уехало из модуля");
     assert.ok(ENV_SRC.indexOf("ycEnsurePath();") >= 0, "окружение больше не получает PATH yc CLI");
-    assert.ok(MAIN_SRC.indexOf("function applyBrowserSettings(s) {") >= 0, "применение профиля браузера уехало из оболочки");
+    assert.ok(BROWSER_SRC.indexOf("function applyBrowserSettings(s) {") >= 0, "применение профиля браузера уехало из модуля");
+    assert.strictEqual(MAIN_SRC.indexOf("function applyBrowserSettings(s) {"), -1, "применение профиля браузера осталось в оболочке");
     assert.ok(STORE_SRC.indexOf("applyAgentEnv(") >= 0 && STORE_SRC.indexOf("applyBrowserSettings(") >= 0,
       "модуль не применяет настройки к живым подсистемам");
   });

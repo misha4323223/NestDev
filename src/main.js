@@ -174,12 +174,29 @@ const {
   applyAgentEnv,
 } = agentEnvState;
 
+// ──────────────────────── Браузер агента: настройки и каналы ────────────────────────
+// Раздел вынесен в src/browser-ipc.js (часть 26): единая точка применения браузерных
+// настроек и каналы browser:* для окна и телефона. Сборка стоит ВЫШЕ хранилища
+// настроек, потому что хранилище берёт applyBrowserSettings себе. Чтение настроек
+// идёт мостом live: хранилище собирается ниже, и прямой вызов до его сборки упал бы
+// на «cannot access before initialization», оборвав загрузку всего бэкенда.
+const { registerBrowserIpc } = require("./browser-ipc.js");
+const { applyBrowserSettings } = registerBrowserIpc({
+  ipcMain,
+  app,
+  fs,
+  path,
+  browserTools,
+  live: { loadSettings: () => loadSettings() },
+});
+
 // ─────────────────────────── Настройки ───────────────────────────
 // ── Настройки, подключения и история чатов — код в src/settings-store.js ──
 // Модуль собран на прежнем месте куска, и имена те же: вызовы ниже (loadSettings,
 // saveSettings, loadChats…) дословно прежние — берём их деструктуризацией.
-// Применение настроек к живым подсистемам: окружение агента теперь в src/agent-env.js,
-// профиль браузера и журнал остаются здесь объявлениями функций — подъём работает.
+// Применение настроек к живым подсистемам: окружение агента в src/agent-env.js,
+// профиль браузера — в src/browser-ipc.js, журнал остаётся здесь объявлением
+// функции — подъём работает.
 const { createSettingsStore } = require("./settings-store.js");
 const {
   DEFAULT_SETTINGS,
@@ -967,39 +984,6 @@ ipcMain.handle("settings:set", (_e, s) => {
   mobileBridge.applySettings(merged);
   return merged;
 });
-
-// ─────────────────────────── Браузер агента (постоянный профиль) ───────────────────────────
-// Сессии ВК и других сайтов хранятся в userData/browser-profile — вход переживает перезапуск.
-// Единая точка применения браузерных настроек: своя папка профиля и режим «свой Chrome» (CDP).
-function applyBrowserSettings(s) {
-  const dir = path.join(app.getPath("userData"), "browser-profile");
-  try {
-    browserTools.setProfileDir(s && s.browserProfile === false ? "" : dir);
-    browserTools.setConnectMode({
-      enabled: !!(s && s.browserConnect === true),
-      port: s && s.browserConnectPort,
-      dataDir: dir,
-    });
-  } catch {}
-}
-
-ipcMain.handle("browser:profileInfo", () => {
-  const s = loadSettings();
-  const dir = browserTools.profilePath();
-  let exists = false;
-  try { exists = !!(dir && fs.existsSync(dir)); } catch {}
-  return { enabled: s.browserProfile !== false, dir: dir || "", exists };
-});
-ipcMain.handle("browser:clearProfile", async () => {
-  const message = await browserTools.clearProfile();
-  return { ok: !/^Не удалось/.test(message), message };
-});
-// Подключение к своему Chrome по CDP (кнопка в Настройках и инструмент агента).
-ipcMain.handle("browser:connect", async (_e, opts) => {
-  const message = await browserTools.connect(opts || {});
-  return { ok: !/^Ошибка/.test(message), message, info: browserTools.connectInfo() };
-});
-ipcMain.handle("browser:connectInfo", () => browserTools.connectInfo());
 
 // ─────────────────────────── Почта (SMTP/IMAP) ───────────────────────────
 // Настройка подключения и каналы почты живут в src/mail-ipc.js (1.5.75): протокол
