@@ -151,7 +151,20 @@ function termComplete(line) {
   }
   return { matches: [...new Set(matches)].sort().slice(0, 30), base, tokenLen: token.length };
 }
-  return { termEmit, termAgentEcho, termStart, termInput, termStop, termStatus, termShutdown, termComplete };
+/* Каналы окна для панели: раньше стояли в main.js (этап B, часть 32). Рабочая папка
+   и настройки берутся те же, что и у остальных функций панели, — модуль уже получает
+   их своими зависимостями, и копий снаружи держать не нужно. Старт терминала читает
+   рабочую папку В МОМЕНТ вызова: человек мог переключить проект, пока панель была
+   закрыта, и терминал обязан открыться в нынешней папке, а не в прежней. */
+function registerTermIpc(ipcMain) {
+  ipcMain.handle("term:start", () => termStart(agentWorkDir(loadSettings())));
+  ipcMain.handle("term:input", (_e, text) => termInput(text));
+  ipcMain.handle("term:stop", () => termStop());
+  ipcMain.handle("term:status", () => termStatus());
+  ipcMain.handle("term:complete", (_e, line) => termComplete(line));
+}
+
+  return { termEmit, termAgentEcho, termStart, termInput, termStop, termStatus, termShutdown, termComplete, registerTermIpc };
 }
 
 module.exports = { createTerminalPanel };

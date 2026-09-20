@@ -22,7 +22,10 @@
      [4] превью: настоящий запуск процесса, вывод в окно, остановка;
      [5] остановка при выходе приложения (before-quit) действительно убивает сервер;
      [6] ни один канал не пишет в папку приложения;
-     [7] проводка ниже зависимостей, каналов в main.js не осталось.
+     [7] проводка ниже зависимостей, каналов в main.js не осталось;
+     [8] освобождение порта: РАЗБОР настоящего lsof на настоящем слушателе —
+         в «убитые» не попадают ни номер порта, ни 127.0.0.1 (убийца подставной,
+         иначе ошибка разбора погасила бы посторонние процессы прямо в прогоне).
 
    Ничего в репозитории приложения не пишется: работа идёт в temp-папках. */
 
@@ -324,6 +327,54 @@ watchdog.unref();
   ok(mainSrc.indexOf("createTerminalPanel({") < mainSrc.indexOf('require("./preview-ipc.js")'), "модуль превью собран после терминала");
   ok(mainSrc.indexOf("let mainWindow = null;") < mainSrc.indexOf('require("./preview-ipc.js")'), "модуль превью собран после объявления окна");
   ok(!/ipcMain\.(handle|on)\("(projects|dev):/.test(mainSrc), "в main.js не осталось каналов проектов и превью");
+
+  console.log("\n[8] освобождение порта: разбор настоящего lsof не путает порт и 127.0.0.1");
+  // Находка живой проверки части 31: раньше из вывода lsof брались ВСЕ числа, поэтому
+  // в «убитые» попадали номер порта и 127.0.0.1, и «⏹ Остановить» на macOS/Linux мог
+  // погасить посторонний процесс. Здесь настоящий lsof, настоящий слушатель и НАСТОЯЩИЙ
+  // разбор, но убийца подставной — сигналы никуда не уходят, пока разбор не сойдётся.
+  const { createBgProcesses } = require(path.join(ROOT, "src", "bg-processes.js"));
+  const cp = require("child_process");
+  const realRun = (cmd, cwd, ms) =>
+    new Promise((resolve) => {
+      cp.execFile("/bin/sh", ["-c", cmd], { cwd: cwd || os.homedir(), timeout: ms || 15000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) =>
+        resolve(String(stdout || "") + String(stderr || "") + (err && !stdout && !stderr ? String(err.message) : ""))
+      );
+    });
+  const killCalls = [];
+  const parser = createBgProcesses({
+    spawn: cp.spawn,
+    os,
+    stripAnsi: (s) => String(s).replace(/\u001b\[[0-9;]*m/g, ""),
+    shellArgsFor: (c) => ["-c", c],
+    commandEnv: () => ({}),
+    runTerminalCommand: realRun,
+    killPid: (pid) => killCalls.push(pid),
+  });
+  const lsPort = 5221;
+  const listener = cp.spawn(process.execPath, ["-e", "require('net').createServer().listen(" + lsPort + ", '127.0.0.1')"]);
+  try {
+    let busy = false;
+    for (let i = 0; i < 40 && !busy; i++) {
+      busy = await new Promise((r) => {
+        const s = require("net").connect(lsPort, "127.0.0.1");
+        s.on("connect", () => { s.destroy(); r(true); });
+        s.on("error", () => r(false));
+      });
+      if (!busy) await sleep(100);
+    }
+    ok(busy, "настоящий слушатель занял порт " + lsPort + " (PID " + listener.pid + ")");
+    const raw = await realRun("lsof -ti tcp:" + lsPort + " 2>/dev/null || fuser " + lsPort + "/tcp 2>/dev/null");
+    const r = await parser.killProcessesOnPort(lsPort);
+    const nums = r.killed.map(String);
+    ok(raw.indexOf(String(listener.pid)) >= 0, "система видит слушателя: " + JSON.stringify(String(raw).trim().split("\n").slice(0, 2)));
+    ok(nums.indexOf(String(listener.pid)) >= 0, "слушатель попал в «убитые»: " + JSON.stringify(nums));
+    ok(nums.indexOf(String(lsPort)) < 0, "номер порта не принят за процесс: " + JSON.stringify(nums));
+    ok(nums.indexOf("127") < 0 && nums.indexOf("1") < 0, "адрес 127.0.0.1 не принят за процессы: " + JSON.stringify(nums));
+    ok(killCalls.length === nums.length && killCalls.every((n) => Number(n) > 1), "подставному убийце ушли только настоящие PID: " + JSON.stringify(killCalls));
+  } finally {
+    try { listener.kill("SIGKILL"); } catch {}
+  }
 
   console.log(failures ? "\n❌ Провалов: " + failures : "\n✅ Все живые проверки пройдены");
   process.exit(failures ? 1 : 0);

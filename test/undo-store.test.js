@@ -207,7 +207,15 @@ const writeFile = (name, content) => {
     for (const keep of ["let activeRunUndo = [];", "let lastUndoLog = [];"]) {
       assert.ok(MAIN_SRC.indexOf(keep) >= 0, "живое значение уехало из оболочки: " + keep);
     }
-    assert.ok(MAIN_SRC.includes("fs.unlinkSync(undoFile())"), "оболочка перестала пользоваться undoFile");
+    // С части 34 каналы отката (undo:status, undo:rollback) и прогон агента (ai:*)
+    // живут в src/run-ipc.js: чекпоинт израсходуется именно там, и сторож обязан
+    // читать модуль, а не оболочку. В main.js остаётся только проводка.
+    const RUN_SRC = read("src", "run-ipc.js");
+    for (const goneCh of ['ipcMain.handle("undo:status"', 'ipcMain.handle("undo:rollback"', 'ipcMain.handle("ai:send"']) {
+      assert.ok(MAIN_SRC.indexOf(goneCh) < 0, "канал остался в оболочке: " + goneCh);
+    }
+    assert.ok(RUN_SRC.includes("fs.unlinkSync(undoFile())"), "чекпоинт больше не удаляется после отката");
+    assert.ok(/undoFile,/.test(MAIN_SRC), "оболочка перестала отдавать путь чекпоинта прогону");
     assert.ok(MODULE_SRC.includes("UNDO_MAX_PER_FILE"), "правило вытеснения пропало из модуля");
   });
 

@@ -14,6 +14,11 @@
      • сохранение с телефона (или старой версией окна) приходило без sitePasswords
        и mailPassword и затирало пароли.
 
+   Тут же живёт выбор рабочей папки в системном диалоге (dialog:pickDir): его зовут и
+   настройки, и панель проекта, а спрашивать надо именно рабочую папку. Родитель
+   диалога — окно приложения: без него диалог открывался бы отдельным окном, которое
+   легко потерять за главным.
+
    Эти поля берутся из текущих настроек, а не из присланного объекта. Каждая
    защита закрыта проверками (test/settings-ipc.test.js) и живым прогоном
    (scripts/live-settings-ipc.js), потому что ошибка тут тихая: настройки
@@ -36,6 +41,8 @@ function registerSettingsIpc(deps) {
     mobileBridge,
     toolPolicy,
     live,
+    dialog,
+    getWindow,
   } = deps;
 
 ipcMain.handle("settings:get", () => loadSettings());
@@ -84,6 +91,19 @@ ipcMain.handle("settings:set", (_e, s) => {
   saveSettings(merged);
   mobileBridge.applySettings(merged);
   return merged;
+});
+
+// Выбор рабочей папки: окно спрашиваем в момент вызова — оно могло быть закрыто или
+// пересоздано. Без живого окна диалог всё равно открывается, просто без родителя
+// (иначе на закрытом окне Electron бросил бы ошибку и выбор папки не работал бы вовсе).
+ipcMain.handle("dialog:pickDir", async () => {
+  const w = getWindow ? getWindow() : null;
+  const parent = w && !w.isDestroyed() ? w : undefined;
+  const r = await dialog.showOpenDialog(parent, {
+    properties: ["openDirectory"],
+    title: "Выберите рабочую директорию",
+  });
+  return r.canceled ? null : r.filePaths[0];
 });
 }
 

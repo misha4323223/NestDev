@@ -284,20 +284,67 @@ const last = (type) => [...events].reverse().find((e) => e.ev && e.ev.type === t
     assert.deepStrictEqual(broken.termStatus(), { running: false }, "сломанный запуск оставил терминал «работающим»");
   });
 
+  await test("каналы панели: имена ровно как у окна и телефона, старт берёт ТЕКУЩУЮ папку", async () => {
+    const handlers = new Map();
+    // Свой экземпляр панели — со своим терминалом: чужое состояние соседей не трогаем.
+    const chan = makePanel();
+    chan.registerTermIpc({ handle: (ch, fn) => handlers.set(ch, fn) });
+    assert.deepStrictEqual([...handlers.keys()].sort(), ["term:complete", "term:input", "term:start", "term:status", "term:stop"]);
+    // Имена сверяем с клиентами: разъехавшееся имя молча ломает панель.
+    const PRELOAD = read("src", "preload.js");
+    const MOBILE = read("src", "renderer", "mobile-api.js");
+    for (const ch of handlers.keys()) {
+      assert.ok(PRELOAD.includes('invoke("' + ch + '"'), "окно не зовёт " + ch);
+      assert.ok(MOBILE.includes('"' + ch + '"'), "телефон не зовёт " + ch);
+    }
+    // Дополнение идёт через канал точно так же, как из панели.
+    const comp = await handlers.get("term:complete")(null, "alph");
+    assert.ok(comp.matches.indexOf("alpha.txt") >= 0 || comp.tokenLen === 4, "term:complete отвечает не как модуль: " + JSON.stringify(comp));
+
+    // Проект переключили, пока панель была закрыта: терминал обязан открыться
+    // в НЫНЕШНЕЙ папке. Иначе команды человека уходят в папку прошлого проекта.
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), "term-panel-other-"));
+    const before = state.settings.workingDir;
+    state.settings = { workingDir: other };
+    try {
+      const started = await handlers.get("term:start")();
+      assert.strictEqual(started.ok, true, "терминал не запустился: " + JSON.stringify(started.error));
+      assert.strictEqual(started.cwd, other, "старт получил не текущую папку: " + started.cwd);
+      assert.deepStrictEqual(await handlers.get("term:status")(), { running: true }, "статус не видит запущенный терминал");
+      events.length = 0;
+      await handlers.get("term:input")(null, sayPwd());
+      await waitFor(() => events.some((e) => e.ev && e.ev.type === "out" && e.ev.text.indexOf(other) >= 0));
+      const out = events.filter((e) => e.ev && e.ev.type === "out").map((e) => e.ev.text).join("\n");
+      assert.ok(
+        out.indexOf(other) >= 0 || out.indexOf(fs.realpathSync(other)) >= 0,
+        "терминал открылся не в текущей папке: " + JSON.stringify(out.slice(0, 160))
+      );
+      assert.deepStrictEqual(await handlers.get("term:stop")(), { ok: true }, "остановка через канал не ответила как модуль");
+      assert.deepStrictEqual(await handlers.get("term:status")(), { running: false }, "статус после остановки не сбросился");
+    } finally {
+      state.settings = { workingDir: before };
+      try { chan.termStop(); } catch {}
+      fs.rmSync(other, { recursive: true, force: true });
+    }
+  });
+
   await test("в оболочке этого больше нет, а модуль собран на своём месте", () => {
     for (const gone of ["let userTerm = null;", "function termEmit(", "function termAgentEcho(", "function termStart(", "function termInput(", "function termStop(", "function termComplete("]) {
       assert.ok(MAIN_SRC.indexOf(gone) < 0, "в main.js осталось: " + gone);
     }
     assert.ok(/const \{ createTerminalPanel \} = require\("\.\/terminal-panel\.js"\)/.test(MAIN_SRC), "модуль не подключён");
     assert.ok(
-      /const \{ termEmit, termAgentEcho, termStart, termInput, termStop, termStatus, termShutdown, termComplete \} = createTerminalPanel\(\{/.test(MAIN_SRC),
+      /const \{ termEmit, termAgentEcho, termStart, termInput, termStop, termStatus, termShutdown, termComplete, registerTermIpc \} = createTerminalPanel\(\{/.test(MAIN_SRC),
       "состав имён в проводке модуля изменился"
     );
     for (const dep of ["fs,", "path,", "os,", "spawn,", "stripAnsi,", "envFor,", "bgKill,", "agentWorkDir,", "loadSettings,", "getWindow: () => mainWindow,"]) {
       assert.ok(MAIN_SRC.includes(dep), "в проводку не передано: " + dep);
     }
     // Каналы и выход приложения зовут модуль, а не держат кусок его состояния.
-    assert.ok(MAIN_SRC.includes('ipcMain.handle("term:status", () => termStatus());'), "канал term:status не переписан на модуль");
+    // С части 32 каналы регистрирует сам модуль — в оболочке остаётся один вызов.
+    assert.ok(MAIN_SRC.includes("registerTermIpc(ipcMain);"), "оболочка не передаёт каналы модулю");
+    assert.ok(!/ipcMain\.(handle|on)\("term:/.test(MAIN_SRC), "в main.js остались каналы терминала");
+    assert.ok(/ipcMain\.handle\("term:start", \(\) => termStart\(agentWorkDir\(loadSettings\(\)\)\)\);/.test(MODULE_SRC), "модуль не регистрирует term:start");
     assert.ok(MAIN_SRC.includes("termShutdown();"), "выход приложения не гасит терминал модулем");
     assert.ok(!/userTerm/.test(MAIN_SRC), "в оболочке осталось чужое состояние: userTerm");
     assert.ok(/termAgentEcho,\n  mailConfig,/.test(MAIN_SRC), "инструменты больше не получают терминал агента");

@@ -345,12 +345,19 @@ const readRaw = (file) => (fs.existsSync(file) ? fs.readFileSync(file, "utf8") :
     const MOBILE_SRC = read("src", "mobile-ipc.js");
     const PROJECTS_SRC = read("src", "projects-ipc.js");
     const PREVIEW_SRC = read("src", "preview-ipc.js");
+    // Самообновление (src/ota-ipc.js, часть 32) читает настройки так же — в момент
+    // вызова: в них лежит выключатель self-update.
+    const OTA_SRC = read("src", "ota-ipc.js");
+    // Панель терминала — туда же: с части 32 её канал term:start читает рабочую
+    // папку в момент запуска (проект мог переключиться, пока панель была закрыта).
+    const TERM_SRC = read("src", "terminal-panel.js");
     const callCount = (src) => (src.match(/(^|[^.\w$])loadSettings\(\)/g) || []).length;
     const calls =
       callCount(MAIN_SRC) + callCount(MEM_SRC) + callCount(SETTINGS_SRC) +
-      callCount(MOBILE_SRC) + callCount(PROJECTS_SRC) + callCount(PREVIEW_SRC);
+      callCount(MOBILE_SRC) + callCount(PROJECTS_SRC) + callCount(PREVIEW_SRC) +
+      callCount(OTA_SRC) + callCount(TERM_SRC);
     assert.ok(calls >= 20, "вызовы loadSettings() в оболочке переписаны: " + calls);
-    for (const [name, src] of [["памяти", MEM_SRC], ["настроек", SETTINGS_SRC], ["мобильного доступа", MOBILE_SRC], ["проектов", PROJECTS_SRC], ["превью", PREVIEW_SRC]]) {
+    for (const [name, src] of [["памяти", MEM_SRC], ["настроек", SETTINGS_SRC], ["мобильного доступа", MOBILE_SRC], ["проектов", PROJECTS_SRC], ["превью", PREVIEW_SRC], ["самообновления", OTA_SRC], ["терминала", TERM_SRC]]) {
       assert.ok(/const \{[^}]*\bloadSettings\b[^}]*\} = deps;/.test(src), "канал " + name + " не получает свежие настройки");
       assert.ok(callCount(src) > 0, "канал " + name + " не читает настройки в момент вызова");
     }

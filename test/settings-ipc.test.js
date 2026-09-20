@@ -71,6 +71,7 @@ function mk(over) {
   };
 
   const saved = [];
+  const opened = [];
   const envApplied = [];
   const browserApplied = [];
   const bridgeApplied = [];
@@ -97,6 +98,16 @@ function mk(over) {
       status: () => ({ pin: current.mobilePin || "" }),
     },
     toolPolicy: { scopeGroups: () => groups },
+    // Системный диалог выбора папки: без родителя окно теряется за главным окном,
+    // а на закрытом окне Electron вообще бросает ошибку — поэтому запоминаем, что
+    // именно пришло родителем.
+    dialog: {
+      showOpenDialog: (parent, opts) => {
+        opened.push({ parent, opts });
+        return o.canceled ? { canceled: true, filePaths: [] } : { canceled: false, filePaths: [o.pick || "/picked/dir"] };
+      },
+    },
+    getWindow: () => (o.win === undefined ? { isDestroyed: () => false } : o.win),
     live: {
       // Мост: значение принадлежит оболочке, поэтому пишем именно вызовом.
       setLastAgentRepoDir: (v) => repoDirResets.push(v),
@@ -107,6 +118,7 @@ function mk(over) {
     handlers,
     listeners,
     saved,
+    opened,
     envApplied,
     browserApplied,
     bridgeApplied,
@@ -129,9 +141,9 @@ const MAIN_SRC = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
 
   await test("каналы объявлены ровно так, как их зовут окно и телефон", () => {
     const h = mk();
-    assert.deepStrictEqual([...h.handlers.keys()].sort(), ["policy:groups", "settings:get", "settings:set"]);
+    assert.deepStrictEqual([...h.handlers.keys()].sort(), ["dialog:pickDir", "policy:groups", "settings:get", "settings:set"]);
     assert.deepStrictEqual([...h.listeners.keys()], [], "модуль завёл лишние слушатели");
-    for (const ch of ["settings:get", "settings:set", "policy:groups"]) {
+    for (const ch of ["settings:get", "settings:set", "policy:groups", "dialog:pickDir"]) {
       assert.ok(PRELOAD.includes(`"${ch}"`), "preload.js не знает канал " + ch);
       assert.ok(MOBILE.includes(`"${ch}"`), "mobile-api.js не знает канал " + ch);
     }
@@ -239,6 +251,23 @@ const MAIN_SRC = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
     assert.deepStrictEqual(h.handlers.get("policy:groups")().cloud, ["YC_TOKEN"], "группы взяты копией");
   });
 
+  await test("dialog:pickDir: отмена — null, выбор — путь, родитель — ЖИВОЕ окно", async () => {
+    const h = mk();
+    assert.strictEqual(await h.handlers.get("dialog:pickDir")(), "/picked/dir", "выбранная папка не отдана окну");
+    assert.strictEqual(h.opened.length, 1, "системный диалог не открывали");
+    assert.ok(h.opened[0].opts && h.opened[0].opts.properties.includes("openDirectory"), "диалог спрашивает не папку: " + JSON.stringify(h.opened[0].opts));
+    assert.ok(h.opened[0].parent && typeof h.opened[0].parent.isDestroyed === "function", "родителем диалога не передано окно");
+
+    const cancelled = mk({ canceled: true });
+    assert.strictEqual(await cancelled.handlers.get("dialog:pickDir")(), null, "отмена диалога выдана за выбор папки");
+
+    // Окно могло быть закрыто: диалог всё равно обязан открыться, без родителя —
+    // иначе на закрытом окне выбор папки упал бы с ошибкой Electron.
+    const noWin = mk({ win: null });
+    assert.strictEqual(await noWin.handlers.get("dialog:pickDir")(), "/picked/dir", "без живого окна выбор папки перестал работать");
+    assert.strictEqual(noWin.opened[0].parent, undefined, "закрытое окно ушло родителем диалога");
+  });
+
   await test("модуль без состояния: нет своей копии папки агента и нет чтения main.js", () => {
     assert.ok(/live\.setLastAgentRepoDir\(null\)/.test(MODULE_SRC), "сброс папки идёт не через мост");
     assert.ok(!/^\s*lastAgentRepoDir\s*=/m.test(MODULE_SRC), "модуль присваивает чужому имени сам");
@@ -250,13 +279,16 @@ const MAIN_SRC = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
     const at = MAIN_SRC.indexOf('require("./settings-ipc.js")');
     const wiring = MAIN_SRC.slice(at, MAIN_SRC.indexOf("\n});", at));
     for (const dep of ["ipcMain,", "loadSettings,", "saveSettings,", "normalizeSettings,",
-      "applyAgentEnv,", "applyBrowserSettings,", "mobileBridge,", "toolPolicy,"]) {
+      "applyAgentEnv,", "applyBrowserSettings,", "mobileBridge,", "toolPolicy,",
+      "dialog,", "getWindow: () => mainWindow,"]) {
       assert.ok(wiring.includes(dep), "в проводку не передан " + dep);
     }
     assert.ok(wiring.includes("setLastAgentRepoDir:"), "папка агента не передана мостом");
     assert.ok(wiring.includes("lastAgentRepoDir = v;"), "мост не пишет в переменную оболочки");
     assert.ok(!/ipcMain\.(handle|on)\("settings:/.test(MAIN_SRC), "в main.js остались каналы настроек");
     assert.ok(!/ipcMain\.(handle|on)\("policy:/.test(MAIN_SRC), "в main.js остался канал policy:groups");
+    assert.ok(!/ipcMain\.(handle|on)\("dialog:/.test(MAIN_SRC), "в main.js остался канал выбора папки");
+    assert.ok(MAIN_SRC.includes('require("./settings-ipc.js")'), "выбор папки остался без модуля настроек");
   });
 
   console.log("\nНастройки и группы выдачи: " + passed + " ✅ / " + failed + " ❌");

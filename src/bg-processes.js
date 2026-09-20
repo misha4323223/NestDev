@@ -14,8 +14,10 @@
        НЕ ловим «vite build» и «npm run build»: это короткие команды);
      • bgWaitFor / waitOutputQuiet / bgTail — ожидание маркера в выводе, ожидание
        «затишья» и хвост вывода для ответа агенту;
-     • parsePortFromUrl / killProcessesOnPort — освобождение порта, который занят
-       предыдущим запуском;
+     • parsePortFromUrl / parsePortOwners / killProcessesOnPort — освобождение порта,
+       который занят предыдущим запуском (разбор вывода lsof и fuser построчный: иначе
+       в список «PID» попадали номер порта и «127.0.0.1», и кнопка «Остановить» могла
+       погасить посторонний процесс);
      • checkUrlStatus — живая HTTP-проверка адреса превью (статус, тип, начало тела).
 
    Живого состояния оболочки здесь нет: карта запущенных процессов и счётчик имён
@@ -24,6 +26,9 @@
 
 function createBgProcesses(deps) {
   const { spawn, os, stripAnsi, shellArgsFor, commandEnv, runTerminalCommand } = deps;
+  // «Кто убивает» вынесено в зависимость: разбор вывода поиска слушателей можно
+  // проверить подставным убийцей, не посылая настоящих сигналов чужим процессам.
+  const killPid = deps.killPid || ((pid) => process.kill(pid, "SIGTERM"));
 
 // Процессы живут между вызовами инструментов; вывод копится в кольцевой буфер.
 const bgProcesses = new Map();
@@ -122,6 +127,28 @@ function parsePortFromUrl(url) {
   return m ? parseInt(m[1], 10) : 0;
 }
 
+// Разбирает вывод поиска слушателей порта в список PID — строго построчно.
+//   • lsof -ti tcp:<порт> печатает по ОДНОМУ PID в строке («12345»);
+//   • fuser <порт>/tcp печатает строку «<порт>\/<протокол>:   PID PID», где PID идут
+//     ПОСЛЕ двоеточия, а число до слэша — это сам порт, а не процесс.
+// Всё остальное (объяснения, адреса вида 127.0.0.1:5199, ошибки оболочки) PID не даёт:
+// раньше из текста брались ВСЕ числа, поэтому в «убитые» попадали порт и 127.0.0.1.
+function parsePortOwners(out) {
+  const pids = [];
+  for (const raw of String(out == null ? "" : out).split("\n")) {
+    const line = raw.replace(/\r/g, "").trim();
+    if (!line) continue;
+    const fuser = line.match(/^\d+\/[^\s:]+:\s*(\S.*)$/);
+    if (fuser) {
+      for (const tok of fuser[1].trim().split(/\s+/)) if (/^\d+$/.test(tok)) pids.push(tok);
+      continue;
+    }
+    // lsof-строка: в ней ровно одно число и ничего больше. Заголовки и текст отсекаются.
+    if (/^\d+$/.test(line)) pids.push(line);
+  }
+  return [...new Set(pids)].filter((x) => Number(x) > 1);
+}
+
 // Находит процессы, слушающие порт, и убивает их (освобождает порт).
 async function killProcessesOnPort(port) {
   const p = parseInt(port, 10);
@@ -148,9 +175,8 @@ async function killProcessesOnPort(port) {
     }
   } else {
     const out = await runTerminalCommand("lsof -ti tcp:" + p + " 2>/dev/null || fuser " + p + "/tcp 2>/dev/null", os.homedir(), 15000);
-    const pids = (String(out).match(/\d+/g) || []).filter((x) => Number(x) > 1);
-    for (const pid of pids) {
-      try { process.kill(Number(pid), "SIGTERM"); } catch {}
+    for (const pid of parsePortOwners(out)) {
+      try { killPid(Number(pid)); } catch {}
       killed.push(pid);
     }
   }
@@ -215,6 +241,7 @@ async function checkUrlStatus(url) {
     killProcessTree,
     bgWaitFor,
     parsePortFromUrl,
+    parsePortOwners,
     killProcessesOnPort,
     waitOutputQuiet,
     bgTail,

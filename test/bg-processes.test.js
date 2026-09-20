@@ -209,6 +209,45 @@ const bg = makeBg();
     }
   });
 
+  await test("разбор слушателей порта: lsof построчно, fuser после двоеточия, чужая брехня — не PID", () => {
+    // lsof -ti: по одному PID в строке.
+    assert.deepStrictEqual(bg.parsePortOwners("12345\n67890\n"), ["12345", "67890"]);
+    // fuser: число ДО слэша — это порт, PID идут ПОСЛЕ «<порт>/tcp:».
+    assert.deepStrictEqual(bg.parsePortOwners("5199/tcp:            12345 67890"), ["12345", "67890"]);
+
+    // Та самая находка живого прогона: раньше из текста брались ВСЕ числа, и в список
+    // «убитых» попадали номер порта и адрес 127.0.0.1 — «⏹ Остановить» мог погасить
+    // посторонний процесс. Здесь регрессия закреплена вместе со старым разбором.
+    const mix = "127.0.0.1:5199\n5199/tcp: 12345\n";
+    const old = (String(mix).match(/\d+/g) || []).filter((x) => Number(x) > 1);
+    assert.ok(old.includes("127") && old.includes("5199"), "старый разбор перестал быть виден — регрессию не с чем сверять");
+    assert.deepStrictEqual(bg.parsePortOwners(mix), ["12345"], "в PID снова попали порт или 127.0.0.1");
+
+    // Ни пустой ответ, ни объяснения оболочки, ни заголовки PID не рождают.
+    assert.deepStrictEqual(bg.parsePortOwners(""), []);
+    assert.deepStrictEqual(bg.parsePortOwners(null), []);
+    assert.deepStrictEqual(bg.parsePortOwners("commands: lsof not found\n/usr/bin/fuser\n"), []);
+    // Один и тот же PID из двух источников убивается один раз.
+    assert.deepStrictEqual(bg.parsePortOwners("12345\n12345\n"), ["12345"]);
+  });
+
+  await test("освобождение порта: подставной убийца получает только настоящие PID", async () => {
+    const killed = [];
+    const fake = makeBg({
+      killPid: (pid) => killed.push(pid),
+      runTerminalCommand: async () => "127.0.0.1:5199\n5199/tcp: 12345 67890\n",
+    });
+    const r = await fake.killProcessesOnPort(5199);
+    assert.deepStrictEqual(killed, [12345, 67890], "убийце достались не те номера: " + JSON.stringify(killed));
+    assert.deepStrictEqual(r, { ok: true, killed: ["12345", "67890"] }, "отчёт об освобождении порта не тот: " + JSON.stringify(r));
+
+    // Никого не нашли — и не убиваем никого: отчёт честно говорит, что освобождать было нечего.
+    let called = 0;
+    const empty = makeBg({ killPid: () => called++, runTerminalCommand: async () => "" });
+    assert.deepStrictEqual(await empty.killProcessesOnPort(5199), { ok: false, killed: [] }, "на пустом выводе кого-то убили");
+    assert.strictEqual(called, 0, "на пустом выводе убийца всё равно вызван");
+  });
+
   await test("ожидание маркера: появился, процесс вышел, таймаут — три разных ответа", async () => {
     const rec = bg.bgSpawn("sleep 0.6; echo ГОТОВО; sleep 5");
     const matched = await bg.bgWaitFor(rec, "ГОТОВО", 5000);

@@ -826,7 +826,7 @@ const { createWindow } = createAppWindow({
 // Имена те же: панель, каналы term:* и инструменты агента зовут их дословно.
 // Окно приходит функцией — оно создаётся позже сборки модуля и может быть закрыто.
 const { createTerminalPanel } = require("./terminal-panel.js");
-const { termEmit, termAgentEcho, termStart, termInput, termStop, termStatus, termShutdown, termComplete } = createTerminalPanel({
+const { termEmit, termAgentEcho, termStart, termInput, termStop, termStatus, termShutdown, termComplete, registerTermIpc } = createTerminalPanel({
   fs,
   path,
   os,
@@ -838,6 +838,11 @@ const { termEmit, termAgentEcho, termStart, termInput, termStop, termStatus, ter
   loadSettings,
   getWindow: () => mainWindow,
 });
+// ── Каналы панели терминала (term:start/input/stop/status/complete) ──
+// Раньше стояли в main.js (часть 32). Рабочую папку и настройки модуль уже получил
+// сборкой выше, и терминал читает папку в МОМЕНТ запуска — проект мог переключиться,
+// пока панель была закрыта.
+registerTermIpc(ipcMain);
 
 // ─────────────────────────── IPC ───────────────────────────
 // ── Настройки и группы выдачи — код в src/settings-ipc.js ──
@@ -857,6 +862,10 @@ registerSettingsIpc({
   applyBrowserSettings,
   mobileBridge,
   toolPolicy,
+  // dialog:pickDir — выбор рабочей папки в системном диалоге. Родитель — окно
+  // приложения: спрашиваем его в момент вызова, оно могло быть закрыто или пересоздано.
+  dialog,
+  getWindow: () => mainWindow,
   live: {
     setLastAgentRepoDir: (v) => {
       lastAgentRepoDir = v;
@@ -929,12 +938,6 @@ registerProjectsIpc({
   },
 });
 
-ipcMain.handle("term:start", () => termStart(agentWorkDir(loadSettings())));
-ipcMain.handle("term:input", (_e, text) => termInput(text));
-ipcMain.handle("term:stop", () => termStop());
-ipcMain.handle("term:status", () => termStatus());
-ipcMain.handle("term:complete", (_e, line) => termComplete(line));
-
 // ─────────────────────────── Быстрый запуск проекта (превью) ───────────────────────────
 // Запуск dev-сервера проекта, остановка с освобождением порта, статус и автоопределение
 // команды — код в src/preview-ipc.js (часть 31); каналы dev:start/stop/status регистрирует
@@ -957,117 +960,51 @@ const { devShutdown } = registerPreviewIpc({
   getWindow: () => mainWindow,
 });
 
-// Локальный self-update (OTA): статус, проверка, откат, открыть папку
-ipcMain.handle("ota:status", () => ota.status(loadSettings()));
-ipcMain.handle("ota:check", async () => {
-  try {
-    return await ota.check(loadSettings());
-  } catch (e) {
-    return { status: "error", message: e.message || String(e) };
-  }
-});
-ipcMain.handle("ota:rollback", () => ota.rollback());
-ipcMain.handle("ota:openDir", () => ota.openDir());
-ipcMain.handle("ota:reset", (_e, removeSource) => ota.reset(!!removeSource, loadSettings()));
+// ─────────────────────────── Самообновление: каналы OTA и штатный апдейтер ───────────────────────────
+// OTA-каналы и подписка electron-updater — код в src/ota-ipc.js (часть 32). Сам
+// локальный self-update — в src/ota.js. Настройки модуль читает в момент вызова:
+// в них лежит выключатель self-update, и снимок «застыл» бы на прежнем значении.
+const { registerOtaIpc, initAutoUpdater } = require("./ota-ipc.js");
+registerOtaIpc({ ipcMain, ota, loadSettings });
 
 const { registerChatsIpc } = require("./chats-ipc.js"); // история чатов: каналы и сигнал «перечитай файл»
 registerChatsIpc({ ipcMain, loadChats, saveChats, getWindow: () => mainWindow });
 
-ipcMain.handle("ai:send", async (e, messages, opts) => {
-  const settings = loadSettings();
-  activeRunOrigin = e && e.sender && e.sender.id ? "desktop" : "mobile";
-  activeRunRole = String((opts && opts.role) || "") || activeRunRole;
-  activeRunChatId = String((opts && opts.chatId) || "");
-  runMissionId = ""; // прогон начинается с чистого листа: миссию выберет missionRead
-  global.__agentStopRequested = false;
-  global.__agentRunning = true;
-  try {
-    await runAi(settings, messages || [], mainWindow, opts || {});
-    return { ok: true };
-  } catch (e) {
-    const msg = e.name === "AbortError" ? "⏹ Генерация остановлена" : e.message || String(e);
-    // Даже при ошибке изменения файлов, сделанные до неё, должны откатываться
-    if (activeRunUndo.length) {
-      lastUndoLog = activeRunUndo.slice();
-      persistUndo();
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send("ai:event", { type: "undo_available", count: lastUndoLog.length });
-      }
-    }
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("ai:event", { type: "error", message: msg });
-    }
-    return { ok: false, error: msg };
-  } finally {
-    global.__agentStopRequested = false;
-    global.__agentPauseRequested = false;
-    global.__agentRunning = false;
-  }
-});
-
-// Ответ пользователя на вопрос агента (askUser)
-ipcMain.handle("ai:answer", (_e, text) => {
-  if (pendingAsk) {
-    const r = pendingAsk;
-    pendingAsk = null;
-    r(text);
-    return true;
-  }
-  return false;
-});
-
-// ─── Откат изменений агента (чекпоинт последнего запуска) ───
-ipcMain.handle("undo:status", () => {
-  loadPersistedUndo(); // чекпоинт мог остаться после перезапуска приложения
-  return {
-    ok: true,
-    count: lastUndoLog.length,
-    files: lastUndoLog.map((u) => u.path),
-  };
-});
-
-ipcMain.handle("undo:rollback", () => {
-  loadPersistedUndo();
-  const restored = [];
-  for (let i = lastUndoLog.length - 1; i >= 0; i--) {
-    const u = lastUndoLog[i];
-    try {
-      if (u.content === null) {
-        if (fs.existsSync(u.path)) fs.unlinkSync(u.path); // файл создан агентом — удаляем
-      } else {
-        fs.writeFileSync(u.path, u.content, "utf8"); // возвращаем прежнее содержимое
-      }
-      restored.push(u.path);
-    } catch (e) {
-      restored.push(u.path + " (ошибка: " + (e.message || String(e)) + ")");
-    }
-  }
-  const count = restored.length;
-  lastUndoLog = [];
-  activeRunUndo = [];
-  try { fs.unlinkSync(undoFile()); } catch {} // чекпоинт израсходован
-  return { ok: true, count, restored };
-});
-
-ipcMain.handle("ai:stop", () => {
-  global.__agentStopRequested = true;
-  if (activeAbort) activeAbort.abort();
-  if (pendingAsk) {
-    const r = pendingAsk;
-    pendingAsk = null;
-    r("");
-  }
-  return true;
-});
-
-ipcMain.handle("ai:test", async (_e, ui) => {
-  const s = normalizeSettings({ ...loadSettings(), ...(ui || {}) });
-  try {
-    const models = await fetchModels(s);
-    return { ok: true, message: "Подключено! Найдено моделей: " + models.length, models };
-  } catch (e) {
-    return { ok: false, message: e.message || String(e), models: [] };
-  }
+// ────────────────── Прогон агента и откат правок ──────────────────
+// Каналы ai:send / ai:answer / ai:stop / ai:test и undo:status / undo:rollback —
+// код в src/run-ipc.js (часть 34). Живого состояния у них много, и оно общее с
+// другими частями оболочки: источник и роль прогона, чат и миссия, снимки отката и
+// журнал, ожидание ответа askUser, прерывание запроса и окно. Всё это уходит мостом
+// live (чтение И запись) — копия «застыла» бы: прогон с телефона пометился бы как
+// «с ПК», события уехали бы не в тот чат, а «Откатить» не нашёл бы ни одной правки.
+// Помощники (runAi, хранилище отката, настройки и список моделей) — значениями.
+const { registerRunIpc } = require("./run-ipc.js");
+registerRunIpc({
+  ipcMain,
+  fs,
+  loadSettings,
+  normalizeSettings,
+  fetchModels,
+  runAi,
+  persistUndo,
+  loadPersistedUndo,
+  undoFile,
+  live: {
+    get mainWindow() { return mainWindow; },
+    get activeAbort() { return activeAbort; },
+    get activeRunOrigin() { return activeRunOrigin; },
+    set activeRunOrigin(v) { activeRunOrigin = v; },
+    get activeRunRole() { return activeRunRole; },
+    set activeRunRole(v) { activeRunRole = v; },
+    set activeRunChatId(v) { activeRunChatId = v; },
+    set runMissionId(v) { runMissionId = v; },
+    get activeRunUndo() { return activeRunUndo; },
+    set activeRunUndo(v) { activeRunUndo = v; },
+    get lastUndoLog() { return lastUndoLog; },
+    set lastUndoLog(v) { lastUndoLog = v; },
+    get pendingAsk() { return pendingAsk; },
+    set pendingAsk(v) { pendingAsk = v; },
+  },
 });
 
 // ── Модели, замер локальной модели и G4F — код в src/model-ipc.js ──
@@ -1089,14 +1026,6 @@ registerModelIpc({
   ollamaNumCtx,
   isLocalEndpoint,
   probeLocalModel,
-});
-
-ipcMain.handle("dialog:pickDir", async () => {
-  const r = await dialog.showOpenDialog(mainWindow, {
-    properties: ["openDirectory"],
-    title: "Выберите рабочую директорию",
-  });
-  return r.canceled ? null : r.filePaths[0];
 });
 
 // ─────────────────────────── GitHub OAuth (device flow) + repo picker ───────────────────────────
@@ -1254,59 +1183,11 @@ registerGitIpc({
   },
 });
 // ─────────────────────────── Жизненный цикл ───────────────────────────
-// ─────────────────────────── Auto Updater ───────────────────────────
-// Показываем прогресс в строке заголовка и уведомляем, когда обновление готово.
-function initAutoUpdater() {
-  autoUpdater.autoDownload = false;           // спросим пользователя перед загрузкой
-  autoUpdater.autoInstallOnAppQuit = true;    // установить при закрытии, если уже скачан
-
-  autoUpdater.on("checking-for-update", () => {
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setTitle("AI Developer Agent — проверка обновлений…");
-  });
-  autoUpdater.on("update-available", (info) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.setTitle("AI Developer Agent — доступно обновление");
-      mainWindow.webContents.send("ai:event", { type: "update:available", info });
-    }
-    // Спрашиваем: скачать?
-    new Notification({
-      title: "AI Developer Agent",
-      body: `Доступна версия ${info.version}. Скачать и установить?`,
-    }).show();
-    autoUpdater.downloadUpdate().catch((e) => console.error("[updater] download error", e));
-  });
-  autoUpdater.on("update-not-available", () => {
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setTitle("AI Developer Agent");
-  });
-  autoUpdater.on("download-progress", (p) => {
-    const pct = Math.round(p.percent);
-    if (mainWindow && !mainWindow.isDestroyed())
-      mainWindow.setTitle(`AI Developer Agent — загрузка ${pct}%`);
-  });
-  autoUpdater.on("update-downloaded", () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.setTitle("AI Developer Agent — обновление готово");
-      mainWindow.webContents.send("ai:event", { type: "update:downloaded" });
-    }
-    new Notification({
-      title: "AI Developer Agent",
-      body: "Обновление скачано. Применится при следующем перезапуске.",
-    }).show();
-  });
-  autoUpdater.on("error", (e) => {
-    console.error("[updater]", e.message);
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setTitle("AI Developer Agent");
-  });
-
-  // Проверка раз в час
-  setTimeout(() => autoUpdater.checkForUpdates().catch(() => {}), 10_000);
-  setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 60 * 60 * 1000);
-}
-
 app.whenReady().then(() => {
   createWindow();
   mobileBridge.applySettings(loadSettings());
-  initAutoUpdater();
+  // Штатный апдейтер сборки: подписка и проверка по таймеру — код в src/ota-ipc.js.
+  initAutoUpdater({ autoUpdater, Notification, getWindow: () => mainWindow });
   // Локальный self-update (OTA): проверка при старте и каждые 60 секунд
   const otaTick = () => {
     ota.check(loadSettings()).catch(() => {});
