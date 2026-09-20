@@ -27,11 +27,19 @@
 
    Пишет только во временные папки. */
 
+// Мост теперь поднимается по https с САМОПОДПИСАННЫМ сертификатом (src/bridge-tls.js),
+// а телефон ходит по wss. Глобальный WebSocket (undici) не принимает опций TLS, поэтому
+// проверку сертификата в этом прогоне отключаем: прогон — про протокол и права доступа,
+// а сам сертификат (структура, SAN, подпись, рукопожатие с доверенным корнем)
+// проверяется отдельно — test/bridge-tls.test.js. Здесь же важно, что канал идёт по TLS.
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
 const Module = require("module");
 const path = require("path");
 const os = require("os");
 const fs = require("fs");
 const net = require("net");
+const tls = require("tls");
 
 const ROOT = path.join(__dirname, "..");
 const userData = fs.mkdtempSync(path.join(os.tmpdir(), "live-mobile-userData-"));
@@ -231,12 +239,28 @@ function phone(url) {
   ok(st && st.enabled === true, "мост включён настройками");
   ok(st.port === port, "мост слушает порт из настроек: " + st.port);
   ok(st.running === true, "мост действительно запущен (а не только включён галочкой)");
+  ok(st.scheme === "https" && st.tls === true, "мост поднял TLS: " + JSON.stringify({ scheme: st.scheme, tls: st.tls, error: st.tlsError }));
+  ok(/^https:\/\//.test(st.url || ""), "адрес для телефона без https: " + st.url);
+  // Сертификат лежит рядом с настройками приложения, а не в папке проекта.
+  const certFile = path.join(userData, "bridge-tls", "cert.pem");
+  ok(fs.existsSync(certFile), "сертификат моста выпущен в userData: " + certFile);
+  if (fs.existsSync(certFile)) {
+    const peer = await new Promise((resolve, reject) => {
+      const s = tls.connect({ host: "127.0.0.1", port: port, ca: [fs.readFileSync(certFile, "utf8")], servername: "localhost", rejectUnauthorized: true }, () => {
+        const c = s.getPeerCertificate();
+        s.end();
+        resolve(c);
+      });
+      s.on("error", reject);
+    });
+    ok(!!peer && /AI Developer Agent/.test(String(peer.subject && peer.subject.CN)), "телефон получает от моста свой сертификат (рукопожатие с доверенным корнем): " + JSON.stringify(peer && peer.subject));
+  }
   ok(typeof st.pair === "string" && st.pair.length >= 16, "ПК получил одноразовый токен пары для QR-кода");
   ok(st.pairUsed === false, "свежий токен пары ещё не использован");
   ok(st.pin === PIN, "статус для ПК содержит PIN (он печатается на экране)");
 
   console.log("\n[2] телефон входит одноразовым токеном пары и получает сеанс");
-  const p1 = phone("ws://127.0.0.1:" + port + "/ws");
+  const p1 = phone("wss://127.0.0.1:" + port + "/ws");
   await p1.open();
   const authOk = await p1.auth({ pair: st.pair });
   ok(authOk.t === "auth_ok", "телефон вошёл по токену пары: " + JSON.stringify(authOk.t));
@@ -277,12 +301,12 @@ function phone(url) {
   ok(answer.openaiApiKey === mask, "в ответе телефону — снова заглушка");
 
   console.log("\n[5] токен пары одноразовый, сеанс работает при переподключении");
-  const p2 = phone("ws://127.0.0.1:" + port + "/ws");
+  const p2 = phone("wss://127.0.0.1:" + port + "/ws");
   await p2.open();
   const stale = await p2.auth({ pair: st.pair });
   ok(stale.t === "auth_err" && stale.badPair === true, "погашенный токен второго устройства не пустил: " + JSON.stringify(stale));
   p2.close();
-  const p3 = phone("ws://127.0.0.1:" + port + "/ws");
+  const p3 = phone("wss://127.0.0.1:" + port + "/ws");
   await p3.open();
   const again = await p3.auth({ session: authOk.session });
   ok(again.t === "auth_ok", "переподключение по сеансу прошло: " + JSON.stringify(again.t));
@@ -311,17 +335,17 @@ function phone(url) {
   ok(/^\d{6}$/.test(String(st2.pin)) && st2.pin !== beforePin, "PIN сменился: " + st2.pin);
   ok(st2.pair !== st.pair, "токен пары сменился вместе с PIN");
   ok(st2.pairUsed === false, "новый токен ещё не использован");
-  const oldSession = phone("ws://127.0.0.1:" + port + "/ws");
+  const oldSession = phone("wss://127.0.0.1:" + port + "/ws");
   await oldSession.open();
   const deadSession = await oldSession.auth({ session: authOk.session });
   ok(deadSession.t === "auth_err" && deadSession.staleSession === true, "старый сеанс закрыт сменой PIN: " + JSON.stringify(deadSession));
   oldSession.close();
-  const oldPair = phone("ws://127.0.0.1:" + port + "/ws");
+  const oldPair = phone("wss://127.0.0.1:" + port + "/ws");
   await oldPair.open();
   const deadPair = await oldPair.auth({ pair: st.pair });
   ok(deadPair.t === "auth_err", "старый QR-код закрыт сменой PIN");
   oldPair.close();
-  const fresh = phone("ws://127.0.0.1:" + port + "/ws");
+  const fresh = phone("wss://127.0.0.1:" + port + "/ws");
   await fresh.open();
   const freshOk = await fresh.auth({ pair: st2.pair });
   ok(freshOk.t === "auth_ok", "новый токен пары пускает: " + JSON.stringify(freshOk.t));
@@ -342,6 +366,8 @@ function phone(url) {
   console.log("\n[9] ничего не записано в папку приложения");
   ok(fs.readdirSync(path.join(ROOT, "src")).sort().join(",") === appFilesBefore, "папка src не менялась во время прогона");
   ok(!fs.existsSync(path.join(ROOT, "settings.json")) && !fs.existsSync(path.join(ROOT, "secrets.json")), "в папке приложения ни настроек, ни секретов");
+  // Приватный ключ моста — тем более не в проекте: он лежит в userData (проверено в [1]).
+  ok(!fs.existsSync(path.join(ROOT, "bridge-tls")) && !fs.existsSync(path.join(ROOT, "key.pem")), "сертификат и ключ моста не пишутся в папку проекта");
 
   console.log(failures ? "\n❌ Провалов: " + failures : "\n✅ Все живые проверки пройдены");
   process.exit(failures ? 1 : 0);

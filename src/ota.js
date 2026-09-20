@@ -6,6 +6,9 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+// Подпись набора: проверяется ДО распаковки — манифест лежит рядом с набором, поэтому
+// один sha256 подмену не ловит (см. src/ota-sign.js).
+const otaSign = require("./ota-sign.js");
 
 // electron подключаем лениво, чтобы модуль можно было тестировать в plain-node
 // с переопределённым корнем OTA (AI_AGENT_OTA_ROOT).
@@ -56,7 +59,9 @@ function versionGt(a, b) {
 // «перекрывал» свежий код, скачанный человеком из репозитория (см. bootstrap.js).
 function installedInfo() {
   const v = readJson(path.join(CURRENT(), "version.json"));
-  return v && v.version ? { version: v.version, codeVersion: v.codeVersion || null, source: "ota" } : null;
+  return v && v.version
+    ? { version: v.version, codeVersion: v.codeVersion || null, keyId: v.keyId || "", signed: !!v.signed, source: "ota" }
+    : null;
 }
 
 // Версия установленного приложения (package.json рядом с кодом).
@@ -134,6 +139,9 @@ async function applyBundle(dir, manifest) {
   if (manifest.sha256 && sha256(raw) !== manifest.sha256) {
     throw new Error("Хеш бандла не совпал — файл повреждён или подменён");
   }
+  // Подпись: хеш говорит «файл не побился», подпись — «файл положил тот, кому
+  // доверяет приложение». Проверяем те же байты, из которых считается sha256.
+  const signature = otaSign.checkBundle(raw.toString("utf8"), manifest);
   let bundle;
   try {
     bundle = JSON.parse(raw.toString("utf8"));
@@ -166,6 +174,9 @@ async function applyBundle(dir, manifest) {
 
   writeJson(path.join(tmpDir, "version.json"), {
     version: manifest.version,
+    // Каким ключом подписан применённый набор (пусто — набор без подписи).
+    keyId: signature.keyId || "",
+    signed: !!signature.signed,
     // Версия кода внутри бандла: по ней bootstrap.js решает, перекрывать ли свежий
     // код приложения (подробности — в bootstrap.js, otaNewerThanInstalled).
     codeVersion: manifest.codeVersion || null,
@@ -228,6 +239,9 @@ function status(settings) {
     codeVersion: (inst && inst.codeVersion) || appVersion() || "",
     appliedCode: (inst && inst.codeVersion) || "",
     appVersion: appVersion() || "",
+    // Состояние подписи: сколько ключей доверено и что об этом сказать человеку.
+    trust: otaSign.trustStatus(),
+    bundleKeyId: (inst && inst.keyId) || "",
     sources: list.map((s) => s.manifest),
     sourceList: list,
     candidate: cand ? { version: cand.manifest.version || "", dir: cand.dir } : null,

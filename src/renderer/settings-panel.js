@@ -258,6 +258,14 @@
       } else {
         parts.push("Ничего новее этого кода нет");
       }
+      // Подпись набора: человек должен видеть, проверяется она или нет — иначе
+      // «обновление не ставится» выглядит поломкой, а «ставится что угодно» — нормой.
+      if (st && st.trust) {
+        if (st.trust.warning) parts.push("⚠ " + st.trust.warning);
+        else if (st.trust.keys) {
+          parts.push("Подпись набора: ключей " + st.trust.keys + " (" + st.trust.ids.join(", ") + ")");
+        }
+      }
       el.textContent = parts.join(" · ");
     } catch {
       el.textContent = "—";

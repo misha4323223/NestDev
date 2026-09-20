@@ -1,6 +1,9 @@
 "use strict";
 /* Мобильный мост: доступ к ядру приложения с телефона/планшета по LAN.
-   - HTTP-сервер отдаёт интерфейс (src/renderer) + PWA (manifest, service worker, иконка).
+   - HTTPS-сервер отдаёт интерфейс (src/renderer) + PWA (manifest, service worker, иконка).
+     Сертификат самоподписанный (src/bridge-tls.js): без TLS страницу телефона мог бы
+     отдать кто угодно из той же сети и забрать сеанс. Если сертификат не создался,
+     мост работает по http, а статус и панель настроек говорят об этом прямо.
    - WebSocket-сервер (/ws) дублирует IPC: те же каналы, что у ipcMain, но только
      те, что перечислены в списке разрешённого (ALLOW ниже), и с защитой входом.
    - Вход: одноразовый токен пары из QR-кода → свой сеанс устройства, либо PIN,
@@ -9,10 +12,12 @@
    Без зависимостей: серверная часть WebSocket (RFC 6455) реализована вручную. */
 
 const http = require("http");
+const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const bridgeTls = require("./bridge-tls.js"); // самоподписанный сертификат для https
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -391,6 +396,11 @@ class WsConn {
 class MobileBridge {
   constructor(opts) {
     this.handlerMap = opts && opts.handlerMap; // Map<channel, fn>
+    // Папка для ключа и сертификата (userData/bridge-tls). Пусто — мост поднимется
+    // без TLS: лучше доступ без шифрования с честным предупреждением, чем ничего.
+    this.certDir = (opts && opts.certDir) || "";
+    this.tls = null; // { cert, key, fingerprint, notAfter }
+    this.tlsError = ""; // почему сертификата нет (показывается человеку)
     this.port = 9090;
     this.pin = "";
     this.host = ""; // предпочитаемый адрес для телефона ("" — автоопределение)
@@ -455,9 +465,49 @@ class MobileBridge {
     return this.pair;
   }
 
+  // Схема, по которой сейчас отвечает мост: её же получает QR-код и телефон
+  // (страница по https открывает сокет как wss — см. src/renderer/mobile-api.js).
+  scheme() {
+    return this.tls ? "https" : "http";
+  }
+
+  // Сертификат для https. Ошибка здесь НЕ должна выключать мобильный доступ:
+  // любой сбой (нет прав на папку, не хватает crypto) возвращает мост к http,
+  // а причина остаётся в статусе — её видно в настройках, а не только в логе.
+  prepareTls() {
+    if (!this.certDir) {
+      this.tls = null;
+      this.tlsError = "Не задана папка для сертификата";
+      return null;
+    }
+    try {
+      const c = bridgeTls.ensureCert({
+        dir: this.certDir,
+        sanIps: this.lanIps(),
+        sanNames: bridgeTls.hostNames(),
+      });
+      this.tls = c;
+      this.tlsError = "";
+      console.log(
+        "[mobile] сертификат " + (c.reused ? "переиспользован" : "создан") +
+          " (" + bridgeTls.prettyFingerprint(c.fingerprint).slice(0, 23) + "…), адреса: " + (c.sanIps || []).join(", ")
+      );
+      return c;
+    } catch (e) {
+      this.tls = null;
+      this.tlsError = (e && e.message) || String(e);
+      console.error("[mobile] сертификат не создан — мост работает без шифрования:", this.tlsError);
+      return null;
+    }
+  }
+
   start() {
     if (this.server) return;
-    const server = http.createServer((req, res) => this.handleHttp(req, res));
+    const tls = this.prepareTls();
+    const handler = (req, res) => this.handleHttp(req, res);
+    const server = tls
+      ? https.createServer({ key: tls.key, cert: tls.cert, minVersion: "TLSv1.2" }, handler)
+      : http.createServer(handler);
     server.on("upgrade", (req, socket) => this.handleUpgrade(req, socket));
     server.on("error", (err) => {
       // Порт занят/недоступен — мост просто не поднимется; приложение продолжает работать.
@@ -466,7 +516,7 @@ class MobileBridge {
     server.listen(this.port, "0.0.0.0");
     this.server = server;
     this.pingTimer = setInterval(() => this.pingAll(), 25000);
-    console.log("[mobile] мост запущен на :" + this.port);
+    console.log("[mobile] мост запущен на :" + this.port + " (" + this.scheme() + ")");
   }
 
   stop() {
@@ -523,8 +573,11 @@ class MobileBridge {
     const want = String(this.host || "").trim();
     const active = !!want && ips.indexOf(want) >= 0;
     const order = active ? [want].concat(ips.filter((ip) => ip !== want)) : ips;
+    const scheme = this.scheme();
+    const link = (ip) => scheme + "://" + ip + ":" + this.port;
+    const tlsInfo = { scheme: scheme, tls: !!this.tls, tlsError: this.tlsError };
     if (forClient) {
-      return { enabled: this.enabled, running: !!this.server, port: this.port, ips, url: order.length ? "http://" + order[0] + ":" + this.port : "", urls: order.map((ip) => ({ ip, url: "http://" + ip + ":" + this.port })) };
+      return Object.assign({ enabled: this.enabled, running: !!this.server, port: this.port, ips, url: order.length ? link(order[0]) : "", urls: order.map((ip) => ({ ip, url: link(ip) })) }, tlsInfo);
     }
     return {
       enabled: this.enabled,
@@ -538,8 +591,14 @@ class MobileBridge {
       ips,
       host: want,
       hostActive: active,
-      url: order.length ? "http://" + order[0] + ":" + this.port : "",
-      urls: order.map((ip) => ({ ip, url: "http://" + ip + ":" + this.port })),
+      url: order.length ? link(order[0]) : "",
+      urls: order.map((ip) => ({ ip, url: link(ip) })),
+      // Шифрование: телефон при первом входе покажет предупреждение о
+      // самоподписанном сертификате — панель настроек говорит об этом словами.
+      scheme: scheme,
+      tls: !!this.tls,
+      tlsError: this.tlsError,
+      tlsFingerprint: this.tls ? bridgeTls.prettyFingerprint(this.tls.fingerprint) : "",
     };
   }
 

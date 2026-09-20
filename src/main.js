@@ -123,7 +123,14 @@ ipcMain.handle = (channel, fn) => {
   ipcHandlerMap.set(channel, fn);
   return _ipcHandleOrig(channel, fn);
 };
-const mobileBridge = new MobileBridge({ handlerMap: ipcHandlerMap });
+// Мост отдаёт телефону страницу по https: сертификат самоподписанный, лежит рядом с
+// настройками (userData) и переиспользуется между запусками — иначе телефон принимал бы
+// новый сертификат каждый раз. Если сертификат не создался, мост падает обратно на http,
+// а причина видна в настройках (mobile:status.tlsError).
+const mobileBridge = new MobileBridge({
+  handlerMap: ipcHandlerMap,
+  certDir: path.join(app.getPath("userData"), "bridge-tls"),
+});
 
 // Кто запустил текущий прогон агента: "desktop" (окно на ПК), "mobile" (клиент
 // мобильного моста — у него фиктивное событие IPC с sender.id = 0). Клиентов

@@ -2534,16 +2534,36 @@ async function testSecrets() {
 }
 
 // ── 3. ota ──────────────────────────────────────────────────────────────────
-function makeBundle(dir, files, version, corrupt) {
+// Наборы здесь собираются ПОДПИСАННЫМИ (src/ota-sign.js): подпись — это то, что
+// отличает «набор собрал владелец» от «набор положил кто-то в папку-источник».
+// Ключи стендовые, создаются на месте, доверие к ним выдаётся переменной окружения
+// в testOta() — то есть идёт настоящая проверка, а не послабление.
+const otaSigner = require(path.join(ROOT, "src", "ota-sign.js"));
+const OTA_TEST_KEYS = (() => {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
+  const pub = publicKey.export({ type: "spki", format: "pem" }).toString();
+  return { priv: privateKey.export({ type: "pkcs8", format: "pem" }).toString(), pub: pub, id: otaSigner.keyId(pub) };
+})();
+const OTA_OTHER_KEYS = (() => {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
+  return { priv: privateKey.export({ type: "pkcs8", format: "pem" }).toString(), pub: publicKey.export({ type: "spki", format: "pem" }).toString() };
+})();
+
+function makeBundle(dir, files, version, corrupt, signer) {
   const filesB64 = {};
   for (const rel of Object.keys(files)) filesB64[rel] = Buffer.from(files[rel]).toString("base64");
   const bundleJson = JSON.stringify({ version, files: filesB64 });
+  // signer === undefined — свой ключ (обычный случай); null — набор без подписи.
+  const key = signer === undefined ? OTA_TEST_KEYS : signer;
   const manifest = {
     app: "ai-agent",
     version,
+    codeVersion: version,
     builtAt: Date.now(),
     files: Object.keys(filesB64).length,
     sha256: crypto.createHash("sha256").update(bundleJson).digest("hex"),
+    sig: key ? otaSigner.signBundle(bundleJson, key.priv) : "",
+    keyId: key ? otaSigner.keyId(key.pub) : "",
   };
   if (corrupt) manifest.sha256 = "0".repeat(64);
   fs.mkdirSync(dir, { recursive: true });
@@ -2554,6 +2574,10 @@ function makeBundle(dir, files, version, corrupt) {
 
 async function testOta() {
   const ota = require(path.join(ROOT, "src", "ota.js"));
+  // Наборы ниже собираются подписанными, и приложение должно принимать их по
+  // доверенному ключу, а не по послаблению «подпись не обязательна».
+  const trustBefore = process.env.AI_AGENT_OTA_TRUST;
+  process.env.AI_AGENT_OTA_TRUST = OTA_TEST_KEYS.pub;
 
   await test("versionGt: сравнение версий", () => {
     assert.ok(ota.versionGt("1.0.1", "1.0.0"));
@@ -2601,6 +2625,35 @@ async function testOta() {
     await assert.rejects(() => ota.applyBundle(srcDir, JSON.parse(fs.readFileSync(path.join(srcDir, "manifest.json"), "utf8"))), /main\.js/);
     delete process.env.AI_AGENT_OTA_ROOT;
   });
+
+  await test("applyBundle: набор без подписи и с чужим ключом отклоняется", async () => {
+    const mine = { "src/main.js": "console.log(1);", "src/renderer/index.html": "<html></html>" };
+    // Ключи доверены — значит набор ОБЯЗАН быть подписан.
+    const unsignedRoot = tmpdir("ota-test4-");
+    const unsignedDir = path.join(unsignedRoot, "src");
+    fs.mkdirSync(path.join(unsignedDir, "renderer"), { recursive: true });
+    makeBundle(unsignedDir, mine, "9.9.6", false, null);
+    process.env.AI_AGENT_OTA_ROOT = unsignedRoot;
+    await assert.rejects(
+      () => ota.applyBundle(unsignedDir, JSON.parse(fs.readFileSync(path.join(unsignedDir, "manifest.json"), "utf8"))),
+      /не подписан/
+    );
+    delete process.env.AI_AGENT_OTA_ROOT;
+    // Подпись есть, но сделана чужим ключом — доверия к ней нет.
+    const alienRoot = tmpdir("ota-test5-");
+    const alienDir = path.join(alienRoot, "src");
+    fs.mkdirSync(path.join(alienDir, "renderer"), { recursive: true });
+    makeBundle(alienDir, mine, "9.9.7", false, OTA_OTHER_KEYS);
+    process.env.AI_AGENT_OTA_ROOT = alienRoot;
+    await assert.rejects(
+      () => ota.applyBundle(alienDir, JSON.parse(fs.readFileSync(path.join(alienDir, "manifest.json"), "utf8"))),
+      /неизвестным ключом/
+    );
+    delete process.env.AI_AGENT_OTA_ROOT;
+  });
+
+  if (trustBefore === undefined) delete process.env.AI_AGENT_OTA_TRUST;
+  else process.env.AI_AGENT_OTA_TRUST = trustBefore;
 }
 
 // ── 4. browser-tools (без браузера) ─────────────────────────────────────────
@@ -3892,10 +3945,11 @@ async function testMobilePanel() {
     // 3. Настоящая сборка в песочнице на заглушках РЕАЛЬНОЙ разметки.
     const known = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
     const els = new Map();
-    const el = () => {
+    const el = (tag) => {
       const classes = new Set();
       let markup = "";
       const node = {
+        tagName: String(tag || "div").toUpperCase(),
         value: "", textContent: "", checked: false, className: "", href: "", target: "", rel: "",
         children: [], listeners: {},
         classList: {
@@ -3919,9 +3973,12 @@ async function testMobilePanel() {
       if (!els.has(id)) els.set(id, el());
       return els.get(id);
     };
+    // Статус моста несёт схему и признак шифрования: мост поднимается по https с
+    // самоподписанным сертификатом, и панель обязана сказать про предупреждение телефона.
     const status = {
       enabled: true, running: true, pin: "135790", host: "", hostActive: true,
-      url: "http://192.168.1.72:9090", urls: [{ url: "http://192.168.1.72:9090" }],
+      scheme: "https", tls: true, tlsError: "", tlsFingerprint: "AB:CD:EF",
+      url: "https://192.168.1.72:9090", urls: [{ url: "https://192.168.1.72:9090" }],
     };
     const settings = { mobileEnabled: true, mobilePort: 9090, mobileHost: "" };
     const calls = { status: 0, regen: 0 };
@@ -3938,7 +3995,7 @@ async function testMobilePanel() {
         window: { QR: { toSvg: (text, opts) => { qr.push([text, opts]); return "<svg>" + text + "</svg>"; } } },
         self: {},
         console: { log() {}, warn() {}, error() {} },
-        document: { createElement: () => el() },
+        document: { createElement: (tag) => el(tag) },
       };
       vm.runInNewContext(src, sandbox, { filename: "mobile-panel.js" });
       assert.strictEqual(typeof sandbox.module.exports, "function", "модуль не отдал фабрику");
@@ -3964,9 +4021,15 @@ async function testMobilePanel() {
     assert.ok(qr[0][0].indexOf("/#pin=135790") > 0, "в QR-код не попал адрес с PIN: " + qr[0][0]);
     assert.strictEqual(qr[0][1].ecc, "M", "у QR-кода не та коррекция ошибок");
     assert.ok(!$("mobile-qr-block").classList.contains("hidden"), "блок QR остался скрытым при работающем мосте");
-    assert.strictEqual($("mobile-urls").children.length, 1, "адрес для телефона не показан");
-    assert.strictEqual($("mobile-urls").children[0].textContent, "http://192.168.1.72:9090", "показан не тот адрес");
-    assert.strictEqual($("mobile-urls").children[0].href, "http://192.168.1.72:9090", "адрес не открывается ссылкой");
+    // Кроме адресов панель показывает пояснения (шифрование, предупреждение телефона),
+    // поэтому адреса считаем по ссылкам, а не по всем строкам списка.
+    const chips = () => $("mobile-urls").children.filter((c) => c.tagName === "A");
+    assert.strictEqual(chips().length, 1, "адрес для телефона не показан");
+    assert.strictEqual(chips()[0].textContent, "https://192.168.1.72:9090", "показан не тот адрес");
+    assert.strictEqual(chips()[0].href, "https://192.168.1.72:9090", "адрес не открывается ссылкой");
+    let notes = $("mobile-urls").children.filter((c) => c.tagName !== "A").map((c) => String(c.textContent));
+    assert.ok(notes.some((t) => t.indexOf("Шифрование включено") >= 0), "панель молчит про шифрование: " + notes.join(" | "));
+    assert.ok(notes.some((t) => t.indexOf("Дополнительно") >= 0), "панель не предупреждает про предупреждение браузера телефона");
 
     // 5. Предупреждение: адрес задан вручную, но такого IP на ПК нет.
     status.host = "192.168.99.99";
@@ -3984,6 +4047,26 @@ async function testMobilePanel() {
     texts = $("mobile-urls").children.map((c) => c.textContent);
     assert.ok(texts.some((t) => String(t).indexOf("Мост не запустился") >= 0), "нет предупреждения о незапустившемся мосте");
     assert.ok($("mobile-qr-block").classList.contains("hidden"), "QR-код показан при неработающем мосте");
+
+    // 6б. Мост без шифрования (сертификат не создался): доступ остаётся, но панель
+    // обязана сказать об этом прямо — это открытая сеть и подмена страницы телефона.
+    status.running = true;
+    status.tls = false;
+    status.tlsError = "ENOTDIR: не папка";
+    await panel.applyMobileFields();
+    notes = $("mobile-urls").children.filter((c) => c.tagName !== "A").map((c) => String(c.textContent));
+    assert.ok(
+      notes.some((t) => t.indexOf("без шифрования") >= 0 && t.indexOf("ENOTDIR") >= 0),
+      "панель молчит про работу без шифрования: " + notes.join(" | ")
+    );
+    // Старый мост про TLS не сообщает: панель не должна выдумывать предупреждение.
+    delete status.tls;
+    delete status.tlsError;
+    await panel.applyMobileFields();
+    notes = $("mobile-urls").children.filter((c) => c.tagName !== "A").map((c) => String(c.textContent));
+    assert.deepStrictEqual(notes, [], "панель выдумала предупреждение о шифровании без данных: " + notes.join(" | "));
+    status.tls = true;
+    status.tlsError = "";
 
     // 7. Статус недоступен: панель не молчит и ничего не роняет.
     statusFails = true;

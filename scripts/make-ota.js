@@ -1,12 +1,20 @@
 "use strict";
 // Сборка локального OTA-бандла (self-update агента).
 // Использование: node scripts/make-ota.js [--out <папка>] [--version x.y.z]
+//                [--key <закрытый ключ>] [--unsigned]
 // По умолчанию пишет в ota/ рядом с репозиторием: manifest.json + bundle.json.
 // Приложение проверяет эту папку при старте и каждые 60 секунд и применяет обновление.
+//
+// Набор ПОДПИСЫВАЕТСЯ ключом из ~/.ai-agent-ota-key.pem (или --key / OTA_SIGN_KEY_FILE /
+// OTA_SIGN_KEY). Без ключа сборка останавливается: набор без подписи приложение примет
+// только пока в src/ota-trust.js нет ни одного доверенного ключа, а молча выпустить
+// неподписанный набор — это тихо понизить защиту. Для осознанного случая есть --unsigned.
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 const { spawnSync } = require("child_process");
+const otaSign = require(path.join(__dirname, "..", "src", "ota-sign.js"));
 
 const ROOT = path.join(__dirname, "..");
 const OUT = (() => {
@@ -17,6 +25,18 @@ const VER_ARG = (() => {
   const i = process.argv.indexOf("--version");
   return i >= 0 && process.argv[i + 1] ? String(process.argv[i + 1]).trim() : "";
 })();
+const UNSIGNED = process.argv.includes("--unsigned");
+const DEFAULT_KEY = path.join(os.homedir(), ".ai-agent-ota-key.pem");
+
+// Где взять закрытый ключ: аргумент → переменная окружения → ключ по умолчанию.
+// Сам ключ в репозиторий не попадает: он лежит у владельца (см. scripts/make-ota-key.js).
+function signingKey() {
+  if (process.env.OTA_SIGN_KEY) return { pem: process.env.OTA_SIGN_KEY, from: "OTA_SIGN_KEY" };
+  const i = process.argv.indexOf("--key");
+  const file = (i >= 0 && process.argv[i + 1]) || process.env.OTA_SIGN_KEY_FILE || DEFAULT_KEY;
+  if (fs.existsSync(file)) return { pem: fs.readFileSync(file, "utf8"), from: file };
+  return null;
+}
 
 // Зеркалит список файлов electron-builder (files: src/**, assets/**, package.json, server.js)
 const INCLUDED = ["src", "assets", "package.json", "server.js"];
@@ -118,6 +138,36 @@ function main() {
   }
 
   const bundleJson = JSON.stringify({ version, files: filesB64 });
+
+  // Подпись: считается по тем же байтам, что и sha256 (строка bundle.json).
+  const key = signingKey();
+  if (UNSIGNED && key) {
+    console.error("✗ Указаны сразу --unsigned и ключ: так нельзя — набор либо подписан, либо нет.");
+    process.exit(1);
+  }
+  if (!key && !UNSIGNED) {
+    console.error(
+      "✗ Нет ключа подписи — набор не собран.\n" +
+        "  Создайте ключ один раз:  npm run ota:key\n" +
+        "  Или укажите свой:        npm run ota:bundle -- --key <файл>\n" +
+        "  Осознанно без подписи:   node scripts/make-ota.js --unsigned\n" +
+        "  (набор без подписи приложение примет, только пока в src/ota-trust.js нет доверенных ключей)"
+    );
+    process.exit(1);
+  }
+  let sig = "";
+  let keyId = "";
+  if (key) {
+    try {
+      sig = otaSign.signBundle(bundleJson, key.pem);
+      const pub = crypto.createPublicKey(key.pem);
+      keyId = otaSign.keyId(pub.export({ type: "spki", format: "pem" }).toString());
+    } catch (e) {
+      console.error("✗ Ключ не подошёл для подписи (" + key.from + "): " + ((e && e.message) || e));
+      process.exit(1);
+    }
+  }
+
   const manifest = {
     app: "ai-agent",
     version,
@@ -128,6 +178,10 @@ function main() {
     builtAt: Date.now(),
     files: Object.keys(filesB64).length,
     sha256: crypto.createHash("sha256").update(bundleJson).digest("hex"),
+    // Подпись набора и отпечаток открытого ключа, которым она сделана.
+    // "" — набор собран с --unsigned и приложение примет его только без доверенных ключей.
+    sig: sig,
+    keyId: keyId,
   };
 
   fs.mkdirSync(OUT, { recursive: true });
@@ -137,6 +191,18 @@ function main() {
   console.log("✓ OTA-бандл собран: " + OUT);
   console.log("  версия: " + version + (VER_ARG ? " (задана --version)" : prev ? " (авто-бамп патча)" : ""));
   console.log("  файлов: " + Object.keys(filesB64).length + " (JS проверено: " + checked + ")");
+  if (key) {
+    const trusted = otaSign.trustedKeys().some((k) => k.id === keyId);
+    console.log("  подпись: есть, ключ " + otaSign.shortId(keyId) + (trusted ? " (доверенный)" : ""));
+    if (!trusted) {
+      console.log(
+        "  ⚠ этот ключ НЕ в списке доверенных (src/ota-trust.js): приложение отклонит набор. " +
+          "Добавьте его: npm run ota:key -- --trust"
+      );
+    }
+  } else {
+    console.log("  подпись: НЕТ (--unsigned) — приложение примет набор только пока нет доверенных ключей");
+  }
   console.log("  размер: " + (bytes / 1024).toFixed(1) + " КБ (base64: " + (bundleJson.length / 1024).toFixed(1) + " КБ)");
 }
 
