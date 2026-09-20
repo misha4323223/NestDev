@@ -89,7 +89,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js"]
+  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -12721,6 +12721,9 @@ async function testTasks() {
   await test("задачи по сроку: приложение будит агента и пишет в чат «Автозадачи»", () => {
     const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
     const send = uiFile("chat-send.js"); // прогон агента живёт своим модулем (этап A, часть 9)
+    // Раздел «дела и напоминания» вынесен в src/tasks-reminders.js (часть 24):
+    // о поведении спрашиваем модуль, у main.js — только проводку.
+    const reminders = fs.readFileSync(path.join(ROOT, "src", "tasks-reminders.js"), "utf8");
     // Схема настроек вынесена в src/settings-store.js (этап B, часть 5).
     const store = fs.readFileSync(path.join(ROOT, "src", "settings-store.js"), "utf8");
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
@@ -12729,11 +12732,12 @@ async function testTasks() {
     // Автозадачи вынесены своим модулем (этап A, часть 4): ищем код там, где он живёт,
     // а у app.js спрашиваем только то, что он и должен теперь делать — звать модуль.
     const auto = uiFile("auto-tasks.js");
-    assert.ok(main.includes("tasksTakeAuto"), "планировщик не берёт автозадачи");
-    assert.ok(main.includes('type: "task-due"'), "событие срока автозадачи не отправляется");
+    assert.ok(reminders.includes("tasksTakeAuto"), "планировщик не берёт автозадачи");
+    assert.ok(reminders.includes('type: "task-due"'), "событие срока автозадачи не отправляется");
     assert.ok(store.includes("taskAuto: true"), "нет настройки «автозадачи выполняет агент»");
-    assert.ok(main.includes("armTaskWake") && main.includes("tasksNextDue"), "нет точного будильника на срок");
-    assert.ok(main.includes('{ type: "task-due", from: "desktop", tasks: auto }'), "автозадача уйдёт и на телефон — прогон удвоится");
+    assert.ok(reminders.includes("armTaskWake") && reminders.includes("tasksNextDue"), "нет точного будильника на срок");
+    assert.ok(reminders.includes('{ type: "task-due", from: "desktop", tasks: auto }'), "автозадача уйдёт и на телефон — прогон удвоится");
+    assert.ok(/createTasksReminders\(\{/.test(main) && /getWindow: \(\) => mainWindow/.test(main), "модуль напоминаний не подключён к оболочке");
     assert.ok(send.includes("async function runTurn("), "обычная отправка и автозадача не идут общим путём");
     assert.ok(send.includes("await runTurn(chat, content"), "отправка не пользуется общим прогоном");
     assert.ok(auto.includes('AUTO_CHAT_TITLE = "Автозадачи"'), "нет отдельного чата автозадач");
@@ -14229,7 +14233,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14239,7 +14243,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
@@ -14265,6 +14269,19 @@ async function testFsGitIpc() {
       "function f(s) { s.count = 1; return obj.count; }",
     ].join("\n");
     assert.deepStrictEqual(scan(propertyOnly), [], "свойство чужого объекта — не наше имя");
+    // Литералы после return/typeof/case и стрелки — тоже не текст для поиска имён.
+    // Без этого страж ругался на `path` внутри /^(unix:path=…)/ и требовал
+    // внедрить имя, которого в модуле нет (жизнь: tasks-reminders.js, часть 24).
+    assert.ok(!/\bpath\b/.test(bareCode("function f(bus) { return /^(unix:path=|unix:abstract=)/.test(bus); }")),
+      "литерал после return остался в тексте");
+    assert.ok(!/\breal\b/.test(bareCode("const r = typeof x === 'string' ? /real-name/ : null;")),
+      "литерал после typeof остался в тексте");
+    assert.ok(!/\bswap\b/.test(bareCode("const f = (a) => /swap-me/.test(a);")),
+      "литерал после стрелки остался в тексте");
+    assert.ok(/\bcount\b/.test(bareCode("function f(n) { return count / n; }")),
+      "деление после return принято за литерал — страж ослепнет");
+    assert.ok(/\brealName\b/.test(bareCode("function f() { return realName + /x/.source; }")),
+      "обычное имя рядом с литералом потерялось");
   });
 
   await test("файловая панель: бинарные файлы, имена и границы рабочей папки", () => {
@@ -15756,7 +15773,10 @@ async function testMissions() {
     // пока пользователь не включит «Память диалогов» (это про другое — про поиск по дням).
     assert.ok(/if \(settings\.agentWorkFiles !== false\) \{\n\s+try \{\n\s+missionStore\.contextMirror/.test(main), "зеркало контекста зависит не от своей галочки");
     assert.ok(/if \(!settings\.contextMemory\) return null;/.test(main), "дневник памяти больше не спрашивает свою галочку");
-    assert.ok(/if \(s\.agentWorkFiles === false\) return;/.test(main), "зеркало дел не слушает галочку файлов работы");
+    // Зеркало дел живёт в src/tasks-reminders.js (часть 24): у main.js спрашиваем
+    // только проводку, а условие галочки — у модуля.
+    const remindersSrc = fs.readFileSync(path.join(ROOT, "src", "tasks-reminders.js"), "utf8");
+    assert.ok(/if \(s\.agentWorkFiles === false\) return;/.test(remindersSrc), "зеркало дел не слушает галочку файлов работы");
     assert.ok(!/if \(!s\.longWork\) return;/.test(main), "зеркало дел всё ещё привязано к «долгой работе»");
     assert.ok(/agentWorkFiles: true/.test(store), "файлы работы выключены по умолчанию");
     for (const ch of ["agentfiles:status", "agentfiles:openDir", "agentfiles:clear"]) {
@@ -15961,7 +15981,8 @@ async function testMissions() {
     assert.ok(mob.indexOf('"mission:state"') >= 0 && mob.indexOf('"agentfiles:status"') >= 0, "с телефона не видно работу агента");
     assert.ok(/mission:|agentfiles:/.test(pre), "мост не знает каналов миссий");
     // Список дел тоже виден файлом: иначе «файлы работы» — только про миссии.
-    assert.ok(main.indexOf("missionStore.tasksMirror") >= 0, "список дел не зеркалится файлом");
+    const taskReminderSrc = fs.readFileSync(path.join(ROOT, "src", "tasks-reminders.js"), "utf8");
+    assert.ok((main + taskReminderSrc).indexOf("missionStore.tasksMirror") >= 0, "список дел не зеркалится файлом");
   });
 }
 
