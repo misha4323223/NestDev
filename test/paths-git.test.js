@@ -275,10 +275,19 @@ fs.writeFileSync(plainFile, "x");
     }
     assert.ok(/const \{ createPathsGit \} = require\("\.\/paths-git\.js"\)/.test(MAIN_SRC), "модуль не подключён");
     assert.ok(/lastAgentRepoDir: \(\) => lastAgentRepoDir/.test(MAIN_SRC), "папка клона передана не мостом");
-    assert.ok(/agentEnv: \(\) => agentEnv/.test(MAIN_SRC), "окружение передано не мостом");
-    assert.ok(/activeToolCapability: \(\) => activeToolCapability/.test(MAIN_SRC), "назначение инструмента передано не мостом");
-    for (const keep of ["let lastAgentRepoDir = null;", "let agentEnv = {};", 'let activeToolCapability = "";']) {
-      assert.ok(MAIN_SRC.indexOf(keep) >= 0, "живое значение уехало из оболочки: " + keep);
+    // Живые значения читаются, а не копируются: окружение и назначение живут теперь
+    // в модуле окружения (часть 22), поэтому мост берёт геттеры оттуда. Папка
+    // последнего клона остаётся в оболочке — её мост отдаёт как раньше.
+    // Смотрим ИМЕННО свой мост: у agent-tools свой такой же блок, и проверка
+    // «где-нибудь в main.js» пропускала бы подмену одного из двух.
+    const bridgeAt = MAIN_SRC.indexOf('const { createPathsGit } = require("./paths-git.js")');
+    assert.ok(bridgeAt > 0, "модуль не подключён");
+    const bridge = MAIN_SRC.slice(bridgeAt, MAIN_SRC.indexOf("\n});", bridgeAt));
+    assert.ok(/agentEnv: getAgentEnv,/.test(bridge), "окружение передано не живым чтением");
+    assert.ok(/activeToolCapability: getCapability,/.test(bridge), "назначение инструмента передано не живым чтением");
+    assert.ok(MAIN_SRC.indexOf("let lastAgentRepoDir = null;") >= 0, "папка клона уехала из оболочки");
+    for (const moved of ["let agentEnv = {},", 'let activeToolCapability = "";']) {
+      assert.ok(MAIN_SRC.indexOf(moved) < 0, "состояние окружения осталось в оболочке: " + moved);
     }
     assert.ok(MODULE_SRC.indexOf("envFor") >= 0 && MODULE_SRC.indexOf("GIT_TERMINAL_PROMPT") >= 0, "окружение git пропало из модуля");
   });

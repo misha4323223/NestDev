@@ -1,6 +1,6 @@
 {
   "name": "ai-agent",
-  "version": "1.5.175",
+  "version": "1.5.176",
   "private": true,
   "description": "AI Developer Agent — чат с AI-агентом (Ollama / Groq / внешние API), файловые операции и git",
   "author": "AI Developer Agent",
@@ -11,7 +11,7 @@
     "release:win": "node scripts/publish-release.js",
     "dist:win": "electron-builder --win --publish never",
     "dist:win:installer": "electron-builder --win nsis --publish never",
-    "test": "node test/smoke.test.js && node test/field-guard.test.js && node test/vk-guide.test.js && node test/qr.test.js && node test/mobile-pair.test.js && node test/auto-tasks.test.js && node test/model-popup.test.js && node test/ask-modal.test.js && node test/chat-rename.test.js && node test/chat-store.test.js && node test/chat-run.test.js && node test/chat-send.test.js && node test/chat-continue.test.js && node test/model-ipc.test.js && node test/github-ipc.test.js && node test/settings-store.test.js && node test/paths-git.test.js && node test/project-search.test.js && node test/undo-store.test.js && node test/bg-processes.test.js && node test/tool-helpers.test.js && node test/project-analysis.test.js && node test/site-guides.test.js && node test/terminal-panel.test.js && node test/app-window.test.js && node test/run-mission.test.js && node test/run-tools.test.js && node test/run-retry.test.js && node test/run-round.test.js && node test/provider-stream.test.js && node test/run-calls.test.js && node test/run-strict.test.js && node test/run-batch.test.js && node test/run-nudge.test.js && node test/repo-shape.test.js && node test/publish-release.test.js",
+    "test": "node test/smoke.test.js && node test/field-guard.test.js && node test/vk-guide.test.js && node test/qr.test.js && node test/mobile-pair.test.js && node test/auto-tasks.test.js && node test/model-popup.test.js && node test/ask-modal.test.js && node test/chat-rename.test.js && node test/chat-store.test.js && node test/chat-run.test.js && node test/chat-send.test.js && node test/chat-continue.test.js && node test/model-ipc.test.js && node test/github-ipc.test.js && node test/settings-store.test.js && node test/paths-git.test.js && node test/project-search.test.js && node test/undo-store.test.js && node test/bg-processes.test.js && node test/tool-helpers.test.js && node test/project-analysis.test.js && node test/site-guides.test.js && node test/terminal-panel.test.js && node test/app-window.test.js && node test/run-mission.test.js && node test/run-tools.test.js && node test/run-retry.test.js && node test/run-round.test.js && node test/provider-stream.test.js && node test/run-calls.test.js && node test/run-strict.test.js && node test/run-batch.test.js && node test/run-nudge.test.js && node test/agent-env.test.js && node test/repo-shape.test.js && node test/publish-release.test.js",
     "test:live": "node scripts/live-ui.js",
     "audit:extract": "node scripts/audit-extractions.js",
     "test:live:desktop": "node scripts/live-desktop.js",

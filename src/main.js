@@ -130,12 +130,56 @@ let missionClaim = ""; // id миссии, которую человек вер�
 const ota = require("./ota.js"); // локальный self-update (OTA)
 const selfDev = require("./self-dev.js"); // защита критичной инфраструктуры самообновления
 
+// ─────────────────────── Окружение агента и назначения ───────────────────────
+// Раздел вынесен в src/agent-env.js (часть 22): переменные окружения агента,
+// автоматические YC_* со свежим IAM, правила выдачи по назначению и окружение
+// команды (команда-дамп секретов не получает). Состояние живёт в модуле, поэтому
+// наружу берём чтение (getAgentEnv/getScopes/getCapability) и постановку
+// назначения (setCapability) — копия «застыла» бы на пустом объекте, и команды
+// остались бы без токенов и PATH.
+// ycConfig создаётся служебным слоем облака ниже по файлу, envPathInfo/setMergedPath —
+// системным разделом: модуль читает их в момент вызова, поэтому к моменту сборки
+// они ещё не объявлены, и это нормально.
+const { createAgentEnv } = require("./agent-env.js");
+const agentEnvState = createAgentEnv({
+  toolPolicy,
+  audit,
+  app,
+  path,
+  yandexCloud,
+  ycCli,
+  live: {
+    getYcConfig: () => ycConfig,
+    envPathInfo: () => envPathInfo(), // результат, а не функция: модуль зовёт её сам
+    setMergedPath: (before, extra) => setMergedPath(before, extra),
+  },
+});
+const {
+  activeCapability,
+  withCapability,
+  getAgentEnv,
+  getUserAgentEnv,
+  getScopes,
+  getCapability,
+  setCapability,
+  pathOnlyEnv,
+  envFor,
+  commandEnv,
+  probeEnv,
+  ycIamEnvToken,
+  ycAutoEnv,
+  rebuildAgentEnv,
+  ycIamSync,
+  ycEnsurePath,
+  applyAgentEnv,
+} = agentEnvState;
+
 // ─────────────────────────── Настройки ───────────────────────────
 // ── Настройки, подключения и история чатов — код в src/settings-store.js ──
 // Модуль собран на прежнем месте куска, и имена те же: вызовы ниже (loadSettings,
 // saveSettings, loadChats…) дословно прежние — берём их деструктуризацией.
-// Применение настроек к живым подсистемам (окружение агента, профиль браузера,
-// журнал) остаётся здесь и передано значениями: это объявления функций, подъём работает.
+// Применение настроек к живым подсистемам: окружение агента теперь в src/agent-env.js,
+// профиль браузера и журнал остаются здесь объявлениями функций — подъём работает.
 const { createSettingsStore } = require("./settings-store.js");
 const {
   DEFAULT_SETTINGS,
@@ -159,176 +203,6 @@ const {
   applyBrowserSettings,
 });
 
-// Переменные окружения агента (envSet/envList/envUnset). Значения хранятся в settings.json
-// (settings.agentEnv) и подмешиваются во все команды: runCommand, фоновые процессы, shell, git, docker.
-let agentEnv = {}; // итоговый набор: пользовательский + автоматический (Yandex Cloud)
-let userAgentEnv = {}; // только то, что задал пользователь — это и сохраняется в настройках
-// Кому какая переменная выдана: { ИМЯ: ["terminal", "git"] } (settings.agentEnvScopes).
-// Пусто для переменной — как раньше: доходит до всех команд агента. Заполнено —
-// только до названных инструментов и групп (см. tool-policy.js).
-let agentEnvScopes = {};
-// Инструмент, который выполняется СЕЙЧАС (его capability). Команды внутри одного
-// вызова получают выданное этому инструменту; действие без инструмента (кнопка
-// «Запустить», авто-коммит, сборка бандла) назначения не имеет и объявляет его само.
-let activeToolCapability = "";
-function activeCapability() {
-  return activeToolCapability;
-}
-
-// Выполнить операцию под названным назначением. Нужно действиям НЕ от инструмента:
-// кнопка «Загрузить» в панели git, «Опубликовать на GitHub». Внутри вложенных вызовов
-// это назначение видят все помощники — runGit, commandEnv, spawnRaw.
-async function withCapability(capability, fn) {
-  const prev = activeToolCapability;
-  activeToolCapability = capability;
-  try {
-    return await fn();
-  } finally {
-    activeToolCapability = prev;
-  }
-}
-
-// Автоматические переменные Yandex Cloud для команд агента. yc CLI читает их прямо
-// из окружения, поэтому подключённый аккаунт работает без интерактивного `yc init`.
-// ВАЖНО: YC_TOKEN и YC_IAM_TOKEN должны содержать IAM-токен — OAuth там не
-// принимается (yc отвечает «The token is invalid»). IAM живёт ~1 час, поэтому
-// держим свежий снимок (ycIamEnv) и продлеваем его в фоне до истечения.
-// В чат значения не выводятся: envList показывает только имя и длину.
-let ycIamEnv = null; // { token, expiresAtMs, forOauth }
-let ycIamTimer = null;
-let ycIamTimerAt = 0;
-let ycIamLastTryTs = 0;
-let lastAgentEnvSettings = null;
-const YC_IAM_REFRESH_MARGIN = 5 * 60 * 1000;
-
-function ycIamEnvToken(cfg) {
-  if (!ycIamEnv || !cfg || !cfg.oauth || ycIamEnv.forOauth !== cfg.oauth) return "";
-  if (Date.now() >= ycIamEnv.expiresAtMs - 60 * 1000) return "";
-  return ycIamEnv.token;
-}
-
-function ycAutoEnv(s) {
-  const out = {};
-  try {
-    const cfg = ycConfig(s);
-    if (cfg.cloudId) out.YC_CLOUD_ID = cfg.cloudId;
-    if (cfg.folderId) out.YC_FOLDER_ID = cfg.folderId;
-    const iam = ycIamEnvToken(cfg);
-    if (iam) {
-      out.YC_IAM_TOKEN = iam;
-      out.YC_TOKEN = iam;
-    }
-  } catch {}
-  return out;
-}
-
-// Пересобрать окружение без сети (зовётся и по таймеру продления токена).
-function rebuildAgentEnv() {
-  agentEnv = { ...userAgentEnv, ...ycAutoEnv(lastAgentEnvSettings) };
-  // Значения переменных агента не должны попадать в журнал действий — даже если
-  // команда честно их напечатала (printenv MY_KEY): журнал вырезает эти значения
-  // по подстроке из любой своей строки.
-  audit.setSecrets(Object.values(agentEnv));
-}
-
-// Ключи окружения, которые можно отдавать даже «слепым» процессам: это пути,
-// а не секреты. Всё остальное (ключи, пароли, токены) — только по назначению.
-function pathOnlyEnv() {
-  const safe = {};
-  for (const k of Object.keys(agentEnv)) {
-    if (/^(path|pathext|comspec|systemroot|temp|tmp)$/i.test(k)) safe[k] = agentEnv[k];
-  }
-  return safe;
-}
-
-// Окружение для названного назначения: инструмент получает ТОЛЬКО те переменные
-// агента, которые ему выданы (или все неограниченные — как раньше). Назначения:
-// capability инструмента в работе, а для действий без инструмента — явное имя
-// (кнопка «Запустить» → terminal.execute, авто-коммит → git.commit).
-function envFor(capability) {
-  const cap = capability || activeToolCapability;
-  return { ...process.env, ...toolPolicy.envForCapability(agentEnv, agentEnvScopes, cap) };
-}
-
-// Окружение для команды, которую СОЧИНИЛ агент (runCommand, фоновые процессы, shell).
-// Обычные команды (npm, docker, yc, git) получают выданные переменные агента, но
-// команда, которая просто печатает всё окружение (env, printenv, set, Get-ChildItem Env:),
-// секретов не получает — иначе модель одной строкой выводит пароли пользователя в чат.
-function commandEnv(command, capability) {
-  const base = { ...process.env, GIT_TERMINAL_PROMPT: "0", FORCE_COLOR: "0" };
-  if (toolPolicy.commandDumpsEnv(command)) return { ...base, ...pathOnlyEnv() };
-  // Инструмент в работе важнее: команда внутри cloud-инструмента получает выданное
-  // облаку, а не терминалу. «terminal.execute» объявляется только тогда, когда
-  // инструмента нет вовсе (терминал пользователя, кнопка запуска превью).
-  return { ...base, ...envFor(capability || activeToolCapability || "terminal.execute") };
-}
-
-// Служебные пробы (поиск программы в PATH, проверка версии) секретов не требуют.
-function probeEnv() {
-  return { ...process.env, ...pathOnlyEnv() };
-}
-
-// Фоновая синхронизация IAM-токена: обмен OAuth→IAM и продление за 5 минут до
-// истечения. Не бросает и не ждёт: команды агента никогда не стоят из-за токена.
-// Повторы ограничены (не чаще раза в минуту), иначе каждая команда дёргала бы IAM.
-function ycIamSync(s) {
-  try {
-    const cfg = ycConfig(s);
-    if (!cfg.oauth) {
-      if (ycIamTimer) { clearTimeout(ycIamTimer); ycIamTimer = null; ycIamTimerAt = 0; }
-      if (ycIamEnv) { ycIamEnv = null; rebuildAgentEnv(); }
-      return;
-    }
-    if (ycIamEnv && ycIamEnv.forOauth === cfg.oauth && Date.now() < ycIamEnv.expiresAtMs - YC_IAM_REFRESH_MARGIN) {
-      const at = ycIamEnv.expiresAtMs - YC_IAM_REFRESH_MARGIN;
-      if (ycIamTimerAt !== at) {
-        if (ycIamTimer) clearTimeout(ycIamTimer);
-        ycIamTimerAt = at;
-        ycIamTimer = setTimeout(() => {
-          ycIamTimer = null;
-          ycIamTimerAt = 0;
-          ycIamSync(lastAgentEnvSettings);
-        }, Math.max(30 * 1000, at - Date.now()));
-        if (ycIamTimer.unref) ycIamTimer.unref();
-      }
-      return;
-    }
-    if (ycIamEnv && ycIamEnv.forOauth !== cfg.oauth) { ycIamEnv = null; rebuildAgentEnv(); }
-    if (Date.now() - ycIamLastTryTs < 60 * 1000) return;
-    ycIamLastTryTs = Date.now();
-    yandexCloud
-      .getIamTokenInfo(cfg.oauth)
-      .then((info) => {
-        ycIamEnv = { token: info.token, expiresAtMs: info.expiresAtMs || Date.now() + 3600 * 1000, forOauth: cfg.oauth };
-        rebuildAgentEnv();
-        ycIamSync(lastAgentEnvSettings);
-      })
-      .catch(() => {
-        /* нет сети или токен не принят — команды отработают без YC_*, без падения */
-      });
-  } catch {}
-}
-
-// Папка со встроенным yc CLI — в PATH всех команд агента (как node).
-function ycEnsurePath() {
-  try {
-    const dir = ycCli.binDir(app.getPath("userData"));
-    if (!dir) return;
-    const before = envPathInfo().value;
-    if (!String(before || "").split(path.delimiter).map((x) => x.trim()).includes(dir)) setMergedPath(before, dir);
-  } catch {}
-}
-
-// Пересобрать окружение агента: пользовательские переменные + автоматические YC.
-function applyAgentEnv(s) {
-  userAgentEnv = (s && typeof s.agentEnv === "object" && s.agentEnv) || {};
-  agentEnvScopes = toolPolicy.normalizeScopes(s && s.agentEnvScopes);
-  lastAgentEnvSettings = s || lastAgentEnvSettings;
-  rebuildAgentEnv();
-  ycEnsurePath();
-  // Фоновая подстановка свежего IAM в YC_IAM_TOKEN/YC_TOKEN (без await).
-  ycIamSync(lastAgentEnvSettings);
-}
 
 // ── Пути и git — код в src/paths-git.js ──
 // Модуль собран на прежнем месте куска, и имена те же: вызовы в оболочке и проводка
@@ -352,8 +226,8 @@ const {
   envFor,
   live: {
     lastAgentRepoDir: () => lastAgentRepoDir,
-    agentEnv: () => agentEnv,
-    activeToolCapability: () => activeToolCapability,
+    agentEnv: getAgentEnv,
+    activeToolCapability: getCapability,
   },
 });
 
@@ -904,7 +778,7 @@ const systemStack = createSystemStack({
   runTerminalCommand,
   live: {
     get agentEnv() {
-      return agentEnv;
+      return getAgentEnv();
     },
     // Системный раздел получает не «всё подряд», а выданное назначению:
     // установщики, архивы и админ-запуск работают под своим инструментом.
@@ -1095,8 +969,8 @@ async function executeTool(name, args, settings) {
   // Инструмент в работе: его capability решает, какие переменные агента дойдут до
   // команд внутри него. Вызовы инструментов идут по очереди (цикл runAi), поэтому
   // одного «текущего назначения» достаточно; вложенный вызов вернёт своё.
-  const prevCapability = activeToolCapability;
-  activeToolCapability = toolPolicy.capabilityOf(name);
+  const prevCapability = getCapability();
+  setCapability(toolPolicy.capabilityOf(name));
   try {
     // Пользователь нажал Esc/«Стоп» — агент должен немедленно остановиться.
     if (global.__agentStopRequested) {
@@ -1110,7 +984,7 @@ async function executeTool(name, args, settings) {
   } catch (e) {
     return "Ошибка: " + fmtError(e);
   } finally {
-    activeToolCapability = prevCapability;
+    setCapability(prevCapability);
   }
 }
 
@@ -2748,11 +2622,11 @@ const agentToolHandlers = createAgentTools({
   runCloudDeploy,
   cloudDeployBrief,
   live: {
-    agentEnv: () => agentEnv,
-    userAgentEnv: () => userAgentEnv,
+    agentEnv: getAgentEnv,
+    userAgentEnv: getUserAgentEnv,
     // Что и кому выдано — envList показывает это честно, чтобы агент не искал
     // переменную, которой у него нет.
-    scopeSummary: (name) => toolPolicy.scopeSummary(agentEnvScopes, name),
+    scopeSummary: (name) => toolPolicy.scopeSummary(getScopes(), name),
     lastAgentRepoDir: () => lastAgentRepoDir,
     setLastAgentRepoDir: (v) => {
       lastAgentRepoDir = v;

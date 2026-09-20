@@ -89,7 +89,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js"]
+  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -5475,51 +5475,89 @@ async function testYandexCloud() {
     }
   });
 
-  await test("yc: в env идёт свежий IAM (YC_IAM_TOKEN/YC_TOKEN), OAuth туда не попадает", () => {
-    const i0 = mainSrc.indexOf("let ycIamEnv = null; // { token, expiresAtMs, forOauth }");
-    const i1 = mainSrc.indexOf("// Пересобрать окружение без сети");
-    assert.ok(i0 > 0 && i1 > i0, "не нашёл блок IAM-окружения в main.js");
-    const box = { yc: null };
-    const mod = new Function(
-      "ycConfig",
-      mainSrc.slice(i0, i1) + "\nreturn { ycAutoEnv, ycIamEnvToken, setIam: (v) => { ycIamEnv = v; } };"
-    )((s) => s);
+  await test("yc: в env идёт свежий IAM (YC_IAM_TOKEN/YC_TOKEN), OAuth туда не попадает", async () => {
+    // Проверяем ЖИВОЙ модуль, а не текст: окружение агента вынесено в src/agent-env.js
+    // (часть 22), и снимок IAM живёт внутри него. Подменяем только то, что модуль
+    // получает снаружи: служебный слой облака, журнал и мост к системному разделу.
+    const { createAgentEnv } = require(path.join(ROOT, "src", "agent-env.js"));
+    const toolPolicy = require(path.join(ROOT, "src", "tool-policy.js"));
     const cfg = { oauth: "OAUTH-SECRET", cloudId: "b1g", folderId: "f1" };
+    const mk = (info) =>
+      createAgentEnv({
+        toolPolicy,
+        audit: { setSecrets() {} },
+        app: { getPath: () => os.tmpdir() },
+        path,
+        yandexCloud: { getIamTokenInfo: async () => info },
+        ycCli: { binDir: () => "" },
+        live: {
+          getYcConfig: () => (s) => s,
+          envPathInfo: () => ({ value: "" }),
+          setMergedPath: () => "",
+        },
+      });
+    // Обмен OAuth→IAM идёт в фоне (команды из-за токена не стоят) — даём микрозадачам
+    // дойти до конца, иначе проверили бы пустой снимок.
+    const settle = async () => {
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+    };
 
-    // Пока IAM не получен — переменных с токеном нет вовсе (раньше сюда попадал OAuth).
-    const out = mod.ycAutoEnv(cfg);
-    assert.strictEqual(out.YC_CLOUD_ID, "b1g");
-    assert.strictEqual(out.YC_FOLDER_ID, "f1");
-    assert.ok(!("YC_TOKEN" in out), "OAuth утёк в YC_TOKEN");
-    assert.ok(!("YC_IAM_TOKEN" in out), "пустой IAM попал в env");
+    // 1. Снимка IAM ещё нет — переменных с токеном нет вовсе (раньше сюда попадал OAuth).
+    const fresh = mk({ token: "IAM-FRESH", expiresAtMs: Date.now() + 3600 * 1000 });
+    const before = fresh.ycAutoEnv(cfg);
+    assert.strictEqual(before.YC_CLOUD_ID, "b1g");
+    assert.strictEqual(before.YC_FOLDER_ID, "f1");
+    assert.ok(!("YC_TOKEN" in before), "OAuth утёк в YC_TOKEN");
+    assert.ok(!("YC_IAM_TOKEN" in before), "пустой IAM попал в env");
 
-    // Свежий IAM подставляется в оба имени.
-    mod.setIam({ token: "IAM-FRESH", expiresAtMs: Date.now() + 3600 * 1000, forOauth: "OAUTH-SECRET" });
-    const out2 = mod.ycAutoEnv(cfg);
-    assert.strictEqual(out2.YC_IAM_TOKEN, "IAM-FRESH");
-    assert.strictEqual(out2.YC_TOKEN, "IAM-FRESH");
-    assert.strictEqual(mod.ycIamEnvToken(cfg), "IAM-FRESH");
+    // 2. После обмена OAuth→IAM свежий токен идёт в ОБА имени и доезжает до команды.
+    await fresh.applyAgentEnv({ ...cfg, agentEnv: { MY_KEY: "v" }, agentEnvScopes: {} });
+    await settle();
+    const after = fresh.ycAutoEnv(cfg);
+    assert.strictEqual(after.YC_IAM_TOKEN, "IAM-FRESH");
+    assert.strictEqual(after.YC_TOKEN, "IAM-FRESH");
+    assert.strictEqual(fresh.ycIamEnvToken(cfg), "IAM-FRESH");
+    assert.strictEqual(fresh.envFor("terminal.execute").YC_IAM_TOKEN, "IAM-FRESH", "токен не доехал до окружения команды");
+    // Тот же свежий снимок, но спрошенный от ДРУГОГО аккаунта: чужой IAM в окружение
+    // не уходит. Проверка изолирует счёт снимка — ветка смены аккаунта в ycIamSync
+    // обнуляет снимок сама и эту ошибку скрыла бы.
+    const foreign = fresh.ycAutoEnv({ oauth: "ДРУГОЙ", cloudId: "b1g", folderId: "f1" });
+    assert.ok(!("YC_IAM_TOKEN" in foreign) && !("YC_TOKEN" in foreign), "токен чужого аккаунта ушёл в окружение");
+    assert.strictEqual(fresh.ycIamEnvToken({ oauth: "ДРУГОЙ" }), "", "чужому аккаунту отдан снимок IAM");
 
-    // Просроченный — не подставляем (yc CLI сказал бы «The token is invalid»).
-    mod.setIam({ token: "IAM-OLD", expiresAtMs: Date.now() - 1000, forOauth: "OAUTH-SECRET" });
-    assert.strictEqual(mod.ycIamEnvToken(cfg), "");
-    assert.ok(!("YC_IAM_TOKEN" in mod.ycAutoEnv(cfg)), "просроченный IAM ушёл в env");
+    // 3. Просроченный IAM не подставляем (yc CLI сказал бы «The token is invalid»).
+    const old = mk({ token: "IAM-OLD", expiresAtMs: Date.now() - 1000 });
+    await old.applyAgentEnv({ ...cfg });
+    await settle();
+    assert.strictEqual(old.ycIamEnvToken(cfg), "", "просроченный IAM считается живым");
+    assert.ok(!("YC_IAM_TOKEN" in old.ycAutoEnv(cfg)), "просроченный IAM ушёл в env");
 
-    // Токен от другого OAuth-аккаунта не используем.
-    mod.setIam({ token: "IAM-OTHER", expiresAtMs: Date.now() + 3600 * 1000, forOauth: "ДРУГОЙ" });
-    assert.strictEqual(mod.ycIamEnvToken(cfg), "");
+    // 4. Сменили OAuth-аккаунт — снимок прошлого аккаунта не переиспользуем ни одной командой.
+    const other = mk({ token: "IAM-FIRST", expiresAtMs: Date.now() + 3600 * 1000 });
+    await other.applyAgentEnv({ ...cfg });
+    await settle();
+    assert.strictEqual(other.ycIamEnvToken(cfg), "IAM-FIRST");
+    await other.applyAgentEnv({ oauth: "ДРУГОЙ", cloudId: "b1g", folderId: "f1" });
+    await settle();
+    assert.strictEqual(other.ycIamEnvToken(cfg), "", "токен чужого аккаунта остался в окружении");
+    assert.ok(!("YC_IAM_TOKEN" in other.ycAutoEnv(cfg)), "токен чужого аккаунта ушёл в команду");
   });
 
   await test("yc: ycInstall пересобирает окружение, а токен продлевается заранее", () => {
+    // Окружение агента и продление IAM живут в src/agent-env.js (часть 22);
+    // пересборка после установки yc CLI — в обработчике инструмента (agent-tools).
+    const envSrc = fs.readFileSync(path.join(ROOT, "src", "agent-env.js"), "utf8");
     assert.ok(
-      /applyAgentEnv\(loadSettings\(\)\);\n          const iamReady/.test(mainSrc),
+      /applyAgentEnv\(loadSettings\(\)\);\n          const iamReady/.test(backendSrc()),
       "после установки yc CLI окружение не пересобирается"
     );
-    assert.ok(/applyAgentEnv\(loadSettings\(\)\);/.test(mainSrc), "нет пересборки окружения в ycInstall");
-    assert.ok(/getIamTokenInfo\(cfg\.oauth\)/.test(mainSrc), "main.js не берёт срок жизни IAM");
-    assert.ok(/YC_IAM_REFRESH_MARGIN = 5 \* 60 \* 1000/.test(mainSrc), "нет запаса на продление IAM");
-    assert.ok(/ycIamTimer\.unref/.test(mainSrc), "таймер продления держит процесс");
-    assert.ok(/Date\.now\(\) - ycIamLastTryTs < 60 \* 1000/.test(mainSrc), "нет ограничения частоты обращений к IAM");
+    assert.ok(/applyAgentEnv\(loadSettings\(\)\)/.test(backendSrc()), "нет пересборки окружения в ycInstall");
+    assert.ok(/getIamTokenInfo\(cfg\.oauth\)/.test(envSrc), "слой окружения не берёт срок жизни IAM");
+    assert.ok(/YC_IAM_REFRESH_MARGIN = 5 \* 60 \* 1000/.test(envSrc), "нет запаса на продление IAM");
+    assert.ok(/ycIamTimer\.unref/.test(envSrc), "таймер продления держит процесс");
+    assert.ok(/Date\.now\(\) - ycIamLastTryTs < 60 \* 1000/.test(envSrc), "нет ограничения частоты обращений к IAM");
     // Тексты (промпт и интерфейс) больше не обещают YC_TOKEN как OAuth.
     assert.ok(/YC_IAM_TOKEN — свежий IAM/.test(coreSrc), "промпт не упоминает YC_IAM_TOKEN");
     assert.ok(!/автоматически \(YC_TOKEN \/ YC_CLOUD_ID/.test(coreSrc), "в промпте остался старый текст про YC_TOKEN");
@@ -14172,7 +14210,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14182,7 +14220,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
@@ -16172,18 +16210,22 @@ async function testSecretScopes() {
     assert.match(unset, /удалена/, "envUnset не ответил: " + unset);
   });
 
-  await test("секреты: одна точка выдачи в main.js и никаких прямых подстановок", () => {
+  await test("секреты: одна точка выдачи в модуле окружения и никаких прямых подстановок", () => {
     for (const f of ["src/main.js", "src/agent-tools.js", "src/system-stack.js", "src/git-ipc.js"]) {
       const src = fs.readFileSync(path.join(ROOT, f), "utf8");
       assert.ok(src.indexOf("...agentEnv") === -1, f + ": окружение агента всё ещё подставляется напрямую");
       assert.ok(src.indexOf("...live.agentEnv") === -1, f + ": модуль берёт окружение копией, а не по назначению");
     }
+    // Точка выдачи окружения живёт в src/agent-env.js (часть 22): оболочка только
+    // собирает модуль и держит состояние через геттеры — прямых подстановок нет.
+    const env = fs.readFileSync(path.join(ROOT, "src", "agent-env.js"), "utf8");
+    assert.ok(env.includes("function envFor(capability)"), "нет единой точки выдачи окружения");
+    assert.ok(env.includes("toolPolicy.envForCapability(agentEnv, agentEnvScopes, cap)"), "выдача не ограничивается настройками");
+    assert.ok(env.includes("agentEnvScopes"), "настройки выдачи не читаются");
+    assert.ok(/commandDumpsEnv\(command\)/.test(env), "команда-дамп окружения получает секреты");
     const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
-    assert.ok(main.includes("function envFor(capability)"), "нет единой точки выдачи окружения");
-    assert.ok(main.includes("toolPolicy.envForCapability(agentEnv, agentEnvScopes, cap)"), "выдача не ограничивается настройками");
-    assert.ok(/activeToolCapability = toolPolicy\.capabilityOf\(name\)/.test(main), "инструмент в работе не объявляет назначение");
-    assert.ok(/finally\s*\{\s*activeToolCapability = prevCapability;/.test(main), "назначение не возвращается после инструмента");
-    assert.ok(main.includes("agentEnvScopes"), "настройки выдачи не читаются");
+    assert.ok(/setCapability\(toolPolicy\.capabilityOf\(name\)\)/.test(main), "инструмент в работе не объявляет назначение");
+    assert.ok(/finally\s*\{\s*setCapability\(prevCapability\);/.test(main), "назначение не возвращается после инструмента");
     assert.ok(main.includes('ipcMain.handle("policy:groups"'), "окно не может получить группы выдачи");
     // Чистка сохранённой выдачи уехала вместе со схемой настроек — в src/settings-store.js.
     const storeSrc = fs.readFileSync(path.join(ROOT, "src", "settings-store.js"), "utf8");

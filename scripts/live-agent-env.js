@@ -17,7 +17,11 @@
      • в журнале действий нет значения секрета.
 
    Платформа учитывается: на Windows команды агента идут в cmd, где printenv нет —
-   поэтому дамп спрашивается через `set`, а явный запрос через `set ИМЯ`. */
+   поэтому дамп спрашивается через `set`, а явный запрос через `set ИМЯ`. На POSIX
+   самого printenv в образе может не быть (в busybox его нет): тогда дамп
+   спрашивается встроенной командой `set` (её знает любая оболочка), а явный запрос —
+   раскрытием переменной оболочкой. Проверяем ровно то же («переменная дошла до
+   команды»), а не наличие конкретной программы в образе. */
 
 const Module = require("module");
 const path = require("path");
@@ -26,8 +30,14 @@ const fs = require("fs");
 
 const ROOT = path.join(__dirname, "..");
 const WIN = process.platform === "win32";
-const dumpCmd = WIN ? "set" : "printenv";
-const explicitCmd = (name) => (WIN ? "set " + name : "printenv " + name);
+// Имена команд подставляются ниже по факту: если в образе нет printenv (в busybox
+// его нет), берём то, что есть в любой оболочке — встроенный `set` для дампа и
+// раскрытие переменной для явного запроса.
+let dumpCmd = WIN ? "set" : "printenv";
+let explicitCmd = (name) => (WIN ? "set " + name : "printenv " + name);
+// Команда не нашла саму программу (127 / «not found»): вывод при этом не пустой,
+// а проверка «секрета не видно» прошла бы на ошибке вместо дампа.
+const cmdFailed = (out) => /not found|not recognized|кодом 127/.test(String(out));
 
 const userData = fs.mkdtempSync(path.join(os.tmpdir(), "live-env-userData-"));
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "live-env-work-"));
@@ -121,9 +131,22 @@ const logTool = (tool, args, result) => audit.record({ tool: tool, args: args, d
   const settings = await settingsGet(null);
   ok(!!(settings && settings.agentEnv && settings.agentEnv.LIVE_LIVE_SECRET), "настройки приняли переменную агента");
 
+  // Один вопрос оболочке: есть ли в образе printenv. Нет — переходим на встроенные
+  // средства, иначе проверки проходили бы на ошибке команды, а не на дампе.
+  if (!WIN) {
+    const probe = String(await tools.runCommand({ command: "printenv __LIVE_PROBE__" }, settings));
+    if (cmdFailed(probe)) {
+      dumpCmd = "set";
+      explicitCmd = (name) => 'printf %s "$' + name + '"';
+      console.log("  · в образе нет printenv: дамп спрашиваем через set, значение — раскрытием оболочки");
+    }
+  }
+
   const dump = String(await tools.runCommand({ command: dumpCmd }, settings));
   ok(!dump.includes(SECRET) && !dump.includes(GIT_ONLY), "дамп окружения («" + dumpCmd + "») секретов не показывает (вывод: " + dump.length + " симв.)");
-  ok(dump.length > 0, "дамп вообще отработал (иначе проверка выше пустая): " + dump.slice(0, 80).replace(/\n/g, " "));
+  // Проверка выше бессмысленна, если команда дампа не выполнилась вовсе: пустой
+  // вывод и текст ошибки секретов тоже «не показывают».
+  ok(dump.length > 0 && !cmdFailed(dump), "дамп вообще отработал (иначе проверка выше пустая): " + dump.slice(0, 80).replace(/\n/g, " "));
 
   logTool("runCommand", { command: dumpCmd }, dump);
   const explicit = String(await tools.runCommand({ command: explicitCmd("LIVE_LIVE_SECRET") }, settings));
