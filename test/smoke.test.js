@@ -89,7 +89,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "project-brief.js", "chats-ipc.js", "memory-ipc.js", "git-stage.js"]
+  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "project-brief.js", "chats-ipc.js", "memory-ipc.js", "git-stage.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -6652,9 +6652,10 @@ async function testYcFolderPersistence() {
   };
   let handle = null;
   const saved = [];
+  let repoDirReset = 0;
   new Function(
     "ipcMain", "loadSettings", "normalizeSettings", "applyAgentEnv",
-    "applyBrowserSettings", "saveSettings", "mobileBridge", "lastAgentRepoDir",
+    "applyBrowserSettings", "saveSettings", "mobileBridge", "live",
     code
   )(
     { handle: (ch, cb) => { handle = cb; } },
@@ -6664,7 +6665,11 @@ async function testYcFolderPersistence() {
     () => {},
     (x) => { saved.push(x); },
     { applySettings: () => {} },
-    null
+    // Сброс «активного репозитория» при смене рабочей папки: код уехал в
+    // src/settings-ipc.js (часть 30) и делает это СЕТТЕРОМ моста — переменная
+    // принадлежит оболочке (её читают пути-и-git, GitHub-каналы и инструменты),
+    // и копия значения «застыла» бы.
+    { setLastAgentRepoDir: () => { repoDirReset++; } }
   );
   assert.strictEqual(typeof handle, "function", "обработчик settings:set не зарегистрировался");
 
@@ -6706,6 +6711,14 @@ async function testYcFolderPersistence() {
     // Инструменты по-прежнему читают свежие настройки, а не снимок начала ответа
     const ycCases = toolBody(mainSrc, "ycStatus", "ycInstall");
     assert.ok(/ycConfig\(loadSettings\(\)\)/.test(ycCases), "yc-инструменты читают устаревший снимок настроек");
+  });
+
+  await test("настройки: смена рабочей папки сбрасывает «активный репозиторий» через мост", () => {
+    const before = repoDirReset;
+    handle(null, { workingDir: "/proj2" });
+    assert.strictEqual(repoDirReset, before + 1, "смена рабочей папки не сбросила папку агента");
+    handle(null, { workingDir: "/proj" });
+    assert.strictEqual(repoDirReset, before + 1, "папка агента сбрасывается без смены рабочей папки");
   });
 }
 
@@ -14233,7 +14246,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "project-brief.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "project-brief.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14243,7 +14256,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "project-brief.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "project-brief.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
@@ -16270,7 +16283,10 @@ async function testSecretScopes() {
     const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
     assert.ok(/setCapability\(toolPolicy\.capabilityOf\(name\)\)/.test(main), "инструмент в работе не объявляет назначение");
     assert.ok(/finally\s*\{\s*setCapability\(prevCapability\);/.test(main), "назначение не возвращается после инструмента");
-    assert.ok(main.includes('ipcMain.handle("policy:groups"'), "окно не может получить группы выдачи");
+    // Группы выдачи отдаёт свой модуль: канал policy:groups уехал в
+    // src/settings-ipc.js (этап B, часть 30), поэтому ищем его там.
+    const policyIpcSrc = fs.readFileSync(path.join(ROOT, "src", "settings-ipc.js"), "utf8");
+    assert.ok(policyIpcSrc.includes('ipcMain.handle("policy:groups"'), "окно не может получить группы выдачи");
     // Чистка сохранённой выдачи уехала вместе со схемой настроек — в src/settings-store.js.
     const storeSrc = fs.readFileSync(path.join(ROOT, "src", "settings-store.js"), "utf8");
     assert.ok(/s\.agentEnvScopes = toolPolicy\.normalizeScopes/.test(storeSrc), "сохранённая выдача не чистится политикой");

@@ -840,52 +840,28 @@ const { termEmit, termAgentEcho, termStart, termInput, termStop, termStatus, ter
 });
 
 // ─────────────────────────── IPC ───────────────────────────
-ipcMain.handle("settings:get", () => loadSettings());
-// Группы выдачи секретов (terminal, git, cloud …) для настроек: собираются из
-// таблицы прав (tool-policy.js) — рендерер ничего не дублирует у себя.
-ipcMain.handle("policy:groups", () => toolPolicy.scopeGroups());
-ipcMain.handle("settings:set", (_e, s) => {
-  const prev = loadSettings();
-  if (s && s.workingDir && prev.workingDir !== s.workingDir) {
-    lastAgentRepoDir = null; // рабочая папка сменилась — сбрасываем «активный репозиторий»
-  }
-  const merged = normalizeSettings({ ...prev, ...(s || {}) });
-  // Защита хранилища паролей: если сохранение пришло без массива sitePasswords
-  // (старая версия интерфейса, обрезанный объект, мобильный клиент) — не затираем
-  // уже сохранённые записи. Пустой массив — это осознанная очистка, её пропускаем.
-  if (!s || !Array.isArray(s.sitePasswords)) merged.sitePasswords = prev.sitePasswords || [];
-  // Защита пароля почты: сохранение без ключа mailPassword (мобильный клиент,
-  // старый интерфейс) не должно стирать уже сохранённый пароль приложения.
-  if (!s || s.mailPassword === undefined) merged.mailPassword = prev.mailPassword || "";
-  // Защита выбора Yandex Cloud: каталог/облако меняются ТОЛЬКО своими IPC
-  // (yc:setToken, yc:setFolder, автовыбор внутри yc:status, сброс в yc:logout) —
-  // в форме настроек такого поля нет. Объект интерфейса, загруженный ДО автовыбора
-  // каталога, приносил пустой (или устаревший) ycFolderId и стирал выбор: агент
-  // снова видел «каталог не выбран», и каталог приходилось выбирать заново.
-  // Та же болезнь, что у sitePasswords и mailPassword. Поэтому поля Yandex Cloud
-  // берём из текущих настроек, а не из присланного объекта.
-  merged.ycFolderId = prev.ycFolderId || "";
-  merged.ycFolderName = prev.ycFolderName || "";
-  merged.ycCloudId = prev.ycCloudId || "";
-  // При смене рабочей папки — сбрасываем локальную папку выбранного GitHub-репозитория,
-  // чтобы не подхватывать старый путь от прошлой локации.
-  if (s && s.workingDir && prev.workingDir !== s.workingDir) {
-    merged.githubRepoDir = "";
-    // Рабочая папка сменилась вручную — обновляем папку активного проекта, чтобы список не расходился.
-    if (Array.isArray(merged.projects) && merged.activeProjectId) {
-      const pr = merged.projects.find((p) => p.id === merged.activeProjectId);
-      if (pr) pr.dir = merged.workingDir;
-    }
-  }
-  applyAgentEnv(merged);
-  // Мобильный доступ: при включении без PIN — генерируем его, затем применяем к мосту.
-  if (merged.mobileEnabled && !merged.mobilePin) {
-    merged.mobilePin = String(Math.floor(100000 + Math.random() * 900000));
-  }
-  applyBrowserSettings(merged);
-  saveSettings(merged);
-  mobileBridge.applySettings(merged);
-  return merged;
+// ── Настройки и группы выдачи — код в src/settings-ipc.js ──
+// Каналы settings:get, settings:set и policy:groups — код в src/settings-ipc.js
+// (часть 30). Сборка стоит на прежнем месте куска: всё, что модулю нужно (хранилище
+// настроек, применение к окружению и браузеру, мобильный мост, политика) объявлено
+// ВЫШЕ, поэтому стрелок в проводке нет. Живое здесь одно: смена рабочей папки
+// сбрасывает «активный репозиторий» — переменная принадлежит оболочке, поэтому
+// уходит сеттером моста live (копия «застыла» бы, и агент остался бы в старой папке).
+const { registerSettingsIpc } = require("./settings-ipc.js");
+registerSettingsIpc({
+  ipcMain,
+  loadSettings,
+  saveSettings,
+  normalizeSettings,
+  applyAgentEnv,
+  applyBrowserSettings,
+  mobileBridge,
+  toolPolicy,
+  live: {
+    setLastAgentRepoDir: (v) => {
+      lastAgentRepoDir = v;
+    },
+  },
 });
 
 // ─────────────────────────── Почта (SMTP/IMAP) ───────────────────────────
@@ -895,14 +871,11 @@ ipcMain.handle("settings:set", (_e, s) => {
 const { registerMailIpc } = require("./mail-ipc.js");
 const { mailConfig } = registerMailIpc({ ipcMain, mail, loadSettings });
 // ─────────────────────────── Мобильный доступ (LAN + PWA + PIN) ───────────────────────────
-ipcMain.handle("mobile:status", () => mobileBridge.status());
-ipcMain.handle("mobile:pinRegen", () => {
-  const s = loadSettings();
-  s.mobilePin = String(Math.floor(100000 + Math.random() * 900000));
-  saveSettings(s);
-  mobileBridge.applySettings(s);
-  return mobileBridge.status();
-});
+// Каналы панели (mobile:status, mobile:pinRegen) — код в src/mobile-ipc.js (часть 30).
+// Смена PIN обязана быть применена к ЖИВОМУ мосту: иначе окно показало бы новый PIN,
+// а телефон остался бы подключён по старому — и «сменить PIN» молча ничего не менял.
+const { registerMobileIpc } = require("./mobile-ipc.js");
+registerMobileIpc({ ipcMain, mobileBridge, loadSettings, saveSettings });
 
 // ─── Дела, миссии и файлы работы агента — код в src/mission-ipc.js ───────────
 // Модуль собирается на прежнем месте куска и регистрирует каналы tasks:*,
@@ -928,85 +901,32 @@ registerMissionIpc({
 });
 
 // ─────────────────────────── Проекты (до 10, переключение) ───────────────────────────
-// Возвращает список проектов (свежие сверху) и id активного.
-ipcMain.handle("projects:list", () => {
-  const s = loadSettings();
-  const list = (Array.isArray(s.projects) ? s.projects : [])
-    .map((p) => ({
-      id: p.id,
-      name: p.name,
-      dir: p.dir,
-      exists: !!(p.dir && fs.existsSync(p.dir)),
-      lastOpened: p.lastOpened || 0,
-    }))
-    .sort((a, b) => (b.lastOpened || 0) - (a.lastOpened || 0));
-  return { ok: true, projects: list, activeId: s.activeProjectId || "" };
-});
-
-// Создаёт проект: имя + папка (если не указана — ~/Имя). Становится активным. Максимум 10.
-ipcMain.handle("projects:create", async (_e, name, dir) => {
-  const s = loadSettings();
-  const list = Array.isArray(s.projects) ? s.projects : [];
-  if (list.length >= 10) return { ok: false, error: "Достигнут лимит: максимум 10 проектов. Удали один из списка (🗑 — папка не удаляется)." };
-  const nm = String(name || "").trim();
-  if (!nm) return { ok: false, error: "Введи название проекта." };
-  if (nm.length > 60) return { ok: false, error: "Название слишком длинное (до 60 символов)." };
-  const safe = nm.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim().slice(0, 60) || "Проект";
-  const target = (typeof dir === "string" && dir.trim()) ? dir.trim() : path.join(os.homedir(), safe);
-  const prep = ensureWritableDir(target);
-  if (!prep.ok) return prep;
-  const abs = prep.dir;
-  const dup = list.find((p) => p.dir && path.resolve(p.dir) === abs);
-  if (dup) return { ok: false, error: "Эта папка уже используется проектом «" + dup.name + "»." };
-  const id = "p-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  const entry = { id, name: nm, dir: abs, createdAt: Date.now(), lastOpened: Date.now() };
-  const merged = { ...s, projects: [...list, entry], activeProjectId: id, workingDir: abs, githubRepoDir: "" };
-  saveSettings(merged);
-  lastAgentRepoDir = null; // рабочая папка сменилась — сбрасываем «активный репозиторий»
-  return { ok: true, project: entry };
-});
-
-// Переключает активный проект: его папка становится workingDir.
-ipcMain.handle("projects:activate", (_e, id) => {
-  const s = loadSettings();
-  const list = Array.isArray(s.projects) ? s.projects : [];
-  const p = list.find((x) => x.id === id);
-  if (!p) return { ok: false, error: "Проект не найден." };
-  if (!p.dir || !fs.existsSync(p.dir)) {
-    return { ok: false, error: "Папка проекта больше не существует: " + (p.dir || "?") + " — убери проект из списка (🗑) и создай заново." };
-  }
-  p.lastOpened = Date.now();
-  const merged = { ...s, projects: list, activeProjectId: id, workingDir: p.dir, githubRepoDir: "" };
-  saveSettings(merged);
-  lastAgentRepoDir = null;
-  clonedRepoPending = false; // флаг «только что склонирован» не переносится между проектами
-  activeRunUndo = []; // undo-снимки предыдущего проекта не применяются в новом
-  return { ok: true, project: p };
-});
-
-// Убирает проект из списка (папка на диске НЕ удаляется).
-ipcMain.handle("projects:remove", (_e, id) => {
-  const s = loadSettings();
-  const list = Array.isArray(s.projects) ? s.projects : [];
-  const rest = list.filter((p) => p.id !== id);
-  if (rest.length === list.length) return { ok: false, error: "Проект не найден." };
-  let activeId = s.activeProjectId;
-  const merged0 = { ...s, projects: rest };
-  if (activeId === id) {
-    const next = [...rest].sort((a, b) => (b.lastOpened || 0) - (a.lastOpened || 0))[0];
-    if (next) {
-      activeId = next.id;
-      merged0.workingDir = next.dir;
-    } else {
-      activeId = "";
-      merged0.workingDir = s.workingDir; // текущая папка не выдёргивается, просто список пуст
-    }
-  }
-  const merged = { ...merged0, activeProjectId: activeId };
-  if (!activeId) merged.githubRepoDir = "";
-  saveSettings(merged);
-  if (!activeId) lastAgentRepoDir = null;
-  return { ok: true, activeId };
+// Каналы projects:list/create/activate/remove — код в src/projects-ipc.js (часть 31).
+// Переключение проекта сбрасывает три живых значения оболочки: папку последнего клона,
+// флаг «только что склонирован» и снимки отката — их читают пути-и-git, GitHub-каналы,
+// прогон и инструменты, поэтому в модуль уходят СЕТТЕРЫ моста live (копия «застыла» бы,
+// и агент остался бы в папке прошлого проекта). ensureWritableDir объявлен ниже обычной
+// функцией — подъём работает, и к моменту вызова канал его видит.
+const { registerProjectsIpc } = require("./projects-ipc.js");
+registerProjectsIpc({
+  ipcMain,
+  fs,
+  path,
+  os,
+  loadSettings,
+  saveSettings,
+  ensureWritableDir,
+  live: {
+    setLastAgentRepoDir: (v) => {
+      lastAgentRepoDir = v;
+    },
+    setClonedRepoPending: (v) => {
+      clonedRepoPending = v;
+    },
+    setActiveRunUndo: (v) => {
+      activeRunUndo = v;
+    },
+  },
 });
 
 ipcMain.handle("term:start", () => termStart(agentWorkDir(loadSettings())));
@@ -1016,95 +936,26 @@ ipcMain.handle("term:status", () => termStatus());
 ipcMain.handle("term:complete", (_e, line) => termComplete(line));
 
 // ─────────────────────────── Быстрый запуск проекта (превью) ───────────────────────────
-// Пользователь сам запускает dev-сервер проекта и останавливает его (освобождая порт).
-let devRun = null; // { rec, command, cwd }
-
-function devEmit(ev) {
-  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("dev:event", ev);
-}
-
-// Автоопределение команды запуска по package.json проекта.
-function detectDevCommand(dir) {
-  let pkg = null;
-  try {
-    pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
-  } catch {}
-  const scripts = (pkg && pkg.scripts) || {};
-  const hasBun =
-    fs.existsSync(path.join(dir, "bun.lockb")) ||
-    fs.existsSync(path.join(dir, "bun.lock")) ||
-    fs.existsSync(path.join(dir, "bunfig.toml"));
-  if (scripts.dev) return hasBun ? "bun run dev" : "npm run dev";
-  if (scripts.start) return hasBun ? "bun run start" : "npm start";
-  if (scripts.serve) return "npm run serve";
-  return "";
-}
-
-function devStart(dir, command) {
-  const d = sanitizeDir(dir) || agentWorkDir(loadSettings());
-  if (!d || !fs.existsSync(d)) return { ok: false, error: "Папка проекта не найдена" };
-  if (devRun && devRun.rec && !devRun.rec.exited) {
-    return { ok: false, error: "Проект уже запущен — сначала останови его (⏹)." };
-  }
-  const cmd = String(command || "").trim() || detectDevCommand(d);
-  if (!cmd) return { ok: false, error: "Не найден скрипт запуска (dev/start в package.json). Укажи команду вручную." };
-  let rec;
-  try {
-    rec = bgSpawn(cmd, { cwd: d, name: "dev:" + cmd.slice(0, 50) });
-  } catch (e) {
-    return { ok: false, error: e.message || String(e) };
-  }
-  devRun = { rec, command: cmd, cwd: d };
-  const push = (chunk) => devEmit({ type: "out", text: stripAnsi(chunk.toString()) });
-  rec.child.stdout.on("data", push);
-  rec.child.stderr.on("data", push);
-  rec.child.on("exit", (code) => {
-    if (devRun && devRun.rec === rec) devRun = null;
-    devEmit({ type: "exit", code });
-  });
-  rec.child.on("error", (e) => {
-    if (devRun && devRun.rec === rec) devRun = null;
-    devEmit({ type: "exit", code: null, error: e.message });
-  });
-  devEmit({ type: "start", command: cmd, cwd: d });
-  return { ok: true, command: cmd, cwd: d };
-}
-
-async function devStop() {
-  const stopped = [];
-  if (devRun && devRun.rec && !devRun.rec.exited) {
-    const rec = devRun.rec;
-    devRun = null;
-    bgKill(rec);
-    stopped.push(rec.name || rec.command);
-  }
-  // Порт тоже освобождаем: процесс мог быть запущен агентом (startBackground /
-  // runCommandOutput для сервера) или остаться сиротой от прошлого запуска.
-  const port = parsePortFromUrl(loadSettings().previewUrl);
-  if (port) {
-    const r = await killProcessesOnPort(port);
-    if (r && r.ok && r.killed && r.killed.length) stopped.push("порт " + port + " (PID " + r.killed.join(", ") + ")");
-  }
-  if (!stopped.length) return { ok: false, error: "Проект не запущен (процесс и порт свободны)" };
-  devEmit({ type: "stopped" });
-  return { ok: true, stopped };
-}
-
-function devStatus(dir) {
-  if (devRun && devRun.rec && devRun.rec.exited) devRun = null;
-  const d = sanitizeDir(dir) || agentWorkDir(loadSettings());
-  return {
-    ok: true,
-    running: !!(devRun && devRun.rec && !devRun.rec.exited),
-    command: devRun ? devRun.command : "",
-    cwd: devRun ? devRun.cwd : "",
-    detected: d && fs.existsSync(d) ? detectDevCommand(d) : "",
-  };
-}
-
-ipcMain.handle("dev:start", (_e, dir, command) => devStart(dir, command));
-ipcMain.handle("dev:stop", () => devStop());
-ipcMain.handle("dev:status", (_e, dir) => devStatus(dir));
+// Запуск dev-сервера проекта, остановка с освобождением порта, статус и автоопределение
+// команды — код в src/preview-ipc.js (часть 31); каналы dev:start/stop/status регистрирует
+// он сам. Состояние запуска (devRun) переехало внутрь модуля: снаружи его читала только
+// остановка при выходе приложения, и она теперь зовёт devShutdown(). Окно приходит
+// функцией — оно создаётся позже сборки модуля и может быть пересоздано.
+const { registerPreviewIpc } = require("./preview-ipc.js");
+const { devShutdown } = registerPreviewIpc({
+  ipcMain,
+  fs,
+  path,
+  loadSettings,
+  sanitizeDir,
+  agentWorkDir,
+  bgSpawn,
+  bgKill,
+  stripAnsi,
+  parsePortFromUrl,
+  killProcessesOnPort,
+  getWindow: () => mainWindow,
+});
 
 // Локальный self-update (OTA): статус, проверка, откат, открыть папку
 ipcMain.handle("ota:status", () => ota.status(loadSettings()));
@@ -1477,11 +1328,7 @@ app.on("before-quit", () => {
   for (const rec of bgProcesses.values()) bgKill(rec);
   bgProcesses.clear();
   termShutdown();
-  if (devRun) {
-    const rec = devRun.rec;
-    devRun = null;
-    bgKill(rec);
-  }
+  devShutdown(); // превью (dev-сервер проекта) — состояние и остановка в src/preview-ipc.js
   mobileBridge.stop();
 });
 

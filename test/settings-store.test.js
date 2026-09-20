@@ -335,12 +335,27 @@ const readRaw = (file) => (fs.existsSync(file) ? fs.readFileSync(file, "utf8") :
     // уехала вместе со своими каналами (память диалогов — src/memory-ipc.js,
     // часть 29), поэтому считаем оболочку и модули, которым настройки переданы
     // значением: там они читаются в момент вызова, как и раньше.
+    // Дальше вызовы уехали вместе со своими каналами: память диалогов —
+    // src/memory-ipc.js (часть 29), настройки и мобильный доступ —
+    // src/settings-ipc.js и src/mobile-ipc.js (часть 30). Считаем оболочку и модули,
+    // которым настройки переданы ЗНАЧЕНИЕМ: там они читаются в момент вызова, как
+    // и раньше, — смысл проверки не меняется.
     const MEM_SRC = read("src", "memory-ipc.js");
+    const SETTINGS_SRC = read("src", "settings-ipc.js");
+    const MOBILE_SRC = read("src", "mobile-ipc.js");
+    const PROJECTS_SRC = read("src", "projects-ipc.js");
+    const PREVIEW_SRC = read("src", "preview-ipc.js");
+    const callCount = (src) => (src.match(/(^|[^.\w$])loadSettings\(\)/g) || []).length;
     const calls =
-      (MAIN_SRC.match(/(^|[^.\w$])loadSettings\(\)/g) || []).length +
-      (MEM_SRC.match(/(^|[^.\w$])loadSettings\(\)/g) || []).length;
+      callCount(MAIN_SRC) + callCount(MEM_SRC) + callCount(SETTINGS_SRC) +
+      callCount(MOBILE_SRC) + callCount(PROJECTS_SRC) + callCount(PREVIEW_SRC);
     assert.ok(calls >= 20, "вызовы loadSettings() в оболочке переписаны: " + calls);
-    assert.ok(/const \{[^}]*\bloadSettings\b[^}]*\} = deps;/.test(MEM_SRC), "канал памяти не получает свежие настройки");
+    for (const [name, src] of [["памяти", MEM_SRC], ["настроек", SETTINGS_SRC], ["мобильного доступа", MOBILE_SRC], ["проектов", PROJECTS_SRC], ["превью", PREVIEW_SRC]]) {
+      assert.ok(/const \{[^}]*\bloadSettings\b[^}]*\} = deps;/.test(src), "канал " + name + " не получает свежие настройки");
+      assert.ok(callCount(src) > 0, "канал " + name + " не читает настройки в момент вызова");
+    }
+    assert.ok(/const \{[^}]*\bsaveSettings\b[^}]*\} = deps;/.test(SETTINGS_SRC), "канал настроек не сохраняет через хранилище");
+    assert.ok(/const \{[^}]*\bsaveSettings\b[^}]*\} = deps;/.test(MOBILE_SRC), "канал PIN не сохраняет через хранилище");
     assert.ok(/^\s+loadSettings,$/m.test(MAIN_SRC), "модули больше не получают свежие настройки");
   });
 
