@@ -521,73 +521,21 @@ const { snapshotFileForUndo, persistUndo, loadPersistedUndo, undoFile } = create
 });
 
 
-// ─────────────────────────── Выполнение инструментов ───────────────────────────
-// Чтение файлов для инструментов (нумерация строк, язык, карта определений и
-// диапазоны блоков) переехало в src/project-analysis.js (этап B, часть 21):
-// имена те же, инструменты получают их прежним списком аргументов.
-
-// Краткая «визитка» проекта для старта сессии: имя, скрипты, двухуровневая структура,
-// первые строки README. Подмешивается к системному промпту в runAi — агенту не нужно
-// осматриваться с нуля, а истории хватает дольше. Чисто синхронная и дешёвая.
-function buildProjectBrief(root) {
-  if (!root || !fs.existsSync(root)) return "";
-  const parts = [];
-  // package.json: имя и скрипты
-  try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
-    const name = (pkg.name && String(pkg.name)) || path.basename(root);
-    parts.push("Проект: " + name + " (каталог: " + root + ")");
-    const scripts = pkg.scripts && typeof pkg.scripts === "object" ? pkg.scripts : {};
-    const scriptList = Object.keys(scripts).slice(0, 12).map((k) => k + ": " + String(scripts[k]).slice(0, 50));
-    if (scriptList.length) parts.push("Скрипты package.json: " + scriptList.join("; "));
-  } catch {}
-  // Двухуровневая структура (без node_modules/.git и прочего мусора)
-  const tree = [];
-  const walkBrief = (dir, depth) => {
-    if (depth > 2 || tree.length >= 80) return;
-    let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      if (tree.length >= 80) return;
-      if (e.name.startsWith(".") || SKIP_DIRS.has(e.name)) continue;
-      const rel = path.relative(root, path.join(dir, e.name)).split(path.sep).join("/");
-      tree.push((e.isDirectory() ? "📁 " : "📄 ") + rel + (e.isDirectory() ? "/" : ""));
-      if (e.isDirectory()) walkBrief(path.join(dir, e.name), depth + 1);
-    }
-  };
-  walkBrief(root, 0);
-  if (tree.length) parts.push("Структура (" + tree.length + " записей):\n" + tree.join("\n"));
-  // README: первые непустые строки без разметки заголовков
-  const readme = ["README.md", "readme.md", "Readme.md", "README.MD"]
-    .map((f) => path.join(root, f))
-    .find((f) => fs.existsSync(f));
-  if (readme) {
-    try {
-      const head = fs.readFileSync(readme, "utf8")
-        .split("\n")
-        .map((l) => l.replace(/^#+\s*/, "").trim())
-        .filter((l) => l && !/^```/.test(l))
-        .slice(0, 10)
-        .join(" · ");
-      if (head) parts.push("README (начало): " + head);
-    } catch {}
-  }
-  // Оболочки: агент сразу видит, что доступно (bash/sh появляются с Git for Windows),
-  // и не тратит попытки на «а вдруг bash есть».
-  try {
-    parts.push("Оболочки: " + shellsBrief());
-  } catch {}
-  // Yandex Cloud: актуальный каталог и разрешения прямо в системном промпте.
-  try {
-    const ycLine = ycBriefLine(loadSettings());
-    if (ycLine) parts.push(ycLine);
-  } catch {}
-  return parts.join("\n\n");
-}
+// ─────────────────────── Визитка проекта для системного промпта ───────────────────────
+// Раздел вынесен в src/project-brief.js (часть 27): имя и скрипты package.json,
+// двухуровневая структура (без node_modules и прочего мусора), начало README,
+// доступные оболочки и строка Yandex Cloud. Визитка собирается на КАЖДЫЙ прогон
+// (настройки приходят функцией), поэтому сборка модуля стоит выше проводки прогона,
+// а считают оболочки и строку облака по-прежнему в main.js — они приходят значениями.
+const { createProjectBrief } = require("./project-brief.js");
+const { buildProjectBrief } = createProjectBrief({
+  fs,
+  path,
+  SKIP_DIRS,
+  shellsBrief,
+  loadSettings,
+  ycBriefLine,
+});
 
 // ═══════════════════ Системные программы и окружение ═══════════════════
 // Раздел вынесен в src/system-stack.js (1.5.78): PATH и поиск программ, живая
