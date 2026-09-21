@@ -492,6 +492,10 @@ async function runAi(settings, messages, win, opts) {
   let finalText = "";
 
   const stopGraceful = () => {
+    // Человек остановил работу: закрываем отрезок в миссии. Дальше она продолжится
+    // с панели новым отрезком, и в пути останется, на чём именно встали, — иначе
+    // следующая сессия видела бы «работа шла», но не знала, где остановилась.
+    mission.stage("остановка человеком");
     if (!String(finalText || "").trim()) {
       finalText = "⏹ Остановлено пользователем. Изменения сохранены; напиши «продолжай», чтобы доработать.";
       emit({ type: "chunk", text: finalText });
@@ -546,7 +550,6 @@ async function runAi(settings, messages, win, opts) {
     if (canonical.length > 1) {
       const sys = canonical[0];
       canonical = [sys, ...(await ctxManager.manage(canonical.slice(1), tools.state.histBudget))];
-      emitContext(canonical);
     }
     // Финальный предохранитель перед отправкой: осиротевшие tool-сообщения
     // (role:"tool" без предшествующего assistant с tool_calls) — 400 wrong_api_format.
@@ -555,10 +558,31 @@ async function runAi(settings, messages, win, opts) {
       canonical = [sys, ...sanitizeToolPairs(canonical.slice(1))];
     }
 
+    // ── Состояние работы: сводка миссии для модели ───────────────────────────
+    // Начало долгой работы вытесняется из окна (обрезка идёт С КОНЦА истории), а
+    // журнал миссии лежит файлами на диске и в запрос не попадал вообще: после
+    // батча или сжатия агент видел только свежий хвост и заново искал, что уже
+    // делал. Поэтому подставляем короткую сводку (цель, план, прогресс, хвост
+    // журнала, что живёт между командами) в КАЖДЫЙ запрос и убираем её сразу
+    // после раунда: в сохранённой истории чата она не копится, а модель видит её
+    // всегда — и в первом раунде, и после границы батча, и после сжатия.
+    const digestMsg = mission.digestMessage();
+    if (digestMsg) canonical.splice(1, 0, digestMsg);
+    // Индикатор контекста — ПОСЛЕ подстановки: иначе он врал бы про занятое место.
+    emitContext(canonical);
+
     // Один раунд (запрос, поток ответа, метрики) живёт в src/run-round.js: там же
     // объяснено, почему состав схем, бюджет и usage ошибаются тихо. Хозяином цикла
     // остаётся прогон: и повтор раунда, и фатальная ошибка — его решение.
-    const roundOut = await roundRunner.run({ n: round, maxRounds: maxRounds, messages: canonical });
+    let roundOut;
+    try {
+      roundOut = await roundRunner.run({ n: round, maxRounds: maxRounds, messages: canonical });
+    } finally {
+      // Сводка ищется ПО ССЫЛКЕ: сама история между раундами пересобирается
+      // (обрезка, сжатие), и по номеру позиции её можно было бы снять не на месте.
+      const di = digestMsg ? canonical.indexOf(digestMsg) : -1;
+      if (di >= 0) canonical.splice(di, 1);
+    }
     if (roundOut.kind === "repeat") {
       round--; // тот же логический раунд: номер не тратится
       repeatAttempt = true; // и раунд миссии не тратится тоже

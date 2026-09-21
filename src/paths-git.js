@@ -119,6 +119,48 @@ function sanitizeDir(p) {
   return abs;
 }
 
+/** Гарантирует, что папка существует и доступна на запись (клонирование, создание файлов).
+ *  Возвращает { ok:true, dir } или { ok:false, error } с понятной подсказкой. */
+function ensureWritableDir(dir) {
+  const abs = dir && typeof dir === "string" && dir.trim() ? path.resolve(String(dir).trim()) : "";
+  if (!abs) return { ok: false, error: "Не указана рабочая директория — выбери её в Настройках → Проект (📁) или в панели проекта." };
+  try {
+    fs.mkdirSync(abs, { recursive: true });
+  } catch (e) {
+    return { ok: false, error: "Не удалось создать папку: " + abs + " — " + (e.message || String(e)) };
+  }
+  try {
+    fs.accessSync(abs, fs.constants.W_OK);
+  } catch (e) {
+    return {
+      ok: false,
+      error: "Нет прав на запись в папку: " + abs + " (Permission denied). " +
+        "Клонирование и создание файлов в ней невозможны — выбери другую рабочую директорию " +
+        "(📁 в панели проекта или Настройки → Проект): обычную папку на диске, а не защищённую системную.",
+    };
+  }
+  // Реальная проверка записи: git падает с «could not create work tree dir ... Permission denied»,
+  // даже когда accessSync(W_OK) проходит (OneDrive Files On-Demand, защищённые/сетевые/системные папки).
+  // Поэтому создаём и удаляем временную подпапку — точно как это сделает git при клонировании.
+  const probe = path.join(abs, ".ai-agent-write-test");
+  try {
+    fs.mkdirSync(probe);
+  } catch (e) {
+    if (e.code !== "EEXIST") {
+      return {
+        ok: false,
+        error: "В папке нет прав на запись — git не сможет создать тут репозиторий: " + abs + " (" + (e.message || String(e)) + "). " +
+          "Выбери другую рабочую директорию (📁 в панели проекта): обычную локальную папку на диске " +
+          "(например, C:\\Users\\<имя>\\projects) — не системную, не сетевую и не синхронизируемую OneDrive.",
+      };
+    }
+  }
+  try {
+    fs.rmdirSync(probe);
+  } catch {}
+  return { ok: true, dir: abs };
+}
+
 function sanitizePath(p) {
   if (!p || typeof p !== "string") return null;
   const abs = path.resolve(String(p));
@@ -134,6 +176,7 @@ function sanitizePath(p) {
     stripUrlCreds,
     sanitizeDir,
     sanitizePath,
+    ensureWritableDir,
   };
 }
 

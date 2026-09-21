@@ -12,7 +12,12 @@
    действует сразу, без перезапуска. */
 
 function registerMemoryIpc(deps) {
-  const { ipcMain, app, fs, shell, agentStore, loadSettings } = deps;
+  // missionStore и agentWorkDir нужны записи памятки при сжатии контекста: зеркало
+  // кладётся рядом с проектом (.agent/context), а дневник — в папку приложения.
+  const { ipcMain, app, fs, shell, agentStore, loadSettings, missionStore, agentWorkDir } = deps;
+  // Папка приложения спрашивается в момент записи: другой модуль (или другой канал)
+  // не должен видеть застывший путь.
+  const userDataDir = () => app.getPath("userData");
 
 // ── 🧠 Память диалогов: локальный дневник сжатых памяток (папка по датам) ──────
 ipcMain.handle("memory:stats", () => {
@@ -51,6 +56,44 @@ ipcMain.handle("memory:clear", (_e, date) => {
       : "Ошибка: " + r.error,
   };
 });
+
+// Память диалогов: сохраняем сжатую памятку в локальный дневник по датам, но
+// ТОЛЬКО если пользователь включил галочку «Память диалогов» (иначе — тишина).
+// Отдельно от дневника памяти работает зеркало рядом с проектом
+// (.agent/context/<дата>.md): долгая работа обязана оставлять следы файлами на ПК,
+// даже когда галочка «Память диалогов» выключена — поэтому зеркало решает своё
+// условие («файлы работы агента»), а не эту галочку.
+function saveContextMemo(settings, entry, emit) {
+  if (!settings || !entry || !String(entry.text || "").trim()) return null;
+  if (settings.agentWorkFiles !== false) {
+    try {
+      missionStore.contextMirror(agentWorkDir(settings), entry.ts, entry.text);
+    } catch {}
+  }
+  if (!settings.contextMemory) return null;
+  try {
+    const r = agentStore.contextMemorySave(userDataDir(), {
+      ts: entry.ts,
+      memo: entry.text,
+      messages: entry.messages,
+      provider: entry.provider,
+      model: entry.model,
+      workDir: agentWorkDir(settings),
+      keepDays: Number(settings.contextMemoryDays) || agentStore.CTX_MEMO_DAY_KEEP,
+    });
+    if (r && r.ok && emit) {
+      emit({
+        type: "memory",
+        text: "🧠 Память диалогов: сохранена памятка за " + r.day + " (памяток за день: " + r.count + "). Спросить прошлые сессии — memoryList / memorySearch.",
+      });
+    }
+    return r;
+  } catch {
+    return null;
+  }
+}
+
+  return { saveContextMemo: saveContextMemo };
 }
 
 module.exports = { registerMemoryIpc };

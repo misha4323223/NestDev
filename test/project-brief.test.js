@@ -254,9 +254,21 @@ function project(files) {
     assert.ok(wiringAt > 0, "main.js не собирает модуль визитки");
     assert.ok(runAt > 0 && wiringAt < runAt, "модуль собран ниже прогона — прогон получит undefined");
     const wiring = MAIN_SRC.slice(wiringAt, MAIN_SRC.indexOf("});", wiringAt));
-    for (const dep of ["  fs,", "  path,", "  SKIP_DIRS,", "  shellsBrief,", "  loadSettings,", "  ycBriefLine,"]) {
-      assert.ok(wiring.includes(dep), "в проводку не передано: " + dep.trim());
+    // Зависимость считается переданной, если она в проводке есть — напрямую именем
+    // или отложенной стрелкой. Стрелка нужна сервису Yandex Cloud: он собирается
+    // НИЖЕ визитки (у него свои зависимости), а спрашивают строку облака уже после
+    // старта приложения — поэтому сюда нельзя подставлять значение в момент сборки.
+    for (const dep of ["fs", "path", "SKIP_DIRS", "shellsBrief", "loadSettings", "ycBriefLine"]) {
+      const direct = wiring.includes("  " + dep + ",");
+      const lazy = new RegExp("^\\s*" + dep + ":\\s*\\(", "m").test(wiring);
+      assert.ok(direct || lazy, "в проводку не передано: " + dep);
     }
+    // И отложенная стрелка обязана вести ИМЕННО в сервис, а не в пустоту: иначе
+    // визитка молча получит «каталог не выбран» вместо настоящей строки.
+    assert.ok(
+      /ycBriefLine: \(\.\.\.args\) => ycService\.ycBriefLine\(\.\.\.args\)/.test(wiring),
+      "строка облака передана не из сервиса Yandex Cloud"
+    );
     assert.ok(/buildProjectBrief,\n/.test(MAIN_SRC.slice(runAt)), "визитка не отдана прогону");
     assert.ok(!/require\(|__dirname/.test(MODULE_SRC), "модуль сам достаёт состояние вместо внедрения");
     // Тело визитки в модуле обязано совпадать с прежним текстом из HEAD байт в байт.

@@ -89,7 +89,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "project-brief.js", "chats-ipc.js", "memory-ipc.js", "git-stage.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "run-ipc.js", "tool-registry.js"]
+  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "project-brief.js", "chats-ipc.js", "memory-ipc.js", "git-stage.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "run-ipc.js", "tool-registry.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -6021,7 +6021,13 @@ async function testShellAndCdp() {
     assert.ok(/require\("\.\/shell-tools\.js"\)/.test(shellOnly), "нет подключения модуля оболочек");
     assert.ok(/findProgram: \(name\) => findProgram\(name\)/.test(shellOnly),
       "системный раздел собирается ниже — без отложенной стрелки оболочки упали бы на сборке");
-    assert.ok(/shellArgsFor\(command\)/.test(shellOnly), "оболочка запускается без хелпера кодировки");
+    // Запуск команды живёт там, где стоит сама сборка вывода: с части 36 сбор вывода
+    // переехал в src/bg-processes.js, а в main.js остался только импорт. Проверяем
+    // СМЫСЛ — любой запуск команды берёт аргументы у хелпера кодировки, — иначе
+    // пропажа вызова не была бы замечена ничем.
+    const bgSrc = fs.readFileSync(path.join(ROOT, "src", "bg-processes.js"), "utf8");
+    assert.ok(/shellArgsFor\(command\)/.test(shellOnly) || /shellArgsFor\(command\)/.test(bgSrc),
+      "оболочка запускается без хелпера кодировки (ни в main.js, ни в bg-processes.js)");
   });
 
   await test("shell: псевдонимы оболочек и команда PowerShell без искажений", () => {
@@ -7897,7 +7903,8 @@ async function testBrowserOverlays() {
       assert.ok(AgentCore.normalizeToolName(a).indexOf("browser") === 0, "алиас " + a + " не ведёт к браузерному инструменту");
     }
     // Карта не должна терять диалог: сортировка в collectMap + защита в formatSnapshot.
-    const btSrc = fs.readFileSync(path.join(ROOT, "src", "browser-tools.js"), "utf8");
+    // Карта живёт в browser-map.js (часть 39), ядро только реэкспортирует её имена.
+    const btSrc = browserHomeSrc();
     assert.ok(/items\.sort\(\(a, b\) => \(b\.inDialog \? 1 : 0\)/.test(btSrc), "collectMap не поднимает диалог наверх");
     const domSrc = fs.readFileSync(path.join(ROOT, "src", "dom-map.js"), "utf8");
     assert.ok(/const dialogItems = shown\.filter\(\(it\) => it\.inDialog\);/.test(domSrc), "formatSnapshot не защищает диалог от обрезки");
@@ -8202,11 +8209,27 @@ async function testBrowserReplayData() {
   });
 }
 
+// Весь дом браузера агента: ядро сессии (browser-tools.js) и вынесенные из него
+// модули (функции страницы, replay, сеть, карта, прокрутка). Читаем по ИМЕНИ
+// файла, а не жёстким списком: перенос кода в новый модуль не должен ослеплять
+// сторожа (на этом уже дважды ловились — см. AGENT-NOTES, часть 39).
+function browserHomeSrc() {
+  const dir = path.join(ROOT, "src");
+  return fs
+    .readdirSync(dir)
+    .filter((f) => /^browser-.*\.js$/.test(f))
+    .sort()
+    .map((f) => fs.readFileSync(path.join(dir, f), "utf8"))
+    .join("\n");
+}
+
 async function testAgentSpeedups() {
   const core = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
   const mainSrc = backendSrc();
   const appUiSrc = fs.readFileSync(path.join(ROOT, "src", "app-ui-tools.js"), "utf8");
-  const browserSrc = fs.readFileSync(path.join(ROOT, "src", "browser-tools.js"), "utf8");
+  // Адаптивный поиск элемента живёт в browser-map.js, прокрутка и наведение — в
+  // browser-scroll.js, остальное — в ядре сессии: читаем весь дом целиком.
+  const browserSrc = browserHomeSrc();
 
   await test("батчинг: правило 35 в промпте + параллельный набор read-only инструментов", () => {
     assert.ok(/^35\. БАТЧИНГ/m.test(core.SYSTEM_PROMPT), "в промпте нет правила 35 (батчинг)");
@@ -12618,6 +12641,22 @@ async function testTasks() {
     assert.ok(!store.parseDue("мусор", NOW).ok, "мусор принят за срок");
     assert.strictEqual(store.parseDue("15.09", NOW).allDay, true, "дата без времени — «весь день»");
     assert.strictEqual(store.parseDue("15.09 14:00", NOW).allDay, false, "со временем — не весь день");
+    // Полная метка времени: время — ЧАСТЬ срока. Секунды и таймзона его не съедают,
+    // иначе дело «час назад» становилось «сегодня 09:00» — просроченное уезжало
+    // в группу «Сегодня», а счётчик «Просрочено» оставался нулевым.
+    const stamp = new Date(NOW - 3600000);
+    const isoR = store.parseDue(stamp.toISOString(), NOW);
+    assert.ok(isoR.ok, "метка времени не разобрана: " + (isoR.error || ""));
+    assert.strictEqual(isoR.allDay, false, "метка времени стала «весь день»");
+    assert.ok(Math.abs(new Date(isoR.due).getTime() - stamp.getTime()) < 60000, "время метки потеряно: " + isoR.due);
+    assert.strictEqual(due("2026-09-15T14:30:45"), "2026-09-15T14:30");
+    assert.strictEqual(due("2026-09-15T14:30"), "2026-09-15T14:30");
+    assert.strictEqual(due("2026-09-15 14:30"), "2026-09-15T14:30");
+    assert.strictEqual(store.parseDue("2026-09-15T09:00", NOW).allDay, false, "время метки не прочитано");
+    // Негодное время не роняет разбор: метка читается хотя бы как дата (как и раньше).
+    assert.strictEqual(due("2026-09-21T25:00"), "2026-09-21T09:00");
+    // А дата без времени — по-прежнему «весь день» в 09:00.
+    assert.strictEqual(due("2026-09-15"), "2026-09-15T09:00");
   });
 
   await test("tasks: добавление, поиск по названию, правка, выполнение, удаление", () => {
@@ -12711,6 +12750,27 @@ async function testTasks() {
     assert.ok(store.tasksTakeReminders(ud, soon).tasks.map((t) => t.title).includes("Без срока"), "после смены срока напоминания нет");
   });
 
+  // Срок, отданный меткой времени (так его присылают живой прогон, мобильный мост и
+  // правка срока в панели), обязан её сохранить: иначе счётчик «Просрочено» врёт.
+  await test("tasks: срок из полной метки времени не теряет время", () => {
+    const ud = tmpdir("tasks-stamp-");
+    const stamp = new Date(NOW - 3600000);
+    const added = store.tasksAdd(ud, { title: "Час назад меткой", due: stamp.toISOString() }, NOW);
+    assert.ok(added.ok, "дело с меткой времени не добавлено: " + (added.error || ""));
+    assert.strictEqual(added.task.allDay, false, "метка времени стала «весь день»");
+    const kept = new Date(added.task.due).getTime();
+    assert.ok(Math.abs(kept - stamp.getTime()) < 60000, "время метки потеряно: " + added.task.due);
+    assert.ok(kept < NOW, "«час назад» оказалось в будущем: " + added.task.due);
+
+    const board = store.tasksBoard(ud, NOW);
+    const count = (id) => (board.groups.find((g) => g.id === id) || { tasks: [] }).tasks.length;
+    assert.strictEqual(count("overdue"), 1, "группы панели: " + board.groups.map((g) => g.id + ":" + g.tasks.length).join(" "));
+    assert.strictEqual(count("today"), 0, "просроченное уехало в «сегодня»");
+    assert.strictEqual(board.summary.overdue, 1, "счётчик панели: " + JSON.stringify(board.summary));
+    // Правка срока в панели отдаёт назад ту же строку — время не должно «отъехать».
+    const again = store.tasksUpdate(ud, "Час назад", { due: added.task.due });
+    assert.strictEqual(again.task.due, added.task.due, "срок не пережил повторную запись: " + again.task.due);
+  });
   await test("tasks: человеческий срок и строка дела (для панели и отчёта модели)", () => {
     const ud = tmpdir("tasks-human-");
     const t = store.tasksAdd(ud, { title: "Отчёт", due: "завтра 14:00", priority: "high", project: "Работа", note: "сверить цифры" }, NOW).task;
@@ -14347,7 +14407,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14357,7 +14417,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
@@ -15897,8 +15957,20 @@ async function testMissions() {
     const missionIpc = fs.readFileSync(path.join(ROOT, "src", "mission-ipc.js"), "utf8");
     // Зеркала решают своё условие: иначе контекст и задачи не попадали на диск,
     // пока пользователь не включит «Память диалогов» (это про другое — про поиск по дням).
-    assert.ok(/if \(settings\.agentWorkFiles !== false\) \{\n\s+try \{\n\s+missionStore\.contextMirror/.test(main), "зеркало контекста зависит не от своей галочки");
-    assert.ok(/if \(!settings\.contextMemory\) return null;/.test(main), "дневник памяти больше не спрашивает свою галочку");
+    // Запись памятки при сжатии контекста вынесена из оболочки в модуль памяти
+    // диалогов (заход 3): условия — и их ПОРЯДОК — спрашиваем у тела функции, где она
+    // теперь живёт. Проверка стала строже: раньше она видела только наличие строк.
+    const memSrc = fs.readFileSync(path.join(ROOT, "src", "memory-ipc.js"), "utf8");
+    const memoAt = memSrc.indexOf("function saveContextMemo(");
+    assert.ok(memoAt > 0, "запись памятки пропала из модуля памяти диалогов");
+    const memoBody = memSrc.slice(memoAt, memSrc.indexOf("\n}\n", memoAt));
+    assert.ok(/if \(settings\.agentWorkFiles !== false\) \{\n\s+try \{\n\s+missionStore\.contextMirror/.test(memoBody), "зеркало контекста зависит не от своей галочки");
+    assert.ok(/if \(!settings\.contextMemory\) return null;/.test(memoBody), "дневник памяти больше не спрашивает свою галочку");
+    assert.ok(
+      memoBody.indexOf("agentWorkFiles") < memoBody.indexOf("contextMemory"),
+      "условия в записи памятки слиты или переставлены: зеркало решается до дневника"
+    );
+
     // Зеркало дел живёт в src/tasks-reminders.js (часть 24): у main.js спрашиваем
     // только проводку, а условие галочки — у модуля.
     const remindersSrc = fs.readFileSync(path.join(ROOT, "src", "tasks-reminders.js"), "utf8");

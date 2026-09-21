@@ -50,6 +50,18 @@ function test(name, fn) {
 }
 
 const DEFAULTS = { contextMemory: true, contextMemoryDays: 30 };
+// Настоящие миссии и пути: зеркало памяток кладётся рядом с проектом (.agent/context),
+// и путь рабочей папки обязан считаться тем же кодом, что и в приложении.
+const missionStore = require(path.join(ROOT, "src", "mission-store.js"));
+const { createPathsGit } = require(path.join(ROOT, "src", "paths-git.js"));
+const { agentWorkDir } = createPathsGit({
+  fs,
+  path,
+  os,
+  execFile: () => {},
+  envFor: () => ({}),
+  live: { lastAgentRepoDir: () => null, agentEnv: () => ({}), activeToolCapability: () => null },
+});
 
 // ── Стенд: модуль с настоящим дневником в временной userData ─────────────────
 function mk(over) {
@@ -65,15 +77,36 @@ function mk(over) {
       return o.openError === undefined ? "" : o.openError;
     },
   };
-  registerMemoryIpc({
+  const memory = registerMemoryIpc({
     ipcMain,
     app: { getPath: (k) => (k === "userData" ? userData : "") },
     fs,
     shell,
-    agentStore,
+    agentStore: o.agentStore || agentStore,
     loadSettings: () => (typeof o.loadSettings === "function" ? o.loadSettings() : settings),
+    missionStore: o.missionStore || missionStore,
+    agentWorkDir,
   });
-  return { handlers, opened, userData };
+  return { handlers, opened, userData, module: memory };
+}
+
+// Сколько памяток лежит в дневнике: считаем файлы, а не содержимое.
+function countDiary(userData) {
+  let n = 0;
+  const walk = (dir) => {
+    let names = [];
+    try {
+      names = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of names) {
+      if (e.isDirectory()) walk(path.join(dir, e.name));
+      else if (/\.json$/.test(e.name)) n++;
+    }
+  };
+  walk(agentStore.contextMemoryDir(userData));
+  return n;
 }
 
 // Настоящая памятка в дневник: без неё проверки видели бы только пустую папку.
@@ -204,6 +237,117 @@ function putMemo(userData, memo) {
     h.handlers.get("memory:stats")();
     h.handlers.get("memory:days")();
     assert.strictEqual(fs.readFileSync(file, "utf8"), before, "каналы чтения изменили дневник");
+  });
+
+  // ── Памятка при сжатии контекста (saveContextMemo) ────────────────────────────
+  // Функция вынесена из оболочки в этот же модуль (этап B, заход 3). У неё ДВА разных
+  // условия в одной функции, и главный риск переноса — слить их в одно: зеркало рядом
+  // с проектом нужно долгой работе даже при выключенной галочке «Память диалогов».
+  await test("памятка при сжатии: дневник И зеркало проекта — каждое по своему условию", () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "mem-work-"));
+    const h = mk();
+    const seen = [];
+    const r = h.module.saveContextMemo(
+      { workingDir: work, agentWorkFiles: true, contextMemory: true },
+      { ts: Date.now(), text: "памятка живая", provider: "openai", model: "m" },
+      (e) => seen.push(e)
+    );
+    assert.ok(r && r.ok === true, "дневник памяти не пополнился: " + JSON.stringify(r));
+    assert.strictEqual(countDiary(h.userData), 1, "в дневнике не ровно одна памятка: " + countDiary(h.userData));
+    assert.strictEqual(seen.length, 1, "в чат ушло не одно сообщение: " + JSON.stringify(seen));
+    assert.ok(/🧠 Память диалогов: сохранена памятка за \d{4}-\d{2}-\d{2}/.test(seen[0].text || ""), "сообщение не то: " + seen[0].text);
+    assert.ok(/памяток за день: 1/.test(seen[0].text || ""), "в сообщении нет числа памяток: " + seen[0].text);
+    const mirrorDir = path.join(work, ".agent", "context");
+    const files = fs.existsSync(mirrorDir) ? fs.readdirSync(mirrorDir) : [];
+    assert.strictEqual(files.length, 1, "зеркало проекта не создано: " + JSON.stringify(files));
+    assert.ok(fs.readFileSync(path.join(mirrorDir, files[0]), "utf8").indexOf("памятка живая") >= 0, "в зеркало легла не сама памятка");
+  });
+
+  await test("памятка: галочка памяти выключена — зеркало пишется, дневник и чат молчат", () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "mem-work-"));
+    const h = mk();
+    const seen = [];
+    const r = h.module.saveContextMemo(
+      { workingDir: work, agentWorkFiles: true, contextMemory: false },
+      { ts: Date.now(), text: "памятка без галочки" },
+      (e) => seen.push(e)
+    );
+    assert.strictEqual(r, null, "памятка записана в дневник при выключенной памяти");
+    assert.strictEqual(countDiary(h.userData), 0, "дневник пополнился при выключенной памяти");
+    assert.strictEqual(seen.length, 0, "в чат ушло сообщение при выключенной памяти: " + JSON.stringify(seen));
+    const files = fs.readdirSync(path.join(work, ".agent", "context"));
+    assert.strictEqual(files.length, 1, "зеркало проекта не написано — а оно не зависит от галочки: " + JSON.stringify(files));
+  });
+
+  await test("памятка: «файлы работы агента» выключены — дневник пишется, зеркала нет", () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "mem-work-"));
+    const h = mk();
+    const r = h.module.saveContextMemo(
+      { workingDir: work, agentWorkFiles: false, contextMemory: true },
+      { ts: Date.now(), text: "памятка в дневник" }
+    );
+    assert.ok(r && r.ok === true, "дневник не пополнился: " + JSON.stringify(r));
+    assert.ok(!fs.existsSync(path.join(work, ".agent", "context")), "зеркало написано при выключенных файлах работы");
+  });
+
+  await test("памятка: пустой текст и пустые настройки — ничего не пишется", () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "mem-work-"));
+    const h = mk();
+    for (const bad of [
+      [{ workingDir: work, agentWorkFiles: true, contextMemory: true }, { ts: Date.now(), text: "   " }],
+      [null, { ts: Date.now(), text: "текст" }],
+      [{ workingDir: work, contextMemory: true }, null],
+    ]) {
+      assert.strictEqual(h.module.saveContextMemo(bad[0], bad[1], () => {}), null, "пустой вызов что-то записал: " + JSON.stringify(bad[1]));
+    }
+    assert.strictEqual(countDiary(h.userData), 0, "пустые вызовы пополнили дневник");
+    assert.ok(!fs.existsSync(path.join(work, ".agent", "context")), "пустые вызовы создали зеркало");
+  });
+
+  await test("памятка: сломанное зеркало не мешает дневнику", () => {
+    // Зеркало — вспомогательный след на диске: если оно не пишется, памятка всё равно
+    // должна попасть в дневник, иначе длинная работа потеряет память целиком.
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "mem-work-"));
+    const h = mk({ missionStore: { contextMirror: () => { throw new Error("нет .agent"); } } });
+    const seen = [];
+    const r = h.module.saveContextMemo(
+      { workingDir: work, agentWorkFiles: true, contextMemory: true },
+      { ts: Date.now(), text: "памятка при сломанном зеркале" },
+      (e) => seen.push(e)
+    );
+    assert.ok(r && r.ok === true, "падение зеркала сорвало запись в дневник: " + JSON.stringify(r));
+    assert.strictEqual(seen.length, 1, "сообщение о памятке не ушло: " + JSON.stringify(seen));
+  });
+
+  await test("памятка: сломанный дневник — тихий отказ, а прогон продолжается", () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "mem-work-"));
+    const h = mk({ agentStore: Object.assign({}, agentStore, { contextMemorySave: () => { throw new Error("диск занят"); } }) });
+    const seen = [];
+    const r = h.module.saveContextMemo(
+      { workingDir: work, agentWorkFiles: true, contextMemory: true },
+      { ts: Date.now(), text: "памятка при сломанном дневнике" },
+      (e) => seen.push(e)
+    );
+    assert.strictEqual(r, null, "отказ дневника вышел наружу значением: " + JSON.stringify(r));
+    assert.strictEqual(seen.length, 0, "о неудавшейся памятке сообщено как об успешной");
+    // Зеркало пишется ПЕРВЫМ — оно про файлы работы, а не про дневник.
+    assert.strictEqual(fs.readdirSync(path.join(work, ".agent", "context")).length, 1, "зеркало не записано до отказа дневника");
+  });
+
+  await test("проводка: функции в оболочке нет, прогон берёт её отложенной стрелкой", () => {
+    const mainSrc = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    const memSrc = fs.readFileSync(path.join(ROOT, "src", "memory-ipc.js"), "utf8");
+    assert.ok(!/function saveContextMemo\(/.test(mainSrc), "в оболочке осталась сама функция");
+    assert.ok(/function saveContextMemo\(settings, entry, emit\) \{/.test(memSrc), "в модуле памяти нет записи памятки");
+    // Модуль памяти собирается НИЖЕ прогона: значение в момент сборки было бы undefined,
+    // и длинная работа молча теряла бы память (сжатие случается только на ней).
+    assert.ok(
+      /saveContextMemo: \(\.\.\.memoArgs\) => memory\.saveContextMemo\(\.\.\.memoArgs\),/.test(mainSrc),
+      "прогон получил памятку не отложенным чтением"
+    );
+    assert.ok(/const memory = registerMemoryIpc\(\{/.test(mainSrc), "модуль памяти не собран в оболочке");
+    assert.ok(/const memory = registerMemoryIpc\(\{[^}]*missionStore/.test(mainSrc), "зеркалу не переданы миссии");
+    assert.ok(/const memory = registerMemoryIpc\(\{[^}]*agentWorkDir/.test(mainSrc), "зеркалу не передана рабочая папка");
   });
 
   console.log("\nПамять диалогов: " + passed + " ✅ / " + failed + " ❌");

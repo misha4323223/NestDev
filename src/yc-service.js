@@ -43,6 +43,28 @@ function ycConfig(s) {
   };
 }
 
+// Строка про Yandex Cloud для САММАРИ ПРОЕКТА: агент всегда видит АКТУАЛЬНЫЙ каталог
+// и разрешения, а не полагается на устаревшие результаты инструментов в истории
+// переписки («каталог не выбран», хотя он уже выбран). Вынесено из оболочки
+// (этап B, заход 3): рядом с ycConfig, поэтому передача настроек значением отпала.
+// Витрина проекта (src/project-brief.js) берёт её через отложенную стрелку: сервис
+// собирается ПОЗЖЕ неё, и к моменту вызова имя уже есть.
+function ycBriefLine(s) {
+  try {
+    const cfg = ycConfig(s);
+    if (!cfg.oauth) return "";
+    if (!cfg.folderId) return "Yandex Cloud: подключён, каталог НЕ выбран — попроси пользователя выбрать каталог в Настройках → «☁️ Yandex Cloud».";
+    return (
+      "Yandex Cloud: каталог «" + (cfg.folderName || cfg.folderId) + "» (" + cfg.folderId + ")" +
+      (cfg.cloudId ? ", облако " + cfg.cloudId : "") +
+      "; создание ресурсов агентом " + (cfg.allowCreate ? "разрешено" : "ЗАПРЕЩЕНО") +
+      ", удаление " + (cfg.allowDelete ? "разрешено" : "ЗАПРЕЩЕНО") + ". "
+    );
+  } catch {
+    return "";
+  }
+}
+
 // Ключ сервиса → тип ресурса Cloud Logging (нужен только как фильтр; по id точнее).
 const YC_RESOURCE_TYPES = {
   apiGateway: "serverless.apigateway",
@@ -209,6 +231,7 @@ function ycRequireAuth(cfg) {
     YANDEX_OAUTH_URL,
     YC_RESOURCE_TYPES,
     ycConfig,
+    ycBriefLine,
     ycRequireAuth,
     ycFindContainerByRef,
     ycActiveRevision,

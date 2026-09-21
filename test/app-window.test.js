@@ -256,7 +256,11 @@ function withTimers(fn) {
     for (const dep of ["  app,", "  path,", "  shell,", "  mobileBridge,", "  BrowserWindow,", "  checkTaskReminders,", "  getRunOrigin: () => activeRunOrigin,", "  setWindow: (w) => { mainWindow = w; },", "  appDir: __dirname,"]) {
       assert.ok(MAIN_SRC.includes(dep), "в проводку не передано: " + dep);
     }
-    assert.ok(MAIN_SRC.includes("  createWindow();"), "окно больше не создаётся при старте");
+    // С части 37 стартовое создание окна идёт из src/lifecycle.js: там шаг «окно»,
+    // и его отказ не обрывает подписку апдейтера и тик OTA.
+    const LIFECYCLE_SRC = read("src", "lifecycle.js");
+    assert.ok(/runStep\("окно", \(\) => createWindow\(\)\)/.test(LIFECYCLE_SRC), "окно больше не создаётся при старте");
+    assert.ok(/^  createWindow,$/m.test(MAIN_SRC), "жизненный цикл не получает создание окна");
     // Модуль не вычисляет пути и не держит чужого состояния сам.
     assert.ok(!/__dirname/.test(MODULE_SRC), "модуль сам догадывается о своей папке");
     assert.ok(!/mainWindow|activeRunOrigin/.test(MODULE_SRC), "модуль держит состояние оболочки напрямую");

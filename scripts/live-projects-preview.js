@@ -248,6 +248,21 @@ watchdog.unref();
   ok(readSettingsFile().workingDir === fs.realpathSync(third) || readSettingsFile().workingDir === third, "рабочая папка в настройках — папка нового проекта: " + readSettingsFile().workingDir);
   const dup = await call("projects:create", "дубль", third);
   ok(dup.ok === false && /уже используется/.test(dup.error), "вторая папка того же проекта отклонена");
+  // Проверка «можно ли писать» приходит сюда из модуля путей (src/paths-git.js) и
+  // делает НАСТОЯЩУЮ пробу записи: папки проекта ещё нет на диске — канал обязан
+  // её создать и НЕ оставить пробную подпапку в папке пользователя.
+  const freshDir = path.join(work, "проект-с-нуля");
+  ok(!fs.existsSync(freshDir), "стенд: папки нового проекта на диске ещё нет");
+  const fresh = await call("projects:create", "с нуля", freshDir);
+  ok(fresh.ok === true, "проект в несуществующей папке создан: " + JSON.stringify(fresh.error));
+  ok(fs.existsSync(freshDir), "канал не создал папку проекта на диске — клон и запись файлов упадут");
+  ok(fs.readdirSync(freshDir).length === 0, "пробная подпапка проверки записи осталась в папке проекта: " + JSON.stringify(fs.readdirSync(freshDir)));
+  // Недоступное место (путь под ФАЙЛОМ): отказ обязан дойти до человека ПРИЧИНОЙ,
+  // а не всплыть позже как «git не работает».
+  fs.writeFileSync(path.join(work, "файл-не-папка"), "x");
+  const bad = await call("projects:create", "некуда", path.join(work, "файл-не-папка", "проект"));
+  ok(bad.ok === false, "недоступная папка принята как рабочая");
+  ok(/Не удалось создать папку/.test(bad.error || ""), "в отказе нет причины и пути: " + bad.error);
 
   console.log("\n[3] переключение и удаление проекта сбрасывают живые значения (видно через чужие мосты)");
   repoDir.setLastAgentRepoDir("/tmp/live-clone");

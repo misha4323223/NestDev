@@ -407,11 +407,17 @@ function startFakeProvider(seen, rounds, rate, script) {
       // тост и сломало бы проверку «напоминание приходит ровно один раз» на шаге 8.
       await window.api.setSettings({ taskReminders: false });
       // Второе дело — заведомо просроченное (час назад), чтобы фильтр было на чём проверить.
-      await window.api.tasksAdd({ title: "Просроченное дело", due: new Date(Date.now() - 3600000).toISOString(), priority: "high", project: "Работа" });
+      const asked = new Date(Date.now() - 3600000).toISOString();
+      await window.api.tasksAdd({ title: "Просроченное дело", due: asked, priority: "high", project: "Работа" });
       document.getElementById("btn-tasks-refresh").click();
       await wait(700);
       const chip = (id) => document.querySelector('#tasks-filters .tk-chip[data-filter="' + id + '"]');
       const chipCounts = [...document.querySelectorAll("#tasks-filters .tk-chip")].map((c) => c.textContent);
+      // Метка времени обязана сохранить своё время: иначе «час назад» станет
+      // «сегодня 09:00», и счётчик «Просрочено» соврёт (утром это видно всегда).
+      const b = await window.api.tasksBoard();
+      const lateTask = (b.groups || []).flatMap((g) => g.tasks).find((t) => t.title === "Просроченное дело");
+      const lateDue = lateTask ? lateTask.due : "";
       chip("overdue").click();
       await wait(600);
       const overdueRows = [...document.querySelectorAll("#tasks-groups .task-row")].map((r) => r.textContent);
@@ -424,8 +430,12 @@ function startFakeProvider(seen, rounds, rate, script) {
       document.getElementById("task-new-due").value = "";
       document.querySelectorAll("#tasks-quick-due button")[1].click();
       const quickFilled = document.getElementById("task-new-due").value;
-      return { chipCounts, overdueRows, overdueHead, activeChip, allRows, tags, quickFilled };
+      return { chipCounts, overdueRows, overdueHead, activeChip, allRows, tags, quickFilled, lateDue, asked };
     });
+    // Сверяем ровно ту метку, что отдали: до минут — так срок и хранится.
+    check("срок «час назад» сохранён меткой, а не срезан на 09:00",
+      Math.abs(new Date(filt.lateDue).getTime() - new Date(filt.asked).getTime()) < 60 * 1000,
+      "отдали «" + filt.asked + "», лежит «" + filt.lateDue + "»");
     check("в фильтрах видны счётчики", filt.chipCounts.some((c) => /Просрочено1/.test(c.replace(/\s+/g, ""))), filt.chipCounts.join(" · "));
     check("фильтр «Просрочено» показывает только просроченные", filt.overdueRows.length === 1 && filt.overdueRows[0].includes("Просроченное дело"), "строк: " + filt.overdueRows.length + ", заголовок: " + filt.overdueHead);
     check("активный фильтр подсвечен", filt.activeChip.length === 1 && filt.activeChip[0].includes("Просрочено"), filt.activeChip.join(""));

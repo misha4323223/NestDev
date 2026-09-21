@@ -366,7 +366,11 @@ const last = (type) => [...events].reverse().find((e) => e.ev && e.ev.type === t
     for (const ch of ["term:start", "term:input", "term:stop", "term:status", "term:complete"]) {
       assert.ok(MODULE_SRC.indexOf('deny(e, "' + ch + '")') >= 0, "канал " + ch + " не проверяет отправителя");
     }
-    assert.ok(MAIN_SRC.includes("termShutdown();"), "выход приложения не гасит терминал модулем");
+    // С части 37 выход приложения гасит терминал из src/lifecycle.js — шагом списка,
+    // а не россыпью вызовов; в оболочке остаётся проводка модуля жизненного цикла.
+    const LIFECYCLE_SRC = read("src", "lifecycle.js");
+    assert.ok(/\{ name: "терминал", run: \(\) => termShutdown\(\) \}/.test(LIFECYCLE_SRC), "выход приложения не гасит терминал модулем");
+    assert.ok(/createLifecycle\(\{[\s\S]*?\n  termShutdown,\n  devShutdown,\n/.test(MAIN_SRC), "termShutdown не отдан жизненному циклу");
     assert.ok(!/userTerm/.test(MAIN_SRC), "в оболочке осталось чужое состояние: userTerm");
     assert.ok(/termAgentEcho,\n  mailConfig,/.test(MAIN_SRC), "инструменты больше не получают терминал агента");
     assert.ok(

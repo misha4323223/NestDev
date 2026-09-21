@@ -11,7 +11,9 @@
      [2] обход не уходит глубже двух уровней;
      [3] визитка не растёт бесконечно — она уходит в КАЖДЫЙ запрос прогона;
      [4] настоящие оболочки машины и настоящий README на месте;
-     [5] строка Yandex Cloud читается из свежих настроек (подставных — только они).
+     [5] НАСТОЯЩАЯ строка Yandex Cloud (src/yc-service.js) — все три её состояния:
+         нет авторизации, «каталог НЕ выбран» и выбранный каталог с разрешениями.
+         Подставные здесь только настройки: функция берётся из самого сервиса.
 
    Ничего не пишется: визитка только читает. */
 
@@ -29,8 +31,10 @@ const ok = (cond, msg) => {
   if (!cond) failures++;
 };
 
-// Оболочки и строка облака считаются в main.js; здесь берём настоящие оболочки
-// машины, а настройки подставляем — окна Electron в Node нет.
+// Оболочки считаются в оболочке приложения; здесь берём настоящие оболочки машины,
+// а настройки подставляем — окна Electron в Node нет. Строку облака берём из
+// НАСТОЯЩЕГО сервиса: заглушка вместо неё проверяла бы саму себя и не поймала бы
+// ни переехавшую формулировку «каталог НЕ выбран», ни застывший снимок настроек.
 const { shellsBrief } = createShellTools({
   fs,
   path,
@@ -43,14 +47,29 @@ const { shellsBrief } = createShellTools({
     return { found: !!found, path: found || "" };
   },
 });
-const settings = { ycFolderId: "b1g-live", ycFolderName: "живой", ycOauthToken: "t" };
+const { createYcService } = require(path.join(ROOT, "src", "yc-service.js"));
+
+// Настройки — настоящей формы (ключи как в приложении), иначе сервис честно решит,
+// что авторизации нет, и живые проверки станут проверять пустоту.
+const settings = {
+  yandexOauthToken: "живой-токен",
+  ycFolderId: "b1g-live",
+  ycFolderName: "живой",
+  ycCloudId: "b1g-live-cloud",
+  ycAllowAgentCreate: true,
+  ycAllowAgentDelete: false,
+};
+const ycService = createYcService({
+  app: {}, path, net: {}, secrets: {}, yandexCloud: {}, ycCli: {}, ycLogs: {}, ycEnsurePath: () => "",
+  loadSettings: () => settings,
+});
 const { buildProjectBrief } = createProjectBrief({
   fs,
   path,
   SKIP_DIRS,
   shellsBrief,
   loadSettings: () => settings,
-  ycBriefLine: (s) => (s && s.ycFolderId ? "Yandex Cloud: каталог «" + s.ycFolderName + "» (" + s.ycFolderId + ")" : ""),
+  ycBriefLine: ycService.ycBriefLine,
 });
 
 const brief = buildProjectBrief(ROOT);
@@ -88,15 +107,33 @@ ok(/Скрипты package\.json: /.test(brief), "скрипты package.json с
 ok(/README \(начало\): /.test(brief), "README проекта прочитан");
 ok(/Оболочки: \S/.test(brief), "доступные оболочки названы: " + (brief.match(/Оболочки:[^\n]*/) || ["нет строки"])[0]);
 
-console.log("\n[5] строка облака читается из свежих настроек");
+console.log("\n[5] настоящая строка облака — все три состояния");
+// (а) авторизации нет — про облако в визитке нет ни слова: иначе агент пошёл бы
+// «выбирать каталог» там, где облако вообще не подключено.
+settings.yandexOauthToken = "";
+const noCloud = buildProjectBrief(ROOT);
+ok(noCloud.indexOf("Yandex Cloud") < 0, "строка облака появилась без авторизации");
+
+// (б) авторизация есть, каталог не выбран — ДОСЛОВНАЯ подсказка человеку.
+settings.yandexOauthToken = "живой-токен";
 settings.ycFolderId = "";
 settings.ycFolderName = "";
-const without = buildProjectBrief(ROOT);
-ok(without.indexOf("Yandex Cloud") < 0, "строка облака осталась при пустом каталоге");
+const noFolder = buildProjectBrief(ROOT);
+const noFolderLine = (noFolder.match(/Yandex Cloud[^\n]*/) || [""])[0];
+ok(
+  noFolderLine === "Yandex Cloud: подключён, каталог НЕ выбран — попроси пользователя выбрать каталог в Настройках → «☁️ Yandex Cloud».",
+  "ветка «каталог НЕ выбран» разошлась: " + noFolderLine
+);
+
+// (в) каталог выбран — свежие настройки, имя, облако и разрешения словами.
 settings.ycFolderId = "b1g-live";
 settings.ycFolderName = "живой";
 const again = buildProjectBrief(ROOT);
-ok(/Yandex Cloud: каталог «живой» \(b1g-live\)/.test(again), "строка облака не перечиталась: " + (again.match(/Yandex Cloud[^\n]*/) || [""])[0]);
+const againLine = (again.match(/Yandex Cloud[^\n]*/) || [""])[0];
+ok(/Yandex Cloud: каталог «живой» \(b1g-live\)/.test(again), "строка облака не перечиталась: " + againLine);
+ok(/, облако b1g-live-cloud/.test(againLine), "облако не попало в строку: " + againLine);
+ok(/создание ресурсов агентом разрешено/.test(againLine), "разрешение на создание не названо: " + againLine);
+ok(/удаление ЗАПРЕЩЕНО/.test(againLine), "запрет удаления не назван: " + againLine);
 
 console.log(failures ? "\n❌ Провалов: " + failures : "\n✅ Все живые проверки пройдены");
 process.exit(failures ? 1 : 0);

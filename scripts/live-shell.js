@@ -1,5 +1,5 @@
 "use strict";
-/* ─── Живой прогон оболочек (main.js без окна Electron) ──────────────────────
+/* ─── Живой прогон оболочек и сбора вывода (main.js без окна Electron) ───────
    Запуск: npm run test:live:shell   (node scripts/live-shell.js)
 
    Зачем. С части 23 модуль оболочек (выбор диалекта, кодировка, поиск Git-оболочки,
@@ -14,7 +14,12 @@
      • неизвестная оболочка — честная ошибка, а не молчаливый запуск в cmd/sh;
      • выбранная оболочка реально запускает команду: вывод настоящего процесса и
        время выполнения доезжают до модели;
-     • shellsStatus отдаёт живой отчёт машины (список, оболочка по умолчанию, совет).
+     • shellsStatus отдаёт живой отчёт машины (список, оболочка по умолчанию, совет);
+     • сбор вывода одной командой (с части 36 живёт в src/bg-processes.js):
+       runCommandOutput с ожиданием маркера возвращается раньше конца команды и без
+       управляющих последовательностей в ответе, timeoutCommand останавливает
+       НЕЗАКОНЧИВШУЮСЯ команду вместе с её детьми (это проверяется живым `ps`),
+       retryCommand действительно повторяет попытку после провала.
 
    Негативные контроли: --break=<имя> ломает одну проводку, и прогон обязан упасть. */
 
@@ -40,6 +45,22 @@ const ok = (cond, msg) => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Ребёнок остановленной команды умирает не мгновенно (SIGTERM, потом SIGKILL через
+// 1,2 с) — труп держал бы порт, поэтому ждём и проверяем живым `ps`.
+// Возвращает true, когда процесса больше нет.
+async function waitForPid(pid, ms) {
+  const { execFile } = require("child_process");
+  const t0 = Date.now();
+  while (Date.now() - t0 < (ms || 5000)) {
+    const alive = await new Promise((resolve) =>
+      execFile("/bin/sh", ["-c", "ps -o pid= -p " + pid], (err, stdout) => resolve(String(stdout || "").trim().length > 0))
+    );
+    if (!alive) return true;
+    await sleep(200);
+  }
+  return false;
+}
+
 /* Негативный контроль ломает ОДНУ проводку до загрузки main.js и обязан провалить
    прогон. Файл восстанавливается байт в байт. */
 const BREAKS = {
@@ -49,6 +70,12 @@ const BREAKS = {
   nonormalize: ["src/shell-tools.js", '  return SHELL_KINDS[key] || "";', '  return SHELL_KINDS[key] || "sh";'],
   // Успешный вывод перестаёт обрезаться — в контекст уедут все 9000 знаков.
   noclip: ["src/shell-tools.js", 'else resolve(clip(out || errText || "Готово (без вывода).") + timeNote);', 'else resolve((out || errText || "Готово (без вывода).") + timeNote);'],
+  // Таймаут перестаёт убивать дерево процессов — ребёнок остаётся сиротой.
+  nokilltree: ["src/bg-processes.js", "      killProcessTree(child);\n      finish({ ok: false, timedOut: true, matched: false, code: \"timeout\" });", "      /* контроль: дерево не убиваем */\n      finish({ ok: false, timedOut: true, matched: false, code: \"timeout\" });"],
+  // В вывод для агента снова утекают управляющие последовательности.
+  noansi: ["src/bg-processes.js", 'out += stripAnsi((d || "").toString());', 'out += (d || "").toString();'],
+  // Маркер больше не возвращает управление раньше конца команды.
+  nowait: ["src/bg-processes.js", 'if (waitFor && out.includes(waitFor)) finish({ ok: true, matched: true, code: 0 });', 'if (false && waitFor && out.includes(waitFor)) finish({ ok: true, matched: true, code: 0 });'],
 };
 let brokenFile = null;
 if (BREAK) {
@@ -106,14 +133,38 @@ const call = (index, id, name, args) => ({ index: index, id: id, type: "function
    2) runCommand с настоящей командой: вывод живого процесса и время выполнения;
    3) shellsStatus: отчёт о машине;
    4) runCommand с огромным выводом: обрезка и честная пометка (не 9000 символов в контекст);
-   5) финальный текст — прогон заканчивается сам. */
+   5) runCommandOutput с ожиданием маркера у долгой команды: ответ приходит раньше
+      её конца, управляющих последовательностей в ответе нет;
+   6) timeoutCommand на НЕЗАКОНЧИВАЮЩЕЙСЯ команде с ребёнком: остановка по таймауту
+      вместе с деревом (живой `ps` проверяет, что ребёнок умер);
+   7) retryCommand на команде, которая падает с первой попытки и проходит со второй;
+   8) финальный текст — прогон заканчивается сам. */
 const SCRIPT = [
   { text: "Раунд 1: пробую неизвестную оболочку.\n", call: { name: "runCommand", args: { command: "echo привет", shell: "calc.exe" } } },
   { text: "Раунд 2: настоящая команда.\n", call: { name: "runCommand", args: { command: 'node -e "console.log(6*7)"' } } },
   { text: "Раунд 3: смотрю оболочки.\n", call: { name: "shellsStatus", args: {} } },
   { text: "Раунд 4: длинный вывод.\n", call: { name: "runCommand", args: { command: 'node -e "console.log(\'я\'.repeat(9000))"' } } },
+  {
+    text: "Раунд 5: жду маркер готовности.\n",
+    call: { name: "runCommandOutput", args: { command: 'printf "\\033[32mГОТОВО\\033[0m\\n"; sleep 20', waitFor: "ГОТОВО", timeoutMs: 20000 } },
+  },
+  {
+    text: "Раунд 6: команда, которая не заканчивается.\n",
+    // Вывод цветной нарочно: timeoutCommand отдаёт вывод как есть (без своего stripAnsi),
+    // значит очистка в модуле — единственная защита от управляющих последовательностей
+    // в ответе модели (у runCommandOutput есть вторая очистка, здесь её нет).
+    call: { name: "timeoutCommand", args: { command: 'sleep 300 & printf "\\033[31mCHILD:%s\\033[0m\\n" "$!"; wait', timeoutMs: 1200 } },
+  },
+  {
+    text: "Раунд 7: повтор после провала.\n",
+    call: { name: "retryCommand", args: { command: "[ -f retry-marker ] || { touch retry-marker; exit 1; }", maxRetries: 2, pauseMs: 200, timeoutMs: 15000 } },
+  },
   { text: "Проверка оболочек закончена." },
 ];
+
+// Папка работы инструментов — та же, что у прогона (agentWorkDir берёт рабочую папку
+// из настроек): маркер повтора ищем именно там.
+const RETRY_MARKER = path.join(workDir, "retry-marker");
 
 function answerFor(n) {
   const step = SCRIPT[n - 1] || { text: "Ход " + n + ": продолжаю." };
@@ -238,11 +289,15 @@ const evOf = (type) => events.filter((e) => e.ch === "ai:event" && e.ev && e.ev.
   });
   ok(saved && saved.model === "test-model", "настройки приняты: " + (saved && saved.model));
 
-  console.log("\n[2] Прогон: четыре инструмента подряд, затем финальный текст");
+  console.log("\n[2] Прогон: семь инструментов подряд, затем финальный текст");
+  const tRun = Date.now();
   const run = await callIpc("ai:send", [{ role: "user", content: "Проверь оболочки" }], { chatId: "chat-live-shell", role: "developer" });
+  // Длительность прогона важна для проверки ожидания маркера: команда в раунде 5
+  // живёт 20 с, и если бы инструмент ждал её конца, весь прогон был бы не короче.
+  const elapsedRun = Date.now() - tRun;
   ok(run && run.ok === true, "прогон завершился без ошибки: " + JSON.stringify(run && run.error));
-  ok(served === 5, "провайдер отдал ровно 5 ответов чата: " + served);
-  ok(requests.length === 5, "тел запросов сохранено: " + requests.length);
+  ok(served === 8, "провайдер отдал ровно 8 ответов чата: " + served);
+  ok(requests.length === 8, "тел запросов сохранено: " + requests.length);
 
   const r2 = requests[1];
   const r3 = requests[2];
@@ -289,7 +344,38 @@ const evOf = (type) => events.filter((e) => e.ch === "ai:event" && e.ev && e.ev.
   ok(/^я/.test(bigText.replace(/^\$ node -e[^\n]*\n\(каталог:[^\n]*\)\n\n/, "")), "начало вывода потеряно: " + bigText.slice(0, 60));
   ok(/\(\d+\.\d с\)$/.test(bigText.trim()), "время выполнения потерялось при обрезке: " + bigText.slice(-40));
 
-  console.log("\n[7] Прогон закончился чисто");
+  // ── Сбор вывода одной командой (spawnCollect, часть 36) ─────────────────────
+  // Результат раунда N лежит в запросе N+1, поэтому индекс на единицу больше.
+  console.log("\n[7] Ожидание маркера: ответ раньше конца команды и без цветов");
+  const waited = toolResults(requests[5]).find((t) => /в выводе появился текст/.test(String(t)));
+  const waitedText = String(waited || "");
+  ok(!!waited, "инструмент доложил о найденном маркере (ожидание закончилось): " + waitedText.slice(0, 120));
+  ok(/в выводе появился текст «ГОТОВО»/.test(waitedText), "в ответе модели — сам маркер: " + waitedText.slice(0, 200));
+  ok(waitedText.indexOf("\u001b") < 0, "управляющие последовательности до модели не дошли");
+  // Команда живёт 20 с, а весь прогон кончился раньше — значит ждали маркера, а не конца.
+  ok(elapsedRun < 15000, "прогон вернулся за " + elapsedRun + " мс, не дожидаясь конца команды");
+
+  console.log("\n[8] Таймаут: незакончившаяся команда остановлена вместе с ребёнком");
+  const stopped = toolResults(requests[6]).find((t) => /не уложилась/.test(String(t)));
+  const stoppedText = String(stopped || "");
+  ok(!!stopped, "модель получила объяснение таймаута: " + stoppedText.slice(0, 120));
+  const childPid = (stoppedText.match(/CHILD:(\d+)/) || [])[1];
+  ok(!!childPid, "в ответе — частичный вывод до остановки (PID ребёнка " + childPid + ")");
+  const dead = childPid ? await waitForPid(Number(childPid), 6000) : false;
+  ok(!!childPid && dead, "ребёнок остановленной команды умер (PID " + childPid + ") — порт и ресурсы свободны");
+  ok(stoppedText.indexOf("\u001b") < 0, "управляющие последовательности не утекли в ответ о таймауте (свой очистки у него нет)");
+  ok(!/в выводе появился текст/.test(stoppedText), "таймаут не выдан за удачное ожидание маркера");
+
+  console.log("\n[9] Повтор после провала: вторая попытка действительно была");
+  // Ищем по СВОЕМУ тексту повтора: слово «попыток:» есть и в ответе runCommandOutput.
+  const retried = toolResults(requests[7]).find((t) => /успех с попытки #/.test(String(t)));
+  const retriedText = String(retried || "");
+  ok(!!retried, "инструмент повтора отчитался об успехе: " + retriedText.slice(0, 120));
+  ok(/\(попыток: 2\)/.test(retriedText) || /Попыток: 2/.test(retriedText), "попыток было ровно две: " + retriedText.slice(0, 160));
+  ok(/успех с попытки #2/.test(retriedText), "успешной названа именно вторая попытка: " + retriedText.slice(0, 300));
+  ok(fs.existsSync(RETRY_MARKER), "команда выполнялась в рабочей папке прогона (маркер повтора на месте)");
+
+  console.log("\n[10] Прогон закончился чисто");
   ok(evOf("error").length === 0, "ошибок в чат не пришло: " + JSON.stringify(evOf("error").map((e) => e.ev.message)));
   ok(global.__agentRunning === false, "признак прогона снят");
 

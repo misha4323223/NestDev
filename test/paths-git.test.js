@@ -269,8 +269,77 @@ fs.writeFileSync(plainFile, "x");
     }
   });
 
+  await test("проверка записи: папка создаётся, а пробная подпапка НЕ остаётся на диске", () => {
+    // Самый неприятный вид поломки здесь — мусор в папке пользователя: если пробную
+    // подпапку не убрать, она останется в проекте навсегда и попадёт в его git.
+    const { api } = makePaths();
+    const target = path.join(tmpRoot, "новая", "вложенная");
+    const r = api.ensureWritableDir(target);
+    assert.strictEqual(r.ok, true, "годная папка не прошла проверку: " + r.error);
+    assert.strictEqual(r.dir, target, "возвращён не абсолютный путь: " + r.dir);
+    assert.ok(fs.existsSync(target), "папка не создана — клон и запись файлов упадут");
+    assert.deepStrictEqual(fs.readdirSync(target), [], "пробная подпапка осталась в папке проекта");
+  });
+
+  await test("проверка записи: пустое значение — отказ с подсказкой, где выбрать папку", () => {
+    const { api } = makePaths();
+    for (const bad of ["", "   ", null, undefined, 42]) {
+      const r = api.ensureWritableDir(bad);
+      assert.strictEqual(r.ok, false, "пустое значение принято за рабочую папку: " + JSON.stringify(bad));
+      assert.ok(/Настройках → Проект/.test(r.error || ""), "в отказе нет пути к выбору папки: " + r.error);
+    }
+  });
+
+  await test("проверка записи: отказал accessSync — сказано «нет прав» и что делать", () => {
+    const broke = Object.assign(Object.create(fs), {
+      accessSync: () => {
+        const e = new Error("EACCES: permission denied, access '" + dirA + "'");
+        e.code = "EACCES";
+        throw e;
+      },
+    });
+    const api = createPathsGit({ fs: broke, path, os, execFile, envFor: () => ({}), live: makeLive().live });
+    const r = api.ensureWritableDir(dirA);
+    assert.strictEqual(r.ok, false, "отказ прав пропущен: " + JSON.stringify(r));
+    assert.ok(/Нет прав на запись/.test(r.error) && /Permission denied/.test(r.error), "причина отказа потеряна: " + r.error);
+    assert.ok(/выбери другую рабочую директорию/.test(r.error), "в отказе нет совета, что делать: " + r.error);
+  });
+
+  await test("проверка записи: пробная подпапка не создалась — это ОТКАЗ, хотя accessSync прошёл", () => {
+    // Ровно та ошибка, из-за которой проверка вообще появилась: OneDrive Files
+    // On-Demand, сетевая и защищённая папка проходят accessSync(W_OK), а git падает
+    // с «could not create work tree dir ... Permission denied». Без пробы отказ
+    // виден только много шагов позже и выглядит как «git не работает».
+    const broke = Object.assign(Object.create(fs), {
+      mkdirSync: (p, o) => {
+        if (/\.ai-agent-write-test$/.test(String(p))) {
+          const e = new Error("EACCES: permission denied, mkdir '" + p + "'");
+          e.code = "EACCES";
+          throw e;
+        }
+        return fs.mkdirSync(p, o);
+      },
+    });
+    const api = createPathsGit({ fs: broke, path, os, execFile, envFor: () => ({}), live: makeLive().live });
+    const r = api.ensureWritableDir(dirA);
+    assert.strictEqual(r.ok, false, "провал пробы записи прошёл за успех — git упадёт у пользователя");
+    assert.ok(/git не сможет создать тут репозиторий/.test(r.error), "в отказе нет главного: git тут не сможет работать: " + r.error);
+    assert.ok(/OneDrive/.test(r.error), "в отказе нет примера, чего избегать: " + r.error);
+  });
+
+  await test("проверка записи: остаток прошлой пробы (EEXIST) не считается отказом", () => {
+    // Прошлый запуск мог упасть, не убрав за собой пробную папку: из-за чужого
+    // остатка папка пользователя не должна становиться «недоступной для записи».
+    const { api } = makePaths();
+    const target = path.join(tmpRoot, "с-остатком");
+    fs.mkdirSync(path.join(target, ".ai-agent-write-test"), { recursive: true });
+    const r = api.ensureWritableDir(target);
+    assert.strictEqual(r.ok, true, "остаток прошлой пробы сломал проверку: " + r.error);
+    assert.ok(!fs.existsSync(path.join(target, ".ai-agent-write-test")), "остаток прошлой пробы остался в папке проекта");
+  });
+
   await test("в оболочке этих функций больше нет, а модуль собран на своём месте с живым мостом", () => {
-    for (const gone of ["function runGit(", "function resolvePath(", "function agentWorkDir(", "function sanitizeDir(", "function stripUrlCreds("]) {
+    for (const gone of ["function runGit(", "function resolvePath(", "function agentWorkDir(", "function sanitizeDir(", "function stripUrlCreds(", "function ensureWritableDir("]) {
       assert.ok(MAIN_SRC.indexOf(gone) < 0, "в main.js осталось: " + gone);
     }
     assert.ok(/const \{ createPathsGit \} = require\("\.\/paths-git\.js"\)/.test(MAIN_SRC), "модуль не подключён");
@@ -290,6 +359,12 @@ fs.writeFileSync(plainFile, "x");
       assert.ok(MAIN_SRC.indexOf(moved) < 0, "состояние окружения осталось в оболочке: " + moved);
     }
     assert.ok(MODULE_SRC.indexOf("envFor") >= 0 && MODULE_SRC.indexOf("GIT_TERMINAL_PROMPT") >= 0, "окружение git пропало из модуля");
+    // Проверка «можно ли писать» — та же семья: она про путь на диске, а не про
+    // настройки, поэтому живёт в этом модуле. Имя взято из распаковки модуля (не
+    // объявлено в оболочке), и потребители получают его прежним именем.
+    assert.ok(MODULE_SRC.indexOf("function ensureWritableDir(dir)") >= 0, "проверки записи нет в модуле путей");
+    assert.ok(/\n  ensureWritableDir,\n/.test(bridge), "проверка записи не взята из модуля путей");
+    assert.ok(/\n  ensureWritableDir,\n/.test(MAIN_SRC), "проверка записи не передана потребителям (каналы GitHub и проектов)");
   });
 
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");

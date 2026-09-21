@@ -91,6 +91,14 @@ function makeRun(over) {
       set missionId(v) {
         live.missionId = v;
       },
+      // Живое состояние для сводки «СОСТОЯНИЕ РАБОТЫ» (имена переменных агента и
+      // фоновые процессы) — мостами, как в оболочке: значения меняются по ходу работы.
+      get agentEnv() {
+        return o.agentEnv || null;
+      },
+      get backgrounds() {
+        return o.backgrounds || null;
+      },
     },
     now: o.now,
   });
@@ -224,10 +232,16 @@ const onlyMission = (dir) => {
     assert.ok(res.notice.indexOf("продолжаю с места остановки") >= 0, "нет текста о продолжении: " + res.notice);
     assert.ok(res.notice.indexOf("готово шагов: 1") >= 0, "не названо, сколько уже готово: " + res.notice);
     assert.ok(notes(dir, rec.id).some((t) => t.indexOf("Продолжаю миссию") >= 0), "в журнал не записано продолжение");
-    // Событие в окно отправляет оболочка — и после текста (порядок событий прежний).
-    assert.strictEqual(r.events.length, 0, "модуль сам рисует событие миссии");
+    // Событие миссии в окно отправляет оболочка — и после текста (порядок прежний).
+    assert.strictEqual(r.events.filter((e) => e.type === "mission").length, 0, "модуль сам рисует событие миссии");
+    const missionEv = r.events.filter((e) => e.type === "mission");
+    // Но про уточнение цели он сообщает сам: человек написал новую просьбу, и она
+    // сохранена в миссии — это видно в чате, а не в файлах на диске.
+    assert.ok(r.events.some((e) => e.type === "notice" && /уточнение/.test(e.text)), "нет сообщения об уточнении цели");
+    assert.strictEqual(missionStore.missionLoad(dir, rec.id).goalNotes.length, 1, "просьба не сохранена уточнением цели");
     r.mission.emitState(res.phase);
-    const ev = r.events[0];
+    const ev = r.events.filter((e) => e.type === "mission")[0];
+    assert.ok(missionEv.length === 0 && !!ev, "событие миссии не отправлено оболочкой");
     assert.ok(ev && ev.type === "mission" && ev.phase === "resume", "событие «продолжаю» не собрано");
     assert.strictEqual(ev.progress.done, 1, "в событии неверный прогресс");
     assert.strictEqual(ev.steps.length, 1, "шаги не ушли в окно");
@@ -383,6 +397,10 @@ const onlyMission = (dir) => {
     assert.ok(res.historyMessage.indexOf(".agent/missions/" + rec.id + "/") >= 0, "в напоминании нет папки миссии");
     assert.ok(res.historyMessage.indexOf("Пройдено шагов: 1 из 2") >= 0, "в напоминании нет пройденных шагов");
     assert.ok(res.historyMessage.indexOf("missionFinish(report)") >= 0, "агент не знает, как закрыть миссию");
+    // Переход между батчами — USER-сообщение: оно переживает обрезку истории, поэтому
+    // в нём теперь едет хвост журнала (что УЖЕ сделано), а не только числа прогресса.
+    assert.ok(res.historyMessage.indexOf("Уже сделано (хвост журнала)") >= 0, "в переходе батча нет хвоста журнала: " + res.historyMessage);
+    assert.ok(res.historyMessage.indexOf("создан файл: src/a.js") >= 0, "в переходе батча нет последних действий: " + res.historyMessage);
     assert.strictEqual(r.mission.state.batches, 1, "счётчик батчей прогона не сдвинулся");
     const onDisk = missionStore.missionLoad(dir, rec.id);
     assert.strictEqual(onDisk.batches, 1, "батч не записан на диск");
@@ -595,6 +613,267 @@ const onlyMission = (dir) => {
     assert.ok(roundSrc.includes("mission.cost(usage, getCompactions())"), "миссия не получает цену работы");
     assert.ok(runAiSrc.includes("getCompactions: () => ctxManager.compactions()"), "сжатия не переданы модулю раунда");
   });
+
+  // ── Сводка «СОСТОЯНИЕ РАБОТЫ» (часть 36, заход 3) ──────────────────────────
+  // Жалоба из жизни: после первого батча агент «забывал» , что уже сделал, и
+  // заново искал свою работу. Причина видна в коде: обрезка истории идёт С КОНЦА,
+  // поэтому начало работы (и сама цель) вытесняется из окна, а журнал миссии
+  // лежит файлами на диске и в запрос не попадал вообще. Сводка собирается ИЗ
+  // ФАЙЛОВ и живого состояния и повторяется каждый раунд — она и есть память.
+  await test("24. сводка состояния: цель, план, прогресс и журнал — из файлов", () => {
+    const dir = workspace();
+    const rec = missionStore.missionCreate(dir, {
+      goal: "Довести интеграцию Freebuff до рабочего состояния: поднять сервер, проверить порт",
+      chatId: "chat-1",
+      steps: ["поднять сервер", "проверить порт", "написать отчёт"],
+    }).mission;
+    missionStore.missionStep(dir, rec.id, { done: "поднять сервер", next: "проверить порт" });
+    const r = makeRun({ dir: dir, rounds: 7 });
+    r.mission.refresh();
+    r.mission.noteCall("writeFile", { path: "src/server.js" });
+    const d = r.mission.digestMessage();
+    assert.ok(d && d.role === "system", "сводка не собрана как системное сообщение: " + JSON.stringify(d));
+    const t = d.content;
+    assert.ok(t.indexOf("СОСТОЯНИЕ РАБОТЫ") === 0, "сводка не начинается с заголовка: " + t.slice(0, 80));
+    assert.strictEqual(t.split("СОСТОЯНИЕ РАБОТЫ").length - 1, 1, "заголовок сводки повторяется");
+    assert.ok(t.indexOf("Довести интеграцию Freebuff") >= 0, "в сводке нет цели работы");
+    assert.ok(t.indexOf("Миссия «") >= 0 && t.indexOf(rec.id) >= 0, "в сводке нет миссии и её id");
+    assert.ok(/батч 1 · раундов 7 ·/.test(t), "в сводке нет счётчиков батча и раундов: " + t.split("\n")[2]);
+    assert.ok(t.indexOf("1) ✓ поднять сервер") >= 0, "в сводке нет выполненного пункта плана: " + t.split("\n")[3]);
+    assert.ok(t.indexOf("3) • написать отчёт") >= 0, "в сводке нет невыполненного пункта плана");
+    assert.ok(t.indexOf("Последние записи журнала") >= 0, "в сводке нет журнала");
+    assert.ok(t.indexOf("создан файл: src/server.js") >= 0, "в сводке нет последнего действия с файлом: " + t);
+    assert.ok(t.indexOf("Файлы, которых касались: src/server.js") >= 0, "в сводке нет списка файлов работы");
+    assert.ok(t.indexOf(".agent/missions/" + rec.id + "/") >= 0, "в сводке нет папки миссии");
+    assert.ok(t.indexOf("missionStatus(journal: 40)") >= 0, "агент не знает, как прочитать полный журнал");
+    assert.ok(t.indexOf("envSet(") >= 0 && t.indexOf("startBackground(") >= 0, "в сводке нет правила про долговечное состояние");
+    assert.ok(t.indexOf("missionStep(done, next)") >= 0, "в сводке нет правила отмечать шаги");
+  });
+
+  await test("25. сводка состояния: что переживёт следующую команду — переменные и фоновые процессы", () => {
+    const dir = workspace();
+    const rec = missionStore.missionCreate(dir, { goal: "поднять dev-сервер", chatId: "chat-1" }).mission;
+    const backgrounds = new Map([
+      ["bg1", { id: "bg1", command: "npm run dev", child: { pid: 4242 }, output: ["", "  ➜  Local: http://localhost:5173/"], exited: false, exitCode: null }],
+      ["bg2", { id: "bg2", command: "node old.js", child: { pid: 4343 }, output: [], exited: true, exitCode: 0 }],
+    ]);
+    const r = makeRun({
+      dir: dir,
+      rounds: 9,
+      agentEnv: { API_KEY: "секретное-значение", PORT: "3000" },
+      backgrounds: backgrounds,
+    });
+    r.mission.refresh();
+    const t = r.mission.digestMessage().content;
+    assert.ok(t.indexOf("Переживает отдельные команды") >= 0, "в сводке нет раздела про долговечное состояние: " + t);
+    assert.ok(t.indexOf("переменные агента: API_KEY, PORT") >= 0, "в сводке нет имён переменных агента: " + t);
+    assert.ok(t.indexOf("секретное-значение") < 0, "в сводку утекло ЗНАЧЕНИЕ переменной");
+    assert.ok(t.indexOf("фон bg1 «npm run dev» PID 4242, порт 5173 (идёт)") >= 0, "в сводке нет живого сервера с портом: " + t);
+    assert.ok(t.indexOf("фон bg2 «node old.js»") >= 0 && t.indexOf("(уже завершился, код 0)") >= 0, "в сводке нет ни завершившегося процесса, ни его кода");
+    assert.ok(t.indexOf("backgroundOutput(id), stopBackground(id)") >= 0, "агент не знает, чем смотреть вывод фонового процесса");
+  });
+
+  await test("26. сводка состояния: без миссии и без долгой работы — ничего не подставляем", () => {
+    const quiet = makeRun({ settings: { longWork: false }, rounds: 9 });
+    assert.strictEqual(quiet.mission.digestMessage(), null, "сводка собирается без долгой работы");
+    const noMission = makeRun({ rounds: MISSION_AUTO_ROUND - 1 });
+    assert.strictEqual(noMission.mission.digestMessage(), null, "сводка собирается, хотя миссии ещё нет");
+    // Миссию заводит сам прогон на шестом раунде (autoStart) — сводка идёт сразу за ней,
+    // иначе перед запросом она читала бы пустоту.
+    noMission.mission.state.rounds = MISSION_AUTO_ROUND;
+    noMission.mission.autoStart();
+    assert.ok(noMission.mission.state.rec, "авто-миссия не завелась");
+    assert.ok(noMission.mission.digestMessage(), "сводка не появилась вместе с авто-миссией");
+  });
+
+  await test("27. сводка состояния: длинная работа не превращается в простыню", () => {
+    const dir = workspace();
+    const longGoal = "довести работу до конца ".repeat(200);
+    const rec = missionStore.missionCreate(dir, { goal: longGoal, chatId: "chat-1" }).mission;
+    for (let i = 0; i < 40; i++) {
+      missionStore.missionNote(dir, rec.id, "tool", "⚙ создан файл: src/очень-длинное-имя-файла-" + i + "-" + "x".repeat(120) + ".js");
+    }
+    const r = makeRun({ dir: dir, rounds: 60 });
+    r.mission.refresh();
+    const t = r.mission.digestMessage().content;
+    assert.ok(t.length < 7000, "сводка разрослась до " + t.length + " символов — она уходит в каждый запрос");
+    assert.ok(t.indexOf("…") >= 0, "длинные строки не обрезаются многоточием");
+    const goalLine = t.split("\n")[1] || "";
+    assert.ok(goalLine.indexOf("Цель: ") === 0 && goalLine.length < 700, "цель не обрезана: " + goalLine.length + " символов");
+    // Считаем САМИ записи («  · время текст»), а не строки до следующего якоря:
+    // так проверка не зависит от того, есть ли после журнала список файлов.
+    const journalBlock = (t.split("Последние записи журнала")[1] || "").split("\n").slice(1);
+    const journalLines = journalBlock.filter((l) => l.indexOf("  · ") === 0).length;
+    assert.ok(journalLines <= 12, "в сводке " + journalLines + " записей журнала вместо 12");
+    assert.ok(t.indexOf("Файлы, которых касались") >= 0, "в сводке нет списка файлов, хотя создано 40");
+  });
+
+  await test("28. сводка состояния: без плана и без живой обвязки — сказано словами, а не пробелом", () => {
+    const dir = workspace();
+    missionStore.missionCreate(dir, { goal: "мелкая работа без шагов", chatId: "chat-1" });
+    const r = makeRun({ dir: dir, rounds: 4 });
+    r.mission.refresh();
+    const t = r.mission.digestMessage().content;
+    assert.ok(t.indexOf("План: не составлен") >= 0, "отсутствие плана не объяснено: " + t.split("\n")[3]);
+    assert.ok(t.indexOf("Переживает отдельные команды") < 0, "раздел про живую обвязку есть, хотя переменных и процессов нет");
+    assert.ok(t.indexOf("Файлы, которых касались") < 0, "список файлов есть, хотя за работу ничего не создано");
+  });
+
+  await test("30. этапы: приложение само сохраняет отрезок работы — с файлами, началом и концом", async () => {
+    const dir = workspace();
+    const rec = missionStore.missionCreate(dir, { goal: "долгая работа", chatId: "chat-1", steps: ["шаг 1", "шаг 2"] }).mission;
+    const r = makeRun({ dir: dir, rounds: 25 });
+    r.mission.refresh();
+    r.mission.noteCall("writeFile", { path: "src/a.js" });
+    r.mission.noteCall("writeFile", { path: "src/b.js" });
+    r.mission.trackProgress([{ name: "writeFile", args: { path: "src/a.js" } }]);
+    const res = await r.mission.afterBatch();
+    assert.strictEqual(res.continue, true, "батч не продолжился — этапа не будет");
+    const stages = missionStore.missionLoad(dir, rec.id).stages;
+    assert.strictEqual(stages.length, 1, "этапов на диске: " + stages.length);
+    assert.strictEqual(stages[0].n, 1, "номер этапа не с первого");
+    assert.strictEqual(stages[0].rounds, 25, "в этапе нет числа раундов отрезка: " + stages[0].rounds);
+    assert.deepStrictEqual(stages[0].files, ["src/a.js", "src/b.js"], "в этапе не файлы отрезка: " + JSON.stringify(stages[0].files));
+    assert.ok(stages[0].head.length > 0 && stages[0].tail.length > 0, "в этапе нет ни начала, ни конца отрезка");
+    assert.ok(stages[0].head[0].indexOf("создан файл: src/a.js") >= 0, "начало отрезка не то: " + stages[0].head[0]);
+    assert.ok(notes(dir, rec.id).some((t) => t.indexOf("🧭 Этап 1") >= 0), "в журнале нет строки этапа");
+  });
+
+  await test("31. этапы: конец отрезка по лимиту раундов виден в пути работы", async () => {
+    const dir = workspace();
+    const rec = missionStore.missionCreate(dir, { goal: "работа с лимитом", chatId: "chat-1", limits: { rounds: 25, minutes: 600 } }).mission;
+    const r = makeRun({ dir: dir, rounds: 25, settings: { longWorkRounds: 25 } });
+    r.mission.refresh();
+    r.mission.noteCall("writeFile", { path: "src/a.js" });
+    const res = await r.mission.afterBatch();
+    assert.strictEqual(res.finish, true, "лимит раундов не остановил работу");
+    const stages = missionStore.missionLoad(dir, rec.id).stages;
+    assert.strictEqual(stages.length, 1, "этап при остановке не записан: " + stages.length);
+    assert.strictEqual(stages[0].reason, "лимит раундов", "в этапе нет причины остановки: " + stages[0].reason);
+    // Остановка человека — тоже конец отрезка: место остановки не теряется.
+    // Отдельная миссия, потому что отработавшая лимит уже на паузе (её продолжает человек).
+    const dir2 = workspace();
+    const rec2 = missionStore.missionCreate(dir2, { goal: "работа по кнопке Стоп", chatId: "chat-1" }).mission;
+    const r2 = makeRun({ dir: dir2, rounds: 26 });
+    r2.mission.refresh();
+    r2.mission.noteCall("writeFile", { path: "src/b.js" });
+    r2.mission.stage("остановка человеком");
+    const stages2 = missionStore.missionLoad(dir2, rec2.id).stages;
+    assert.strictEqual(stages2.length, 1, "«Стоп» не закрыл отрезок: " + stages2.length);
+    assert.strictEqual(stages2[0].reason, "остановка человеком", "в отрезке нет причины «Стоп»");
+    assert.deepStrictEqual(stages2[0].files, ["src/b.js"], "в отрезке «Стоп» нет его файлов");
+  });
+
+  await test("32. уточнение цели: новая просьба сохраняется, текст кнопки «Продолжить» — нет", () => {
+    const dir = workspace();
+    const rec = missionStore.missionCreate(dir, { goal: "сделай всё сам", chatId: "chat-1" }).mission;
+    const r = makeRun({ dir: dir, rounds: 1, messages: [{ role: "user", content: "а именно: собери отчёт в reports/" }] });
+    const view = r.mission.resume();
+    assert.ok(view && view.id === rec.id, "миссия не продолжилась — уточнения не будет");
+    const onDisk = missionStore.missionLoad(dir, rec.id);
+    assert.strictEqual(onDisk.goalNotes.length, 1, "уточнение цели не сохранилось: " + JSON.stringify(onDisk.goalNotes));
+    assert.strictEqual(onDisk.goalNotes[0].text, "а именно: собери отчёт в reports/", "сохранился не тот текст");
+    assert.strictEqual(onDisk.goal, "сделай всё сам", "исходная цель переписана уточнением");
+    assert.ok(notes(dir, rec.id).some((t) => t.indexOf("➕ Уточнение к цели") >= 0), "уточнение не попало в журнал");
+    assert.ok(r.events.some((e) => e.type === "notice" && /уточнение/.test(e.text)), "человеку не сказано про уточнение");
+    // «▶ Продолжить» кладёт в поле ввода текст ПРИЛОЖЕНИЯ — это не просьба человека.
+    const service = missionStore.missionResumeText(onDisk, "Хвост журнала:\n- 10:00 создан файл: a.js");
+    const r2 = makeRun({ dir: dir, rounds: 1, messages: [{ role: "user", content: service }] });
+    r2.mission.resume();
+    const after = missionStore.missionLoad(dir, rec.id);
+    assert.strictEqual(after.goalNotes.length, 1, "служебный текст кнопки записан уточнением цели: " + JSON.stringify(after.goalNotes));
+    // Та же просьба дважды в миссию не пишется.
+    const r3 = makeRun({ dir: dir, rounds: 1, messages: [{ role: "user", content: "а именно: собери отчёт в reports/" }] });
+    r3.mission.resume();
+    assert.strictEqual(missionStore.missionLoad(dir, rec.id).goalNotes.length, 1, "одна просьба записана дважды");
+  });
+
+  await test("33. сводка: путь работы и уточнения цели; у старой миссии без этих полей ничего не ломается", () => {
+    const dir = workspace();
+    const old = missionStore.missionCreate(dir, { goal: "старая работа", chatId: "chat-1" }).mission;
+    // Миссия, заведённая ДО появления этапов: в файле нет ни stages, ни goalNotes.
+    const file = missionStore.missionFile(dir, old.id);
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete raw.stages;
+    delete raw.goalNotes;
+    fs.writeFileSync(file, JSON.stringify(raw, null, 2));
+    const r = makeRun({ dir: dir, rounds: 7 });
+    r.mission.refresh();
+    const t = r.mission.digestMessage().content;
+    assert.ok(t.indexOf("старая работа") >= 0, "цель старой миссии потерялась");
+    assert.ok(t.indexOf("Этапы работы") < 0, "у миссии без этапов появился раздел пути работы");
+    assert.ok(t.indexOf("Уточнения к цели") < 0, "у миссии без уточнений появился их список");
+    // Путь работы и уточнения появляются в сводке, когда они есть в файлах миссии.
+    missionStore.missionGoalNote(dir, old.id, "и положи отчёт в reports/");
+    missionStore.missionNote(dir, old.id, "tool", "⚙ создан файл: reports/итог.md");
+    missionStore.missionStage(dir, old.id, { rounds: 25, next: "проверка" });
+    r.mission.refresh();
+    const t2 = r.mission.digestMessage().content;
+    assert.ok(/Уточнения к цели после начала/.test(t2) && t2.indexOf("и положи отчёт в reports/") >= 0, "уточнение цели не дошло до сводки");
+    assert.ok(/Этапы работы/.test(t2) && /этап 1 ·/.test(t2), "путь работы не дошёл до сводки");
+    assert.ok(t2.indexOf("далее: проверка") >= 0, "в этапе не видно, чем отрезок закончился");
+  });
+
+  await test("34. сводка: путь работы идёт от начала к концу и укладывается в предел", () => {
+    const dir = workspace();
+    const rec = missionStore.missionCreate(dir, {
+      goal: "довести работу до конца ".repeat(80),
+      chatId: "chat-1",
+      steps: ["разведка", "правка", "проверка"],
+    }).mission;
+    for (let i = 1; i <= 14; i++) {
+      missionStore.missionNote(dir, rec.id, "tool", "⚙ создан файл: src/модуль-" + i + "-" + "x".repeat(80) + ".js");
+      missionStore.missionStage(dir, rec.id, { rounds: i * 25, next: "шаг " + (i + 1) });
+    }
+    const r = makeRun({ dir: dir, rounds: 60 });
+    r.mission.refresh();
+    const t = r.mission.digestMessage().content;
+    assert.ok(t.indexOf("Этапы работы") >= 0, "в сводке нет пути работы");
+    assert.ok(t.indexOf("этап 1 ·") >= 0, "в сводке нет НАЧАЛА пути");
+    assert.ok(t.indexOf("этап 14 ·") >= 0, "в сводке нет КОНЦА пути");
+    assert.ok(t.indexOf("…ещё") >= 0, "середина пути не помечена как сокращённая");
+    assert.ok(t.length <= 8000, "сводка разрослась до " + t.length + " символов — она уходит в каждый запрос");
+    assert.ok(t.indexOf("Цель: довести работу до конца") >= 0, "цель потерялась при сокращении сводки");
+  });
+
+  await test("35. сводка берёт миссию с диска: этапы и отметки шагов из инструментов видны сразу", () => {
+    const dir = workspace();
+    const rec = missionStore.missionCreate(dir, { goal: "долгая работа", chatId: "chat-1", steps: ["разведка", "правка"] }).mission;
+    const r = makeRun({ dir: dir, rounds: 9 });
+    r.mission.refresh();
+    // Так это делает инструмент агента: пишет в хранилище, о копии в памяти не зная.
+    // Копия отстала бы на целый батч — до 25 раундов модель видела бы старый прогресс.
+    missionStore.missionStep(dir, rec.id, { done: "разведка", next: "правка" });
+    missionStore.missionNote(dir, rec.id, "tool", "⚙ создан файл: src/a.js");
+    missionStore.missionStage(dir, rec.id, { rounds: 25, next: "правка" });
+    const t = r.mission.digestMessage().content;
+    assert.ok(t.indexOf("✓ разведка") >= 0, "отметка шага не дошла до сводки без перезагрузки: " + (t.split("\n")[3] || ""));
+    assert.ok(t.indexOf("этап 1 ·") >= 0, "этап не дошёл до сводки без перезагрузки");
+    assert.ok(t.indexOf("⚙ создан файл: src/a.js") >= 0, "работа из журнала не дошла до сводки");
+    // И обратная сторона: по ЗАКРЫТОЙ миссии сводка не подставляется вовсе.
+    missionStore.missionFinish(dir, rec.id, { status: "done", report: "готово" });
+    assert.strictEqual(r.mission.digestMessage(), null, "сводка подставляется по закрытой миссии");
+  });
+
+  await test("29. сводка состояния: прогон подставляет её в каждый раунд и снимает после", () => {
+    const runAiSrc = read("src", "run-ai.js");
+    assert.ok(runAiSrc.includes("mission.digestMessage()"), "прогон не берёт сводку у миссии");
+    assert.ok(runAiSrc.includes("canonical.splice(1, 0, digestMsg)"), "сводка не подставляется перед запросом");
+    assert.ok(/const digestMsg = mission\.digestMessage\(\);/.test(runAiSrc), "сводка собирается не один раз за раунд");
+    assert.ok(/const di = digestMsg \? canonical\.indexOf\(digestMsg\) : -1;/.test(runAiSrc), "сводка ищется не по ссылке — снимет не ту строку");
+    assert.ok(/\} finally \{[\s\S]{0,300}canonical\.splice\(di, 1\);/.test(runAiSrc), "сводка не снимается после раунда: она копилась бы в истории");
+    // Индикатор контекста обязан считать УЖЕ подставленную сводку, иначе он врёт
+    // про занятое место. Смотрим именно тот вызов, что стоит после подстановки.
+    const spliceAt = runAiSrc.indexOf("canonical.splice(1, 0, digestMsg)");
+    const emitAfter = runAiSrc.indexOf("emitContext(canonical)", spliceAt);
+    assert.ok(spliceAt > 0 && emitAfter > spliceAt && emitAfter - spliceAt < 400, "индикатор контекста считается до подстановки сводки");
+    // Сводка уходит модели: раунд получает ту самую историю, куда её подставили.
+    assert.ok(/roundRunner\.run\(\{[^}]*messages: canonical/.test(runAiSrc), "раунд получает не ту историю, куда подставлена сводка");
+    // Живые мосты для сводки держит оболочка: значения меняются по ходу работы.
+    assert.ok(/get agentEnv\(\) \{ return getAgentEnv\(\); \}/.test(MAIN_SRC), "сводка не видит имена переменных агента");
+    assert.ok(/get backgrounds\(\) \{ return bgProcesses; \}/.test(MAIN_SRC), "сводка не видит фоновые процессы");
+  });
+
 
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");
   process.exit(failed ? 1 : 0);

@@ -317,14 +317,84 @@ const bg = makeBg();
     for (const cmd of no) assert.ok(!bg.SERVER_CMD_RE.test(cmd), "короткая команда принята за сервер: " + cmd);
   });
 
+  // ── Сбор вывода одной командой (spawnCollect, часть 36) ─────────────────────
+  // Три исхода, каждый — обещание, данное инструментам (runCommandOutput,
+  // timeoutCommand, retryCommand): «команда отработала», «дождались маркера»,
+  // «не уложилась — остановлена вместе с детьми».
+  await test("сбор вывода: команда отработала — код возврата, вывод и чистота от цветов", async () => {
+    const r = await bg.spawnCollect('printf "\\033[31mкрасный\\033[0m\\nвторая строка\\n"', os.tmpdir(), 15000, "");
+    assert.strictEqual(r.ok, true, "успешная команда помечена провалом: " + JSON.stringify(r));
+    assert.strictEqual(r.code, 0, "код возврата: " + r.code);
+    assert.strictEqual(r.timedOut, false, "успешная команда помечена таймаутом");
+    assert.ok(/красный/.test(r.out) && /вторая строка/.test(r.out), "вывод команды не собран: " + JSON.stringify(r.out));
+    assert.ok(r.out.indexOf("\u001b") < 0, "в вывод для агента утекли управляющие последовательности: " + JSON.stringify(r.out));
+
+    const bad = await bg.spawnCollect("exit 3", os.tmpdir(), 15000, "");
+    assert.strictEqual(bad.ok, false, "ненулевой код возврата прошёл за успех");
+    assert.strictEqual(bad.code, 3, "код возврата упавшей команды потерялся: " + bad.code);
+  });
+
+  await test("сбор вывода: маркер возвращает управление раньше выхода процесса", async () => {
+    const t0 = Date.now();
+    // Команда живёт 5 с, маркер печатается сразу — ждать её конца никто не должен.
+    const r = await bg.spawnCollect('echo СЕРВЕР-ГОТОВ; sleep 5', os.tmpdir(), 20000, "СЕРВЕР-ГОТОВ");
+    const spent = Date.now() - t0;
+    assert.strictEqual(r.matched, true, "маркер не найден: " + JSON.stringify(r));
+    assert.strictEqual(r.ok, true, "найденный маркер не засчитан за успех");
+    assert.ok(spent < 3000, "ждали конца процесса вместо маркера: " + spent + " мс");
+    assert.ok(/СЕРВЕР-ГОТОВ/.test(r.out), "вывод с маркером не отдан агенту: " + JSON.stringify(r.out));
+    // Процесс по маркеру НЕ убивается — он может быть запущенным сервером. Это
+    // записанное поведение: для длительных серверов инструмент уходит в bgSpawn,
+    // а здесь останавливать работу никто не просил.
+  });
+
+  await test("сбор вывода: таймаут убивает ДЕРЕВО, а не только оболочку", async () => {
+    const t0 = Date.now();
+    // sh запускает ребёнка в фоне и висит на wait: если убить только оболочку,
+    // `sleep` останется сиротой и будет держать ресурсы (та самая беда с портом).
+    const r = await bg.spawnCollect("sleep 300 & echo CHILD:$!; wait", os.tmpdir(), 1500, "");
+    const spent = Date.now() - t0;
+    assert.strictEqual(r.timedOut, true, "команда не остановлена по таймауту: " + JSON.stringify(r));
+    assert.strictEqual(r.ok, false, "таймаут прошёл за успех");
+    assert.strictEqual(r.code, "timeout", "код исхода не «timeout»: " + r.code);
+    assert.ok(spent < 8000, "таймаут сработал не по своему времени: " + spent + " мс");
+    assert.ok(/CHILD:(\d+)/.test(r.out), "частичный вывод до таймаута потерян: " + JSON.stringify(r.out));
+    const childPid = Number(r.out.match(/CHILD:(\d+)/)[1]);
+    const gone = await waitFor(async () => !(await pidAlive(childPid)), 6000);
+    assert.ok(gone, "ребёнок процесса остался жив после таймаута (PID " + childPid + ")");
+  });
+
+  await test("сбор вывода: оболочку не удалось запустить — отказ, а не зависание", async () => {
+    const { EventEmitter } = require("events");
+    const { PassThrough } = require("stream");
+    const fakeSpawn = () => {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.pid = 4242;
+      child.kill = () => {};
+      setTimeout(() => child.emit("error", Object.assign(new Error("нет такой программы"), { code: "ENOENT" })), 10);
+      return child;
+    };
+    const box = makeBg({ spawn: fakeSpawn });
+    const r = await box.spawnCollect("echo привет", os.tmpdir(), 15000, "");
+    assert.strictEqual(r.ok, false, "отказ запуска прошёл за успех");
+    assert.strictEqual(r.code, "ENOENT", "код отказа запуска потерялся: " + r.code);
+    assert.strictEqual(r.timedOut, false, "отказ запуска помечен таймаутом");
+  });
+
   await test("в оболочке этого больше нет, а карта процессов отдана тем же объектом", () => {
-    for (const gone of ["function bgSpawn(", "function bgKill(", "function killProcessTree(", "async function checkUrlStatus(", "const bgProcesses = new Map();"]) {
+    for (const gone of ["function bgSpawn(", "function bgKill(", "function killProcessTree(", "async function checkUrlStatus(", "const bgProcesses = new Map();", "function spawnCollect("]) {
       assert.ok(MAIN_SRC.indexOf(gone) < 0, "в main.js осталось: " + gone);
     }
     assert.ok(/const \{ createBgProcesses \} = require\("\.\/bg-processes\.js"\)/.test(MAIN_SRC), "модуль не подключён");
     assert.ok(/= createBgProcesses\(\{ spawn, os, stripAnsi, shellArgsFor, commandEnv, runTerminalCommand \}\)/.test(MAIN_SRC), "проводка модуля не та");
     // Закрытие приложения гасит все фоновые процессы — значит карта обязана быть ЖИВОЙ.
-    assert.ok(MAIN_SRC.includes("for (const rec of bgProcesses.values()) bgKill(rec);"), "оболочка перестала гасить фоновые процессы");
+    // Сам обход с части 37 живёт в src/lifecycle.js: здесь важно, что оболочка отдаёт
+    // туда ТУ ЖЕ карту и тот же bgKill (копия «застыла» бы на пустом Map).
+    const LIFECYCLE_SRC = read("src", "lifecycle.js");
+    assert.ok(LIFECYCLE_SRC.includes("for (const rec of bgProcesses.values()) bgKill(rec);"), "гашение фоновых процессов потерялось");
+    assert.ok(/createLifecycle\(\{[\s\S]*?\n  bgProcesses,\n[\s\S]*?\n  bgKill,\n/.test(MAIN_SRC), "живая карта процессов и bgKill не отданы жизненному циклу");
     assert.ok(MAIN_SRC.includes("bgProcesses,") && MAIN_SRC.includes("SERVER_CMD_RE,"), "карта процессов или правило dev-команд не переданы дальше");
     assert.ok(/stripAnsi/.test(MODULE_SRC) && /commandEnv/.test(MODULE_SRC), "окружение команды пропало из модуля");
   });

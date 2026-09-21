@@ -18,6 +18,14 @@
      • журнал наполняется и автоматически (по действиям), и руками модели
        (missionStep видит ИМЕННО миссию этого прогона — мост runMissionId);
      • граница батча объявлена в чат и в панель, метрики и токены дошли;
+     • сводка состояния работы (цель, план, прогресс, журнал, живое состояние)
+       уехала провайдеру в системном блоке КАЖДОГО запроса начиная с раунда, где
+       завелась миссия — и до, и после границы батча, ровно по разу на запрос,
+       последней в блоке и ни разу в файлы миссии;
+     • этапы работы (отрезки) ведёт приложение: граница батча и остановка по лимиту
+       оставляют в миссии, сколько длился отрезок, какие файлы в нём появились и на
+       чём именно встали; после «▶ Продолжить» и после новой просьбы человека путь
+       виден модели целиком, а служебный текст кнопки в цель НЕ записывается;
      • конец прогона — мягкая остановка с сохранением, а не «превышено раундов».
 
    Негативные контроли: --break=<имя> ломает одну проводку и прогон обязан упасть. */
@@ -56,6 +64,10 @@ const BREAKS = {
   noteCall: ["src/main.js", "      mission.noteCall(c.name, c.args);\n", ""],
   trackProgress: ["src/main.js", "    mission.trackProgress(calls);\n", ""],
   batches: ["src/run-mission.js", "    state.batches++;\n", ""],
+  nodigest: ["src/run-ai.js", "    if (digestMsg) canonical.splice(1, 0, digestMsg);\n", ""],
+  digeststays: ["src/run-ai.js", "      if (di >= 0) canonical.splice(di, 1);\n", ""],
+  nostage: ["src/run-mission.js", "      missionStore.missionStage(dir, r.id, { rounds: state.rounds, batches: state.batches, next: r.next });\n", ""],
+  noamend: ["src/run-mission.js", "        const add = missionStore.missionGoalNote(dir, had.id, goalSeed);\n", ""],
   missionId: ["src/main.js", "        runMissionId = v;\n", '        runMissionId = "мусор";\n'],
 };
 let brokenFile = null;
@@ -111,6 +123,10 @@ function FakeWindow() {
 
 // ── Подменённый провайдер: SSE-поток, как у OpenAI-совместимого сервера ────
 const asked = [];
+// Тела запросов чата: провайдер здесь — единственный свидетель того, что модель
+// ВИДИТ. Сводка состояния работы подставляется прогоном перед каждым запросом,
+// и проверить это можно только тут (см. раздел [9]).
+const chatBodies = [];
 let served = 0; // сколько раз провайдер отдал ответ чата
 const sse = (chunks) => chunks.map((c) => "data: " + JSON.stringify(c) + "\n\n").join("") + "data: [DONE]\n\n";
 
@@ -167,6 +183,7 @@ const provider = http.createServer((req, res) => {
       return res.end(JSON.stringify({ data: [{ id: "test-model", context_length: 128000 }] }));
     }
     if (u.pathname.endsWith("/chat/completions")) {
+      chatBodies.push({ n: served + 1, body: body });
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       return res.end(chatAnswer());
     }
@@ -340,7 +357,125 @@ const ROUND_LIMIT = 50;
   ok(kind("done").length === 1, "прогон закончился одним «готово»: " + kind("done").length);
   ok(kind("error").length === 0, "ошибок в чат не пришло: " + JSON.stringify(kind("error").map((e) => e.ev.message)));
 
-  console.log("\n[9] Ничего не осталось висеть");
+  console.log("\n[9] Состояние работы видит модель — в каждом раунде и после границы батча");
+  // Сводка ("СОСТОЯНИЕ РАБОТЫ …") собирается приложением из файлов миссии и
+  // подставляется перед КАЖДЫМ запросом. Она — единственное, что объясняет модели
+  // после батча, что она уже начала делать; поэтому проверяем не «строка есть в
+  // коде», а что она реально уехала провайдеру — и ОТДЕЛЬНЫМ сообщением, а не
+  // приклеенной к ответам историей (иначе следующий раздел проверял бы историю).
+  const reqs = chatBodies.map((b) => {
+    let msgs = [];
+    try {
+      const j = JSON.parse(b.body);
+      msgs = Array.isArray(j.messages) ? j.messages : [];
+    } catch {}
+    // Провайдер получает ОДИН system-блок: транспорт склеивает ведущие системные
+    // сообщения (mergeLeadingSystem в provider-transport.js), поэтому искать сводку
+    // отдельным сообщением бессмысленно. Сводка подставлена прогоном сразу за
+    // системным — значит в склейке она ПОСЛЕДНЯЯ и её видно в хвосте блока.
+    const head = msgs[0] && msgs[0].role === "system" && typeof msgs[0].content === "string" ? msgs[0].content : "";
+    const at = head.indexOf("СОСТОЯНИЕ РАБОТЫ");
+    return { n: b.n, head: head, count: (head.match(/СОСТОЯНИЕ РАБОТЫ/g) || []).length, at: at, digest: at >= 0 ? head.slice(at) : "" };
+  });
+  const withDigest = reqs.filter((r) => r.count > 0).map((r) => r.n);
+  const firstDigest = withDigest.length ? withDigest[0] : 0;
+  // Миссию прогон заводит сам на шестом раунде — с него сводка и обязана идти.
+  ok(firstDigest === 6, "сводка пошла с раунда, где прогон завёл миссию: " + firstDigest + " (запросов чата " + reqs.length + ")");
+  const missing = reqs.filter((r) => r.n >= 6 && r.count === 0).map((r) => r.n);
+  ok(missing.length === 0, "сводка есть в каждом запросе с миссией (без сводки: " + JSON.stringify(missing) + ")");
+  ok(reqs.every((r) => r.head !== ""), "системный блок провайдеру уходит — запрос разбирается целиком");
+  // Сводка стоит В КОНЦЕ системного блока: то, что модель читает последним перед
+  // диалогом. Если бы её туда не клали, она терялась бы вместе с началом истории.
+  const notLast = reqs.filter((r) => r.n >= 6 && !/отмечай missionStep\(done, next\)\.\s*$/.test(r.head)).map((r) => r.n);
+  ok(notLast.length === 0, "сводка стоит в конце системного блока (не там: " + JSON.stringify(notLast) + ")");
+  const doubled = reqs.filter((r) => r.count > 1).map((r) => r.n);
+  ok(doubled.length === 0, "сводка ровно по разу в запросе — не копится (дубликаты в: " + JSON.stringify(doubled) + ")");
+  const afterBatch = reqs.filter((r) => r.n > 25);
+  ok(afterBatch.length === 25 && afterBatch.every((r) => r.count === 1), "после границы батча сводка тоже в каждом запросе: " + afterBatch.length + " из 25");
+  // Главное: после батча модель видит РАННИЕ свои действия — в САМОЙ СВОДКЕ, а не
+  // в остатках истории (те заменяются обрезкой и сжатием).
+  const firstAfterBatch = afterBatch[0] || { digest: "" };
+  ok(firstAfterBatch.digest.indexOf("Цель: Сделай 50 заметок в папке notes") >= 0, "после границы батча сводка называет цель работы");
+  ok(/План: /.test(firstAfterBatch.digest), "после границы батча сводка несёт план работы");
+  ok(/· батч 2 ·/.test(firstAfterBatch.digest), "после границы батча сводка говорит, какой батч идёт: " + (firstAfterBatch.digest.split("\n")[2] || ""));
+  const earlier = (firstAfterBatch.digest.match(/notes\/round-(\d+)\.txt/g) || []).map((s) => Number(/(\d+)/.exec(s)[1])).filter((n) => n < 26);
+  ok(earlier.length > 0, "после границы батча сводка напоминает файлы, сделанные ДО неё: " + JSON.stringify(earlier.slice(0, 5)));
+  // И обратная сторона: сводка — не файл. В журнал и план миссии она попадать не должна.
+  ok(journal.indexOf("СОСТОЯНИЕ РАБОТЫ") < 0, "сводки нет ни в журнале миссии, ни в файле миссии");
+  ok(String(fs.existsSync(runFile) ? fs.readFileSync(runFile, "utf8") : "").indexOf("СОСТОЯНИЕ РАБОТЫ") < 0, "сводка не осела в файлах миссии (только в запросе)");
+
+  console.log("\n[10] Этапы работы: путь сохранён миссией — с чего начали и на чём закончили");
+  // Именно этого не хватало модели после батча: не только свежий хвост, а весь путь.
+  // Отрезки закрывает ПРИЛОЖЕНИЕ: на границе батча и на остановке по лимиту.
+  const recDone = missionStore.missionLoad(workDir, missionId);
+  const stages = (recDone && recDone.stages) || [];
+  ok(stages.length === 2, "отрезков в миссии: " + stages.length + " (ждали батч + остановку по лимиту)");
+  const st1 = stages[0] || {};
+  const st2 = stages[1] || {};
+  ok(st1.rounds === 25, "в первом отрезке раундов: " + st1.rounds);
+  ok(Array.isArray(st1.files) && st1.files.some((f) => /^notes\/round-/.test(f)), "первый отрезок помнит свои файлы: " + JSON.stringify(st1.files.slice(0, 4)) + "…");
+  ok(Array.isArray(st1.head) && st1.head.some((t) => /notes\/round-/.test(t)), "первый отрезок помнит своё начало: " + JSON.stringify(st1.head.slice(0, 2)));
+  ok(Array.isArray(st1.tail) && st1.tail.length > 0, "первый отрезок помнит свой конец: " + JSON.stringify(st1.tail.slice(-2)));
+  ok(st1.entries >= 20, "записей в первом отрезке: " + st1.entries);
+  ok(st1.reason === "", "первый отрезок закрыт продолжением работы, а не остановкой: " + JSON.stringify(st1.reason));
+  ok(st2.reason === "лимит раундов", "второй отрезок помнит, НА ЧЁМ остановились: " + st2.reason);
+  ok(/🧭 Этап 1/.test(journal) && /🧭 Этап 2/.test(journal), "строки этапов видны человеку в журнале миссии");
+  // Путь работы доехал до модели: в запросах после границы есть раздел этапов с
+  // файлами ПЕРВОГО отрезка — то самое «что я уже построил».
+  ok(afterBatch.every((r) => r.digest.indexOf("Этапы работы") >= 0), "после границы батча сводка несёт путь работы в каждом запросе: " + afterBatch.length);
+  ok(afterBatch.every((r) => r.digest.indexOf("этап 1 ·") >= 0), "после границы батча сводка помнит первый отрезок");
+  ok(/файлов \d+: notes\/round-/.test(firstAfterBatch.digest), "в сводке после границы — файлы первого отрезка: " + (firstAfterBatch.digest.match(/этап 1 ·[^\n]*/) || [""])[0]);
+
+  console.log("\n[11] Новая просьба человека уточняет цель, а не теряется");
+  // Панель «Миссия» → «▶ Продолжить»: она отдаёт прогону СВОЙ текст — он не должен
+  // становиться уточнением цели (иначе миссия запоминала бы служебные строки).
+  const beforeRun2 = chatBodies.length;
+  await call("settings:set", { longWorkRounds: 3 });
+  const resumed = await call("mission:resume");
+  ok(resumed && resumed.ok && resumed.id === missionId, "«▶ Продолжить» вернуло миссию в работу: " + (resumed && resumed.id));
+  ok(missionStore.isResumeText(resumed.text), "текст кнопки «Продолжить» опознаётся как служебный");
+  const res2 = await call("ai:send", [{ role: "user", content: resumed.text }], { chatId: "chat-live", role: "developer" });
+  ok(res2 && res2.ok === true, "прогон после «Продолжить» прошёл: " + (res2 && res2.ok));
+  const rec2 = missionStore.missionLoad(workDir, missionId);
+  ok(rec2 && rec2.goalNotes.length === 0, "служебный текст кнопки уточнением цели НЕ стал: " + JSON.stringify(rec2 && rec2.goalNotes));
+  ok(rec2 && rec2.stages.length === 3, "после второго запуска отрезков: " + (rec2 && rec2.stages.length) + " (ждали ещё один — остановка по новому лимиту)");
+  ok(rec2 && (rec2.stages[2] || {}).reason === "лимит раундов", "новый отрезок помнит причину остановки: " + (rec2 && (rec2.stages[2] || {}).reason));
+  // Продолжение видит ВЕСЬ путь, а не только свежий хвост.
+  const run2 = chatBodies.slice(beforeRun2).map((b) => {
+    let head = "";
+    try {
+      const j = JSON.parse(b.body);
+      head = j.messages && j.messages[0] && typeof j.messages[0].content === "string" ? j.messages[0].content : "";
+    } catch {}
+    return head;
+  });
+  ok(run2.length > 0 && run2.every((h) => h.indexOf("Этапы работы") >= 0), "после «Продолжить» сводка несёт путь работы в каждом запросе: " + run2.length);
+  ok(run2.every((h) => h.indexOf("этап 1 ·") >= 0 && h.indexOf("этап 2 ·") >= 0), "в сводке продолжения виден и первый отрезок, и тот, на котором встали");
+
+  // Теперь человек пишет НОВУЮ просьбу по ходу работы — вот её и надо запомнить.
+  const beforeRun3 = chatBodies.length;
+  await call("settings:set", { longWorkRounds: 2 });
+  await call("mission:resume");
+  const res3 = await call("ai:send", [{ role: "user", content: "а именно: сложи все заметки в папку notes/done" }], { chatId: "chat-live", role: "developer" });
+  ok(res3 && res3.ok === true, "третий прогон прошёл: " + (res3 && res3.ok));
+  const rec3 = missionStore.missionLoad(workDir, missionId);
+  ok(rec3 && rec3.goalNotes.length === 1, "уточнений у цели: " + (rec3 && rec3.goalNotes.length));
+  ok(rec3 && (rec3.goalNotes[0] || {}).text === "а именно: сложи все заметки в папку notes/done", "сохранилась та самая просьба: " + JSON.stringify(rec3 && rec3.goalNotes[0]));
+  ok(rec3 && rec3.goal === "Сделай 50 заметок в папке notes", "исходная цель переписана просьбой: " + (rec3 && rec3.goal));
+  ok(/➕ Уточнение к цели/.test(missionStore.missionJournalText(workDir, missionId, { limit: 60 })), "уточнение цели не попало в журнал миссии");
+  const run3 = chatBodies.slice(beforeRun3).map((b) => {
+    let head = "";
+    try {
+      const j = JSON.parse(b.body);
+      head = j.messages && j.messages[0] && typeof j.messages[0].content === "string" ? j.messages[0].content : "";
+    } catch {}
+    return head;
+  });
+  ok(run3.length > 0 && run3.every((h) => /Уточнения к цели после начала/.test(h)), "новая просьба дошла до модели как уточнение цели: " + run3.length + " запросов");
+  ok(run3.every((h) => h.indexOf("а именно: сложи все заметки в папку notes/done") >= 0), "в сводке есть текст новой просьбы");
+  ok(run3.every((h) => h.indexOf("этап 1 ·") >= 0 && h.indexOf("этап 3 ·") >= 0), "в сводке третьего запуска — весь путь: от первого отрезка до последнего");
+
+  console.log("\n[12] Ничего не осталось висеть");
   ok(global.__agentRunning === false, "признак прогона снят");
   ok(global.__agentStopRequested === false && global.__agentPauseRequested === false, "флаги остановки сняты");
 

@@ -54,7 +54,7 @@ function mk(over) {
   const calls = {
     rounds: [], events: [], notifies: [], metrics: [],
     switched: 0, saves: 0, commits: 0, parallel: 0, strict: [], manages: [],
-    mission: [], brief: [],
+    mission: [], brief: [], histories: [],
   };
   const queue = (o.rounds || [{ text: "Готово." }]).slice();
   const win = {
@@ -86,6 +86,12 @@ function mk(over) {
 
   const mission = {
     state: { rounds: 0 },
+    // Сводка состояния работы: по умолчанию её нет (как до её появления), поэтому
+    // остальные проверки набора остаются про то же самое. Кому нужна — отдаёт
+    // `mk({ digest })`.
+    digestMessage: () => (o.digest === undefined ? null : o.digest),
+    // Закрытие отрезка работы (этапа): зовётся при остановке человеком.
+    stage: (reason) => calls.mission.push("stage:" + reason),
     resume: () => (o.resume ? { notice: "продолжаю миссию с места остановки", phase: "active" } : null),
     autoStart: () => calls.mission.push("autoStart"),
     pause: () => { calls.mission.push("pause"); return { text: "⏸ Пауза. Работа сохранена." }; },
@@ -142,7 +148,9 @@ function mk(over) {
     },
     createRunRound: () => ({
       run: async (a) => {
-        calls.rounds.push({ n: a.n, maxRounds: a.maxRounds, messages: a.messages });
+        // Снимок, а не ссылка: прогон подставляет сводку состояния и снимает её
+        // после раунда ИЗ ТОГО ЖЕ массива — по ссылке проверка увидела бы пустоту.
+        calls.rounds.push({ n: a.n, maxRounds: a.maxRounds, messages: a.messages.slice() });
         const step = queue.length ? queue.shift() : (o.defaultStep || { text: "Готово." });
         if (step.onRun) step.onRun();
         if (step.error) throw step.error;
@@ -150,7 +158,14 @@ function mk(over) {
         return { kind: "ok", toolCalls: step.toolCalls || [], text: step.text === undefined ? "Готово." : step.text };
       },
     }),
-    createRunStrict: () => ({ runStrict: async (c) => { calls.strict.push(c.length); } }),
+    createRunStrict: () => ({
+      runStrict: async (c, d) => {
+        calls.strict.push(c.length);
+        // История, которую получают инструменты, — та же, что сохранится: ею же
+        // проверяется, что сводка в неё не осела (см. проверку про сводку ниже).
+        calls.histories.push(d && d.history);
+      },
+    }),
     createRunTools: (d) => { calls.toolsDeps = d; return tools; },
     createThinkingStripper: () => (s) => s,
     describeImageRemote: async () => "описание",
@@ -293,6 +308,8 @@ const systemOf = (m) => String((m.calls.rounds[0] || {}).messages && (m.calls.ro
       assert.ok(mCase.calls.events.some((e) => e.ev && e.ev.type === "undo_available" && e.ev.count === 1), "окно не узнало про откат");
       assert.strictEqual(mCase.calls.rounds.length, 1, "после «Стоп» начался новый раунд");
       assert.ok(mCase.calls.events.some((e) => e.ev && e.ev.type === "done"), "остановка не закрыла прогон событием done");
+      // Отрезок работы закрыт: следующий запуск увидит, на чём именно встали.
+      assert.ok(mCase.calls.mission.some((x) => x === "stage:остановка человеком"), "остановка не закрыла этап работы: " + JSON.stringify(mCase.calls.mission));
       // Модель успела сказать полуслово — его НЕ затираем: человек видит и текст, и что работа прервана.
       global.__agentStopRequested = false; // новый прогон — новая кнопка
       mCase = mkStop("Начал читать файл");
@@ -477,6 +494,38 @@ const systemOf = (m) => String((m.calls.rounds[0] || {}).messages && (m.calls.ro
     assert.strictEqual(notices.length, 1, "«продолжаю миссию» сказано не один раз: " + notices.length);
     assert.ok(m.calls.mission.includes("state:active"), "состояние миссии не объявлено окну");
     assert.ok(m.calls.mission.includes("state:end"), "конец работы не отмечен в миссии");
+  });
+
+  await test("сводка состояния работы идёт в каждый запрос и в историю не попадает", async () => {
+    // Сводка собирается приложением из файлов миссии и подставляется перед запросом:
+    // именно она говорит модели после границы батча, что она уже начала делать.
+    const digest = { role: "system", content: "СОСТОЯНИЕ РАБОТЫ (тест)" };
+    const m = mk({
+      digest: digest,
+      rounds: [
+        { text: "шаг 1", toolCalls: [{ name: "writeFile", args: { path: "a.txt", content: "1" } }] },
+        { text: "Финал." },
+      ],
+    });
+    await run(m);
+    assert.strictEqual(m.calls.rounds.length, 2, "раундов прошло не два: " + m.calls.rounds.length);
+    for (const r of m.calls.rounds) {
+      assert.strictEqual(r.messages[1], digest, "сводки нет вторым сообщением в раунде " + (r.n + 1));
+      assert.strictEqual(r.messages.filter((x) => x === digest).length, 1, "сводка продублирована в раунде " + (r.n + 1));
+    }
+    // Индикатор контекста считается ПОСЛЕ подстановки: иначе он врал бы про занятое место.
+    const ctx = m.calls.events.filter((e) => e.ch === "ai:event" && e.ev && e.ev.type === "context");
+    assert.ok(ctx.length > 0, "индикатор контекста не пришёл");
+    // Инструментам уходит история БЕЗ сводки — иначе она сохранялась бы в чат и множилась.
+    assert.ok(m.calls.histories.length > 0, "история ни разу не дошла до инструментов");
+    for (const h of m.calls.histories) {
+      assert.ok(Array.isArray(h) && h.indexOf(digest) < 0, "сводка осталась в истории, которая сохраняется");
+    }
+    // Без миссии сводки нет вовсе: подставлять нечего.
+    const quiet = mk({ rounds: [{ text: "Финал." }] });
+    await run(quiet);
+    assert.strictEqual(quiet.calls.rounds[0].messages.indexOf(digest), -1, "сводка подставилась без миссии");
+    assert.strictEqual(quiet.calls.rounds[0].messages.length, 2, "в запрос ушло лишнее сообщение: " + quiet.calls.rounds[0].messages.length);
   });
 
   await test("в оболочке этого больше нет, а мост к живому состоянию на месте", () => {

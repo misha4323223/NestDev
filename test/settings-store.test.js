@@ -351,16 +351,22 @@ const readRaw = (file) => (fs.existsSync(file) ? fs.readFileSync(file, "utf8") :
     // Панель терминала — туда же: с части 32 её канал term:start читает рабочую
     // папку в момент запуска (проект мог переключиться, пока панель была закрыта).
     const TERM_SRC = read("src", "terminal-panel.js");
+    // Жизненный цикл (src/lifecycle.js, часть 37) читает настройки так же — в момент
+    // старта и в каждом тике OTA: иначе выключатель self-update застыл бы на времени
+    // запуска приложения.
+    const LIFE_SRC = read("src", "lifecycle.js");
     const callCount = (src) => (src.match(/(^|[^.\w$])loadSettings\(\)/g) || []).length;
     const calls =
       callCount(MAIN_SRC) + callCount(MEM_SRC) + callCount(SETTINGS_SRC) +
       callCount(MOBILE_SRC) + callCount(PROJECTS_SRC) + callCount(PREVIEW_SRC) +
-      callCount(OTA_SRC) + callCount(TERM_SRC);
+      callCount(OTA_SRC) + callCount(TERM_SRC) + callCount(LIFE_SRC);
     assert.ok(calls >= 20, "вызовы loadSettings() в оболочке переписаны: " + calls);
     for (const [name, src] of [["памяти", MEM_SRC], ["настроек", SETTINGS_SRC], ["мобильного доступа", MOBILE_SRC], ["проектов", PROJECTS_SRC], ["превью", PREVIEW_SRC], ["самообновления", OTA_SRC], ["терминала", TERM_SRC]]) {
       assert.ok(/const \{[^}]*\bloadSettings\b[^}]*\} = deps;/.test(src), "канал " + name + " не получает свежие настройки");
       assert.ok(callCount(src) > 0, "канал " + name + " не читает настройки в момент вызова");
     }
+    assert.ok(/const \{[\s\S]*?\bloadSettings\b[\s\S]*?\} = deps/.test(LIFE_SRC), "жизненный цикл не получает свежие настройки");
+    assert.ok(callCount(LIFE_SRC) > 0, "жизненный цикл не читает настройки в момент вызова");
     assert.ok(/const \{[^}]*\bsaveSettings\b[^}]*\} = deps;/.test(SETTINGS_SRC), "канал настроек не сохраняет через хранилище");
     assert.ok(/const \{[^}]*\bsaveSettings\b[^}]*\} = deps;/.test(MOBILE_SRC), "канал PIN не сохраняет через хранилище");
     assert.ok(/^\s+loadSettings,$/m.test(MAIN_SRC), "модули больше не получают свежие настройки");

@@ -51,6 +51,15 @@ const BREAKS = {
   usage: ["src/run-retry.js", "      state.includeUsage = false;\n", ""],
   cold: ["src/run-retry.js", "    if (cold) {\n", "    if (false && cold) {\n"],
   context: ["src/run-retry.js", "      await shrinkContext();\n", ""],
+  // Лимитер снова выдаётся НОВЫЙ на каждый запрос (карта темпа убрана). Так было
+  // ДО выноса: «Стоп» и новый прогон получали свой лимитер, слали запрос сразу и
+  // снова ловили 429. Проверка — «пауза 429 выждана ДО следующего запроса», а не
+  // после него (её даёт не явная пауза повтора, а память лимитера).
+  rateMemory: ["src/rate-limiters.js", "    if (!byKey.has(key)) byKey.set(key, createRateLimiter());\n    return byKey.get(key);\n", "    return createRateLimiter();\n"],
+  // Памятку прогон получает отложенной стрелкой из модуля памяти (он собирается ниже).
+  // Если проводка пустая, модульный набор этого не увидит (он водит модуль напрямую),
+  // а длинная работа молча потеряет память — ловится только живым прогоном.
+  memo: ["src/main.js", "  saveContextMemo: (...memoArgs) => memory.saveContextMemo(...memoArgs),\n", "  saveContextMemo: () => null,\n"],
 };
 let brokenFile = null;
 if (BREAK) {
@@ -129,8 +138,17 @@ const SCRIPT = {
   10: { run: final },
 };
 let phrase = "main";
+// Текст, которым подставной провайдер отвечает на запрос ЗА ПАМЯТКОЙ (сжатие контекста).
+// Ищем его потом в зеркале проекта и в дневнике — так видно, что сохранён именно он.
+const MEMO_TEXT = "ПАМЯТКА: прокси собран, осталось проверить запуск и порт.";
 function respond(n) {
   if (phrase === "402") return { status: 402, text: JSON.stringify({ error: { message: "Insufficient Balance" } }) };
+  // Темп между прогонами: первый запрос получает 429 с частотой (6 запросов в минуту
+  // → держатель темпа расставляет запросы по 10 с), второй — уже ответ.
+  if (phrase === "pace") {
+    if (n === 1) return { status: 429, headers: { "Retry-After": "2" }, text: "rate limit exceeded — 6 requests per minute" };
+    return { status: 200, run: final };
+  }
   const step = SCRIPT[n];
   if (!step) return { status: 200, run: final };
   if (step.status) return step;
@@ -336,6 +354,153 @@ const COLD_WAIT_MS = core.coldCacheInfo(503, "cache_only_cold", 1).waitMs;
   console.log("\n[10] Ничего не осталось висеть");
   ok(global.__agentRunning === false, "признак прогона снят");
   ok(global.__agentStopRequested === false && global.__agentPauseRequested === false, "флаги остановки сняты");
+
+  console.log("\n[12] Памятка контекста: дневник памяти и зеркало проекта — по СВОИМ условиям");
+  // saveContextMemo вынесен из оболочки в модуль памяти. У него ДВА разных условия в
+  // одной функции, и главный риск переноса — слить их в одно:
+  //   • «файлы работы агента» (agentWorkFiles) → зеркало .agent/context рядом с проектом;
+  //   • галочка «Память диалогов» (contextMemory) → дневник памяток в папке приложения.
+  // Проверяем на настоящем прогоне: окно модели маленькое, поэтому история переполняется
+  // и приложение САМО сжимает контекст — только так эта ветка кода вообще вызывается.
+  //
+  // Провайдер здесь СОБСТВЕННЫЙ (свой адрес): окно модели кешируется на адрес, и на
+  // старом адресе ответ «128000 токенов» уже лежит в кеше — сжатие просто не наступило бы.
+  const memoReqs = [];
+  const memoServer = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const u = new URL(req.url, "http://127.0.0.1");
+      if (u.pathname.endsWith("/models")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ data: [{ id: "memo-model", context_length: 12000 }] }));
+      }
+      let parsed = null;
+      try {
+        parsed = JSON.parse(body || "{}");
+      } catch {}
+      memoReqs.push({
+        stream: parsed && parsed.stream,
+        tools: (parsed && parsed.tools) || [],
+        chars: JSON.stringify((parsed && parsed.messages) || []).length,
+        msgs: ((parsed && parsed.messages) || []).length,
+      });
+      // Запрос за памяткой идёт БЕЗ потока и БЕЗ инструментов, и ответ читается как JSON.
+      if (parsed && parsed.stream === false) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ choices: [{ message: { content: MEMO_TEXT } }] }));
+      }
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.end(final(1));
+    });
+  });
+  let memoBase = "";
+  try {
+    await new Promise((resolve, reject) => {
+      memoServer.once("error", reject);
+      memoServer.listen(0, "127.0.0.1", resolve);
+    });
+    memoBase = "http://127.0.0.1:" + memoServer.address().port + "/v1";
+  } catch (e) {
+    console.error("✗ Не удалось поднять второго подменённого провайдера: " + e.message);
+    process.exit(2);
+  }
+
+  const countDiary = (dir) => {
+    let n = 0;
+    const walk = (d) => {
+      let names = [];
+      try {
+        names = fs.readdirSync(d, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of names) {
+        if (e.isDirectory()) walk(path.join(d, e.name));
+        else if (/\.json$/.test(e.name)) n++;
+      }
+    };
+    walk(dir);
+    return n;
+  };
+
+  const memoWork = fs.mkdtempSync(path.join(os.tmpdir(), "live-retry-memo-"));
+  await callIpc("settings:set", {
+    provider: "openai",
+    model: "memo-model",
+    openaiUrl: memoBase,
+    workingDir: memoWork,
+    contextMemory: true,
+    agentWorkFiles: true,
+    longWork: false,
+  });
+  const mirrorDir = path.join(memoWork, ".agent", "context");
+  const diaryDir = path.join(userData, "context-memory");
+  const longAsk = "Подробное задание для длинной работы: собери прокси и проверь его. ".repeat(500).slice(0, 30000);
+  // Историю чата ведёт интерфейс и присылает её ЦЕЛИКОМ — поэтому копим её здесь сами:
+  // сжатие контекста возможно только когда история перед новым вопросом уже большая.
+  let memoHistory = [{ role: "user", content: longAsk }];
+  const memo1 = await callIpc("ai:send", memoHistory.slice(), { chatId: "chat-live-memo", role: "developer" });
+  ok(memo1 && memo1.ok === true, "первый прогон (длинное задание) прошёл: " + JSON.stringify(memo1 && memo1.error));
+  ok(!fs.existsSync(mirrorDir), "зеркало появилось ДО сжатия контекста — проверка ниже была бы пустой");
+
+  const memosBefore = kind("memory").length;
+  const diaryBefore = countDiary(diaryDir);
+  memoHistory.push({ role: "assistant", content: "Прокси собран, перехожу к проверке запуска." });
+  const ask2 = { role: "user", content: "Продолжай работу" };
+  const memo2 = await callIpc("ai:send", memoHistory.concat([ask2]), { chatId: "chat-live-memo", role: "developer" });
+  memoHistory.push(ask2);
+  ok(memo2 && memo2.ok === true, "второй прогон прошёл: " + JSON.stringify(memo2 && memo2.error));
+  ok(memoReqs.some((r) => r.stream === false && !r.tools.length), "приложение так и не сжало контекст — ветка памятки не проверена");
+  if (process.env.DEBUG_MEMO) console.log("  ℹ запросов: " + JSON.stringify(memoReqs.map((r) => ({ stream: r.stream, tools: r.tools.length, msgs: r.msgs, chars: r.chars }))));
+
+  const memoTexts = kind("memory").map((e) => e.ev.text || "");
+  ok(memoTexts.length === memosBefore + 1, "в чат ушло ровно одно сообщение о памятке: " + JSON.stringify(memoTexts).slice(0, 160));
+  ok(/Память диалогов: сохранена памятка за/.test(memoTexts.join("\n")), "сообщение о памятке не то: " + JSON.stringify(memoTexts).slice(0, 160));
+
+  const mirrorFiles = fs.existsSync(mirrorDir) ? fs.readdirSync(mirrorDir) : [];
+  ok(mirrorFiles.length === 1 && /\.md$/.test(mirrorFiles[0] || ""), "зеркало .agent/context создано не так: " + JSON.stringify(mirrorFiles));
+  const mirrorPath = mirrorFiles.length ? path.join(mirrorDir, mirrorFiles[0]) : "";
+  const mirrorText = mirrorPath && fs.existsSync(mirrorPath) ? fs.readFileSync(mirrorPath, "utf8") : "";
+  ok(mirrorText.indexOf(MEMO_TEXT) >= 0, "в зеркало проекта легла НЕ сама памятка: " + mirrorText.slice(0, 140));
+  ok(countDiary(diaryDir) === diaryBefore + 1, "дневник памяти не пополнился: было " + diaryBefore + ", стало " + countDiary(diaryDir));
+
+  // Независимость условий: выключаем галочку «Память диалогов» и повторяем.
+  await callIpc("settings:set", { contextMemory: false });
+  const mirrorBefore = mirrorText.length;
+  const diaryBefore2 = countDiary(diaryDir);
+  const memosBefore2 = kind("memory").length;
+  memoHistory.push({ role: "assistant", content: "Запуск проверен, порт свободен." });
+  const memo3 = await callIpc("ai:send", memoHistory.concat([{ role: "user", content: "И ещё шаг" }]), { chatId: "chat-live-memo", role: "developer" });
+  ok(memo3 && memo3.ok === true, "третий прогон прошёл: " + JSON.stringify(memo3 && memo3.error));
+  const mirrorAfter = mirrorPath && fs.existsSync(mirrorPath) ? fs.readFileSync(mirrorPath, "utf8") : "";
+  ok(mirrorAfter.length > mirrorBefore, "зеркало НЕ пополнилось — а оно не зависит от галочки памяти: " + mirrorBefore + " → " + mirrorAfter.length);
+  ok(kind("memory").length === memosBefore2, "сообщение о памятке пришло при ВЫКЛЮЧЕННОЙ памяти");
+  ok(countDiary(diaryDir) === diaryBefore2, "дневник памяти пополнился при выключенной галочке: " + countDiary(diaryDir));
+  // Возвращаем настройки на ОСНОВНОЙ провайдер: следующий раздел гоняет темп уже по нему,
+  // а закрытый порт памятки дал бы «отказы» там, где их никто не планировал.
+  await callIpc("settings:set", { provider: "openai", model: "test-model", openaiUrl: providerBase, workingDir: workDir });
+  try {
+    memoServer.close();
+  } catch {}
+
+  console.log("\n[11] Темп провайдера переживает конец прогона (карта лимитеров общая)");
+  // Ровно та жалоба, из-за которой карта лимитеров вынесена отдельным модулем:
+  // «после Стоп ничего не работает» — если держатель темпа создаётся на прогон, то
+  // следующий стартует с чистым счётчиком, шлёт запрос сразу и снова ловит 429.
+  // Первый прогон получает 429 с частотой (6 запросов/мин) и запоминает её;
+  // первый же запрос ВТОРОГО прогона обязан эту частоту соблюсти.
+  phrase = "pace";
+  const paced1 = await callIpc("ai:send", [{ role: "user", content: "Продолжай работу" }], { chatId: "chat-live-pace", role: "developer" });
+  ok(paced1 && paced1.ok === true, "первый прогон дожил до конца после 429: " + JSON.stringify(paced1 && paced1.error));
+  const paceReqs = requests.filter((r) => r.phrase === "pace");
+  ok(paceReqs.length >= 2 && paceReqs[1].status === 200, "после ожидания раунд повторился и был принят: " + paceReqs.map((r) => r.status).join(","));
+  const paced2 = await callIpc("ai:send", [{ role: "user", content: "И ещё шаг" }], { chatId: "chat-live-pace", role: "developer" });
+  ok(paced2 && paced2.ok === true, "второй прогон прошёл без отказа: " + JSON.stringify(paced2 && paced2.error));
+  const later = requests.filter((r) => r.phrase === "pace" && r.at > (paceReqs[1] ? paceReqs[1].at : 0));
+  const gapNext = later.length ? Math.min(...later.map((r) => r.at - paceReqs[1].at)) : -1;
+  ok(gapNext >= 8000, "темп, узнанный первым прогоном, соблюдён во втором: разрыв " + gapNext + " мс (ожидалось ≈10000)");
+  ok(later.length > 0 && later.every((r) => r.status === 200), "второй прогон действительно ходил к провайдеру и не получал отказов: " + later.map((r) => r.status).join(","));
 
   try {
     provider.close();

@@ -1,15 +1,5 @@
 "use strict";
 
-// Держатели темпа для провайдеров: лимит считается на ключ, но привязка к
-// провайдеру+модели даёт то же поведение и не хранит секрет в ключе карты.
-const rateLimiters = new Map(); // rateLimiterFor: один лимитер на провайдера
-function rateLimiterFor(settings) {
-  const s = settings || {};
-  const key = String(s.provider || "openai") + "|" + String(s.model || "");
-  if (!rateLimiters.has(key)) rateLimiters.set(key, createRateLimiter());
-  return rateLimiters.get(key);
-}
-
 const { app, BrowserWindow, ipcMain, dialog, shell, Notification, clipboard, desktopCapturer } = require("electron");
 const { autoUpdater } = require("electron-updater");
 const path = require("path");
@@ -70,6 +60,13 @@ const {
   normalizePlanTasks,
   planSummary,
 } = require("./renderer/agent-core.js");
+
+// ─────────── Держатели темпа провайдера — код в src/rate-limiters.js ───────────
+// Собирается ОДИН раз на приложение: лимитер один на «провайдер+модель» и общий
+// всем прогонам. Свой лимитер на прогон означал бы, что «Стоп» и новый запуск
+// шлют запросы сразу и снова ловят 429 — из-за этого и держим карту в модуле.
+const { createRateLimiters } = require("./rate-limiters.js");
+const { rateLimiterFor } = createRateLimiters({ createRateLimiter });
 
 // ─────────────────────────── Мобильный мост (LAN + PWA + PIN) ───────────────────────────
 // Мост отдаёт интерфейс и дублирует IPC по WebSocket для телефона/планшета в той же сети.
@@ -250,6 +247,7 @@ const {
   stripUrlCreds,
   sanitizeDir,
   sanitizePath,
+  ensureWritableDir,
 } = createPathsGit({
   fs,
   path,
@@ -307,24 +305,6 @@ const { stripAnsi, shellArgsFor, normalizeShell, powershellArgs, findGitShell, s
   findProgram: (name) => findProgram(name),
   truncateText,
 });
-// Строка про Yandex Cloud для САММАРИ ПРОЕКТА: агент всегда видит АКТУАЛЬНЫЙ
-// каталог и разрешения, а не полагается на устаревшие результаты инструментов
-// в истории переписки («каталог не выбран», хотя он уже выбран).
-function ycBriefLine(s) {
-  try {
-    const cfg = ycConfig(s);
-    if (!cfg.oauth) return "";
-    if (!cfg.folderId) return "Yandex Cloud: подключён, каталог НЕ выбран — попроси пользователя выбрать каталог в Настройках → «☁️ Yandex Cloud».";
-    return (
-      "Yandex Cloud: каталог «" + (cfg.folderName || cfg.folderId) + "» (" + cfg.folderId + ")" +
-      (cfg.cloudId ? ", облако " + cfg.cloudId : "") +
-      "; создание ресурсов агентом " + (cfg.allowCreate ? "разрешено" : "ЗАПРЕЩЕНО") +
-      ", удаление " + (cfg.allowDelete ? "разрешено" : "ЗАПРЕЩЕНО") + ". "
-    );
-  } catch {
-    return "";
-  }
-}
 
 // ── Помощники инструментов — код в src/tool-helpers.js ──
 // Имена те же: вызовы в инструментах и каналах остались дословно прежними.
@@ -348,120 +328,16 @@ const { projectSourceFiles, buildFileStructure, refactorRenameFiles, findSymbolR
   numberedLines, langFromExt, buildFileOutline, buildBlockRanges } = createProjectAnalysis({ fs, path });
 
 
-// Запуск команды со сбором вывода, пока не появится waitFor / процесс не завершится / не выйдет таймаут.
-function spawnCollect(command, cwd, timeoutMs, waitFor) {
-  return new Promise((resolve) => {
-    const shell = process.platform === "win32" ? process.env.ComSpec || "cmd.exe" : "/bin/sh";
-    const args = shellArgsFor(command);
-    let out = "";
-    let done = false;
-    const finish = (payload) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      payload.out = out;
-      resolve(payload);
-    };
-    const timer = setTimeout(() => {
-      // Убиваем ДЕРЕВО (taskkill /T /F), а не только оболочку — иначе node/expo-сирота держит порт.
-      killProcessTree(child);
-      finish({ ok: false, timedOut: true, matched: false, code: "timeout" });
-    }, timeoutMs || 120000);
-    const child = spawn(shell, args, {
-      cwd,
-      detached: !(process.platform === "win32"),
-      windowsHide: true,
-      env: commandEnv(command),
-    });
-    const onData = (d) => {
-      out += stripAnsi((d || "").toString());
-      if (waitFor && out.includes(waitFor)) finish({ ok: true, matched: true, code: 0 });
-    };
-    child.stdout.on("data", onData);
-    child.stderr.on("data", onData);
-    child.on("error", (e) => finish({ ok: false, timedOut: false, matched: false, code: e && e.code }));
-    child.on("close", (code) => finish({ ok: code === 0, timedOut: false, matched: false, code }));
-  });
-}
-
-// Скриншот страницы: невидимое окно, ждём загрузку и отрисовку, снимаем capturePage.
-function screenshotUrl(url) {
-  return new Promise((resolve) => {
-    let win = null;
-    let timer = null;
-    const done = (payload) => {
-      if (timer) clearTimeout(timer);
-      if (win && !win.isDestroyed()) { win.destroy(); win = null; }
-      resolve(payload);
-    };
-    const fail = (msg) => done({ ok: false, err: msg });
-    try {
-      win = new BrowserWindow({
-        show: false,
-        width: 1280,
-        height: 800,
-        webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
-      });
-    } catch (e) {
-      return fail(e.message);
-    }
-    timer = setTimeout(() => fail("таймаут загрузки " + url + " (30 с)"), 30000);
-    win.webContents.once("did-finish-load", () => {
-      setTimeout(async () => {
-        try {
-          const img = await win.webContents.capturePage();
-          const shot = encodeShot(img, {});
-          done({ ok: true, dataUrl: "data:" + shot.mime + ";base64," + shot.buf.toString("base64"), mime: shot.mime });
-        } catch (e) {
-          fail(e.message);
-        }
-      }, 2500);
-    });
-    win.webContents.once("did-fail-load", (_e, code, desc) => fail(code + " " + String(desc || "").slice(0, 300)));
-    win.loadURL(url).catch((e) => fail(e.message));
-  });
-}
-
-// Сохранение скриншота на диск: скриншоты хранятся в userData/screenshots, чтобы
-// агент мог проанализировать их vision-моделью через analyzeImage(path).
-// Кодирование скриншота: JPEG по умолчанию (быстро, компактно, вдвое дешевле для
-// vision-модели), PNG — по флагу png:true (точные задачи, чтение мелкого текста).
-// Длинная сторона при необходимости ужимается до MAX_SHOT_SIDE.
-const MAX_SHOT_SIDE = 1440;
-function encodeShot(img, args) {
-  const a = args || {};
-  const wantPng = a.png === true || a.format === "png";
-  let out = img;
-  try {
-    const sz = img.getSize();
-    const longest = Math.max(sz.width || 0, sz.height || 0);
-    const cap = Math.min(Math.max(parseInt(a.maxWidth, 10) || MAX_SHOT_SIDE, 480), 2560);
-    if (longest > cap) {
-      const k = cap / longest;
-      out = img.resize({ width: Math.max(1, Math.round(sz.width * k)), height: Math.max(1, Math.round(sz.height * k)), quality: "good" });
-    }
-  } catch {}
-  if (!wantPng) {
-    try {
-      const q = Math.min(Math.max(parseInt(a.quality, 10) || 72, 30), 100);
-      const jpg = out.toJPEG(q);
-      if (jpg && jpg.length) return { buf: jpg, mime: "image/jpeg", ext: ".jpg" };
-    } catch {}
-  }
-  const png = out.toPNG();
-  return { buf: png, mime: "image/png", ext: ".png" };
-}
-
-// Сохранить скриншот на диск (расширение — по типу картинки). Агент читает его
-// через analyzeImage(path).
-function saveScreenshotPng(buf, baseName, mime) {
-  const dir = path.join(app.getPath("userData"), "screenshots");
-  fs.mkdirSync(dir, { recursive: true });
-  const ext = String(mime || "").indexOf("jpeg") !== -1 ? ".jpg" : ".png";
-  const file = path.join(dir, String(baseName || "shot").replace(/[^\w.-]+/g, "_") + "-" + Date.now() + ext);
-  fs.writeFileSync(file, buf);
-  return file;
-}
+// ── Скриншоты: страница невидимым окном и сохранение на диск — код в src/screens.js ──
+// Имена те же (screenshotUrl / encodeShot / saveScreenshotPng), поэтому вызовы в
+// инструментах и каналах остались дословно прежними. Настоящее окно Electron и папка
+// приложения приходят в модуль значениями: сам он ни `app`, ни `electron` не трогает.
+// Сборка стоит на прежнем месте куска — до всего, что эти имена зовёт.
+const { createScreens } = require("./screens.js");
+const { screenshotUrl, encodeShot, saveScreenshotPng } = createScreens({
+  BrowserWindow,
+  userDataDir: app.getPath("userData"),
+});
 
 // ── Фоновые процессы, оболочки и dev-серверы — код в src/bg-processes.js ──
 // Имена те же, поэтому вызовы в инструментах, каналах и панели проекта не менялись.
@@ -473,6 +349,7 @@ const {
   bgSpawn,
   bgKill,
   killProcessTree,
+  spawnCollect,
   bgWaitFor,
   parsePortFromUrl,
   killProcessesOnPort,
@@ -535,7 +412,7 @@ const { snapshotFileForUndo, persistUndo, loadPersistedUndo, undoFile } = create
 // двухуровневая структура (без node_modules и прочего мусора), начало README,
 // доступные оболочки и строка Yandex Cloud. Визитка собирается на КАЖДЫЙ прогон
 // (настройки приходят функцией), поэтому сборка модуля стоит выше проводки прогона,
-// а считают оболочки и строку облака по-прежнему в main.js — они приходят значениями.
+// а считают оболочки здесь, а строку облака — сервис Yandex Cloud (src/yc-service.js).
 const { createProjectBrief } = require("./project-brief.js");
 const { buildProjectBrief } = createProjectBrief({
   fs,
@@ -543,7 +420,9 @@ const { buildProjectBrief } = createProjectBrief({
   SKIP_DIRS,
   shellsBrief,
   loadSettings,
-  ycBriefLine,
+  // Сервис Yandex Cloud собирается НИЖЕ (у него свои зависимости), поэтому внутрь идёт
+  // отложенная стрелка: к моменту вызова витрина проекта вызывается уже после старта.
+  ycBriefLine: (...args) => ycService.ycBriefLine(...args),
 });
 
 // ═══════════════════ Системные программы и окружение ═══════════════════
@@ -647,41 +526,6 @@ let activePlanSummary = null;
 // Роутер инструментов текущего запуска: findTools по нему включает группы на лету.
 let activeToolRouter = null;
 
-// Память диалогов: сохраняем сжатую памятку в локальный дневник по датам, но
-// ТОЛЬКО если пользователь включил галочку «Память диалогов» (иначе — тишина).
-// Отдельно от дневника памяти работает зеркало рядом с проектом
-// (.agent/context/<дата>.md): долгая работа обязана оставлять следы файлами на ПК,
-// даже когда галочка «Память диалогов» выключена — поэтому зеркало решает своё
-// условие («файлы работы агента»), а не эту галочку.
-function saveContextMemo(settings, entry, emit) {
-  if (!settings || !entry || !String(entry.text || "").trim()) return null;
-  if (settings.agentWorkFiles !== false) {
-    try {
-      missionStore.contextMirror(agentWorkDir(settings), entry.ts, entry.text);
-    } catch {}
-  }
-  if (!settings.contextMemory) return null;
-  try {
-    const r = agentStore.contextMemorySave(app.getPath("userData"), {
-      ts: entry.ts,
-      memo: entry.text,
-      messages: entry.messages,
-      provider: entry.provider,
-      model: entry.model,
-      workDir: agentWorkDir(settings),
-      keepDays: Number(settings.contextMemoryDays) || agentStore.CTX_MEMO_DAY_KEEP,
-    });
-    if (r && r.ok && emit) {
-      emit({
-        type: "memory",
-        text: "🧠 Память диалогов: сохранена памятка за " + r.day + " (памяток за день: " + r.count + "). Спросить прошлые сессии — memoryList / memorySearch.",
-      });
-    }
-    return r;
-  } catch {
-    return null;
-  }
-}
 
 // ── Реестр агентских инструментов и вызов инструмента — код в src/tool-registry.js ──
 // Модуль берём ЗДЕСЬ, а собираем ниже (в конце файла): его обработчики живут всем,
@@ -754,7 +598,10 @@ const { runAi } = createRunAi({
   routerMaxTokens,
   routerTaskText,
   sanitizeToolPairs,
-  saveContextMemo,
+  // Памятку при сжатии контекста пишет модуль памяти диалогов (src/memory-ipc.js) —
+  // он собирается НИЖЕ прогона, поэтому внутрь идёт отложенная стрелка: к первому
+  // вызову (сжатие случается только на длинной работе) имя уже есть.
+  saveContextMemo: (...memoArgs) => memory.saveContextMemo(...memoArgs),
   saveSettings,
   snapshotFileForUndo,
   switchOpenaiProfile,
@@ -794,6 +641,12 @@ const { runAi } = createRunAi({
     // Модуль миссии зовёт это значение missionId — тот же живой runMissionId.
     get missionId() { return runMissionId; },
     set missionId(v) { runMissionId = v; },
+    // «Состояние работы» (сводка миссии в каждом запросе) показывает модели, что
+    // переживёт следующую команду: имена выданных переменных и живые фоновые
+    // процессы с портами. Читаем ПО ИМЕНИ каждый раз — окружение меняет envSet,
+    // а процессы появляются и гаснут по ходу работы.
+    get agentEnv() { return getAgentEnv(); },
+    get backgrounds() { return bgProcesses; },
   },
 });
 
@@ -923,8 +776,8 @@ registerMissionIpc({
 // Переключение проекта сбрасывает три живых значения оболочки: папку последнего клона,
 // флаг «только что склонирован» и снимки отката — их читают пути-и-git, GitHub-каналы,
 // прогон и инструменты, поэтому в модуль уходят СЕТТЕРЫ моста live (копия «застыла» бы,
-// и агент остался бы в папке прошлого проекта). ensureWritableDir объявлен ниже обычной
-// функцией — подъём работает, и к моменту вызова канал его видит.
+// и агент остался бы в папке прошлого проекта). Вместе с путями из src/paths-git.js
+// приходит и проверка «можно ли писать в папку» — она собрана ВЫШЕ этого места.
 const { registerProjectsIpc } = require("./projects-ipc.js");
 registerProjectsIpc({
   ipcMain,
@@ -1041,47 +894,7 @@ registerModelIpc({
 });
 
 // ─────────────────────────── GitHub OAuth (device flow) + repo picker ───────────────────────────
-/** Гарантирует, что папка существует и доступна на запись (клонирование, создание файлов).
- *  Возвращает { ok:true, dir } или { ok:false, error } с понятной подсказкой. */
-function ensureWritableDir(dir) {
-  const abs = dir && typeof dir === "string" && dir.trim() ? path.resolve(String(dir).trim()) : "";
-  if (!abs) return { ok: false, error: "Не указана рабочая директория — выбери её в Настройках → Проект (📁) или в панели проекта." };
-  try {
-    fs.mkdirSync(abs, { recursive: true });
-  } catch (e) {
-    return { ok: false, error: "Не удалось создать папку: " + abs + " — " + (e.message || String(e)) };
-  }
-  try {
-    fs.accessSync(abs, fs.constants.W_OK);
-  } catch (e) {
-    return {
-      ok: false,
-      error: "Нет прав на запись в папку: " + abs + " (Permission denied). " +
-        "Клонирование и создание файлов в ней невозможны — выбери другую рабочую директорию " +
-        "(📁 в панели проекта или Настройки → Проект): обычную папку на диске, а не защищённую системную.",
-    };
-  }
-  // Реальная проверка записи: git падает с «could not create work tree dir ... Permission denied»,
-  // даже когда accessSync(W_OK) проходит (OneDrive Files On-Demand, защищённые/сетевые/системные папки).
-  // Поэтому создаём и удаляем временную подпапку — точно как это сделает git при клонировании.
-  const probe = path.join(abs, ".ai-agent-write-test");
-  try {
-    fs.mkdirSync(probe);
-  } catch (e) {
-    if (e.code !== "EEXIST") {
-      return {
-        ok: false,
-        error: "В папке нет прав на запись — git не сможет создать тут репозиторий: " + abs + " (" + (e.message || String(e)) + "). " +
-          "Выбери другую рабочую директорию (📁 в панели проекта): обычную локальную папку на диске " +
-          "(например, C:\\Users\\<имя>\\projects) — не системную, не сетевую и не синхронизируемую OneDrive.",
-      };
-    }
-  }
-  try {
-    fs.rmdirSync(probe);
-  } catch {}
-  return { ok: true, dir: abs };
-}
+
 
 // ── GitHub: каналы и клонирование — код в src/github-ipc.js ──
 // Модуль собран на прежнем месте куска и отдаёт наружу клон-помощники: их же
@@ -1136,8 +949,11 @@ const {
 } = ycService;
 registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, loadSettings, saveSettings, svc: ycService });
 
-const { registerMemoryIpc } = require("./memory-ipc.js"); // память диалогов: каналы дневника памяток
-registerMemoryIpc({ ipcMain, app, fs, shell, agentStore, loadSettings });
+// Память диалогов: каналы дневника памяток и запись самой памятки при сжатии контекста
+// (её кладёт прогон через onMemo). Собирается ПОСЛЕ путей-и-git и миссий: зеркало
+// памяток пишется в .agent/context рядом с проектом, а рабочую папку дают пути.
+const { registerMemoryIpc } = require("./memory-ipc.js");
+const memory = registerMemoryIpc({ ipcMain, app, fs, shell, agentStore, loadSettings, missionStore, agentWorkDir });
 
 // ───────────────────── Деплой: рецепты, состояние, конвейер ─────────────────────
 // Мост деплоя вынесен в src/deploy-ipc.js (1.5.75): конвейер остаётся чистым в
@@ -1206,35 +1022,29 @@ registerGitIpc({
   },
 });
 // ─────────────────────────── Жизненный цикл ───────────────────────────
-app.whenReady().then(() => {
-  createWindow();
-  mobileBridge.applySettings(loadSettings());
-  // Штатный апдейтер сборки: подписка и проверка по таймеру — код в src/ota-ipc.js.
-  initAutoUpdater({ autoUpdater, Notification, getWindow: () => mainWindow });
-  // Локальный self-update (OTA): проверка при старте и каждые 60 секунд
-  const otaTick = () => {
-    ota.check(loadSettings()).catch(() => {});
-  };
-  setTimeout(otaTick, 5000);
-  setInterval(otaTick, 60000);
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
-  });
+// Старт (окно, настройки моста, апдейтер, тик OTA) и ПОРЯДОК остановки — код в
+// src/lifecycle.js. Там же объяснено, почему отказ одного шага не отменяет
+// остальные: мост с негодным портом больше не выключает проверку обновлений, а
+// упавший шаг остановки не оставляет живым dev-сервер, держащий порт.
+const { createLifecycle } = require("./lifecycle.js");
+const { startLifecycle } = createLifecycle({
+  app,
+  BrowserWindow,
+  createWindow,
+  mobileBridge,
+  loadSettings,
+  initAutoUpdater,
+  autoUpdater,
+  Notification,
+  ota,
+  browserTools,
+  bgProcesses,
+  bgKill,
+  termShutdown,
+  devShutdown,
+  getWindow: () => mainWindow,
 });
-
-app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") app.quit();
-});
-
-// При выходе — останавливаем все фоновые процессы.
-app.on("before-quit", () => {
-  browserTools.stop().catch(() => {}); // закрываем окно Chromium агента
-  for (const rec of bgProcesses.values()) bgKill(rec);
-  bgProcesses.clear();
-  termShutdown();
-  devShutdown(); // превью (dev-сервер проекта) — состояние и остановка в src/preview-ipc.js
-  mobileBridge.stop();
-});
+startLifecycle();
 
 // ─────────────────────── Реестр агентских инструментов ───────────────────────
 // Собираем обработчики один раз при загрузке: к этому месту все константы уже

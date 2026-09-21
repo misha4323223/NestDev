@@ -356,7 +356,11 @@ const MAIN_SRC = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
       assert.ok(wiring.includes(dep), "в проводку не передан " + dep);
     }
     assert.ok(wiring.includes("getWindow: () => mainWindow"), "окно передано не стрелкой — «застынет» на null");
-    assert.ok(/\bdevShutdown\(\);/.test(MAIN_SRC), "остановка при выходе приложения не подключена");
+    // С части 37 шаги остановки собирает src/lifecycle.js: в оболочке остаётся проводка,
+    // а остановка превью обязана быть именно в списке шагов, который сторожит набор.
+    const LIFECYCLE_SRC = fs.readFileSync(path.join(ROOT, "src", "lifecycle.js"), "utf8");
+    assert.ok(/\{ name: "превью проекта", run: \(\) => devShutdown\(\) \}/.test(LIFECYCLE_SRC), "остановка превью при выходе приложения не подключена");
+    assert.ok(/createLifecycle\(\{[\s\S]*?\n  termShutdown,\n  devShutdown,\n/.test(MAIN_SRC), "devShutdown не отдан жизненному циклу");
     for (const before of ["new MobileBridge(", "createBgProcesses({", "createTerminalPanel({"]) {
       assert.ok(MAIN_SRC.indexOf(before) < at, "модуль превью собран раньше зависимости: " + before);
     }

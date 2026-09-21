@@ -107,6 +107,42 @@ function killProcessTree(child) {
   try { child.kill(); } catch {}
 }
 
+// Запуск команды со сбором вывода, пока не появится waitFor / процесс не завершится / не выйдет таймаут.
+function spawnCollect(command, cwd, timeoutMs, waitFor) {
+  return new Promise((resolve) => {
+    const shell = process.platform === "win32" ? process.env.ComSpec || "cmd.exe" : "/bin/sh";
+    const args = shellArgsFor(command);
+    let out = "";
+    let done = false;
+    const finish = (payload) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      payload.out = out;
+      resolve(payload);
+    };
+    const timer = setTimeout(() => {
+      // Убиваем ДЕРЕВО (taskkill /T /F), а не только оболочку — иначе node/expo-сирота держит порт.
+      killProcessTree(child);
+      finish({ ok: false, timedOut: true, matched: false, code: "timeout" });
+    }, timeoutMs || 120000);
+    const child = spawn(shell, args, {
+      cwd,
+      detached: !(process.platform === "win32"),
+      windowsHide: true,
+      env: commandEnv(command),
+    });
+    const onData = (d) => {
+      out += stripAnsi((d || "").toString());
+      if (waitFor && out.includes(waitFor)) finish({ ok: true, matched: true, code: 0 });
+    };
+    child.stdout.on("data", onData);
+    child.stderr.on("data", onData);
+    child.on("error", (e) => finish({ ok: false, timedOut: false, matched: false, code: e && e.code }));
+    child.on("close", (code) => finish({ ok: code === 0, timedOut: false, matched: false, code }));
+  });
+}
+
 // Ждёт появления маркера в выводе фонового процесса (не убивая его и не дожидаясь выхода).
 function bgWaitFor(rec, needle, timeoutMs) {
   return new Promise((resolve) => {
@@ -239,6 +275,7 @@ async function checkUrlStatus(url) {
     bgSpawn,
     bgKill,
     killProcessTree,
+    spawnCollect,
     bgWaitFor,
     parsePortFromUrl,
     parsePortOwners,

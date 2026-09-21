@@ -230,7 +230,11 @@ function mkOta(over) {
     assert.ok(!/ipcMain\.(handle|on)\("ota:/.test(MAIN_SRC), "в main.js остались каналы OTA");
     assert.ok(MAIN_SRC.includes('require("./ota-ipc.js")'), "модуль не подключён");
     assert.ok(/registerOtaIpc\(\{ ipcMain, ota, loadSettings \}\)/.test(MAIN_SRC), "проводка каналов OTA не та");
-    assert.ok(/initAutoUpdater\(\{ autoUpdater, Notification, getWindow: \(\) => mainWindow \}\)/.test(MAIN_SRC), "проводка апдейтера не та");
+    // С части 37 подписка апдейтера ставится из src/lifecycle.js (и ставится, даже если
+    // окно или мост телефона упали) — в оболочке остаётся проводка.
+    const LIFECYCLE_SRC = read("src", "lifecycle.js");
+    assert.ok(/initAutoUpdater\(\{ autoUpdater, Notification, getWindow \}\)/.test(LIFECYCLE_SRC), "проводка апдейтера не та");
+    assert.ok(/createLifecycle\(\{[\s\S]*?\n  initAutoUpdater,\n  autoUpdater,\n  Notification,\n  ota,\n/.test(MAIN_SRC), "оболочка не отдаёт апдейтер жизненному циклу");
     // Модуль не держит живого состояния: окно и настройки приходят снаружи.
     assert.ok(/aliveWindow/.test(MODULE_SRC) && /getWindow/.test(MODULE_SRC), "окно больше не берётся функцией");
     assert.ok(!/^\s*(let|const|var)\s+mainWindow\s*=/m.test(MODULE_SRC), "модуль завёл свою копию окна");

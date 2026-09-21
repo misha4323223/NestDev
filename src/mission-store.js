@@ -29,6 +29,14 @@ const AGENT_DIR = ".agent";
 const MISSIONS_DIR = "missions";
 const MISSION_MAX_KEEP = 40; // сколько миссий храним (старые закрытые удаляются)
 const MISSION_MAX_STEPS = 200; // шагов в одной миссии
+// Этапы работы (отрезки) — их ведёт ПРИЛОЖЕНИЕ, в отличие от шагов плана, которые
+// ставит модель. Смысл: длинная история обрезается с конца, и модель помнит только
+// свежий хвост; сохранённые этапы дают ей весь путь (с чего началось, что было в
+// каждом отрезке, чем закончилось) и растут медленно — одна запись на отрезок.
+const MISSION_MAX_STAGES = 30; // этапов храним (старые отрезаются)
+const MISSION_STAGE_FILES = 12; // файлов в записи этапа
+const MISSION_STAGE_KEEP = 4; // записей журнала из начала и из конца этапа
+const MISSION_GOAL_NOTES_MAX = 20; // уточнений к цели храним
 const MISSION_TEXT_MAX = 2000; // символов в поле/строке журнала
 const JOURNAL_MAX_BYTES = 1500 * 1024; // после этого журнал подрезается до хвоста
 const JOURNAL_KEEP_LINES = 400;
@@ -98,8 +106,8 @@ const AGENT_README = [
   "",
   "Здесь агент хранит свою работу, чтобы не терять её при перезапуске:",
   "",
-  "- `missions/<id>/mission.json` — цель, план, шаги, состояние, метрики;",
-  "- `missions/<id>/journal.md` — журнал шагов человеческим языком;",
+  "- `missions/<id>/mission.json` — цель, план, шаги, этапы работы, состояние, метрики;",
+  "- `missions/<id>/journal.md` — журнал шагов человеческим языком (в нём же строки «🧭 Этап …»);",
   "- `missions/<id>/report.md` — итог по завершении;",
   "- `tasks.md` — зеркало списка дел приложения (если включено в настройках);",
   "- `context/<дата>.md` — зеркало памяток контекста (если включена «Память диалогов»).",
@@ -247,6 +255,10 @@ function missionCreate(workDir, opts) {
     rounds: 0,
     batches: 0,
     steps: stepsFrom(o.steps),
+    // Этапы работы и уточнения к цели: у миссий, заведённых до их появления, этих
+    // полей нет — весь код обязан обходиться пустым списком (см. missionStage).
+    stages: [],
+    goalNotes: [],
     next: o.next ? clip(o.next, 400) : "",
     limits: {
       minutes: Math.max(1, Math.min(24 * 60, Number(o.limits && o.limits.minutes) || 480)),
@@ -372,6 +384,96 @@ function missionStep(workDir, id, opts) {
 }
 
 // Служебная запись в журнал (батч начался, пауза, ошибка, авто-продолжение).
+// ── Этапы работы (отрезки) ────────────────────────────────────────────────────
+// Этап закрывается в конце отрезка: граница батча, остановка по лимиту, пауза,
+// «Стоп» человека. Внутрь едет ИМЕННО этот отрезок: сколько длился, сколько в нём
+// было раундов, какие файлы появились, чем он начался и на чём закончился.
+// Ничего не выдумываем: записи берём из журнала по времени — начала отрезка.
+function missionStage(workDir, id, opts) {
+  const o = opts || {};
+  const rec = missionLoad(workDir, id);
+  if (!rec) return { ok: false, error: "Миссия не найдена: " + id };
+  const at = Number(o.at) || Date.now();
+  const stages = Array.isArray(rec.stages) ? rec.stages : [];
+  const from = stages.length ? Number(stages[stages.length - 1].at) || Number(rec.startedAt) || at : Number(rec.startedAt) || at;
+  let rows = [];
+  try {
+    rows = missionJournal(workDir, id, { limit: 200 }) || [];
+  } catch {
+    rows = [];
+  }
+  // Граница отрезка — «не раньше начала»: запись, сделанная в ту же миллисекунду
+  // (а первая запись миссии именно такая), обязана попасть в свой отрезок.
+  const mine = rows.filter((e) => Number(e.ts) >= from && e.kind !== "stage");
+  const files = [];
+  for (const e of mine) {
+    const m = /(?:создан файл|правка файла|применён патч):\s*(.+)$/.exec(String(e.text || ""));
+    const f = m ? m[1].trim() : "";
+    if (f && files.indexOf(f) < 0 && files.length < MISSION_STAGE_FILES) files.push(f);
+  }
+  // «Как началось» и «чем закончилось» — про РАБОТУ отрезка. Служебные строки
+  // (начало миссии, план, граница батча, строки этапов) в сводке и так есть выше,
+  // и без них видно, с какого действия путь начался.
+  const work = mine.filter((e) => ["tool", "step", "fail", "goal", "note"].indexOf(e.kind) >= 0);
+  const texts = (work.length ? work : mine).map((e) => clip(e.text, 200));
+  const pr = missionProgress(rec);
+  const stage = {
+    n: stages.length + 1,
+    at,
+    from,
+    minutes: Math.max(0, Math.round((at - from) / 60000)),
+    rounds: Math.max(0, Number(o.rounds) || 0),
+    batches: Math.max(0, Number(rec.batches) || 0),
+    entries: mine.length,
+    done: pr.done,
+    total: pr.total,
+    current: clip(pr.current || "", 200),
+    next: clip(o.next || rec.next || "", 200),
+    reason: clip(o.reason || "", 200),
+    files,
+    head: texts.slice(0, MISSION_STAGE_KEEP),
+    tail: texts.slice(-MISSION_STAGE_KEEP),
+  };
+  rec.stages = stages.concat([stage]).slice(-MISSION_MAX_STAGES);
+  const saved = missionSave(workDir, rec);
+  if (!saved.ok) return saved;
+  const human =
+    "🧭 Этап " + stage.n + (stage.reason ? " закрыт: " + stage.reason : "") + " · " + humanTs(from) + "→" + humanTs(at) +
+    (stage.minutes ? " (" + stage.minutes + " мин)" : "") + " · раундов " + stage.rounds + " · записей " + stage.entries +
+    " · файлов " + files.length + " · шагов " + stage.done + "/" + stage.total +
+    (!stage.reason && stage.next ? " · далее: " + stage.next : "");
+  journalAppend(workDir, id, { kind: "stage", text: human, ts: at });
+  return { ok: true, mission: rec, stage };
+}
+
+// Уточнение цели: человек написал новую просьбу по ходу работы. Раньше она просто
+// уходила в историю и вытеснялась обрезкой — модель возвращалась к первой фразе
+// («сделай всё сам») и не знала, что именно от неё теперь хотят.
+function missionGoalNote(workDir, id, text) {
+  const rec = missionLoad(workDir, id);
+  if (!rec) return { ok: false, error: "Миссия не найдена: " + id };
+  const t = clip(text, 600);
+  if (!t) return { ok: false, error: "Пустое уточнение цели." };
+  const notes = Array.isArray(rec.goalNotes) ? rec.goalNotes : [];
+  // Тот же текст дважды не пишем и цель не дублируем значением записи.
+  if (notes.some((n) => n.text === t) || String(rec.goal || "").indexOf(t) >= 0) {
+    return { ok: true, mission: rec, added: false };
+  }
+  notes.push({ at: Date.now(), text: t });
+  rec.goalNotes = notes.slice(-MISSION_GOAL_NOTES_MAX);
+  const saved = missionSave(workDir, rec);
+  if (!saved.ok) return saved;
+  journalAppend(workDir, id, { kind: "goal", text: "➕ Уточнение к цели: " + t });
+  return { ok: true, mission: rec, added: true };
+}
+
+// Служебная строка кнопки «▶ Продолжить» (missionResumeText): это текст ПРИЛОЖЕНИЯ,
+// а не просьба человека, — уточнением к цели он быть не должен. Проверка живёт
+// рядом с самим текстом, чтобы они менялись вместе.
+function isResumeText(text) {
+  return /^Продолжи миссию «/.test(String(text || "").trim());
+}
+
 function missionNote(workDir, id, kind, text) {
   const rec = missionLoad(workDir, id);
   if (!rec) return { ok: false, error: "Миссия не найдена: " + id };
@@ -640,6 +742,9 @@ module.exports = {
   missionSave,
   missionProgress,
   missionStep,
+  missionStage,
+  missionGoalNote,
+  isResumeText,
   missionNote,
   missionCounters,
   missionFinish,
