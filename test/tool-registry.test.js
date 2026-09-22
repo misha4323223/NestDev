@@ -58,7 +58,7 @@ const MAIN_SRC = read("src", "main.js");
 // agent-tools-cloud.js, git и GitHub — в agent-tools-git.js, файлы — в
 // agent-tools-files.js). Обратная проверка ниже спрашивает распаковку у ВСЕХ
 // модулей дома: иначе забытое в main.js значение опять перестало бы быть видно.
-const TOOLS_HOME = ["agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js"].map((f) => read("src", f));
+const TOOLS_HOME = ["agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js"].map((f) => read("src", f));
 const TOOLS_SRC = TOOLS_HOME[0];
 
 /* Стенд: настоящий реестр, поддельные соседи. Назначение — коробка, по ней и видно,
