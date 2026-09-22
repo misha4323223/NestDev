@@ -29,7 +29,12 @@ const path = require("path");
 const ROOT = path.join(__dirname, "..");
 const SRC = path.join(ROOT, "src");
 const { createAgentTools } = require(path.join(SRC, "agent-tools.js"));
-const AGENT_TOOLS_SRC = fs.readFileSync(path.join(SRC, "agent-tools.js"), "utf8");
+// ДОМ агентских инструментов целиком, а не файл-оболочка: буфер обмена переехал
+// своим модулем (часть 40, заход 8 — agent-tools-app.js), и текстовая проверка ниже
+// спрашивает про ТЕЛО, а не про то, в каком файле оно лежит (HANDOFF §4 п.1).
+const AGENT_TOOLS_SRC = ["agent-tools.js", "agent-tools-app.js"]
+  .map((f) => fs.readFileSync(path.join(SRC, f), "utf8"))
+  .join("\n");
 const PKG = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
 
 let passed = 0;
@@ -130,7 +135,7 @@ function jsFiles(dir) {
     assert.match(r, /Буфер обмена пуст/, "пустой буфер не назван пустым: " + r);
   });
 
-  await test("в agent-tools.js не осталось синхронных вызовов буфера", () => {
+  await test("в доме инструментов не осталось синхронных вызовов буфера", () => {
     const bare = [];
     AGENT_TOOLS_SRC.split("\n").forEach((line, i) => {
       if (!/clipboard\.(readText|writeText)\(/.test(line)) return;

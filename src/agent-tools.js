@@ -31,6 +31,7 @@ const { createSystemTools } = require("./agent-tools-system.js"); // систе�
 const { createNetTools } = require("./agent-tools-net.js"); // сеть и проверки доступности
 const { createMemoryTools } = require("./agent-tools-memory.js"); // пояс проекта: заметки, дела, память диалогов, чекпоинты
 const { createMissionTools } = require("./agent-tools-mission.js"); // миссии и план (живой мост: роль, чат, лента, сводка плана)
+const { createAppTools } = require("./agent-tools-app.js"); // окно приложения, буфер обмена, скриншот экрана (живой мост: окно и лента)
 
 
 function createAgentTools(deps) {
@@ -261,6 +262,10 @@ function createAgentTools(deps) {
   // чат текущего прогона, лента событий и сводка плана живут в main.js, а у
   // missionOfRun без моста не было бы «своей» миссии прогона.
   const mission = createMissionTools(deps, live);
+  // Окно и рабочий стол — своим модулем (часть 40, заход 8). Живой мост нужен:
+  // окно приложения меняется, а скриншот уходит событием в ленту.
+  // Имя appTools, а не app: app уже занято распакованным deps.app (окно Electron).
+  const appTools = createAppTools(deps, live);
   return {
     "findTools": async (args, settings) => {
         const query = String(args.query || "").trim();
@@ -700,36 +705,18 @@ function createAgentTools(deps) {
         }
         return "Код подтверждения не найден в последних " + r.messages.length + " письмах" + (want ? " от «" + want + "»" : "") + ". Вызови mailList — возможно, письмо ещё не пришло.";
     },
-    "appRead": async (args, settings) => {
-        return await appUi.read(args, live.mainWindow);
-    },
-    "appClick": async (args, settings) => {
-        return await appUi.click(args, live.mainWindow);
-    },
-    "appFill": async (args, settings) => {
-        return await appUi.fill(args, live.mainWindow);
-    },
-    "appSelect": async (args, settings) => {
-        return await appUi.select(args, live.mainWindow);
-    },
-    "appPress": async (args, settings) => {
-        return await appUi.press(args, live.mainWindow);
-    },
-    "appWait": async (args, settings) => {
-        return await appUi.wait(args, live.mainWindow);
-    },
-    "appScreenshot": async (args, settings) => {
-        const dataUrl = await appUi.screenshot(args, live.mainWindow);
-        if (live.activeEmit) live.activeEmit({ type: "image", path: "app:window", dataUrl });
-        return "OK — скриншот окна приложения снят и показан во встроенном просмотрщике. Детали разбирай через analyzeImage.";
-    },
+    "appRead": appTools.appRead,
+    "appClick": appTools.appClick,
+    "appFill": appTools.appFill,
+    "appSelect": appTools.appSelect,
+    "appPress": appTools.appPress,
+    "appWait": appTools.appWait,
+    "appScreenshot": appTools.appScreenshot,
     "searchFile": files.searchFile,
     "fileOutline": files.fileOutline,
     "listFiles": files.listFiles,
     "searchProject": files.searchProject,
-    "askUser": async (args, settings) => {
-        return "Ошибка: askUser обрабатывается отдельно — дождись ответа пользователя.";
-    },
+    "askUser": appTools.askUser,
     "listDirectory": files.listDirectory,
     "gitClone": git.gitClone,
     "gitStatus": git.gitStatus,
@@ -903,61 +890,12 @@ function createAgentTools(deps) {
     // writeText теперь возвращают Promise. Без await инструмент отдал бы модели
     // "[object Promise]" вместо текста, а отказ записи улетел бы в необработанный
     // reject вместо честной ошибки: обе ветки обязаны ЖДАТЬ результат.
-    "clipboardWrite": async (args, settings) => {
-        const text = String(args.text == null ? "" : args.text);
-        try {
-          await clipboard.writeText(text);
-        } catch (e) {
-          return "Ошибка: не удалось записать в буфер обмена: " + (e.message || String(e));
-        }
-        return "OK — текст скопирован в буфер обмена (" + text.length + " симв.).";
-    },
-    "clipboardRead": async (args, settings) => {
-        let text = "";
-        try {
-          text = String((await clipboard.readText()) || "");
-        } catch (e) {
-          return "Ошибка: не удалось прочитать буфер обмена: " + (e.message || String(e));
-        }
-        if (!text.trim()) return "Буфер обмена пуст (текста нет).";
-        return "Содержимое буфера обмена:\n\n" + truncateText(text, 4000);
-    },
-    "screenshotDesktop": async (args, settings) => {
-        const winFilter = String(args.window || "").trim().toLowerCase();
-        let sources = [];
-        try {
-          sources = await desktopCapturer.getSources({
-            types: winFilter ? ["window"] : ["screen"],
-            thumbnailSize: { width: 1920, height: 1080 },
-            fetchWindowIcons: false,
-          });
-        } catch (e) {
-          return "Ошибка захвата экрана: " + (e.message || String(e)) + " (работает только в десктоп-приложении).";
-        }
-        let src = sources[0];
-        if (winFilter) src = sources.find((s) => s.name.toLowerCase().indexOf(winFilter) !== -1) || sources[0];
-        if (!src) return "Не удалось получить источники экрана/окон.";
-        const shot = encodeShot(src.thumbnail, args);
-        if (!shot.buf || !shot.buf.length) return "Пустой скриншот «" + src.name + "» — не удалось захватить.";
-        const sz = src.thumbnail.getSize();
-        const dataUrl = "data:" + shot.mime + ";base64," + shot.buf.toString("base64");
-        if (live.activeEmit) live.activeEmit({ type: "image", path: "desktop:" + src.name, dataUrl });
-        let saved = null;
-        try {
-          if (shot.buf.length) saved = saveScreenshotPng(shot.buf, "screen", shot.mime);
-        } catch {}
-        return "OK — скриншот «" + src.name + "» (" + sz.width + "×" + sz.height + ") снят, показан пользователю во встроенном просмотрщике" +
-          (saved ? " и сохранён: " + saved : "") +
-          ". Чтобы понять, что на экране, вызови analyzeImage(path: '" + (saved || "") + "') — вернёт описание вспомогательной vision-моделью.";
-    },
+    "clipboardWrite": appTools.clipboardWrite,
+    "clipboardRead": appTools.clipboardRead,
+    "screenshotDesktop": appTools.screenshotDesktop,
     "registryRead": system.registryRead,
     "registryWrite": system.registryWrite,
-    "openPath": async (args, settings) => {
-        const p = resolvePath(args.path, settings);
-        if (!fs.existsSync(p)) return "Ошибка: путь не найден: " + p;
-        const err = await shell.openPath(p);
-        return err ? "Не удалось открыть: " + err : "OK — открыто системным приложением: " + p;
-    },
+    "openPath": appTools.openPath,
     "wingetSearch": system.wingetSearch,
     "installExe": system.installExe,
     "noteSave": memory.noteSave,
