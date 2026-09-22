@@ -3,7 +3,7 @@
    - HTTPS-сервер отдаёт интерфейс (src/renderer) + PWA (manifest, service worker, иконка).
      Сертификат самоподписанный (src/bridge-tls.js): без TLS страницу телефона мог бы
      отдать кто угодно из той же сети и забрать сеанс. Если сертификат не создался,
-     мост работает по http, а статус и панель настроек говорят об этом прямо.
+     мост не запускается, а статус и панель настроек объясняют причину.
    - WebSocket-сервер (/ws) дублирует IPC: те же каналы, что у ipcMain, но только
      те, что перечислены в списке разрешённого (ALLOW ниже), и с защитой входом.
    - Вход: одноразовый токен пары из QR-кода → свой сеанс устройства, либо PIN,
@@ -26,6 +26,11 @@ const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const AUTH_MAX_FAILS = 10;
 const AUTH_FAIL_WINDOW_MS = 60000;
 const AUTH_LOCK_MS = 5 * 60 * 1000;
+const WS_MAX_FRAME = 1024 * 1024;
+const WS_MAX_MESSAGE = 2 * 1024 * 1024;
+const WS_MAX_BUFFER = 4 * 1024 * 1024;
+const WS_MAX_CONNECTIONS = 16;
+const WS_MAX_CLIENTS = 8;
 const RENDERER_DIR = path.join(__dirname, "renderer");
 
 // ─── Что телефону МОЖНО ──────────────────────────────────────────────────────
@@ -281,6 +286,9 @@ self.addEventListener("fetch", (e) => {
 class WsConn {
   constructor(socket, onMessage, onClose) {
     this.socket = socket;
+    this.maxFrame = WS_MAX_FRAME;
+    this.maxMessage = WS_MAX_MESSAGE;
+    this.maxBuffer = WS_MAX_BUFFER;
     this.onMessage = onMessage;
     this.onClose = onClose;
     this.buf = Buffer.alloc(0);
@@ -295,6 +303,10 @@ class WsConn {
   }
 
   feed(chunk) {
+    if (this.buf.length + chunk.length > this.maxBuffer) {
+      this.close(1009, "buffer too large");
+      return;
+    }
     this.buf = Buffer.concat([this.buf, chunk]);
     for (;;) {
       if (this.buf.length < 2) return;
@@ -314,7 +326,11 @@ class WsConn {
         len = Number(this.buf.readBigUInt64BE(2));
         off = 10;
       }
-      const maskLen = masked ? 4 : 0;
+      if (!masked || len > this.maxFrame || len > Number.MAX_SAFE_INTEGER) {
+        this.close(1009, "frame too large or unmasked");
+        return;
+      }
+      const maskLen = 4;
       if (this.buf.length < off + maskLen + len) return;
       let payload = this.buf.slice(off + maskLen, off + maskLen + len);
       if (masked) {
@@ -339,9 +355,12 @@ class WsConn {
         else {
           this.fragOp = opcode;
           this.frag = [payload];
+          if (payload.length > this.maxMessage) { this.close(1009, "message too large"); return; }
         }
       } else if (opcode === 0x0 && this.fragOp) {
         this.frag.push(payload);
+        const total = this.frag.reduce((n, part) => n + part.length, 0);
+        if (total > this.maxMessage) { this.close(1009, "message too large"); return; }
         if (fin) {
           const all = Buffer.concat(this.frag);
           this.frag = [];
@@ -354,7 +373,8 @@ class WsConn {
 
   sendFrame(opcode, payload) {
     try {
-      if (this.socket.destroyed) return;
+      if (this.socket.destroyed || payload.length > this.maxMessage) return;
+      if (this.socket.writableLength > WS_MAX_BUFFER) { this.destroy(); return; }
       let header;
       if (payload.length < 126) {
         header = Buffer.alloc(2);
@@ -379,9 +399,11 @@ class WsConn {
     this.sendFrame(0x1, Buffer.from(String(str), "utf8"));
   }
 
-  close() {
+  close(code, reason) {
     try {
-      this.sendFrame(0x8, Buffer.alloc(0));
+      const body = code ? Buffer.concat([Buffer.alloc(2), Buffer.from(String(reason || "").slice(0, 120), "utf8")]) : Buffer.alloc(0);
+      if (code) body.writeUInt16BE(code, 0);
+      this.sendFrame(0x8, body);
       this.socket.end();
     } catch {}
   }
@@ -407,6 +429,7 @@ class MobileBridge {
     this.enabled = false;
     this.server = null;
     this.clients = new Set();
+    this.connections = new Set();
     this.pingTimer = null;
     this.allow = ALLOW; // что телефону можно (см. список выше)
     this.notForPhone = NOT_FOR_PHONE; // что закрыто сознательно — и почему
@@ -471,9 +494,9 @@ class MobileBridge {
     return this.tls ? "https" : "http";
   }
 
-  // Сертификат для https. Ошибка здесь НЕ должна выключать мобильный доступ:
-  // любой сбой (нет прав на папку, не хватает crypto) возвращает мост к http,
-  // а причина остаётся в статусе — её видно в настройках, а не только в логе.
+  // Сертификат обязателен: откат к открытому HTTP в LAN позволял подменить
+  // страницу и украсть сеанс. При ошибке мост не запускается, а причина видна
+  // в настройках — лучше явный отказ, чем тихая небезопасная деградация.
   prepareTls() {
     if (!this.certDir) {
       this.tls = null;
@@ -496,7 +519,7 @@ class MobileBridge {
     } catch (e) {
       this.tls = null;
       this.tlsError = (e && e.message) || String(e);
-      console.error("[mobile] сертификат не создан — мост работает без шифрования:", this.tlsError);
+      console.error("[mobile] сертификат не создан — мост не запущен:", this.tlsError);
       return null;
     }
   }
@@ -504,10 +527,9 @@ class MobileBridge {
   start() {
     if (this.server) return;
     const tls = this.prepareTls();
+    if (!tls) return;
     const handler = (req, res) => this.handleHttp(req, res);
-    const server = tls
-      ? https.createServer({ key: tls.key, cert: tls.cert, minVersion: "TLSv1.2" }, handler)
-      : http.createServer(handler);
+    const server = https.createServer({ key: tls.key, cert: tls.cert, minVersion: "TLSv1.2" }, handler);
     server.on("upgrade", (req, socket) => this.handleUpgrade(req, socket));
     server.on("error", (err) => {
       // Порт занят/недоступен — мост просто не поднимется; приложение продолжает работать.
@@ -526,6 +548,7 @@ class MobileBridge {
     }
     for (const c of this.clients) c.destroy();
     this.clients.clear();
+    this.connections.clear();
     if (this.server) {
       try {
         this.server.close();
@@ -656,6 +679,10 @@ class MobileBridge {
 
   // ─── WebSocket: рукопожатие ───
   handleUpgrade(req, socket) {
+    if (this.connections.size >= WS_MAX_CONNECTIONS || this.clients.size >= WS_MAX_CLIENTS) {
+      try { socket.destroy(); } catch {}
+      return;
+    }
     if (req.url.split("?")[0] !== "/ws") {
       socket.destroy();
       return;
@@ -676,8 +703,9 @@ class MobileBridge {
     const conn = new WsConn(
       socket,
       (payload) => this.onWsMessage(conn, payload),
-      (c) => this.clients.delete(c)
+      (c) => { this.clients.delete(c); this.connections.delete(c); }
     );
+    this.connections.add(conn);
     socket.on("data", (chunk) => conn.feed(chunk));
   }
 
@@ -786,6 +814,10 @@ class MobileBridge {
     conn.authed = true;
     this.authFailCount = 0;
     this.authFailWindowStart = 0;
+    if (this.clients.size >= WS_MAX_CLIENTS) {
+      conn.close(1013, "too many clients");
+      return;
+    }
     this.clients.add(conn);
     const payload = { t: "auth_ok", v: this.status({ client: true }) };
     if (opts && opts.session) payload.session = opts.session;

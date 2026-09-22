@@ -41,8 +41,16 @@ function createBrowserTools(deps, live) {
     },
     "browserOpen": async (args, settings) => {
         const opened = await browserTools.open(args);
+        // Отказом набора считается не только «Ошибка …»: без запущенного браузера
+        // набор отвечает «Браузер не запущен…». Раньше подсказка справочника
+        // приклеивалась и к отказу — агент мог решить, что страница открылась.
+        // Список отказов живёт в самом наборе (isBrowserFailure).
+        const refused =
+          typeof browserTools.isBrowserFailure === "function"
+            ? browserTools.isBrowserFailure(opened)
+            : /^Ошибка/.test(String(opened || ""));
         // Есть справочник по этому сайту — говорим сразу, а не после блужданий.
-        if (typeof opened === "string" && !/^Ошибка/.test(opened)) {
+        if (typeof opened === "string" && !refused) {
           const g = guideForUrl(args && args.url);
           if (g) {
             return (

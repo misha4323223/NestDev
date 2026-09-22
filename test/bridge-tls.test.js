@@ -269,33 +269,22 @@ function wsHandshake(port, cert, key) {
     }
   });
 
-  await test("мост: без папки для сертификата доступ остаётся, но без шифрования и с причиной", async () => {
+  await test("мост: без папки для сертификата не запускается по открытому HTTP", async () => {
     const b = new MobileBridge({ handlerMap: new Map(), certDir: "" });
     b.port = await freePort();
     b.start();
     try {
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 100));
       const st = b.status({});
-      assert.strictEqual(st.scheme, "http", "мост без сертификата назвался https: " + st.scheme);
-      assert.strictEqual(st.tls, false, "статус сообщает о шифровании без сертификата");
+      assert.strictEqual(st.running, false, "мост запустился без TLS");
+      assert.strictEqual(st.tls, false, "статус сообщает о TLS без сертификата");
       assert.ok(st.tlsError.length > 0, "причина отказа от TLS не названа");
-      assert.ok(st.urls.every((u) => /^http:\/\//.test(u.url)), "адреса не соответствуют схеме: " + JSON.stringify(st.urls));
-      const page = await new Promise((resolve, reject) => {
-        http
-          .get({ host: "127.0.0.1", port: b.port, path: "/" }, (res) => {
-            let body = "";
-            res.on("data", (c) => (body += c));
-            res.on("end", () => resolve({ status: res.statusCode, body: body }));
-          })
-          .on("error", reject);
-      });
-      assert.strictEqual(page.status, 200, "без TLS доступ к приложению потерян: " + page.status);
     } finally {
       b.stop();
     }
   });
 
-  await test("мост: сбой выпуска сертификата не выключает доступ, а объясняется человеку", async () => {
+  await test("мост: сбой выпуска сертификата блокирует небезопасный запуск", async () => {
     // Путь, по которому папку создать нельзя: под ним уже лежит файл.
     const dir = tmpdir("bridge-tls-");
     const blocker = path.join(dir, "file");
@@ -306,17 +295,8 @@ function wsHandshake(port, cert, key) {
     try {
       await new Promise((r) => setTimeout(r, 300));
       const st = b.status({});
-      assert.strictEqual(st.scheme, "http", "мост без сертификата назвался https");
+      assert.strictEqual(st.running, false, "мост запустился после сбоя TLS");
       assert.ok(st.tlsError.length > 0, "причина сбоя не записана в статус");
-      const page = await new Promise((resolve, reject) => {
-        http
-          .get({ host: "127.0.0.1", port: b.port, path: "/" }, (res) => {
-            res.resume();
-            res.on("end", () => resolve(res.statusCode));
-          })
-          .on("error", reject);
-      });
-      assert.strictEqual(page, 200, "сбой сертификата сломал мобильный доступ");
     } finally {
       b.stop();
     }

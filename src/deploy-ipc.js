@@ -1,5 +1,7 @@
 "use strict";
 
+const { spawn } = require("child_process");
+
 /* ─── Деплой: мост между интерфейсом, агентом и конвейером ────────────────────
    Сам конвейер (порядок стадий, проверка после выката, откат) живёт в
    src/deploy-engine.js и остаётся чистым модулем. Здесь — обвязка вокруг него,
@@ -55,33 +57,69 @@ function registerDeployIpc(deps) {
 // Деплою нельзя судить по словам в выводе: «error» встречается и в удачных сборках.
 function runCapture(command, cwd, timeoutMs, opts) {
   const o = opts || {};
+  const limit = 32 * 1024 * 1024;
   return new Promise((resolve) => {
     const finish = (code, out) => resolve({ code, out: String(out || "").trim() });
     const sh = resolveShell(command, o.shellName);
     let child = null;
+    let timer = null;
+    let settled = false;
+    let timedOut = false;
+    let output = "";
+    const append = (chunk) => {
+      if (output.length < limit) output += String(chunk).slice(0, limit - output.length);
+      if (output.length >= limit && child && !child.killed) killTree(child);
+    };
+    const done = (code, extra) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      finish(code, output + (extra ? "\n" + extra : ""));
+    };
     try {
-      child = execFile(sh.shell, sh.args, {
+      child = spawn(sh.shell, sh.args, {
         cwd,
-        timeout: timeoutMs || 120000,
-        maxBuffer: 32 * 1024 * 1024,
+        detached: process.platform !== "win32",
         windowsHide: true,
         env: commandEnv(command),
-      }, (err, stdout, stderr) => {
-        const out = stripAnsi(String(stdout || "")) + (stderr ? "\n" + stripAnsi(String(stderr)) : "");
-        if (!err) return finish(0, out);
-        const code = err.killed ? 124 : Number.isFinite(err.code) ? err.code : 1;
-        finish(code, out + "\n" + String(err.message || ""));
+        stdio: ["pipe", "pipe", "pipe"],
       });
-    } catch (e) {
-      return finish(1, (e && e.message) || String(e));
-    }
-    if (o.input != null && child && child.stdin) {
-      try {
+      child.stdout.on("data", append);
+      child.stderr.on("data", append);
+      child.on("error", (err) => done(timedOut ? 124 : (Number.isFinite(err.code) ? err.code : 1), err.message || String(err)));
+      child.on("close", (code, signal) => {
+        done(timedOut ? 124 : (Number.isInteger(code) ? code : 1), signal ? "Сигнал: " + signal : "");
+      });
+      timer = setTimeout(() => {
+        timedOut = true;
+        killTree(child);
+      }, timeoutMs || 120000);
+      if (o.input != null) {
         child.stdin.write(String(o.input) + "\n");
         child.stdin.end();
-      } catch {}
+      } else {
+        child.stdin.end();
+      }
+    } catch (e) {
+      done(1, (e && e.message) || String(e));
     }
   });
+}
+
+function killTree(child) {
+  if (!child || child.killed) return;
+  try {
+    if (process.platform === "win32") {
+      spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true, stdio: "ignore" });
+    } else {
+      process.kill(-child.pid, "SIGTERM");
+      setTimeout(() => {
+        try { process.kill(-child.pid, "SIGKILL"); } catch {}
+      }, 250);
+    }
+  } catch {
+    try { child.kill("SIGTERM"); } catch {}
+  }
 }
 
 // События деплоя: yc_step — как раньше (панель деплоя), deploy_* — для истории.

@@ -169,6 +169,16 @@ function notFoundText(list, query) {
   );
 }
 
+// Отказом браузерного набора считается не только «Ошибка …»: без запущенного
+// браузера набор отвечает «Браузер не запущен…», «Вкладка не найдена…», и раньше
+// такой отказ выглядел успехом — vaultFill отчитывался о подстановке, которой не
+// было. Список отказов живёт в browser-tools.js (isBrowserFailure) — берём его,
+// когда он передан; у стендов со своей заменой набора остаётся прежний признак.
+function browserRefused(bt, res) {
+  if (bt && typeof bt.isBrowserFailure === "function") return bt.isBrowserFailure(res);
+  return /^Ошибка/.test(String(res || ""));
+}
+
 // Подстановка логина и пароля в форму на открытой странице.
 // bt — модуль browser-tools (fill/press/click); передаётся, чтобы логика тестировалась.
 // opts: { loginSelector, passwordSelector, submit, tabId }
@@ -188,7 +198,7 @@ async function fillLogin(entry, opts, bt) {
   }
 
   const rl = await bt.fill({ selector: loginSel, text: entry.login, tabId: opts.tabId });
-  if (/^Ошибка/.test(String(rl || ""))) {
+  if (browserRefused(bt, rl)) {
     return "Не удалось заполнить поле логина для «" + name + "»: " + String(rl).slice(0, 200);
   }
   if (!entry.password) {
@@ -199,7 +209,7 @@ async function fillLogin(entry, opts, bt) {
   }
 
   const rp = await bt.fill({ selector: passSel, text: entry.password, tabId: opts.tabId });
-  if (/^Ошибка/.test(String(rp || ""))) {
+  if (browserRefused(bt, rp)) {
     return (
       "Логин для «" + name + "» заполнен, но поле пароля не найдено. Посмотри страницу через browserText, " +
       "при необходимости передай точный selector поля пароля в passwordSelector — или попроси пользователя ввести пароль вручную."
@@ -209,7 +219,7 @@ async function fillLogin(entry, opts, bt) {
   let out = "OK — логин и пароль для «" + name + "» подставлены в форму (пароль в чат не выводится).";
   if (opts.submit) {
     const rs = await bt.press({ key: "Enter", tabId: opts.tabId });
-    out += /^Ошибка/.test(String(rs || ""))
+    out += browserRefused(bt, rs)
       ? "\nОтправить форму клавишей Enter не удалось — нажми кнопку входа через browserClick (или попроси пользователя дожать вручную)."
       : "\nФорма отправлена (Enter). Проверь результат через browserText — вошёл ли пользователь.";
   } else {

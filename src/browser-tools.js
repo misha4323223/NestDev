@@ -798,7 +798,10 @@ async function goBackStep(page) {
   return "OK — вернулся назад. URL: " + (pi.url || "—");
 }
 
-function stepFailed(res) {
+// Единый список отказов набора: им пользуются browserAct (остановка цепочки),
+// browserOpen и vaultFill. Отказом считается не только «Ошибка …»: без запущенного
+// браузера набор отвечает «Браузер не запущен…», и раньше такой отказ выглядел успехом.
+function isBrowserFailure(res) {
   return /^(Ошибка|Не нашёл|Браузер не запущен|Вкладка не найдена|browserDOM:)/.test(String(res || ""));
 }
 
@@ -855,7 +858,7 @@ async function act(args) {
     else if (st.kind === "scroll") res = await scrollPage(page, a);
     else if (st.kind === "open") res = await open(a);
     else if (st.kind === "back") res = await goBackStep(page);
-    const bad = stepFailed(res);
+    const bad = isBrowserFailure(res);
     if (bad) failed++;
     const one = String(res || "").replace(/\s+/g, " ").trim().slice(0, 220);
     rows.push(num + ". " + (bad ? "❌ " : "✅ ") + st.label + " — " + (one || "(без ответа)"));
@@ -1833,4 +1836,5 @@ module.exports = {
   lazyKeyOf, // тесты: определение «появилось ли новое содержимое»
   loadAllScroll, // тесты: цикл догрузки ленивого списка
   setPlaywright, // только для тестов: подменить/сбросить кэш playwright
+  isBrowserFailure, // отказ набора: «Ошибка …», «Браузер не запущен …», «Вкладка не найдена …»
 };

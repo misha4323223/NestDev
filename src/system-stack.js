@@ -348,8 +348,38 @@ async function installSystemPkg(pkg) {
   );
 }
 
-// Скачивает файл по URL в указанный путь с проверкой размера.
+// Скачивает файл по URL в указанный путь с проверкой размера. Поток не собирается
+// целиком в RAM: это важно для установщиков и архивов, которыми управляет агент.
+async function downloadResponseToFile(res, dest, limit) {
+  let size = 0;
+  const tmp = dest + ".part-" + process.pid + "-" + Date.now().toString(36);
+  try {
+    const out = fs.createWriteStream(tmp, { flags: "wx" });
+    for await (const chunk of res.body) {
+      size += chunk.length;
+      if (size > limit) {
+        out.destroy();
+        throw new Error("__LIMIT__");
+      }
+      if (!out.write(chunk)) await new Promise((resolve, reject) => {
+        out.once("drain", resolve);
+        out.once("error", reject);
+      });
+    }
+    await new Promise((resolve, reject) => {
+      out.end((err) => err ? reject(err) : resolve());
+      out.once("error", reject);
+    });
+    fs.renameSync(tmp, dest);
+    return { size };
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw e;
+  }
+}
+
 async function downloadFileTo(url, dest, limitMb) {
+  const limit = (limitMb || 800) * 1024 * 1024;
   let res;
   try {
     res = await fetch(url, { redirect: "follow", headers: { "User-Agent": "AI-Developer-Agent" } });
@@ -357,15 +387,14 @@ async function downloadFileTo(url, dest, limitMb) {
     return { ok: false, error: "Ошибка загрузки " + url + ": " + (e.message || String(e)) };
   }
   if (!res.ok) return { ok: false, error: "Ошибка HTTP " + res.status + " при загрузке " + url };
-  const buf = Buffer.from(await res.arrayBuffer());
-  const limit = (limitMb || 800) * 1024 * 1024;
-  if (buf.length > limit) return { ok: false, error: "Файл слишком большой (> " + (limitMb || 800) + " МБ)." };
+  const announced = Number(res.headers.get("content-length") || 0);
+  if (announced > limit) return { ok: false, error: "Файл слишком большой (> " + (limitMb || 800) + " МБ)." };
   try {
-    fs.writeFileSync(dest, buf);
+    const r = await downloadResponseToFile(res, dest, limit);
+    return { ok: true, size: r.size };
   } catch (e) {
-    return { ok: false, error: "Не удалось сохранить файл: " + (e.message || String(e)) };
+    return { ok: false, error: e && e.message === "__LIMIT__" ? "Файл слишком большой (> " + (limitMb || 800) + " МБ)." : "Не удалось сохранить файл: " + (e.message || String(e)) };
   }
-  return { ok: true, size: buf.length };
 }
 
 // ── Проверка скачанного установщика ──────────────────────────────────────────
@@ -475,6 +504,14 @@ function archiveKind(url, contentType) {
   return "";
 }
 
+function safeArchiveEntry(name) {
+  const raw = String(name || "").replace(/\\/g, "/");
+  if (!raw || raw.startsWith("/") || /^[A-Za-z]:\//.test(raw)) return false;
+  const parts = raw.split("/").filter((p) => p && p !== ".");
+  if (parts.some((p) => p === ".." || p.includes("\0"))) return false;
+  return true;
+}
+
 async function downloadAndExtractTo(url, destDir) {
   const u = String(url || "").trim();
   if (!/^https?:\/\//i.test(u)) return "Ошибка: укажи полный URL (https://…/archive.zip, .tar.gz и т.п.)";
@@ -490,30 +527,59 @@ async function downloadAndExtractTo(url, destDir) {
     return "Ошибка загрузки " + u + ": " + (e.message || String(e));
   }
   if (!res.ok) return "Ошибка HTTP " + res.status + " при загрузке " + u;
-  const buf = Buffer.from(await res.arrayBuffer());
-  if (buf.length > 300 * 1024 * 1024) return "Архив слишком большой (>300 МБ): " + buf.length + " байт.";
+  const archiveLimit = 300 * 1024 * 1024;
+  const announced = Number(res.headers.get("content-length") || 0);
+  if (announced > archiveLimit) return "Архив слишком большой (>300 МБ): " + announced + " байт.";
   const contentType = (res.headers.get("content-type") || "").toLowerCase();
   const pathLow = u.toLowerCase();
   const kind = archiveKind(u, contentType);
   if (!kind) return "Не похоже на архив (.zip / .tar.gz / .tgz): " + u + ". Скачивать обычные файлы через runCommand (curl / Invoke-WebRequest).";
   const isZip = kind === "zip";
   const tmpFile = path.join(os.tmpdir(), "ai-agent-dl-" + Date.now().toString(36) + (isZip ? ".zip" : ".tar"));
+  const staging = tmpFile + "-out";
   try {
-    fs.writeFileSync(tmpFile, buf);
-    let note = "";
-    if (process.platform === "win32") {
-      const ps = "Expand-Archive -Path '" + tmpFile.replace(/'/g, "''") + "' -DestinationPath '" + destDir.replace(/'/g, "''") + "' -Force";
+    await downloadResponseToFile(res, tmpFile, archiveLimit);
+    // Сначала проверяем имена архива, затем распаковываем только во временный
+    // каталог. Так ни traversal, ни частично распакованный архив не попадают в
+    // рабочую папку. Символические ссылки отбрасываются отдельной проверкой ниже.
+    const list = isZip
+      ? await spawnRaw(["unzip", "-Z1", tmpFile], { timeoutMs: 30000 })
+      : await spawnRaw(["tar", "-tf", tmpFile], { timeoutMs: 30000 });
+    if (!list.ok) return "Не удалось проверить архив: " + ((list.err || list.out || "").trim() || "код " + list.code);
+    const archiveNames = String(list.out || "").split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+    const bad = archiveNames.find((name) => !safeArchiveEntry(name));
+    if (bad) return "Архив отклонён: опасный путь или ссылка в записи «" + bad + "».";
+    const details = isZip
+      ? await spawnRaw(["unzip", "-Z", "-l", tmpFile], { timeoutMs: 30000 })
+      : await spawnRaw(["tar", "-tvf", tmpFile], { timeoutMs: 30000 });
+    if (!details.ok) return "Не удалось проверить типы записей архива: " + ((details.err || details.out || "").trim() || "код " + details.code);
+    if ((!isZip && /^l|^h/m.test(details.out || "")) || (isZip && /\s->\s/.test(details.out || ""))) {
+      return "Архив отклонён: символические и жёсткие ссылки запрещены.";
+    }
+    fs.mkdirSync(staging, { recursive: true });
+    if (process.platform === "win32" && isZip) {
+      const ps = "Expand-Archive -Path '" + tmpFile.replace(/'/g, "''") + "' -DestinationPath '" + staging.replace(/'/g, "''") + "' -Force";
       const r = await spawnRaw(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps], { timeoutMs: 180000 });
       if (!r.ok) return "Не удалось распаковать: " + ((r.err || r.out || "").trim() || "код " + r.code);
     } else if (isZip) {
-      const r = await spawnRaw(["unzip", "-q", "-o", tmpFile, "-d", destDir], { timeoutMs: 180000 });
+      const r = await spawnRaw(["unzip", "-q", "-o", tmpFile, "-d", staging], { timeoutMs: 180000 });
       if (!r.ok) return "Не удалось распаковать (нужен unzip): " + ((r.err || r.out || "").trim() || "код " + r.code) + "\nВарианты: установи unzip (installSystemPackage) или скачай tar-архив (.tar.gz).";
     } else {
-      // -z ставим только там, где это точно gzip: лишний -z на несжатом tar ломает распаковку.
       const flag = /\.(tar\.gz|tgz)$/.test(pathLow) || contentType.includes("gzip") ? "-xzf" : "-xf";
-      const r = await spawnRaw(["tar", flag, tmpFile, "-C", destDir], { timeoutMs: 180000 });
+      const r = await spawnRaw(["tar", flag, tmpFile, "-C", staging], { timeoutMs: 180000 });
       if (!r.ok) return "Не удалось распаковать: " + ((r.err || r.out || "").trim() || "код " + r.code);
     }
+    const stagedEntries = [];
+    const checkStaging = (d) => {
+      for (const en of fs.readdirSync(d, { withFileTypes: true })) {
+        const full = path.join(d, en.name);
+        if (en.isSymbolicLink() || en.isBlockDevice() || en.isCharacterDevice() || en.isSocket()) throw new Error("опасная ссылка: " + path.relative(staging, full));
+        if (en.isDirectory()) checkStaging(full);
+        else stagedEntries.push(full);
+      }
+    };
+    checkStaging(staging);
+    fs.cpSync(staging, destDir, { recursive: true, force: true });
     const names = [];
     const walk = (d) => {
       let entries;
@@ -527,6 +593,7 @@ async function downloadAndExtractTo(url, destDir) {
     walk(destDir);
     return "OK — скачано и распаковано в " + destDir + "\nФайлов: " + names.length + (names.length ? "\nПримеры:\n" + names.slice(0, 15).map((n) => "• " + n).join("\n") : "");
   } finally {
+    try { fs.rmSync(staging, { recursive: true, force: true }); } catch {}
     try { fs.unlinkSync(tmpFile); } catch {}
   }
 }

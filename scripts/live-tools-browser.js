@@ -13,6 +13,8 @@
      • browserStatus и browserClearProfile зовутся БЕЗ доводов — как в приложении;
      • подсказка о справочнике в browserOpen появляется только там, где надо, а
        сам справочник ищется НАСТОЯЩИМ guideForUrl (в шапке vk.md есть sites:);
+       отказ набора («Браузер не запущен…», без слова «Ошибка») подсказкой НЕ
+       украшается — отказ узнаётся общим списком browser-tools.js (isBrowserFailure);
      • снимок ложится файлом, картинка уходит в ленту ЧЕРЕЗ ЖИВОЙ МОСТ, а на
        отказе браузера ни файла, ни события нет;
      • зрение не настроено — сказано, где включить.
@@ -261,16 +263,21 @@ const CALLS = [
     ok(guided.indexOf("📘 По этому сайту есть справочник агента «vk»") > 0, "подсказка о справочнике не добавлена: " + oneLine(guided));
     ok(guided.indexOf('agentGuide { name: "vk" }') > 0, "подсказка не зовёт справочник: " + oneLine(guided, 3));
     ok(noGuide === "Вкладка tab2 открыта (движок: Chromium)", "к адресу без справочника ответ изменён: " + oneLine(noGuide));
+    // Отказ набора — не только «Ошибка …» (см. isBrowserFailure в browser-tools.js):
+    // без запущенного браузера набор отвечает «Браузер не запущен…». Раньше сторож
+    // подсказки знал только «Ошибка», и настоящий отказ выглядел как успех.
+    ok(typeof real.isBrowserFailure === "function", "набор отдаёт наружу список отказов");
+    ok(real.isBrowserFailure(realText) === true, "настоящий отказ набора признан отказом: " + oneLine(realText));
+    ok(real.isBrowserFailure("Вкладка tab1 открыта (движок: Chromium)") === false, "успех признан отказом");
     scripted.open = () => "Ошибка: браузер не запущен";
     const refusedOpen = await call("browserOpen", { url: "https://vk.com/лента" });
     scripted.open = () => realText;
-    const decorated = await call("browserOpen", { url: "https://vk.com/лента" });
+    const refusedReal = await call("browserOpen", { url: "https://vk.com/лента" });
     delete scripted.open;
     ok(refusedOpen === "Ошибка: браузер не запущен", "к отказу «Ошибка: …» подсказка приклеена: " + oneLine(refusedOpen));
-    ok(decorated.indexOf("📘") > 0, "к настоящему отказу набора подсказка не приклеивается");
+    ok(refusedReal === realText, "к настоящему отказу набора приклеена подсказка: " + oneLine(refusedReal));
     const realError = String((await real.screenshotFile({})).error || "");
     ok(/^Браузер не запущен/.test(realError) && !/^Ошибка/.test(realError), "и снимок набора отказывает тем же честным текстом, без «Ошибка»: " + oneLine(realError));
-    console.log("    └ ЗАПИСЬ (не исправлено): отказы набора не начинаются с «Ошибка», а сторож подсказки — только этот префикс, поэтому отказ («" + oneLine(realText) + "») выглядит как успех и подсказка приклеивается. Та же болезнь у vaultFill (HANDOFF §6.1); правильный список префиксов у browser-tools.js есть (isBrowserFailure), но не экспортируется.");
 
     console.log("\n[5] снимок: файл, событие через живой мост и честный отказ");
     ok(seen.runLive.activeEmit === null, "без прогона отправителя нет: " + String(seen.runLive.activeEmit));

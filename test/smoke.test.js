@@ -3660,6 +3660,20 @@ async function testVault() {
     const errBt = { async fill() { return "Ошибка browserFill: элемент не найден"; }, async press() { return "OK"; } };
     assert.ok((await vault.fillLogin(site[0], {}, errBt)).includes("Не удалось заполнить поле логина"));
 
+    // Отказ набора без слова «Ошибка» («Браузер не запущен…») тоже обязан считаться
+    // отказом: иначе vaultFill отчитывается об успехе, ничего не заполнив.
+    const stoppedBt = {
+      isBrowserFailure: require(path.join(ROOT, "src", "browser-tools.js")).isBrowserFailure,
+      async fill() { return "Браузер не запущен. Сначала вызови browserOpen (url)."; },
+      async press() { return "Браузер не запущен. Сначала вызови browserOpen (url)."; },
+    };
+    const stopped = await vault.fillLogin(site[0], {}, stoppedBt);
+    assert.ok(stopped.includes("Не удалось заполнить поле логина"), "отказ браузера не назван: " + stopped);
+    assert.ok(!stopped.includes("подставлены в форму"), "отказ браузера выдан за подстановку: " + stopped);
+    assert.ok(stopped.indexOf("pass1") < 0, "пароль утёк в ответ об отказе: " + stopped);
+    const stoppedSubmit = await vault.fillLogin(site[0], { submit: true }, stoppedBt);
+    assert.ok(!stoppedSubmit.includes("Форма отправлена"), "на отказавшем браузере форма «отправлена»: " + stoppedSubmit);
+
     let n = 0;
     const halfBt = { async fill() { n++; return n === 1 ? "OK" : "Ошибка browserFill: нет поля"; }, async press() { return "OK"; } };
     const r4 = await vault.fillLogin(site[0], {}, halfBt);
@@ -4508,27 +4522,27 @@ async function testMobileBridge() {
 
 
   await test("mobile-bridge: отдаёт monochrome.css и highlight.js", async () => {
-    const b = new MobileBridge({ handlerMap: new Map() });
+    const b = new MobileBridge({ handlerMap: new Map(), certDir: tmpdir("mobile-smoke-tls-") });
     b.port = await freePort();
     b.pin = "123456";
     b.start();
     try {
-      const css = await get(b.port, "/monochrome.css");
+      const css = await get(b.port, "/monochrome.css", true);
       assert.strictEqual(css.status, 200, "monochrome.css не отдаётся (" + css.status + ")");
       assert.ok(/backdrop-filter/.test(css.body), "отдан не монохромный слой");
-      const hl = await get(b.port, "/highlight.js");
+      const hl = await get(b.port, "/highlight.js", true);
       assert.strictEqual(hl.status, 200, "highlight.js не отдаётся (" + hl.status + ")");
       assert.ok(hl.body.length > 100, "highlight.js пустой");
-      const gate = await get(b.port, "/mobile-api.js");
+      const gate = await get(b.port, "/mobile-api.js", true);
       assert.strictEqual(gate.status, 200, "mobile-api.js перестал отдаваться");
-      const escaped = await get(b.port, "/../package.json");
+      const escaped = await get(b.port, "/../package.json", true);
       assert.strictEqual(escaped.status, 404, "мост отдал файл вне renderer");
       // Данные агента (промпт и таблица схем) телефон обязан получать так же, как ПК:
       // без них на телефоне ядро стартует без правил и без инструментов.
-      const prm = await get(b.port, "/prompts.js");
+      const prm = await get(b.port, "/prompts.js", true);
       assert.strictEqual(prm.status, 200, "промпт не отдаётся телефону (" + prm.status + ")");
       assert.ok(prm.body.indexOf("SYSTEM_PROMPT") > 0, "отдан не файл промпта");
-      const sch = await get(b.port, "/tool-schemas.js");
+      const sch = await get(b.port, "/tool-schemas.js", true);
       assert.strictEqual(sch.status, 200, "таблица схем не отдаётся телефону (" + sch.status + ")");
       assert.ok(sch.body.indexOf("TOOL_DEFINITIONS") > 0, "отдан не файл схем");
       assert.ok(sch.body.indexOf("findTools") > 0, "в схемах нет инструментов");
@@ -4544,13 +4558,16 @@ async function testMobileBridge() {
       ["settings:get", () => ({ provider: "openai", agentEnv: { TOKEN: "секрет" }, yandexOauthToken: "y0-TOKEN" })],
       ["yc:status", () => ({ loggedIn: true, folderName: "prod", allowUpdate: true })],
     ]);
-    const b = new MobileBridge({ handlerMap: handlers });
+    const b = new MobileBridge({ handlerMap: handlers, certDir: tmpdir("mobile-smoke-ws-tls-") });
     b.port = await freePort();
     b.pin = "123456";
     b.start();
     let ws = null;
     try {
-      ws = new WebSocket("ws://127.0.0.1:" + b.port + "/ws");
+      const oldTlsReject = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+      process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+      ws = new WebSocket("wss://127.0.0.1:" + b.port + "/ws");
+      if (oldTlsReject === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED; else process.env.NODE_TLS_REJECT_UNAUTHORIZED = oldTlsReject;
       const seen = [];
       await new Promise((resolve, reject) => {
         const t = setTimeout(() => reject(new Error("таймаут WebSocket")), 5000);
@@ -4593,19 +4610,19 @@ async function testMobileBridge() {
 
   await test("mobile-bridge: service worker получает версию приложения (телефон не залипает на старом коде)", async () => {
     const pkgVersion = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
-    const b = new MobileBridge({ handlerMap: new Map() });
+    const b = new MobileBridge({ handlerMap: new Map(), certDir: tmpdir("mobile-smoke-sw-tls-") });
     b.port = await freePort();
     b.pin = "123456";
     b.start();
     try {
-      const sw = await get(b.port, "/sw.js");
+      const sw = await get(b.port, "/sw.js", true);
       assert.strictEqual(sw.status, 200, "sw.js не отдаётся");
       assert.ok(
         sw.body.includes("ai-agent-mobile-" + pkgVersion),
         "в имени кэша service worker нет версии приложения: " + (sw.body.match(/ai-agent-mobile-[^"]*/) || ["—"])[0]
       );
       assert.ok(sw.body.includes("caches.delete"), "старые кэши не удаляются");
-      const boot = await get(b.port, "/bootstrap.js");
+      const boot = await get(b.port, "/bootstrap.js", true);
       assert.ok(/__mobileBridge = true/.test(boot.body), "без флага моста mobile-api не включится");
     } finally {
       b.stop();
@@ -4722,9 +4739,10 @@ function freePort() {
   });
 }
 
-function get(port, p) {
+function get(port, p, secure) {
   return new Promise((resolve) => {
-    const req = require("http").get({ host: "127.0.0.1", port, path: p, timeout: 5000 }, (res) => {
+    const mod = secure ? require("https") : require("http");
+    const req = mod.get({ host: "127.0.0.1", port, path: p, timeout: 5000, rejectUnauthorized: false }, (res) => {
       let body = "";
       res.on("data", (d) => (body += d));
       res.on("end", () => resolve({ status: res.statusCode, body }));
@@ -15215,6 +15233,27 @@ async function testAgentTools() {
     browserTools.open = async () => "Ошибка: браузер не запущен";
     const failed = await mod.browserOpen({ url: "https://vk.com/лента" }, {});
     assert.strictEqual(failed, "Ошибка: браузер не запущен", "отказ украшен справочником: " + failed);
+
+    // Отказ набора — не только «Ошибка …»: без запущенного браузера набор отвечает
+    // «Браузер не запущен…», и такой отказ раньше выглядел успехом — подсказка
+    // справочника приклеивалась к отказу. Список отказов живёт в browser-tools.js.
+    const realBrowserTools = require(path.join(ROOT, "src", "browser-tools.js"));
+    assert.strictEqual(typeof realBrowserTools.isBrowserFailure, "function", "browser-tools не отдаёт список отказов наружу");
+    for (const refusedText of [
+      "Ошибка browserFill: элемент не найден",
+      "Браузер не запущен. Сначала вызови browserOpen (url).",
+      "Вкладка не найдена: tab1. Открой страницу через browserOpen (url).",
+      "Не нашёл поле с подписью «Вход»",
+      "browserDOM: элемента нет",
+    ]) {
+      assert.ok(realBrowserTools.isBrowserFailure(refusedText), "отказ не признан отказом: " + refusedText);
+    }
+    assert.ok(!realBrowserTools.isBrowserFailure("Вкладка tab1 открыта (движок: Chromium)"), "успех признан отказом");
+    assert.ok(!realBrowserTools.isBrowserFailure("OK — логин и пароль подставлены в форму"), "успех признан отказом");
+    browserTools.isBrowserFailure = realBrowserTools.isBrowserFailure;
+    browserTools.open = async () => "Браузер не запущен. Сначала вызови browserOpen (url).";
+    const realRefused = await mod.browserOpen({ url: "https://vk.com/лента" }, {});
+    assert.strictEqual(realRefused, "Браузер не запущен. Сначала вызови browserOpen (url).", "к настоящему отказу набора приклеена подсказка: " + realRefused);
 
     // Снимок: файл в системной временной папке, событие человеку, зрение — по настройкам.
     events.length = 0;
