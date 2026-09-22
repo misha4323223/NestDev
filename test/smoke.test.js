@@ -107,7 +107,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "project-brief.js", "chats-ipc.js", "memory-ipc.js", "git-stage.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "run-ipc.js", "tool-registry.js"]
+  return ["main.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "agent-tools-browser.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "project-brief.js", "chats-ipc.js", "memory-ipc.js", "git-stage.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "run-ipc.js", "tool-registry.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -118,7 +118,7 @@ function backendSrc() {
 // уезжает, и тогда падает не текстом, а отсутствием строки (та же ловушка, что у
 // toolBodySelf — HANDOFF §4).
 function toolsHomeSrc() {
-  return ["agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js"]
+  return ["agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "agent-tools-browser.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -14648,7 +14648,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "agent-tools-browser.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14658,7 +14658,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "agent-tools-browser.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
@@ -15175,6 +15175,100 @@ async function testAgentTools() {
     assert.ok(!/app\.getPath|__dirname|require\("\.\/agent-tools/.test(mod), "модуль сам достаёт состояние вместо внедрения");
     assert.ok(!/^let |^var /m.test(mod), "в модуле завелось состояние уровня файла");
   });
+  await test("браузер агента: снимок уходит событием, а справочник — к месту", async () => {
+    const { createBrowserTools } = require(path.join(ROOT, "src", "agent-tools-browser.js"));
+    const saw = [];
+    const events = [];
+    const png = "iVBORw0KGgoABC";
+    const dir = fs.mkdtempSync(path.join(require("os").tmpdir(), "browser-tools-"));
+    const shotPath = path.join(dir, "кадр.png");
+    const browserTools = {};
+    let visionFails = false;
+    for (const name of ["connect", "open", "snapshot", "fill", "click", "act", "select", "press", "text", "evalJs", "domHtml", "overlays", "wait", "scroll", "hover", "network", "replay", "close", "status", "clearProfile"]) {
+      browserTools[name] = async (a) => { saw.push(name + ":" + JSON.stringify(a === undefined ? null : a)); return "ответ " + name; };
+    }
+    browserTools.screenshotFile = async (a) => { saw.push("screenshotFile:" + JSON.stringify(a)); return { buf: Buffer.from(png, "base64"), path: shotPath, url: "https://пример.рф", title: "Страница" }; };
+    const mod = createBrowserTools({
+      browserTools,
+      guideForUrl: (u) => (/vk\.com/.test(String(u)) ? { name: "vk", title: "ВКонтакте" } : null),
+      path,
+      os: require("os"),
+      auxConfig: (s) => s.aux || { enabled: false },
+      describeImageRemote: async (cfg, dataUrl, q, model) => { if (visionFails) throw new Error("нет страницы"); saw.push("vision:" + model + ":" + (dataUrl.indexOf("data:image/png;base64,") === 0) + ":" + String(q).length); return "видно кнопку «Войти»"; },
+    }, { activeEmit: (e) => events.push(e) });
+
+    // Действия: каждое доходит до своего метода настоящего браузерного набора — с теми же доводами.
+    const MAP = { browserConnect: "connect", browserSnapshot: "snapshot", browserFill: "fill", browserClick: "click", browserAct: "act", browserSelect: "select", browserPress: "press", browserText: "text", browserEval: "evalJs", browserDOM: "domHtml", browserOverlays: "overlays", browserWait: "wait", browserScroll: "scroll", browserHover: "hover", browserNetwork: "network", browserReplay: "replay", browserClose: "close", browserStatus: "status", browserClearProfile: "clearProfile" };
+    for (const [tool, method] of Object.entries(MAP)) {
+      const args = method === "status" || method === "clearProfile" ? {} : { probe: tool };
+      assert.strictEqual(await mod[tool](args, {}), "ответ " + method, "инструмент «" + tool + "» не дошёл до браузера");
+      const want = method + ":" + (method === "status" || method === "clearProfile" ? "null" : JSON.stringify({ probe: tool }));
+      assert.ok(saw.includes(want), "доводы «" + tool + "» не дошли как есть: " + saw[saw.length - 1]);
+    }
+
+    // Открытие адреса: справочник подставляется к месту, а к отказу — нет.
+    const plain = await mod.browserOpen({ url: "https://пример.рф" }, {});
+    assert.strictEqual(plain, "ответ open", "у адреса без справочника ответ изменён: " + plain);
+    const guided = await mod.browserOpen({ url: "https://vk.com/лента" }, {});
+    assert.match(guided, /📘 По этому сайту есть справочник агента «vk» \(ВКонтакте\)/, "справочник не подсказан: " + guided);
+    assert.match(guided, /agentGuide \{ name: "vk" \}/, "в подсказке нет вызова справочника: " + guided);
+    browserTools.open = async () => "Ошибка: браузер не запущен";
+    const failed = await mod.browserOpen({ url: "https://vk.com/лента" }, {});
+    assert.strictEqual(failed, "Ошибка: браузер не запущен", "отказ украшен справочником: " + failed);
+
+    // Снимок: файл в системной временной папке, событие человеку, зрение — по настройкам.
+    events.length = 0;
+    saw.length = 0;
+    const noVision = await mod.browserScreenshot({ analyze: false }, {});
+    assert.ok(noVision.indexOf(shotPath) > 0, "путь снимка не назван: " + noVision);
+    assert.match(noVision, /analyzeImage \{ path: /, "не сказано, как разобрать снимок: " + noVision);
+    const asked = saw.find((s) => s.indexOf("screenshotFile:") === 0) || "";
+    assert.ok(asked.indexOf(JSON.stringify(path.join(require("os").tmpdir(), "ai-agent-shots"))) > 0, "снимок просят не во временную папку системы: " + asked.slice(0, 200));
+    assert.strictEqual(events.length, 1, "событие снимка не ушло или ушло не одно: " + events.length);
+    assert.strictEqual(events[0].type, "image", "событие снимка не картинка: " + JSON.stringify(events[0]).slice(0, 80));
+    assert.strictEqual(events[0].path, shotPath, "в событии не путь файла: " + events[0].path);
+    assert.strictEqual(events[0].dataUrl, "data:image/png;base64," + Buffer.from(png, "base64").toString("base64"), "в событии не та картинка");
+
+    saw.length = 0;
+    const vision = await mod.browserScreenshot({}, { aux: { visionModel: "м-1", key: "к" } });
+    assert.match(vision, /Что видно \(vision-модель\):\nвидно кнопку «Войти»/, "разбор зрения не попал в ответ: " + vision);
+    assert.ok(saw.some((x) => /^vision:м-1:true:[1-9][0-9]*$/.test(x)), "зрение спрошено не так (модель, картинка, вопрос): " + saw.join(" | ").slice(0, 200));
+
+    visionFails = true;
+    const broke = await mod.browserScreenshot({}, { aux: { visionModel: "м-1", key: "к" } });
+    visionFails = false;
+    assert.match(broke, /Vision-модель не ответила \(нет страницы\) — это не блокер/, "сбой зрения не объяснён: " + broke);
+    assert.match(broke, /работай по DOM/, "не сказано, что делать вместо зрения: " + broke);
+
+    const blind = await mod.browserScreenshot({}, {});
+    assert.match(blind, /Зрение не настроено — работай по DOM: browserSnapshot, browserDOM, browserEval, browserOverlays\./, "не сказано, где включить зрение: " + blind);
+
+    events.length = 0;
+    browserTools.screenshotFile = async () => ({ error: "Браузер не запущен. Сначала вызови browserOpen (url)." });
+    const refused = await mod.browserScreenshot({}, {});
+    assert.strictEqual(refused, "Браузер не запущен. Сначала вызови browserOpen (url).", "отказ браузера не отдан как есть: " + refused);
+    assert.strictEqual(events.length, 0, "на отказе ушло событие картинки");
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  });
+
+  await test("браузер агента: модуль собран до реестра, с живым мостом и ссылками", () => {
+    const shellSrc = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
+    assert.ok(/const agentBrowser = createBrowserTools\(deps, live\);/.test(shellSrc), "модуль не собран или собран без живого моста — снимок не покажется в ленте");
+    assert.ok(/const agentBrowser = createBrowserTools/.test(shellSrc.slice(0, shellSrc.indexOf("return {"))), "модуль собран после реестра — ссылки будут пустыми");
+    assert.ok(shellSrc.indexOf("const browserTools = createBrowserTools") < 0, "модуль назван browserTools — это имя занято настоящим браузерным набором из deps");
+    const names = ["browserConnect", "browserOpen", "browserSnapshot", "browserFill", "browserClick", "browserAct", "browserSelect", "browserPress", "browserText", "browserScreenshot", "browserEval", "browserDOM", "browserOverlays", "browserWait", "browserScroll", "browserHover", "browserNetwork", "browserReplay", "browserClose", "browserStatus", "browserClearProfile"];
+    for (const name of names) {
+      assert.ok(shellSrc.includes('"' + name + '": agentBrowser.' + name + ","), "инструмент «" + name + "» не сослался на модуль");
+      assert.ok(shellSrc.indexOf('"' + name + '": async (args, settings) => {') < 0, "тело «" + name + "» осталось в оболочке");
+    }
+    const mod = fs.readFileSync(path.join(ROOT, "src", "agent-tools-browser.js"), "utf8");
+    for (const name of names) {
+      assert.ok(mod.includes('"' + name + '": async (args, settings) => {'), "в модуле нет тела «" + name + "»");
+    }
+    assert.ok(!/app\.getPath|__dirname|require\("\.\/agent-tools/.test(mod), "модуль сам достаёт состояние вместо внедрения");
+    assert.ok(!/^let |^var /m.test(mod), "в модуле завелось состояние уровня файла");
+  });
+
   await test("пароли и почта: модуль собран на своём месте и с тем же deps", () => {
     const shellSrc = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
     assert.ok(/const vaultTools = createVaultTools\(deps\);/.test(shellSrc), "модуль не собран или собран не тем аргументом");

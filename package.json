@@ -1,6 +1,6 @@
 {
   "name": "ai-agent",
-  "version": "1.5.206",
+  "version": "1.5.207",
   "private": true,
   "description": "AI Developer Agent — чат с AI-агентом (Ollama / Groq / внешние API), файловые операции и git",
   "author": "AI Developer Agent",
@@ -43,6 +43,7 @@
     "test:live:tools-media": "node scripts/live-tools-media.js",
     "test:live:tools-vault": "node scripts/live-tools-vault.js",
     "test:live:tools-env": "node scripts/live-tools-env.js",
+    "test:live:tools-browser": "node scripts/live-tools-browser.js",
     "test:live:github": "node scripts/live-github-ipc.js",
     "test:live:yc:real": "node scripts/live-yc-real.js",
     "test:boot": "node scripts/live-boot.js",

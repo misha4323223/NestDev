@@ -47,14 +47,18 @@ function test(name, fn) {
 
 const guide = fs.readFileSync(path.join(ROOT, "src", "agent-guides", "vk.md"), "utf8");
 const coreSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "agent-core.js"), "utf8");
-// Подсказка о справочнике при открытии адреса живёт в обёртке инструмента
-// (agent-tools.js), а не в main.js — читаем оба, как это делает smoke-тест.
+// Подсказка о справочнике при открытии адреса живёт в обёртке инструмента, а не
+// в main.js — читаем все три места, где она может быть (smoke-тест читает дом так же).
+// С части 40, захода 13 обёртка browserOpen уехала в свой модуль
+// (agent-tools-browser.js) — поэтому он в списке.
 // Сама логика справочников (guideForUrl/guideReadText) с этапа B, части 11
 // живёт в своём модуле — проверяем её там, где она есть.
 const mainSrc =
   fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8") +
   "\n" +
   fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8") +
+  "\n" +
+  fs.readFileSync(path.join(ROOT, "src", "agent-tools-browser.js"), "utf8") +
   "\n" +
   fs.readFileSync(path.join(ROOT, "src", "site-guides.js"), "utf8");
 const AgentCore = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
