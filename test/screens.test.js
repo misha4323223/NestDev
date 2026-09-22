@@ -365,7 +365,11 @@ function emit(w, event, args) {
     assert.ok(/createScreens\(\{\s*BrowserWindow,\s*userDataDir: app\.getPath\("userData"\)/.test(main), "в модуль не переданы настоящее окно и папка приложения");
     assert.ok(/function screenshotUrl\(|function encodeShot\(|function saveScreenshotPng\(/.test(main) === false,
       "в main.js осталась вторая копия кода скриншотов");
-    const tools = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
+    // Дом читается ЦЕЛИКОМ: `screenshotCapture` уехал своим модулем (часть 40, заход 10),
+    // и проверка по одному `agent-tools.js` зеленела бы на пустом месте.
+    const tools = ["agent-tools.js", "agent-tools-media.js"]
+      .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
+      .join("\n");
     for (const name of ["screenshotUrl", "saveScreenshotPng", "encodeShot"]) {
       assert.ok(new RegExp("\\b" + name + "\\b").test(tools), "инструмент больше не зовёт " + name);
     }

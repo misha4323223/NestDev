@@ -107,7 +107,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "project-brief.js", "chats-ipc.js", "memory-ipc.js", "git-stage.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "run-ipc.js", "tool-registry.js"]
+  return ["main.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "project-brief.js", "chats-ipc.js", "memory-ipc.js", "git-stage.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "run-ipc.js", "tool-registry.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -118,7 +118,7 @@ function backendSrc() {
 // уезжает, и тогда падает не текстом, а отсутствием строки (та же ловушка, что у
 // toolBodySelf — HANDOFF §4).
 function toolsHomeSrc() {
-  return ["agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js"]
+  return ["agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -14648,7 +14648,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14658,7 +14658,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
@@ -15038,6 +15038,126 @@ async function testAgentTools() {
     assert.ok(/const devtools = createDevTools/.test(shellSrc.slice(0, shellSrc.indexOf("return {"))), "модуль собран после реестра — ссылки будут пустыми");
     for (const name of ["dockerBuild", "installPackage", "runTests", "lintProject", "formatCode", "dbQuery", "explainError", "checkInstalledProgram", "canExecute", "validateProject", "getDependencies", "dockerRun", "dockerExec"]) {
       assert.ok(shellSrc.includes('"' + name + '": devtools.' + name + ","), "инструмент «" + name + "» не сослался на модуль");
+    }
+  });
+  // Медиа, просмотр и справка — из своего модуля (часть 40, заход 10). Проверяем ПО ФАКТУ:
+  // что уходит человеку событием, что отвечает модель при выключенной вспомогательной
+  // модели и куда ложится сгенерированная картинка (имя из ответа модели — не доверяем).
+  await test("медиа и просмотр: картинки уходят человеку, а отказы названы", async () => {
+    const { createMediaTools } = require(path.join(ROOT, "src", "agent-tools-media.js"));
+    const dir = fs.mkdtempSync(path.join(require("os").tmpdir(), "media-tools-"));
+    const events = [];
+    const saw = [];
+    const png = Buffer.from("89504e470d0a1a0a", "hex").toString("base64");
+    const img = path.join(dir, "кадр.png");
+    fs.writeFileSync(img, Buffer.from(png, "base64"));
+    fs.writeFileSync(path.join(dir, "текст.txt"), "не картинка\n", "utf8");
+    fs.writeFileSync(path.join(dir, "второй.png"), Buffer.from("89504e470d0a1a0b", "hex").toString("base64"));
+    const groups = [];
+    const live = {
+      activeEmit: (ev) => events.push(ev),
+      activeToolRouter: { addGroups: (g) => groups.push.apply(groups, g), names: () => ["sendMail"] },
+    };
+    const media = createMediaTools({
+      fs,
+      path,
+      agentWorkDir: () => dir,
+      resolvePath: (p) => path.resolve(dir, String(p == null ? "" : p)),
+      truncateText: (t, n) => String(t == null ? "" : t).slice(0, n || 4000),
+      fmtError: (e) => (e && e.message) || String(e),
+      searchTools: (q) => (q === "почта" ? [{ name: "sendMail", group: "mail", description: "отправить письмо" }, { name: "mailCode", group: "mail", description: "код из письма" }] : []),
+      shell: { openExternal: async (u) => saw.push("open:" + u) },
+      auxConfig: (s) => s.aux || { enabled: false },
+      describeImageRemote: async (cfg, dataUrl, question, model) => {
+        saw.push("vision:" + model + ":" + String(question).slice(0, 12) + ":" + (dataUrl.indexOf("data:image/png;base64,") === 0));
+        return "на картинке жёлтый круг";
+      },
+      generateImageRemote: async (cfg, prompt, model) => {
+        saw.push("gen:" + model + ":" + prompt);
+        return { b64: png, mediaType: "image/png", label: "провайдер-1" };
+      },
+      unifiedDiff: async () => ({ patch: "--- a\n+++ b\n@@ -1 +1 @@\n-старое\n+новое\n" }),
+      screenshotUrl: async (u) => { saw.push("shot:" + u); return { ok: true, dataUrl: "data:image/png;base64," + png, mime: "image/png" }; },
+      saveScreenshotPng: (buf, kind) => { saw.push("saved:" + kind + ":" + buf.length); return path.join(dir, "снимок.png"); },
+      browserTools: { waitForIdle: async (a) => { saw.push("idle:" + JSON.stringify(a)); return "покой наступил"; } },
+      agentGuideCall: (a) => { saw.push("guide:" + a.topic); return "справка по теме"; },
+    }, live);
+
+    // Поиск инструмента: группа включается, а о том, что не поместилось в схемы, сказано честно.
+    const empty = await media.findTools({}, {});
+    assert.match(empty, /Укажи query/, "пустой запрос не объяснён: " + empty);
+    const none = await media.findTools({ query: "такого-нет" }, {});
+    assert.match(none, /Ничего не нашлось/, "пустой поиск не назван: " + none);
+    const found = await media.findTools({ query: "почта" }, {});
+    assert.deepStrictEqual(groups, ["mail"], "группы найденных инструментов не включены: " + groups.join(", "));
+    assert.match(found, /Включены группы: mail/, "включённые группы не названы: " + found);
+    assert.match(found, /не поместились \(узкое окно модели\): mailCode/, "модель не предупреждена о схемах, которых нет в запросе: " + found);
+    assert.match(found, /Сейчас в запросе 1 инструментов/, "не сказано, что реально в запросе: " + found);
+
+    assert.match(await media.openUrl({ url: "не-ссылка" }, {}), /укажи полный URL/, "плохой URL не отклонён");
+    await media.openUrl({ url: "https://пример.рф" }, {});
+    assert.deepStrictEqual(saw.filter((s) => s.indexOf("open:") === 0), ["open:https://пример.рф"], "ссылка не ушла в браузер: " + saw.join(" | "));
+
+    // Картинки: чужая папка и не-картинка не показываются, настоящая — уходит событием.
+    assert.match(await media.showImage({ path: "нет-файла.png" }, {}), /файл не найден/, "несуществующий файл не назван");
+    assert.match(await media.showImage({ path: "текст.txt" }, {}), /это не изображение/, "не-картинка не отклонена: " + (await media.showImage({ path: "текст.txt" }, {})));
+    events.length = 0;
+    const shown = await media.showImage({ path: "кадр.png" }, {});
+    assert.match(shown, /OK — изображение показано пользователю/, "картинка не показана: " + shown);
+    assert.strictEqual(events.length, 1, "событий о картинке: " + events.length);
+    assert.strictEqual(events[0].type, "image", "тип события не тот: " + events[0].type);
+    assert.ok(String(events[0].dataUrl).indexOf("data:image/png;base64,") === 0, "картинка ушла не как data-URL: " + String(events[0].dataUrl).slice(0, 40));
+
+    // Вспомогательная модель: выключена — сказано, что включить; без модели-зрения — что указать.
+    const off = await media.analyzeImage({ path: "кадр.png" }, {});
+    assert.match(off, /вспомогательная модель выключена/, "выключенная модель не объяснена: " + off);
+    const noModel = await media.analyzeImage({ path: "кадр.png" }, { aux: { enabled: true } });
+    assert.match(noModel, /не указана модель для чтения изображений/, "модель-зрение не спрошена: " + noModel);
+    saw.length = 0;
+    const described = await media.analyzeImage({ path: "кадр.png", question: "что тут? подробнее" }, { aux: { enabled: true, visionModel: "в-1" } });
+    assert.match(described, /на картинке жёлтый круг/, "описание не доехало до агента: " + described);
+    assert.ok(saw.some((s) => s.indexOf("vision:в-1:что тут? под:true") === 0), "картинка ушла модели не тем: " + saw.join(" | "));
+
+    // Генерация: имя из ответа модели не управляет папкой — файл ложится в рабочую.
+    assert.match(await media.generateImage({}, {}), /укажи prompt/, "пустой prompt не отклонён");
+    assert.match(await media.generateImage({ prompt: "кот" }, {}), /вспомогательная модель выключена/, "выключенная модель не объяснена");
+    const gen = await media.generateImage({ prompt: "кот в шапке", filename: "../../злой.png", aspect_ratio: "16:9" }, { aux: { enabled: true, imageModel: "г-1" } });
+    const made = (gen.match(/сохранено: ([^ ]+)/) || [])[1] || "";
+    assert.ok(made.indexOf(dir) === 0 && made.indexOf("..") < 0, "картинка легла вне рабочей папки: " + made);
+    assert.ok(fs.existsSync(made), "файла картинки нет на диске: " + made);
+    assert.strictEqual(fs.readFileSync(made).toString("base64"), png, "на диск легли не те байты");
+    assert.ok(gen.indexOf("провайдер: провайдер-1") > 0, "каким провайдером сделана картинка — не сказано: " + gen);
+    assert.ok(events.some((e) => e.type === "image" && e.path === made), "сгенерированная картинка не показана событием");
+
+    // Просмотр: дифф и предпросмотр открываются событием, скриншот страницы сохраняется файлом.
+    events.length = 0;
+    const diff = await media.diffView({ path1: "кадр.png", path2: "второй.png" }, {});
+    assert.match(diff, /Дифф /, "дифф не открыт: " + diff);
+    assert.strictEqual(events[0] && events[0].type, "diff", "событие диффа не ушло: " + JSON.stringify(events[0] || {}).slice(0, 60));
+    assert.ok(/@@/.test(events[0].patch), "в событие не попал патч: " + events[0].patch);
+    assert.match(await media.previewUI({ url: "ftp://пример" }, {}), /укажи полный URL/, "плохой адрес предпросмотра не отклонён");
+    events.length = 0;
+    await media.previewUI({ url: "http://localhost:3000" }, {});
+    assert.strictEqual(events[0] && events[0].type, "preview", "предпросмотр не открыт событием");
+    saw.length = 0;
+    const shot = await media.screenshotCapture({ url: "http://localhost:3000" }, {});
+    assert.match(shot, /скриншот http:\/\/localhost:3000 снят/, "скриншот не снят: " + shot);
+    assert.ok(saw.some((s) => s.indexOf("saved:page:") === 0), "скриншот не сохранён файлом: " + saw.join(" | "));
+    assert.ok(shot.indexOf("снимок.png") > 0, "путь сохранённого скриншота не назван: " + shot);
+
+    assert.strictEqual(await media.waitForIdle({ tab: 1 }, {}), "покой наступил", "покой спрошен не у браузера");
+    assert.strictEqual(await media.agentGuide({ topic: "деплой" }, {}), "справка по теме", "справка не взята из данных приложения");
+    const missing = ["findTools", "openUrl", "showImage", "analyzeImage", "generateImage", "diffView", "previewUI", "screenshotCapture", "waitForIdle", "agentGuide"]
+      .filter((n) => typeof media[n] !== "function");
+    assert.deepStrictEqual(missing, [], "в модуле нет обработчиков: " + missing.join(", "));
+  });
+
+  await test("медиа: модуль собран на своём месте и с живым мостом", () => {
+    const shellSrc = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
+    assert.ok(/const media = createMediaTools\(deps, live\);/.test(shellSrc), "модуль собран без живого моста — лента и роутер будут пустыми");
+    assert.ok(/const media = createMediaTools/.test(shellSrc.slice(0, shellSrc.indexOf("return {"))), "модуль собран после реестра — ссылки будут пустыми");
+    for (const name of ["findTools", "openUrl", "showImage", "analyzeImage", "generateImage", "diffView", "previewUI", "screenshotCapture", "waitForIdle", "agentGuide"]) {
+      assert.ok(shellSrc.includes('"' + name + '": media.' + name + ","), "инструмент «" + name + "» не сослался на модуль");
     }
   });
   await test("реестр инструментов: откат меняет журнал через сеттер, а не копию", async () => {

@@ -40,6 +40,7 @@
     "test:live:tools-mission": "node scripts/live-tools-mission.js",
     "test:live:tools-app": "node scripts/live-tools-app.js",
     "test:live:tools-devtools": "node scripts/live-tools-devtools.js",
+    "test:live:tools-media": "node scripts/live-tools-media.js",
     "test:live:github": "node scripts/live-github-ipc.js",
     "test:live:yc:real": "node scripts/live-yc-real.js",
     "test:boot": "node scripts/live-boot.js",
