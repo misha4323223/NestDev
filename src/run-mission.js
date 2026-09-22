@@ -543,7 +543,7 @@ function createRunMission(deps) {
         " · в работе " + elapsed + " мин · шагов " + pr.done + " из " + pr.total + (pr.failed ? " (сбоев " + pr.failed + ")" : ""),
       "План: " + (r.steps.length
         ? r.steps.slice(0, DIGEST_STEPS).map((s, i) => (i + 1) + ") " + (s.state === "done" ? "✓ " : s.state === "failed" ? "⚠ " : s.state === "doing" ? "→ сейчас " : "• ") + oneLine(s.title, 90)).join("; ")
-        : "не составлен — вызови todoWrite и missionStep, тогда он не потеряется"),
+        : "не составлен — вызови todoWrite с планом (3–7 пунктов): он ляжет и в панель, и в шаги этой миссии"),
     ];
     // Уточнения к цели: человек писал по ходу работы. Без этого миссия, заведённая
     // на «сделай всё сам», так и помнила бы только эту фразу.

@@ -102,7 +102,13 @@ function createRunRound(deps) {
       });
     } catch (e) {
       if (e.name === "AbortError") throw e;
-      throw new Error("Сетевая ошибка при запросе к " + provider + ": " + e.message);
+      // Оборванная связь — такой же временный отказ, как 503: ждём и повторяем ТОТ ЖЕ
+      // раунд. Решение и текст — в src/run-retry.js (transport). Возврат null значит
+      // «повторять нечего»: неверный адрес, неизвестный хост, отказ в соединении.
+      const netVerdict = await retry.transport(e);
+      if (!netVerdict) throw new Error("Сетевая ошибка при запросе к " + provider + ": " + e.message);
+      if (netVerdict.kind === "repeat") return { kind: "repeat" };
+      throw netVerdict.error;
     }
     ttfbMs = Date.now() - startedAt; // заголовки ответа = первый байт
     if (res.ok) retry.noteSuccess();

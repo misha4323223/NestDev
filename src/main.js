@@ -98,7 +98,7 @@ const ycCosts = require("./yc-costs.js"); // стоимость облака: п
 const ycLogs = require("./yc-logs.js"); // логи Cloud Logging внутренним API (REST + gRPC) — внешний yc CLI не нужен
 const winPs = require("./win-ps.js"); // живая сессия PowerShell: системные справки без холодного старта
 const toolPolicy = require("./tool-policy.js"); // политика инструментов: capability/риск/подтверждение (одна точка правды)
-const { createAgentTools } = require("./agent-tools.js"); // агентские инструменты: 154 обработчиков своим модулем
+const { createAgentTools } = require("./agent-tools.js"); // агентские инструменты: 159 обработчиков своим модулем (облачные — в agent-tools-cloud.js)
 
 const audit = require("./audit-log.js");
 // Куда главному процессу можно ходить по адресу, который назвал интерфейс
@@ -295,12 +295,15 @@ const PARALLEL_SAFE_TOOLS = new Set([
 // их дословно. findProgram приходит стрелкой: системный раздел (system-stack.js)
 // собирается НИЖЕ по файлу, а оболочки нужны уже здесь — их берут tool-helpers,
 // фоновые процессы и обзор проекта.
+// spawn (а не execFile) — не мелочь: команда запускается своей ГРУППОЙ процессов,
+// и по таймауту гасится всё дерево. execFile молча теряет `detached`, из-за чего
+// после таймаута ребёнок оболочки оставался жить и держал порт.
 const { createShellTools } = require("./shell-tools.js");
 const { stripAnsi, shellArgsFor, normalizeShell, powershellArgs, findGitShell, shellMissingHint,
   resolveShell, shellsStatus, shellsBrief, runTerminalCommand } = createShellTools({
   fs,
   path,
-  execFile,
+  spawn,
   commandEnv,
   findProgram: (name) => findProgram(name),
   truncateText,

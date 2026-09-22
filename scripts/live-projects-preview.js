@@ -187,7 +187,10 @@ Module._load = function (req, parent, isMain) {
       },
     };
   }
-  if (t.indexOf("agent-tools") >= 0) {
+  // Только САМ сводный модуль: с части 40 в доме живут agent-tools-git/files/write/run/cloud,
+  // и широкая подстрока возвращала их как «{ createAgentTools } без createGitTools» —
+  // прогон падал на «createGitTools is not a function» и молчал об этом никто, кроме него.
+  if (/agent-tools\.js$/.test(t)) {
     const real = origin.apply(this, arguments);
     return {
       createAgentTools: (deps) => {

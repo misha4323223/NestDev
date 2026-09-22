@@ -95,7 +95,7 @@ const HISTORY = [
 
 function makeRound(opts) {
   const o = opts || {};
-  const seen = { term: [], chat: [], think: [], pace: 0, success: 0, plans: [], cost: [], reqs: [] };
+  const seen = { term: [], chat: [], think: [], pace: 0, success: 0, plans: [], nets: [], cost: [], reqs: [] };
   let budget = o.budget == null ? 32000 : o.budget;
   let modelWin = o.modelWin == null ? 128000 : o.modelWin;
   const tools = {
@@ -120,6 +120,13 @@ function makeRound(opts) {
       seen.plans.push(failure);
       if (o.verdict) return o.verdict;
       return { kind: "throw", error: new Error("API error " + failure.status + ": " + failure.detail) };
+    },
+    // Оборванная связь (ответа с кодом нет): решение принимает src/run-retry.js.
+    // Заглушка по умолчанию отвечает «повторять нечего» — тогда ошибка уходит
+    // наружу с прежним текстом, как и было до появления этого пути.
+    transport: async (err) => {
+      seen.nets.push(err);
+      return o.netVerdict || null;
     },
   };
   const mission = { cost: (u, comps) => seen.cost.push({ usage: u, comps: comps }) };
@@ -420,6 +427,24 @@ const RUN = { n: 2, maxRounds: 25, messages: HISTORY };
     });
     try {
       await assert.rejects(() => r.round.run(RUN), (e) => /Сетевая ошибка при запросе к deepseek: ECONNREFUSED/.test(e.message));
+      // Оборванная связь проходит ЧЕРЕЗ решение модуля повторов (там и живёт правило
+      // «сеть моргнула — ждём», а неверный адрес — сразу наружу).
+      assert.strictEqual(r.seen.nets.length, 1, "обрыв сети не отдан модулю повторов: " + r.seen.nets.length);
+      await assert.rejects(
+        () => makeRound({ netVerdict: { kind: "throw", error: new Error("Сетевая ошибка: свои слова") } }).round.run(RUN),
+        (e) => e.message === "Сетевая ошибка: свои слова",
+        "решение модуля повторов не исполнено"
+      );
+      const repeat = makeRound({ netVerdict: { kind: "repeat" } });
+      const restore3 = fakeFetch(() => {
+        throw new Error("fetch failed");
+      });
+      try {
+        const out = await repeat.round.run(RUN);
+        assert.deepStrictEqual(out, { kind: "repeat" }, "повтор раунда после обрыва связи не вернулся: " + JSON.stringify(out));
+      } finally {
+        restore3();
+      }
     } finally {
       restore();
     }

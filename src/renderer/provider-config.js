@@ -166,6 +166,10 @@
     return "call_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10);
   }
 
+  // Заголовок HTML-страницы ошибки: у шлюзовых страниц (Cloudflare) в нём лежит и
+  // хост, и код («example.com | 524: A timeout occurred») — этого человеку хватает.
+  const HTML_TITLE = /<title[^>]*>([\s\S]{0,200}?)<\/title>/i;
+
   /** Читает тело ошибочного ответа и возвращает человекочитаемый фрагмент. */
   async function readApiError(res) {
     const body = await res.text().catch(() => "");
@@ -174,7 +178,21 @@
       const j = JSON.parse(body);
       const err = (j && j.error) || j;
       detail = typeof err === "string" ? err.slice(0, 600) : JSON.stringify(err, null, 2).slice(0, 600);
+      return detail;
     } catch {}
+    // Не JSON? Чаще всего это HTML-СТРАНИЦА шлюза или его CDN (Cloudflare 520/524 и
+    // родственные коды): запрос до модели не дошёл, а разбирать её как текст нечего.
+    // Раньше эта простыня тегов уезжала в чат и журнал целиком — человек видел
+    // «<!DOCTYPE html>…» вместо причины. Берём из страницы только заголовок.
+    if (/<(!doctype|html|head|body|\?xml)/i.test(detail)) {
+      const m = HTML_TITLE.exec(detail);
+      const title = m ? m[1].replace(/\s+/g, " ").trim().slice(0, 160) : "";
+      return (
+        "HTML-страница вместо JSON (шлюз провайдера или его CDN)" +
+        (title ? ": «" + title + "»" : "") +
+        " — причины в теле нет, дело на стороне провайдера"
+      );
+    }
     return detail;
   }
 

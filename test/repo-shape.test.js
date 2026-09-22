@@ -259,6 +259,33 @@ function walk(rel, out) {
     assert.ok(checked > 10, "проводок проверено подозрительно мало: " + checked);
   });
 
+  await test("живые прогоны: перехват модуля по подстроке не заглатывает соседей по дому", () => {
+    // Почему: живые прогоны подменяют электрон и перехватывают require по ПОДСТРОКЕ
+    // (`if (t.indexOf("agent-tools") >= 0)`). Пока в доме был один agent-tools.js, это
+    // работало; после дробления (часть 40) та же подстрока стала матчить и
+    // agent-tools-git.js — прогон получал «{ createAgentTools } без createGitTools» и падал
+    // на «createGitTools is not a function». Два таких прогона (projects и run-ipc) молчали
+    // до тех пор, пока живые прогоны не прогнали ЦЕЛИКОМ: ни набор, ни сторож дома в них
+    // не смотрит.
+    const srcFiles = fs.readdirSync(path.join(ROOT, "src"));
+    const liveScripts = fs.readdirSync(path.join(ROOT, "scripts")).filter((f) => /^live-.*\.js$/.test(f));
+    assert.ok(liveScripts.length > 20, "живых прогонов найдено подозрительно мало: " + liveScripts.length);
+    const bad = [];
+    let needles = 0;
+    for (const f of liveScripts) {
+      const src = fs.readFileSync(path.join(ROOT, "scripts", f), "utf8");
+      for (const m of src.matchAll(/indexOf\("([^"]+)"\)\s*>=\s*0/g)) {
+        const needle = m[1];
+        const hits = srcFiles.filter((x) => x.indexOf(needle) >= 0);
+        if (!hits.length) continue; // это не имя модуля, а поиск по тексту — не наше дело
+        needles++;
+        if (hits.length > 1) bad.push(f + ": «" + needle + "» → " + hits.join(", "));
+      }
+    }
+    assert.ok(needles >= 5, "перехватов модулей найдено подозрительно мало: " + needles);
+    assert.deepStrictEqual(bad, [], "перехват по подстроке заглатывает несколько модулей — прогон слепнет или падает: " + bad.join(" | "));
+  });
+
   await test("бюджет прямых чтений app.js в тестах не растёт", () => {
     // Разбор app.js идёт этапами: код уезжает в модули, и проверки должны находить его
     // через uiFile/uiAll/uiFind (test/smoke.test.js). Прямое чтение app.js остаётся

@@ -176,7 +176,15 @@ function destructured(src) {
   const executeTool = seen.api.executeTool;
 
   console.log("\n[2] у каждого имени из распаковки инструментов есть значение");
-  const needed = destructured(fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8"));
+  // Распаковку спрашиваем у ВСЕХ модулей дома инструментов: обработчики разошлись
+  // по своим файлам (часть 40: облачные — agent-tools-cloud.js, git и GitHub —
+  // agent-tools-git.js, чтение и поиск — agent-tools-files.js, запись и правки —
+  // agent-tools-write.js, команды и оболочка — agent-tools-run.js), и сторож
+  // обязан видеть каждый — иначе пропущенное в main.js значение снова станет невидимым.
+  const needed = [...new Set(
+    ["agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js"]
+      .flatMap((f) => destructured(fs.readFileSync(path.join(ROOT, "src", f), "utf8")))
+  )];
   ok(needed.length > 100, "имён в распаковке: " + needed.length);
   const missing = needed.filter((n) => typeof d[n] === "undefined");
   ok(missing.length === 0, "имена без значения (инструмент ответит «is not defined»): " + (missing.join(", ") || "нет"));

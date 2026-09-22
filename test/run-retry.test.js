@@ -172,6 +172,60 @@ const RESP_429 = (detail) => ({ status: 429, headers: { get: () => null }, detai
     assert.strictEqual(c.kind, "repeat", "«холодный» отказ под 500 не распознан");
   });
 
+  // ── Шлюз провайдера и обрыв чтения тела запроса ───────────────────────────
+  // Живая беда: провайдер за Cloudflare отвечал 524 (и 520) HTML-страницей. Ветку
+  // «холодного» пула такие коды НЕ брали — прогон падал насмерть, человек видел в чате
+  // простыню тегов и писал «продолжай» руками, хотя весь отказ лечится ожиданием.
+  await test("шлюз провайдера (524 и родственные): ждём и повторяем ТОТ ЖЕ раунд, а не падаем", async () => {
+    const html =
+      '<!DOCTYPE html>\n<html class="no-js ie6 oldie" lang="en-US"><head><title>api.example.com | 524: A timeout occurred</title></head><body>…';
+    const r = makeRetry();
+    const cold = core.coldCacheInfo(524, html, 1);
+    assert.ok(cold, "524 с HTML-страницей не распознан как временный отказ шлюза");
+    assert.strictEqual(cold.cold, false, "отказ шлюза принят за «холодный» пул");
+    const v = await r.retry.plan({ status: 524, headers: { get: () => null }, detail: html });
+    assert.strictEqual(v.kind, "repeat", "524 роняет раунд: " + JSON.stringify(v).slice(0, 120));
+    assert.deepStrictEqual(r.seen.pauses, [cold.waitMs], "пауза не совпала с расчётом ядра: " + r.seen.pauses);
+    assert.ok(r.termText().indexOf("524") >= 0, "в «Консоль» не сказано, какой код отказал: " + r.termText());
+    assert.strictEqual(r.termText().indexOf("<"), -1, "в «Консоль» уехала HTML-страница");
+    // Родственные коды шлюза: 504 (таймаут до модели), семейство 520–527, 530.
+    for (const code of [504, 520, 521, 522, 523, 525, 527, 530]) {
+      assert.ok(core.coldCacheInfo(code, "", 1), code + " не считается отказом шлюза");
+    }
+    // Исчерпав повторы, говорим словами — и ни одного тега в тексте ошибки.
+    // Один повтор уже сделан выше (v): добираем остаток до предела счётчика.
+    let last = v;
+    for (let i = 1; i < core.UNAVAILABLE_MAX; i++) last = await r.retry.plan({ status: 524, headers: { get: () => null }, detail: html });
+    assert.strictEqual(last.kind, "repeat", "раньше исчерпания повторов сдались");
+    assert.strictEqual(r.state.unavailableRetries, core.UNAVAILABLE_MAX, "предел повторов не набран");
+    const fatal = await r.retry.plan({ status: 524, headers: { get: () => null }, detail: html });
+    assert.strictEqual(fatal.kind, "throw", "исчерпав повторы, всё равно повторяем бесконечно");
+    assert.ok(/провайдер временно недоступен/.test(fatal.error.message), "нет понятного объяснения: " + fatal.error.message);
+    assert.strictEqual(fatal.error.message.indexOf("<"), -1, "в текст ошибки уехала HTML-страница");
+  });
+
+  await test("обрыв чтения тела запроса (400 «Could not read the request body»): повторяем, а не падаем", async () => {
+    const detail = JSON.stringify({ type: "bad_request", message: "Could not read the request body.", request_id: "2f35f2ec" });
+    const r = makeRetry();
+    const info = core.coldCacheInfo(400, detail, 1);
+    assert.ok(info && info.why === "body", "обрыв чтения тела на шлюзе не распознан");
+    const v = await r.retry.plan({ status: 400, headers: { get: () => null }, detail: detail });
+    assert.strictEqual(v.kind, "repeat", "обрыв на шлюзе роняет раунд");
+    assert.ok(/не смог прочитать тело запроса/.test(r.termText()), "человеку не сказано, в чём дело: " + r.termText());
+    // И после исчерпания повторов текст остаётся человеческим и с советом.
+    let last = v;
+    for (let i = 1; i < core.UNAVAILABLE_MAX; i++) last = await r.retry.plan({ status: 400, headers: { get: () => null }, detail: detail });
+    assert.strictEqual(last.kind, "repeat", "раньше исчерпания повторов сдались");
+    const fatal = await r.retry.plan({ status: 400, headers: { get: () => null }, detail: detail });
+    assert.strictEqual(fatal.kind, "throw", "обрыв чтения тела повторяется бесконечно");
+    assert.ok(/не смог прочитать тело запроса/.test(fatal.error.message), "нет объяснения обрыва: " + fatal.error.message);
+    assert.ok(/другую модель или провайдера/.test(fatal.error.message), "нет честного совета человеку");
+    // Наша же ошибка в САМОМ запросе повтором не лечится: ветка обрыва узкая намеренно.
+    const own = makeRetry();
+    const bad = await own.retry.plan({ status: 400, headers: { get: () => null }, detail: "bad request: field tools[3] not allowed" });
+    assert.strictEqual(bad.kind, "throw", "наша же ошибка в запросе ушла в повторы");
+  });
+
   // ── Строгий сервер и метрики токенов ─────────────────────────────────────
   await test("строгий сервер без stream_options: выключаем метрики и повторяем, а не падаем", async () => {
     const r = makeRetry();
@@ -210,6 +264,57 @@ const RESP_429 = (detail) => ({ status: 429, headers: { get: () => null }, detai
     const v = await r.retry.plan({ status: 400, headers: { get: () => null }, detail: "context too long" });
     assert.strictEqual(v.kind, "throw", "ужимаем то, что уже меньше минимума");
     assert.strictEqual(r.seen.shrink, 0, "shrinkContext вызван на крошечном бюджете");
+  });
+
+  // ── Оборванная связь (ответа с кодом нет вообще) ──────────────────────────
+  // Живая беда: «останавливается молча после обращений к внешним сервисам» — запрос
+  // ушёл, ответа не было, fetch упал. Раньше это роняло прогон с первой попытки.
+  await test("обрыв связи: ждём и повторяем тот же раунд, а не падаем с первой ошибки", async () => {
+    const r = makeRetry();
+    const reset = Object.assign(new Error("fetch failed"), { cause: { code: "ECONNRESET" } });
+    const v = await r.retry.transport(reset);
+    assert.ok(v && v.kind === "repeat", "обрыв соединения не повторяется: " + JSON.stringify(v));
+    assert.strictEqual(r.seen.pauses.length, 1, "паузы перед повтором не было");
+    assert.ok(r.seen.pauses[0] >= 1000 && r.seen.pauses[0] <= 30000, "пауза вне разумных рамок: " + r.seen.pauses[0]);
+    assert.ok(/оборвалась/.test(r.termText()), "в «Консоль» не сказано, почему ждём: " + r.termText());
+    assert.strictEqual(r.state.unavailableRetries, 1, "повтор не посчитан");
+    // Другие виды обрыва: прокси закрыл поток, таймаут сокета, оборванный поток.
+    for (const err of [
+      new Error("socket hang up"),
+      Object.assign(new Error("read ETIMEDOUT"), { code: "ETIMEDOUT" }),
+      new Error("other side closed"),
+      new Error("terminated"),
+    ]) {
+      const rt = makeRetry();
+      const w = await rt.retry.transport(err);
+      assert.ok(w && w.kind === "repeat", "обрыв не распознан: " + err.message);
+    }
+    // Исчерпав повторы — человеческий текст с советом, а не сырое сообщение undici.
+    let last = v;
+    for (let i = 1; i < core.UNAVAILABLE_MAX; i++) last = await r.retry.transport(reset);
+    assert.strictEqual(last.kind, "repeat", "раньше исчерпания повторов сдались");
+    const fatal = await r.retry.transport(reset);
+    assert.strictEqual(fatal.kind, "throw", "обрыв повторяется бесконечно");
+    assert.ok(/Сетевая ошибка при запросе к openai/.test(fatal.error.message), "провайдер не назван: " + fatal.error.message);
+    assert.ok(/ECONNRESET/.test(fatal.error.message), "причина обрыва потеряна: " + fatal.error.message);
+    assert.ok(/напиши «продолжай»/.test(fatal.error.message), "нет честного совета человеку");
+  });
+
+  await test("постоянные сетевые ошибки не ждём: адрес, хост и отказ в соединении — сразу наружу", async () => {
+    const r = makeRetry();
+    for (const err of [
+      Object.assign(new Error("getaddrinfo ENOTFOUND no-such-host"), { code: "ENOTFOUND" }),
+      Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), { code: "ECONNREFUSED" }),
+      new Error("Invalid URL"),
+      Object.assign(new Error("self-signed certificate in certificate chain"), { code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" }),
+      Object.assign(new Error("Прервано"), { name: "AbortError" }),
+      new Error("что-то своё"),
+      null,
+    ]) {
+      const v = await r.retry.transport(err);
+      assert.strictEqual(v, null, "постоянная ошибка ушла в повторы: " + ((err && err.message) || err));
+    }
+    assert.strictEqual(r.seen.pauses.length, 0, "ждали на постоянной ошибке");
   });
 
   // ── Фатальные ответы ─────────────────────────────────────────────────────

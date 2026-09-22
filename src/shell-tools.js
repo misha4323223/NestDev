@@ -32,10 +32,23 @@
 
    findProgram приходит функцией-обёрткой: системный раздел (system-stack.js)
    собирается НИЖЕ по файлу оболочки, а оболочки нужны уже здесь — модулю их
-   берёг tool-helpers, фоновые процессы и САММАРИ проекта. */
+   берёг tool-helpers, фоновые процессы и САММАРИ проекта.
+
+   Команда запускается через spawn СО СВОЕЙ ГРУППОЙ процессов (detached), и в этом
+   весь смысл: у команды агента бывают дети (node, tsc, dev-сервер), и по таймауту
+   надо гасить ДЕРЕВО, а не одну оболочку. Здесь раньше стоял execFile — он молча
+   игнорирует `detached` (сам собирает опции для spawn), группы не было, и после
+   таймаута ребёнок оставался жить: держал порт, а в фоновых процессах его не было,
+   то есть остановить его агенту было нечем (следующая попытка — «порт занят»).
+   Видно это только по pgid процесса в /proc, а не по ответу инструмента: поэтому
+   находка и прожила так долго (снята в части 40, заход 4.1). */
 
 function createShellTools(deps) {
-  const { fs, path, execFile, commandEnv, findProgram, truncateText } = deps;
+  const { fs, path, spawn, commandEnv, findProgram, truncateText } = deps;
+  // «Кто гасит дерево процессов» вынесено в зависимость тем же приёмом, что killPid
+  // у фоновых процессов: иначе сторож не сможет проверить ветку таймаута, не посылая
+  // настоящих сигналов чужим процессам. По умолчанию — настоящий убийца дерева.
+  const killTree = deps.killTree || killCommandTree;
 
 // Предел вывода, который уезжает в контекст. Правило то же, что у инструментов
 // (truncateText из ядра): обрезать и назвать, сколько символов было всего.
@@ -210,45 +223,141 @@ function shellsBrief() {
   return "по умолчанию " + (win ? "cmd" : "sh") + "; доступно: " + uniq.join(", ") + " (параметр shell у runCommand/startBackground)";
 }
 
+// Предел НАКОПЛЕННОГО вывода: раньше его держал maxBuffer у execFile, теперь
+// накопитель наш — и предел держим сами. Сверх предела команда гасится деревом,
+// а агент получает честное объяснение (а не пустоту и не гигабайты в памяти).
+const MAX_BUF = 32 * 1024 * 1024;
+
+// Гасит команду ВМЕСТЕ С ДЕТЬМИ — приём тот же, что у фоновых процессов
+// (bg-processes.js): у команды своя группа (detached), поэтому сигнал уходит
+// группе целиком. Обычный child.kill() бьёт только оболочку, а её дети
+// (node/tsc/dev-сервер) остаются жить и держат порт.
+function killCommandTree(child) {
+  const pid = child && child.pid;
+  if (!pid) return;
+  try {
+    if (process.platform === "win32") {
+      // На Windows группы процессов свои, поэтому дерево гасит taskkill /T /F.
+      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true });
+    } else {
+      try { process.kill(-pid, "SIGTERM"); } catch {}
+      // Кто не понял SIGTERM — получает SIGKILL чуть позже (как в фоновых процессах).
+      setTimeout(() => { try { process.kill(-pid, "SIGKILL"); } catch {} }, 1200);
+    }
+  } catch {}
+  try { child.kill(); } catch {}
+}
+
 // Запуск произвольной команды в терминале (без интерактива).
 // Возвращает текст с кодом завершения и временем выполнения.
+// Вывод читается потоками и склеивается как буферы: посимвольная расшифровка
+// кусками ломала бы многобайтовую кириллицу на границе чанков.
 function runTerminalCommand(command, cwd, timeoutMs, shellName) {
   return new Promise((resolve) => {
     const sh = resolveShell(command, shellName);
-    const shell = sh.shell;
-    const args = sh.args;
+    const limit = timeoutMs || 120000;
     const start = Date.now();
-    execFile(shell, args, {
-      cwd,
-      timeout: timeoutMs || 120000,
-      maxBuffer: 32 * 1024 * 1024,
-      windowsHide: true,
-      env: commandEnv(command),
-    }, (err, stdout, stderr) => {
+    const outChunks = [];
+    const errChunks = [];
+    let bytes = 0;
+    let timedOut = false;
+    let overflow = false;
+    let timer = null;
+    let settled = false;
+    const timeoutError = () => {
+      const e = new Error("Команда не уложилась в " + limit + " мс — остановлена вместе с дочерними процессами.");
+      e.killed = true;
+      return e;
+    };
+    // Один выход на все ветки: завершение, отказ запуска, предел вывода, таймаут.
+    // Без него на отказе запуска промис не разрешился бы никогда, а инструмент
+    // агента завис бы навсегда — это хуже любого отказа.
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
       const secs = ((Date.now() - start) / 1000).toFixed(1);
       const timeNote = " (" + secs + " с)";
-      const out = stripAnsi(stdout || "").trim();
-      const errText = stripAnsi(stderr || "").trim();
+      const out = stripAnsi(Buffer.concat(outChunks).toString("utf8")).trim();
+      const errText = stripAnsi(Buffer.concat(errChunks).toString("utf8")).trim();
       if (!err) {
         // Обрезка — ДО времени: отметка «(0.4 с)» обязана остаться видимой,
         // иначе по ответу не понять, сколько команда работала.
-        if (out && errText) resolve(clip(out, PART_OUT) + "\n\n[stderr]\n" + clip(errText, PART_OUT) + timeNote);
-        else resolve(clip(out || errText || "Готово (без вывода).") + timeNote);
-      } else {
-        const code = err.killed ? "таймаут" : err.code == null ? 1 : err.code;
-        const parts = [];
-        if (out) parts.push(clip(out, PART_OUT));
-        if (errText) parts.push(clip(errText, PART_OUT));
-        // Ошибки запуска (ENOENT/EACCES/EINVAL) не пишут в stderr — без этого
-        // агент видел пустой вывод и не мог понять причину.
-        if (!errText && err.message) parts.push(String(err.message));
-        if (!parts.length) parts.push(err.message || String(err));
-        const shHint = (err.code === "ENOENT" || sh.missing === true) && sh.shellHint ? "\n\n" + sh.shellHint : "";
-        // Части уже обрезаны по отдельности (см. выше) — здесь только склейка:
-        // второй обрезки нет, иначе хвост терял бы пометку о своей длине.
-        resolve("Команда завершилась с кодом " + code + timeNote + ":\n" + parts.join("\n") + shHint);
+        if (out && errText) return resolve(clip(out, PART_OUT) + "\n\n[stderr]\n" + clip(errText, PART_OUT) + timeNote);
+        return resolve(clip(out || errText || "Готово (без вывода).") + timeNote);
       }
+      const code = err.killed ? "таймаут" : err.code == null ? 1 : err.code;
+      const parts = [];
+      if (out) parts.push(clip(out, PART_OUT));
+      if (errText) parts.push(clip(errText, PART_OUT));
+      // Ошибки запуска (ENOENT/EACCES/EINVAL) и наши остановки не пишут в stderr —
+      // без этого агент видел пустой вывод и не мог понять причину.
+      if (!errText && err.message) parts.push(String(err.message));
+      if (!parts.length) parts.push(err.message || String(err));
+      const shHint = (err.code === "ENOENT" || sh.missing === true) && sh.shellHint ? "\n\n" + sh.shellHint : "";
+      // Части уже обрезаны по отдельности (см. выше) — здесь только склейка:
+      // второй обрезки нет, иначе хвост терял бы пометку о своей длине.
+      resolve("Команда завершилась с кодом " + code + timeNote + ":\n" + parts.join("\n") + shHint);
+    };
+
+    let child;
+    try {
+      child = spawn(sh.shell, sh.args, {
+        cwd,
+        windowsHide: true,
+        env: commandEnv(command),
+        // Своя группа процессов — это и есть условие, по которому таймаут гасит
+        // ДЕРЕВО. Именно так не умел execFile: он сам собирает опции для spawn
+        // и молча теряет detached, а вместе с ним и группу.
+        detached: process.platform !== "win32",
+        // stdin закрыт: команды агента не интерактивны, и «cat» без этого ждал бы
+        // ввода до самого таймаута.
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (e) {
+      // spawn бросает на негодных опциях (например, кривой cwd) — события "error"
+      // уже не будет, и без этого ответа инструмент агента завис бы.
+      finish(e);
+      return;
+    }
+
+    const collect = (arr) => (chunk) => {
+      if (overflow) return;
+      arr.push(chunk);
+      bytes += chunk.length;
+      // Предел наш (вместо maxBuffer) — и за ним команда останавливается деревом.
+      if (bytes > MAX_BUF) {
+        overflow = true;
+        killTree(child);
+      }
+    };
+    child.stdout.on("data", collect(outChunks));
+    child.stderr.on("data", collect(errChunks));
+    // Отказ запуска (ENOENT у оболочки) приходит событием, а не кодом возврата.
+    child.on("error", (e) => finish(e));
+    child.on("close", (code, signal) => {
+      if (timedOut) return finish(timeoutError());
+      if (overflow) {
+        const e = new Error("Вывод команды превысил " + Math.round(MAX_BUF / (1024 * 1024)) + " МБ — команда остановлена вместе с дочерними процессами.");
+        e.code = 1;
+        return finish(e);
+      }
+      if (code === 0) return finish(null);
+      // Смерть от чужого сигнала называем сигналом, а не выдуманным кодом.
+      const e = new Error(signal ? "Процесс завершён сигналом " + signal + "." : "Вывода нет — команда завершилась молча.");
+      e.code = code == null ? 1 : code;
+      finish(e);
     });
+
+    timer = setTimeout(() => {
+      timedOut = true;
+      killTree(child);
+      // Оболочка может не отреагировать на SIGTERM (или её уже нет): отвечаем не
+      // позже чем через полторы секунды — к тому времени группе уходит SIGKILL.
+      // Таймер намеренно НЕ unref: обещание обязано быть разрешено, иначе
+      // инструмент агента повиснет. Ответ уже отдан — этот просто не сработает.
+      setTimeout(() => finish(timeoutError()), 1500);
+    }, limit);
   });
 }
 

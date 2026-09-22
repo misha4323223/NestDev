@@ -383,6 +383,68 @@ function missionStep(workDir, id, opts) {
   return { ok: true, mission: rec, progress: missionProgress(rec) };
 }
 
+// План панели (todoWrite) становится планом миссии. План у агента ОДИН, а мест показа
+// два: панель «План» (её ведёт интерфейс по событию todoWrite) и список шагов в панели
+// «Миссия» (его ведут файлы миссии). Раньше todoWrite наполнял только первую, поэтому
+// миссия, заведённая приложением без steps, навсегда оставалась «без плана» — хотя
+// план есть и агент работает именно по нему. Здесь план ложится в шаги, а переходы
+// (сделано / не вышло) — в журнал теми же строками, что пишет missionStep.
+const PLAN_STATES = { done: "done", failed: "failed", in_progress: "doing", doing: "doing" };
+function missionSetPlan(workDir, id, tasks) {
+  const rec = missionLoad(workDir, id);
+  if (!rec) return { ok: false, error: "Миссия не найдена: " + id };
+  const ts = Date.now();
+  const want = [];
+  for (const raw of (Array.isArray(tasks) ? tasks : []).slice(0, MISSION_MAX_STEPS)) {
+    const title = clip(typeof raw === "string" ? raw : raw && raw.text, 200);
+    if (!title) continue;
+    const key = title.toLowerCase();
+    const state = PLAN_STATES[String((raw && raw.status) || "")] || "todo";
+    const prev = rec.steps.find((s) => String(s.title || "").toLowerCase() === key);
+    want.push({
+      title: title,
+      state: state,
+      // Заметку ведёт не план, а missionStep (ею объясняется сбой): у знакомого шага
+      // она сохраняется, у нового пустая.
+      note: clip((raw && raw.note) || (prev && prev.note) || "", 400),
+      doneAt: state === "done" || state === "failed" ? (prev && prev.doneAt) || ts : 0,
+    });
+  }
+  if (!want.length) return { ok: false, error: "Пустой план: миссии нечего записывать." };
+  // История не выбрасывается: шаги, закрытые раньше (их нет в новом плане), остаются
+  // внизу списка — иначе прогресс миссии «улучшался» бы от смены плана.
+  const kept = rec.steps.filter(
+    (s) =>
+      (s.state === "done" || s.state === "failed") &&
+      !want.some((w) => w.title.toLowerCase() === String(s.title || "").toLowerCase())
+  );
+  const lines = [];
+  const prevState = (title) => {
+    const p = rec.steps.find((x) => String(x.title || "").toLowerCase() === String(title).toLowerCase());
+    return p ? p.state : "";
+  };
+  if (rec.steps.map((s) => String(s.title || "").toLowerCase()).join("|") !== want.map((w) => w.title.toLowerCase()).join("|")) {
+    lines.push({ kind: "plan", text: "План (" + want.length + "): " + want.map((w) => w.title).join(" · ") });
+  }
+  for (const s of want) {
+    const was = prevState(s.title);
+    if (s.state === "done" && was !== "done" && was !== "failed") {
+      lines.push({ kind: "step", text: "✅ Шаг выполнен: " + s.title });
+      s.doneAt = s.doneAt || ts;
+    } else if (s.state === "failed" && was !== "failed") {
+      lines.push({ kind: "fail", text: "⚠ Не удалось: " + s.title + (s.note ? " — " + s.note : "") });
+      s.doneAt = s.doneAt || ts;
+    }
+  }
+  rec.steps = want.concat(kept).slice(0, MISSION_MAX_STEPS);
+  const nextStep = want.find((s) => s.state !== "done" && s.state !== "failed");
+  rec.next = nextStep ? nextStep.title : "";
+  for (const l of lines) journalAppend(workDir, id, { kind: l.kind, text: l.text, ts });
+  const saved = missionSave(workDir, rec);
+  if (!saved.ok) return saved;
+  return { ok: true, mission: rec, progress: missionProgress(rec), changed: lines.length > 0 };
+}
+
 // Служебная запись в журнал (батч начался, пауза, ошибка, авто-продолжение).
 // ── Этапы работы (отрезки) ────────────────────────────────────────────────────
 // Этап закрывается в конце отрезка: граница батча, остановка по лимиту, пауза,
@@ -742,6 +804,7 @@ module.exports = {
   missionSave,
   missionProgress,
   missionStep,
+  missionSetPlan,
   missionStage,
   missionGoalNote,
   isResumeText,

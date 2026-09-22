@@ -17,7 +17,12 @@
      • переполнение контекста: бюджет контекста падает и история пересобирается;
      • успех снимает счётчики: следующий 429 снова «попытка 1»;
      • 402: прогон заканчивается понятной ошибкой (а не сырым JSON), и до неё
-       внешний авто-повтор успевает сообщить о попытках.
+       внешний авто-повтор успевает сообщить о попытках;
+     • шлюз провайдера (524 с HTML-страницей вместо JSON) и обрыв чтения тела запроса
+       (400 «Could not read the request body»): прогон ЖДЁТ и повторяет тот же раунд
+       сам, а не падает насмерть и не вываливает в чат простыню тегов;
+     • оборванная связь (провайдер рвёт соединение, ответа нет вовсе): прогон ждёт
+       и повторяет тот же раунд, а не останавливается молча (1.5.20x:
 
    Негативные контроли: --break=<имя> ломает одну проводку, и прогон обязан упасть. */
 
@@ -50,6 +55,17 @@ const BREAKS = {
   noteSuccess: ["src/run-retry.js", "    state.rateRetries = 0;\n    state.unavailableRetries = 0;\n", "    state.unavailableRetries = 0;\n"],
   usage: ["src/run-retry.js", "      state.includeUsage = false;\n", ""],
   cold: ["src/run-retry.js", "    if (cold) {\n", "    if (false && cold) {\n"],
+  // Шлюзовые коды (524/520) снова уходят в фатальную ошибку: живой прогон обязан
+  // упасть на сценарии со HTML-страницей шлюза.
+  gateway: ["src/renderer/agent-core.js", "const gateway = is5xx && GATEWAY_CODES.indexOf(st) >= 0;", "const gateway = is5xx && false;"],
+  // То же про обрыв чтения тела запроса.
+  gatewayBody: [
+    "src/renderer/agent-core.js",
+    "const bodyRead = BODY_READ_RE.test(d) && (st === 400 || st === 411 || st === 413);",
+    "const bodyRead = false && BODY_READ_RE.test(d) && (st === 400 || st === 411 || st === 413);",
+  ],
+  // Оборванная связь снова считается фатальной: живой прогон обязан упасть.
+  transport: ["src/run-retry.js", "    if (!text || FATAL_NET.test(text) || !TRANSIENT_NET.test(text)) return null;", "    if (true) return null;"],
   context: ["src/run-retry.js", "      await shrinkContext();\n", ""],
   // Лимитер снова выдаётся НОВЫЙ на каждый запрос (карта темпа убрана). Так было
   // ДО выноса: «Стоп» и новый прогон получали свой лимитер, слали запрос сразу и
@@ -122,6 +138,11 @@ const final = (n) => sse([
 
 /* Сценарий основного прогона: каждый второй запрос — отказ, между ними успех.
    Так проверяются и ожидание, и повтор ТОГО ЖЕ раунда (тела совпадают). */
+// Та самая HTML-страница, которой шлюз (Cloudflare) отвечал вместо JSON: раньше она
+// уезжала в чат целиком, а прогон падал насмерть — ровно то, на что жаловался человек.
+const CF_HTML =
+  '<!DOCTYPE html>\n<html class="no-js ie6 oldie" lang="en-US"><head><title>api.example.com | 524: A timeout occurred</title>' +
+  "</head><body><h1>Error 524</h1><p>A timeout occurred</p></body></html>";
 const SCRIPT = {
   1: { status: 429, headers: { "Retry-After": "2" }, text: "rate limit exceeded" },
   2: { run: answer },
@@ -135,7 +156,17 @@ const SCRIPT = {
   // держатель темпа промолчит. Выждать обязан сам прогон (по умолчанию 5 с) —
   // именно это ловит контроль `wait`.
   9: { status: 429, text: "rate limit exceeded" },
-  10: { run: final },
+  // Шлюз провайдера: страница ошибки вместо JSON (запрос до модели не дошёл).
+  10: { status: 524, headers: { "Content-Type": "text/html" }, text: CF_HTML },
+  11: { run: answer },
+  // Обрыв на шлюзе при чтении тела запроса: модель запроса тоже не получила.
+  12: { status: 400, text: JSON.stringify({ type: "bad_request", message: "Could not read the request body.", request_id: "2f35f2ec" }) },
+  13: { run: answer },
+  // Провайдер (или прокси перед ним) рвёт соединение: ответа нет ВООБЩЕ. Раньше это
+  // роняло прогон с первой попытки — «останавливается молча после обращения к API».
+  14: { destroy: true },
+  15: { run: answer },
+  16: { run: final },
 };
 let phrase = "main";
 // Текст, которым подставной провайдер отвечает на запрос ЗА ПАМЯТКОЙ (сжатие контекста).
@@ -151,6 +182,8 @@ function respond(n) {
   }
   const step = SCRIPT[n];
   if (!step) return { status: 200, run: final };
+  // Оборванная связь: у шага нет ни кода, ни ответа — сокет закрывается.
+  if (step.destroy) return step;
   if (step.status) return step;
   return { status: 200, run: step.run };
 }
@@ -177,10 +210,17 @@ const provider = http.createServer((req, res) => {
       at: Date.now(),
       phrase: phrase,
       status: step.status,
+      destroyed: !!step.destroy,
       tools: (parsed && parsed.tools) || [],
       messages: (parsed && parsed.messages) || [],
       streamOptions: parsed && parsed.stream_options,
     });
+    // Оборванная связь: сокет закрывается без ответа (так ведёт себя прокси, когда
+    // соединение до модели рвётся). fetch в приложении падает — это и проверяем.
+    if (step.destroy) {
+      req.socket.destroy();
+      return;
+    }
     if (step.status !== 200) {
       res.writeHead(step.status, Object.assign({ "Content-Type": "application/json" }, step.headers || {}));
       return res.end(step.text);
@@ -284,7 +324,7 @@ const COLD_WAIT_MS = core.coldCacheInfo(503, "cache_only_cold", 1).waitMs;
   const took = ((Date.now() - t0) / 1000).toFixed(1);
   ok(run && run.ok === true, "прогон завершился без ошибки (" + took + " с): " + JSON.stringify(run && run.error));
   const reqs = requests.filter((r) => r.phrase === "main");
-  ok(reqs.length === 10, "провайдер получил ровно 10 запросов (4 отказа + 4 раунда + финал): " + reqs.length);
+  ok(reqs.length === 16, "провайдер получил ровно 16 запросов (8 отказов + 7 раундов + финал): " + reqs.length);
 
   const kind = (t) => events.filter((e) => e.ch === "ai:event" && e.ev && e.ev.type === t);
   const consoleText = () => events.filter((e) => e.ch === "term:event" && e.ev && e.ev.type === "metrics").map((e) => e.ev.text).join("\n");
@@ -308,7 +348,7 @@ const COLD_WAIT_MS = core.coldCacheInfo(503, "cache_only_cold", 1).waitMs;
 
   console.log("\n[5] Строгий сервер без stream_options: следующий запрос уходит без него");
   const bad400 = reqs.filter((r) => r.status === 400).length;
-  ok(bad400 === 2, "отказов 400 было ровно два (stream_options и контекст): " + bad400);
+  ok(bad400 === 3, "отказов 400 было ровно три (stream_options, контекст и обрыв чтения тела): " + bad400);
   ok(reqs[4].streamOptions && reqs[4].streamOptions.include_usage === true, "до отказа метрики токенов запрашивались");
   ok(!reqs[5].streamOptions, "после отказа stream_options больше не уходит — раунд не падает по кругу");
   ok(/Провайдер не понял stream_options\.include_usage/.test(consoleText()), "в «Консоль» сказано, что метрики выключены");
@@ -325,6 +365,33 @@ const COLD_WAIT_MS = core.coldCacheInfo(503, "cache_only_cold", 1).waitMs;
   ok(reqs[7].messages.length <= reqs[6].messages.length, "история пересобрана и не выросла: " + reqs[6].messages.length + " → " + reqs[7].messages.length);
   ok(reqs[7].status === 200, "после ужатия раунд продолжился, а не упал");
 
+  console.log("\n[6Б] Шлюз провайдера: 524 с HTML-страницей и обрыв чтения тела — ждём и повторяем сами");
+  // Это и была немота: прогон останавливался после ответа внешнего сервиса. Теперь тот
+  // же раунд повторяется сам, а если шлюз совсем молчит — прогон говорит словами.
+  const gw = reqs[9];
+  const gwRetry = reqs[10];
+  ok(gw.status === 524, "шлюз ответил 524: " + gw.status);
+  ok(same(gw, gwRetry), "повтор ушёл с ТЕМ ЖЕ телом — это тот же раунд, а не новый");
+  ok(gwRetry.at - gw.at >= 3800, "перед повтором выждана пауза ядра: " + (gwRetry.at - gw.at) + " мс");
+  ok(/временно недоступен \(524\)/.test(consoleText()), "человеку не сказано, что отказал шлюз");
+  ok(!/[<>]|DOCTYPE/.test(consoleText()), "в «Консоль» уехала HTML-страница шлюза");
+  const br = reqs[11];
+  const brRetry = reqs[12];
+  ok(br.status === 400, "пришёл 400 на обрыв чтения тела: " + br.status);
+  ok(same(br, brRetry), "после обрыва тела повтор ушёл с тем же телом");
+  ok(brRetry.at - br.at >= 3800, "после обрыва тела тоже выждали паузу: " + (brRetry.at - br.at) + " мс");
+  ok(/не смог прочитать тело запроса/.test(consoleText()), "в «Консоли» нет объяснения обрыва: " + consoleText().slice(-160));
+  ok(!/bad_request|request_id/.test(chatText() + consoleText()), "в чат/консоль уехал сырой JSON шлюза");
+
+  console.log("\n[6В] Оборванная связь: провайдер рвёт соединение — ждём и повторяем тот же раунд");
+  const cut = reqs[13];
+  const cutRetry = reqs[14];
+  ok(cut.destroyed === true, "на этом раунде провайдер оборвал соединение");
+  ok(same(cut, cutRetry), "после обрыва повтор ушёл с ТЕМ ЖЕ телом — это тот же раунд");
+  ok(cutRetry.at - cut.at >= 1800, "перед повтором после обрыва выждали паузу: " + (cutRetry.at - cut.at) + " мс");
+  ok(/оборвалась/.test(consoleText()), "в «Консоли» не сказано, что связь оборвалась: " + consoleText().slice(-160));
+  ok(!/Сетевая ошибка/.test(chatText() + consoleText()), "обрыв связи назван ошибкой, а не вылечен повтором");
+
   console.log("\n[7] Успех снимает счётчики: второй лимит снова «попытка 1»");
   const waits = [...chatText().matchAll(/жду \d+ с и повторю сам \(попытка (\d+)\)/g)].map((m) => Number(m[1]));
   ok(waits.length === 2, "ожиданий в чате ровно два: " + waits.length);
@@ -336,7 +403,7 @@ const COLD_WAIT_MS = core.coldCacheInfo(503, "cache_only_cold", 1).waitMs;
 
   console.log("\n[8] Работа действительно шла: файлы на диске, ответ дошёл");
   const written = fs.existsSync(path.join(workDir, "notes")) ? fs.readdirSync(path.join(workDir, "notes")) : [];
-  ok(written.length === 4, "записано файлов: " + written.length + " — по одному на успешный раунд");
+  ok(written.length === 7, "записано файлов: " + written.length + " — по одному на успешный раунд");
   const text = kind("chunk").map((e) => e.ev.text).join("");
   ok(/Работа завершена/.test(text), "итоговый текст дошёл до чата");
   ok(kind("done").length === 1, "«готово» пришло ровно один раз");

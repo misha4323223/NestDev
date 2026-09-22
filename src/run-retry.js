@@ -14,7 +14,9 @@
        хотя повтор того же запроса лечится попаданием в кэш;
      • не ужали контекст — на модели с малым окном прогон падает навсегда;
      • не выключили stream_options после отказа строгого сервера — каждый раунд
-       падает по кругу на одном и том же месте.
+       падает по кругу на одном и том же месте;
+     • оборванную связь (ответа не было вовсе) приняли за фатальную ошибку —
+       хотя она лечится ожиданием и повтором того же раунда (transport).
 
    Живые значения приходят мостами: бюджет контекста — функциями (он ужимается
    здесь же), ужатие истории — обратным вызовом (история и контекст-менеджер
@@ -160,6 +162,10 @@ function createRunRetry(deps) {
             ? "API error 503 cache_only_cold: провайдер принимает только запрос с готовым кэшем. " +
               "Повторил " + UNAVAILABLE_MAX + " раза — пул всё ещё отказывает. Подожди 10–30 с и напиши «продолжай» " +
               "или выбери другую модель/тариф: смена ключа внутри того же бесплатного пула не поможет."
+            : cold.why === "body"
+            ? "API error " + status + ": провайдер не смог прочитать тело запроса (обрыв на его стороне). " +
+              "Повторил " + UNAVAILABLE_MAX + " раза — подожди немного и напиши «продолжай». " +
+              "Если это повторяется на каждом шаге, выбери другую модель или провайдера в настройках."
             : "API error " + status + ": провайдер временно недоступен. Повторил " + UNAVAILABLE_MAX +
               " раза — подожди немного и напиши «продолжай»."
         ),
@@ -187,7 +193,45 @@ function createRunRetry(deps) {
     return { kind: "throw", error: new Error("API error " + status + ": " + detail) };
   };
 
-  return { state: state, pace: pace, noteSuccess: noteSuccess, plan: plan, provider: provider };
+  // ── Оборванная связь: ответа с кодом нет вообще ─────────────────────────────
+  // Второй вид «остановки после обращения к внешнему сервису»: запрос ушёл, а ответа
+  // не было — сеть моргнула (ECONNRESET/EPIPE/ETIMEDOUT), прокси закрыл поток,
+  // «fetch failed» с сорванным сокетом. Раньше это роняло прогон С ПЕРВОЙ ПОПЫТКИ:
+  // человек видел «Сетевая ошибка…» и писал «продолжай» руками — хотя достаточно
+  // было подождать пару секунд и повторить тот же раунд. Здесь повтор тот же, а
+  // фатальный текст остаётся понятным.
+  //
+  // Посторонние ошибки НЕ перехватываются: неверный адрес, неизвестный хост, отказ в
+  // соединении и ошибки сертификата не лечатся ожиданием — про них говорим сразу.
+  const TRANSIENT_NET = /fetch failed|ECONNRESET|ECONNABORTED|ETIMEDOUT|EPIPE|EAI_AGAIN|socket hang up|other side closed|premature close|terminated|UND_ERR/i;
+  const FATAL_NET = /ENOTFOUND|EAI_NONAME|ECONNREFUSED|ERR_INVALID_URL|ERR_TLS|CERT_|UNABLE_TO_VERIFY/i;
+  // Свой график пауз: сеть моргает быстрее, чем перегруженный пул провайдера.
+  const NET_WAITS = [2000, 5000, 10000];
+  const transport = async (err) => {
+    if (!err || err.name === "AbortError") return null;
+    const cause = err.cause || null;
+    const text = [err.message, cause && (cause.code || cause.message), err.code].filter(Boolean).join(" · ");
+    if (!text || FATAL_NET.test(text) || !TRANSIENT_NET.test(text)) return null;
+    if (state.unavailableRetries < UNAVAILABLE_MAX) {
+      state.unavailableRetries++;
+      const waitMs = NET_WAITS[Math.min(NET_WAITS.length - 1, state.unavailableRetries - 1)];
+      termEmit({
+        type: "metrics",
+        text: "⏳ Связь с провайдером оборвалась. Жду " + Math.round(waitMs / 1000) + " с и повторяю тот же раунд.",
+      });
+      await pause(waitMs);
+      return { kind: "repeat" };
+    }
+    return {
+      kind: "throw",
+      error: new Error(
+        "Сетевая ошибка при запросе к " + provider + ": " + text + ". Повторил " + UNAVAILABLE_MAX +
+        " раза — подожди немного и напиши «продолжай»; если повторяется, проверь соединение или выбери другого провайдера."
+      ),
+    };
+  };
+
+  return { state: state, pace: pace, noteSuccess: noteSuccess, plan: plan, transport: transport, provider: provider };
 }
 
 module.exports = { createRunRetry };

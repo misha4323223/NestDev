@@ -67,7 +67,14 @@ function test(name, fn) {
 // main.js, теперь это запись реестра `"имя": async (args, settings) => {` в
 // agent-tools.js (1.5.77). Проверяем НАЛИЧИЕ инструмента, а не место, где он лежал.
 function hasTool(src, name) {
-  return src.includes('case "' + name + '"') || src.includes('"' + name + '": async (args, settings) =>');
+  // Третья форма — ссылка на модуль дома инструментов (часть 40): тело уехало,
+  // а в реестре осталось `"имя": write.имя,`. Без неё инструмент считался бы
+  // необъявленным ровно после того, как его перенесли (ловилось уже четырежды).
+  return (
+    src.includes('case "' + name + '"') ||
+    src.includes('"' + name + '": async (args, settings) =>') ||
+    new RegExp('"' + name + '":\\s*[A-Za-z_$][\\w$]*\\.' + name + ',', 'm').test(src)
+  );
 }
 
 // Тело инструмента: срез от его начала до начала следующего — в любом из двух видов.
@@ -84,12 +91,34 @@ function toolBody(src, from, to) {
   return start >= 0 && end > start ? src.slice(start, end) : "";
 }
 
+// Тело инструмента ЦЕЛИКОМ — от его записи до закрывающей `    },`. Нужен там, где
+// инструмент уехал в свой модуль дома (часть 40): сосед по прежнему файлу больше
+// не рядом, и срез «до следующего имени» отдавал пустоту — проверка молчала, хотя
+// выглядела живой (ловилось на installExe).
+function toolBodySelf(src, name) {
+  const start = src.indexOf('"' + name + '": async (args, settings) =>');
+  if (start < 0) return "";
+  const end = /\n    \},?\n/.exec(src.slice(start));
+  return end ? src.slice(start, start + end.index + end[0].length) : src.slice(start);
+}
+
 function mainOnlySrc() {
   return fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "project-brief.js", "chats-ipc.js", "memory-ipc.js", "git-stage.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "run-ipc.js", "tool-registry.js"]
+  return ["main.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "project-brief.js", "chats-ipc.js", "memory-ipc.js", "git-stage.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "run-ipc.js", "tool-registry.js"]
+    .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
+    .join("\n");
+}
+
+// Дом агентских инструментов ЦЕЛИКОМ: тела обработчиков разбираются по своим модулям
+// (часть 40), а проверка «повтор доходит до хранилища» спрашивает про ТЕЛО, а не про
+// файл-оболочку. Без этого проверка зеленеет ровно до того дня, когда обработчик
+// уезжает, и тогда падает не текстом, а отсутствием строки (та же ловушка, что у
+// toolBodySelf — HANDOFF §4).
+function toolsHomeSrc() {
+  return ["agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -6209,7 +6238,7 @@ async function testShellAndCdp() {
   });
 
   await test("installExe: ветки .msi (msiexec) и .zip на месте, .exe не форсируется", () => {
-    const inst = toolBody(mainFull, "installExe", "noteSave");
+    const inst = toolBodySelf(mainFull, "installExe");
     assert.ok(inst.includes("msiexec /i"), "нет ветки .msi");
     assert.ok(inst.includes("/passive /norestart"), "нет тихих ключей msiexec по умолчанию");
     assert.ok(inst.includes("downloadAndExtractTo(url, destDir)"), "нет распаковки .zip");
@@ -6318,7 +6347,7 @@ async function testShellAndCdp() {
   });
 
   await test("installExe: проверка стоит ДО запуска во всех трёх ветках", () => {
-    const inst = toolBody(mainFull, "installExe", "noteSave");
+    const inst = toolBodySelf(mainFull, "installExe");
     assert.strictEqual((inst.match(/await verifyInstaller\(/g) || []).length, 3, "проверка хэша стоит не во всех ветках");
     assert.strictEqual((inst.match(/installerGate\(/g) || []).length, 3, "решение о запуске не во всех ветках");
     const pairs = [
@@ -6406,6 +6435,77 @@ async function testShellAndCdp() {
     } finally {
       server.close();
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test("system-stack: .tar.gz не путается с .zip (тип application/gzip содержит «zip»)", async () => {
+    // Живой прогон сети (часть 40, заход 6a) нашёл это на деле: сервер отдал .tar.gz
+    // стандартным типом application/gzip, а инструмент ушёл в ветку unzip и упал —
+    // потому что проверял `contentType.includes("zip")`, а «gzip» содержит «zip».
+    // Набор этого не видел: он проверял ТЕКСТ инструмента, а не решение.
+    const stack = mkSystemStack();
+    const kind = stack.archiveKind;
+    assert.strictEqual(typeof kind, "function", "решение «zip или tar» не вынесено наружу — проверить нельзя");
+    const cases = [
+      ["https://x/pkg.tar.gz", "application/gzip", "tar", ".tar.gz с типом gzip"],
+      ["https://x/pkg.tgz", "application/gzip", "tar", ".tgz"],
+      ["https://x/pkg.tar.gz", "", "tar", "имя решает без типа"],
+      ["https://x/pkg.tar.gz", "application/octet-stream", "tar", "чужой тип не мешает имени"],
+      ["https://x/pkg.zip", "application/zip", "zip", ".zip"],
+      ["https://x/pkg.zip", "application/octet-stream", "zip", ".zip с чужим типом"],
+      ["https://x/archive", "application/zip", "zip", "тип без имени"],
+      ["https://x/archive", "application/gzip", "tar", "тип gzip без имени"],
+      ["https://x/photo.png", "image/png", "", "не архив — распаковывать нельзя"],
+      ["https://x/archive", "text/plain", "", "неизвестный тип — лучше отказать"],
+    ];
+    for (const [url, ct, want, note] of cases) {
+      assert.strictEqual(kind(url, ct), want, note + ": " + kind(url, ct));
+    }
+
+    // И следствие на деле: настоящий .tar.gz с настоящего сервера обязан распаковаться
+    // (без этого проверка решения ничего не стоит). На Windows архив распаковывает
+    // Expand-Archive, и там ветка tar своя — проверку ведём на остальных ОС.
+    if (process.platform !== "win32") {
+      const zlib = require("zlib");
+      const mkTar = (name, content) => {
+        const buf = Buffer.from(content, "utf8");
+        const h = Buffer.alloc(512);
+        h.write(name, 0, 100, "utf8");
+        h.write("0000644\0", 100, 8);
+        h.write("0000000\0", 108, 8);
+        h.write("0000000\0", 116, 8);
+        h.write(buf.length.toString(8).padStart(11, "0") + "\0", 124, 12);
+        h.write(Math.floor(Date.now() / 1000).toString(8).padStart(11, "0") + "\0", 136, 12);
+        h.write("        ", 148, 8);
+        h.write("0", 156, 1);
+        h.write("ustar\0", 257, 6);
+        h.write("00", 263, 2);
+        let sum = 0;
+        for (const b of h) sum += b;
+        h.write(sum.toString(8).padStart(6, "0") + "\0 ", 148, 8);
+        const pad = Buffer.alloc((512 - (buf.length % 512)) % 512);
+        return Buffer.concat([h, buf, pad]);
+      };
+      const tarGz = zlib.gzipSync(Buffer.concat([mkTar("progon.txt", "распаковалось\n"), Buffer.alloc(1024)]));
+      const server2 = http.createServer((req, res) => {
+        if (req.url === "/pkg.tar.gz") { res.writeHead(200, { "Content-Type": "application/gzip" }); res.end(tarGz); return; }
+        res.writeHead(404); res.end("no");
+      });
+      await new Promise((r) => server2.listen(0, "127.0.0.1", r));
+      const dir2 = tmpdir("unpack-test-");
+      try {
+        // Распаковка — НАСТОЯЩАЯ: у mkSystemStack() execFile подменён заглушкой, и
+        // первый заход этого теста получил «OK — Файлов: 0» (tar не запускался вовсе).
+        const realStack = mkSystemStack({ execFile: require("child_process").execFile });
+        const res = await realStack.downloadAndExtractTo("http://127.0.0.1:" + server2.address().port + "/pkg.tar.gz", path.join(dir2, "out"));
+        assert.ok(/^OK — скачано и распаковано/.test(res), ".tar.gz не распаковался: " + res);
+        const f = path.join(dir2, "out", "progon.txt");
+        assert.ok(fs.existsSync(f), "файла из архива нет: " + res);
+        assert.ok(/распаковалось/.test(fs.readFileSync(f, "utf8")), "содержимое файла из архива не то");
+      } finally {
+        server2.close();
+        fs.rmSync(dir2, { recursive: true, force: true });
+      }
     }
   });
 
@@ -10152,6 +10252,15 @@ async function testPromptCacheAndUsage() {
     assert.ok(/staticSystem: SYSTEM_PROMPT/.test(roundSrc), "граница статичного промпта не передана в запрос");
     assert.ok(/includeUsage: retry\.state\.includeUsage/.test(roundSrc), "флаг токен-отчёта не передаётся в запрос");
     assert.ok(/ttfbMs = Date\.now\(\) - startedAt/.test(roundSrc), "нет замера времени до первого байта");
+    // Оборванная связь: решение «ждать и повторить или сказать сразу» живёт в модуле
+    // повторов, а не в теле раунда — иначе правила разойдутся и прогон снова упадёт
+    // с первой же сетевой ошибки («останавливается молча после обращения к API»).
+    assert.ok(/const netVerdict = await retry\.transport\(e\)/.test(roundSrc), "обрыв связи не отдан модулю повторов");
+    assert.ok(/if \(netVerdict\.kind === "repeat"\) return \{ kind: "repeat" \}/.test(roundSrc), "повтор раунда после обрыва связи не возвращается");
+    assert.ok(/if \(!netVerdict\) throw new Error\("Сетевая ошибка при запросе к "/.test(roundSrc), "постоянная сетевая ошибка не уходит наружу прежним текстом");
+    const retrySrc = fs.readFileSync(path.join(ROOT, "src", "run-retry.js"), "utf8");
+    assert.ok(/transport: transport,/.test(retrySrc), "модуль повторов не отдаёт решение по обрыву связи");
+    assert.ok(/TRANSIENT_NET/.test(retrySrc) && /FATAL_NET/.test(retrySrc), "нет разделения «моргнувшая сеть» и «постоянная ошибка»");
     // Строгий сервер без stream_options: выключаем и повторяем раунд, а не падаем.
     assert.ok(
       /state\.includeUsage &&\s*\(status === 400 \|\| status === 422\)/.test(mainSrc),
@@ -10363,6 +10472,22 @@ async function testToolRouter() {
     // 5xx без признаков «холода» и перегрузки не трогаем — иначе будем ждать зря.
     assert.strictEqual(core.coldCacheInfo(500, "internal error", 1), null, "любой 500 стал повтором");
     assert.ok(core.coldCacheInfo(500, "cache_only_cold", 1).cold, "холодный отказ под 500 не распознан");
+    // Шлюз провайдера: HTML-страница вместо JSON (Cloudflare 524 и родственные коды).
+    // Раньше такое роняло прогон насмерть, а в чат уезжала простыня тегов.
+    const cfHtml =
+      '<!DOCTYPE html>\n<html class="no-js ie6 oldie" lang="en-US"><head><title>api.example.com | 524: A timeout occurred</title>';
+    const gateway = core.coldCacheInfo(524, cfHtml, 1);
+    assert.ok(gateway && !gateway.cold, "524 с HTML-страницей не считается временным отказом шлюза");
+    assert.strictEqual(gateway.text.indexOf("<"), -1, "в объяснение уехала HTML-страница: " + gateway.text);
+    for (const code of [504, 520, 521, 522, 523, 525, 527, 530]) {
+      assert.ok(core.coldCacheInfo(code, "", 1), code + " не считается отказом шлюза");
+    }
+    // Обрыв чтения тела запроса (шлюз не донёс запрос до модели) — тот же повтор.
+    const bodyRead = core.coldCacheInfo(400, '{"type":"bad_request","message":"Could not read the request body."}', 1);
+    assert.ok(bodyRead && bodyRead.why === "body", "обрыв чтения тела запроса не распознан");
+    assert.ok(/тело запроса/.test(bodyRead.text), "нет человеческого объяснения: " + bodyRead.text);
+    assert.strictEqual(core.coldCacheInfo(400, "invalid request body: tools[3]", 1), null, "наша же ошибка в запросе ушла в повторы");
+    assert.strictEqual(core.coldCacheInfo(404, "could not read the request body", 1), null, "404 перехвачен веткой обрыва тела");
     // И это подключено в main.js: повтор ТОГО ЖЕ раунда вместо падения с сырым JSON.
     const mainSrc = backendSrc();
     assert.ok(/const cold = coldCacheInfo\(status, detail, state\.unavailableRetries \+ 1\)/.test(mainSrc), "503 не обрабатывается");
@@ -12902,7 +13027,7 @@ async function testTasks() {
     const store = fs.readFileSync(path.join(ROOT, "src", "settings-store.js"), "utf8");
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     const core = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
-    const tools = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
+    const tools = toolsHomeSrc(); // дела и заметки — уже своим модулем (часть 40, заход 6b)
     // Автозадачи вынесены своим модулем (этап A, часть 4): ищем код там, где он живёт,
     // а у app.js спрашиваем только то, что он и должен теперь делать — звать модуль.
     const auto = uiFile("auto-tasks.js");
@@ -14407,7 +14532,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14417,7 +14542,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
@@ -14707,6 +14832,282 @@ async function testAgentTools() {
     state.activeRunUndo = [];
     const empty = await tools.undoEdit({}, {});
     assert.match(empty, /Нет изменений для отката/, "пустой журнал честно об этом говорит: " + empty);
+
+    // Ветка «что можно откатить»: журнал НЕПУСТОЙ, path не указан. Ровно здесь жил
+    // настоящий баг (часть 40, заход 3b): вместо живого моста стояли голые
+    // activeRunUndo / lastUndoLog — в строгом режиме это ReferenceError, и агент
+    // получал «Ошибка: activeRunUndo is not defined» именно тогда, когда просил
+    // список своих правок. Пустой журнал уходил в честный отказ выше и баг прятал.
+    const second = path.join(tmp, "second.txt");
+    state.activeRunUndo = [{ path: file, content: "старое" }, { path: file, content: "старое-2" }];
+    state.lastUndoLog = [{ path: second, content: "из журнала" }];
+    const list = await tools.undoEdit({}, {});
+    assert.match(list, /Можно откатить/, "список отката не отдан: " + list);
+    assert.ok(list.includes(file) && list.includes(second), "файлы живого и сохранённого журнала не названы: " + list);
+    assert.ok(/шагов в истории: 2/.test(list), "повторы одного файла не сведены: " + list);
+    state.activeRunUndo = [];
+    state.lastUndoLog = [];
+  });
+  // Правки файла — из модуля записи (часть 40, заход 3b). Проверяем ПО ФАКТУ: обработчик
+  // зовётся живьём с настоящим fs, а предохранители читаются по результату, а не по тексту.
+  // Зависимости названы явно (так видно, чего обработчику на самом деле нужно).
+  await test("правки файла: неоднозначность не правит файл молча", async () => {
+    const { createWriteTools } = require(path.join(ROOT, "src", "agent-tools-write.js"));
+    const dir = fs.mkdtempSync(path.join(require("os").tmpdir(), "write-tools-"));
+    const target = path.join(dir, "правки.js");
+    const writeTools = createWriteTools({
+      fs,
+      path,
+      resolvePath: (p) => path.resolve(String(p == null ? "" : p)),
+      agentWorkDir: () => dir,
+      selfDev: { protectedSelfPath: () => false, protectedSelfPathMessage: () => "" },
+      ota: { resolveCurrent: () => path.join(dir, "ota-нет") },
+      snapshotFileForUndo: () => {},
+      truncateText: (t, n) => String(t == null ? "" : t).slice(0, n || 4000),
+    });
+    fs.writeFileSync(target, "нужно();\nещё();\nнужно();\n", "utf8");
+    const before = fs.readFileSync(target, "utf8");
+
+    // 1. Фрагмент встречается дважды и не сказано, какой брать: правки быть НЕ должно
+    // (снятие этого предохранителя не видел ни один текстовый сторож).
+    const ambiguous = await writeTools.editFile({ path: target, oldText: "нужно();", newText: "готово();" }, {});
+    assert.match(ambiguous, /встречается 2 раз \(строки: 1, 3\)/, "неоднозначность не названа: " + ambiguous);
+    assert.strictEqual(fs.readFileSync(target, "utf8"), before, "файл изменён, хотя выбор был неоднозначен");
+
+    // 2. occurrence выбирает вхождение по номеру — и правит именно его.
+    const second = await writeTools.editFile({ path: target, oldText: "нужно();", newText: "готово();", occurrence: 2 }, {});
+    assert.match(second, /OK — заменено/, "замена по номеру не прошла: " + second);
+    assert.strictEqual(fs.readFileSync(target, "utf8"), "нужно();\nещё();\nготово();\n", "заменено не то вхождение");
+
+    // 3. Замена строк по номерам: файл обязан стать ровно тем, что просили.
+    fs.writeFileSync(target, "первая\nвторая\nтретья\nчетвёртая\n", "utf8");
+    const range = await writeTools.editFile({ path: target, startLine: 2, endLine: 3, newText: "НОВАЯ" }, {});
+    assert.match(range, /заменены строки 2–3/, "замена по номерам не названа: " + range);
+    assert.strictEqual(fs.readFileSync(target, "utf8"), "первая\nНОВАЯ\nчетвёртая\n", "диапазон строк заменён не так");
+    const over = await writeTools.editFile({ path: target, startLine: 99, newText: "нет" }, {});
+    assert.match(over, /больше числа строк файла/, "выход за конец файла не объяснён: " + over);
+  });
+  // Файловые инструменты — своим модулем (часть 40, заход 3a). Проверяем ПО ФАКТУ,
+  // а не по тексту: обработчики зовутся живьём, помощники разбора (numberedLines,
+  // buildFileOutline, buildBlockRanges, langFromExt) берутся из настоящего модуля,
+  // а не из заглушек. Текстового сторожа на ветку «большой файл» не было вовсе —
+  // негативный контроль показал это: набор молчал, пока файл выгружался целиком.
+  await test("файловые инструменты: большой файл — обзор вместо выгрузки целиком", async () => {
+    const { createFileTools } = require(path.join(ROOT, "src", "agent-tools-files.js"));
+    const { createProjectAnalysis } = require(path.join(ROOT, "src", "project-analysis.js"));
+    const dir = fs.mkdtempSync(path.join(require("os").tmpdir(), "files-real-"));
+    const bigFile = path.join(dir, "big.js");
+    fs.writeFileSync(
+      bigFile,
+      Array.from({ length: 900 }, (_, i) => (i === 0 ? "function big() {" : "  // строка " + (i + 1))).join("\n") + "\n  return 1;\n}\n",
+      "utf8"
+    );
+    const smallFile = path.join(dir, "small.js");
+    fs.writeFileSync(smallFile, "function greet() {\n  return 1;\n}\n", "utf8");
+    const bigLines = fs.readFileSync(bigFile, "utf8").split("\n").length;
+
+    // Заглушки — только для того, что этот вызов не трогает; всё нужное настоящему
+    // readFile приходит из настоящего модуля разбора файлов.
+    const realDeps = Object.assign(Object.create(base), {
+      fs,
+      path,
+      resolvePath: (p) => path.resolve(String(p == null ? "" : p)),
+      agentWorkDir: () => dir,
+      truncateText: (t, n) => String(t == null ? "" : t).slice(0, n || 4000),
+      ...createProjectAnalysis({ fs, path }),
+    });
+    const real = createFileTools(realDeps);
+
+    const big = await real.readFile({ path: bigFile }, {});
+    assert.match(big, new RegExp("Файл большой: " + bigLines + " строк"), "большой файл не назван числами строк: " + String(big).slice(0, 80));
+    assert.ok(/─ СТРУКТУРА/.test(big) && /─ НАЧАЛО ФАЙЛА:/.test(big) && /─ КОНЕЦ ФАЙЛА:/.test(big), "обзор большого файла неполный");
+    assert.ok(!/строка 450/.test(big), "середина большого файла выгружена целиком — экономия токенов потеряна");
+
+    const small = await real.readFile({ path: smallFile }, {});
+    assert.ok(/function greet/.test(small) && /\(4 строк\)/.test(small), "маленький файл прочитан не целиком: " + String(small).slice(0, 60));
+    const missing = await real.readFile({ path: path.join(dir, "нет.js") }, {});
+    assert.match(missing, /файл не найден/, "отсутствующий файл не объяснён: " + missing);
+  });
+
+  // Пояс проекта — своим модулем (часть 40, заход 6b). Проверяем ПО ФАКТУ, а не по
+  // тексту: заметки, дела, чекпоинты и поиск по смыслу зовутся живьём, хранилище
+  // настоящее (src/agent-store.js), индекс настоящий (src/code-index.js), диск
+  // настоящий. Тела уехали целиком, поэтому текстовый сторож не стоил бы здесь ничего.
+  await test("пояс проекта: заметки, дела, чекпоинты и поиск по смыслу — на настоящем диске", async () => {
+    const { createMemoryTools } = require(path.join(ROOT, "src", "agent-tools-memory.js"));
+    const agentStore = require(path.join(ROOT, "src", "agent-store.js"));
+    const codeIndex = require(path.join(ROOT, "src", "code-index.js"));
+    const userData = fs.mkdtempSync(path.join(os.tmpdir(), "memory-userData-"));
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "memory-work-"));
+    const target = path.join(work, "сервер.js");
+    fs.writeFileSync(target, "function validateLogin(user) { return !!user; }\n", "utf8");
+    let tasksPinged = 0;
+    const tools = createMemoryTools({
+      fs,
+      path,
+      agentStore,
+      codeIndex,
+      app: { getPath: () => userData },
+      agentWorkDir: () => work,
+      userDataDir: () => userData,
+      emitTasksChanged: () => { tasksPinged++; },
+      loadSettings: () => ({ contextMemory: true }),
+      resolvePath: (p) => path.resolve(String(p == null ? "" : p)),
+    });
+
+    // 1. Заметки: круг «сохранить → прочитать → список → удалить». Кириллический ключ
+    // обязан перевестись сам, а память проекта — лежать ВНЕ проекта (иначе уедет в git).
+    const saved = await tools.noteSave({ key: "Клиенты ВК", content: "Адрес: app.local" }, {});
+    assert.match(saved, /^OK — /, "заметка не сохранилась: " + saved);
+    assert.ok(saved.includes("klienty-vk"), "кириллический ключ не переведён в латиницу: " + saved);
+    const one = await tools.noteRead({ key: "klienty-vk" }, {});
+    assert.ok(one.includes("Заметка «klienty-vk»") && one.includes("app.local"), "заметка не читается: " + one);
+    assert.ok(/Заметки проекта \(1\)/.test(await tools.noteList({}, {})), "список заметок пуст");
+    assert.ok(!fs.readdirSync(work).some((f) => f.indexOf("project-memory") >= 0), "память проекта легла внутрь проекта");
+    assert.match(await tools.noteDelete({ key: "klienty-vk" }, {}), /удалена/, "заметка не удалилась");
+
+    // 2. Дела: повтор обязан дойти до хранилища (именно это сторожит проверка выше),
+    // а каждая правка — сразу отозваться панели дел.
+    assert.match(await tools.taskAdd({ title: "Полить цветы", due: "завтра 10:00", repeat: "каждый день" }, {}), /^OK — /, "дело не создалось");
+    const tasks = await tools.taskList({}, {});
+    assert.ok(tasks.includes("Полить цветы") && tasks.includes("🔁 каждый день"), "повтор не дошёл до хранилища: " + tasks);
+    assert.ok(tasksPinged > 0, "панель дел не получила событие об изменении");
+    assert.match(await tools.taskDone({ key: "Полить" }, {}), /^OK — /, "дело не отметилось выполненным");
+    assert.match(await tools.taskDelete({ key: "Полить" }, {}), /удалено/, "дело не удалилось");
+
+    // 3. Чекпоинты: снимок → правка → откат. Проверяем РЕЗУЛЬТАТ на диске, иначе
+    // предохранители отката не видит никто.
+    const shot = await tools.checkpointSave({ label: "перед правками" }, {});
+    assert.match(shot, /^OK — /, "чекпоинт не создался: " + shot);
+    const id = (/checkpointRollback\(id: ([a-z0-9-]+)\)/.exec(shot) || [])[1];
+    assert.ok(id, "в ответе нет id чекпоинта: " + shot);
+    fs.writeFileSync(target, "сломано\n", "utf8");
+    assert.match(await tools.checkpointRollback({ id }, {}), /^OK — /, "откат не прошёл");
+    assert.strictEqual(fs.readFileSync(target, "utf8"), "function validateLogin(user) { return !!user; }\n", "файл не вернулся к прежнему содержимому");
+    assert.ok(/перед правками/.test(await tools.checkpointList({}, {})), "созданный чекпоинт не виден в списке");
+
+    // 4. Поиск по смыслу: настоящий индекс по настоящей папке. Пустой запрос обязан
+    // отказать ДО всякого поиска (и не трогать диск).
+    assert.match(await tools.semanticSearch({ query: "validateLogin" }, {}), /validateLogin\.js|сервер\.js/, "поиск по смыслу не нашёл файл");
+    assert.match(await tools.semanticSearch({}, {}), /укажи query/, "пустой запрос не отвергнут");
+
+    fs.rmSync(userData, { recursive: true, force: true });
+    fs.rmSync(work, { recursive: true, force: true });
+  });
+
+  // Миссии и план — своим модулем (часть 40, заход 6c). Проверяем ПО ФАКТУ на
+  // настоящем хранилище миссий: файлы на диске, «своя» миссия прогона и события
+  // панели. Текстовый сторож здесь не стоил бы ничего: тела уехали целиком.
+  await test("миссии и план: своя миссия прогона, журнал на диске и события панели", async () => {
+    const { createMissionTools } = require(path.join(ROOT, "src", "agent-tools-mission.js"));
+    const missionStore = require(path.join(ROOT, "src", "mission-store.js"));
+    const AgentCore = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "mission-work-"));
+    const emitted = [];
+    let planSummaryValue = null;
+    let runMissionId = "";
+    // ЛОВУШКА ПЕРЕНОСА: у двух «живых» объектов РАЗНАЯ форма, и это не описка.
+    // deps.live (мост main.js) держит activeEmit методом-доступором — его зовут
+    // БЕЗ аргументов, и он возвращает отправителя событий (или null): так делает
+    // notifyMission. А live-мост модуля отдаёт самого отправителя геттером:
+    // обработчики зовут live.activeEmit({...}) напрямую. Перепутать — значит
+    // отправить событие никуда: промах прячет try/catch внутри notifyMission.
+    const liveBridge = { activeEmit: () => (ev) => { emitted.push(ev); } }; // форма main.js
+    const live = {
+      get activeRunRole() { return "manager"; },
+      get activeRunChatId() { return "chat-42"; },
+      get activeRunMissionId() { return runMissionId; },
+      get activeEmit() { return liveBridge.activeEmit(); },
+      get activePlanSummary() { return planSummaryValue; },
+      set activePlanSummary(v) { planSummaryValue = v; },
+    };
+    const tools = createMissionTools({
+      missionStore,
+      agentWorkDir: () => work,
+      normalizePlanTasks: AgentCore.normalizePlanTasks,
+      planSummary: AgentCore.planSummary,
+      live: liveBridge,
+    }, live);
+
+    // 1. План: событие панели, сводка для предохранителя «план не закрыт» и полный
+    // ответ человеку. Пустой план обязан отказать, а не показать пустую панель.
+    const plan = await tools.todoWrite({ tasks: [{ text: "прочитать", status: "done" }, { text: "свести" }], title: "Разбор" }, {});
+    assert.match(plan, /^OK — план показан пользователю: 1 из 2 готово/, "план подан не так: " + plan.slice(0, 80));
+    const planEvent = emitted.find((e) => e && e.type === "plan");
+    assert.ok(planEvent && planEvent.tasks.length === 2 && planEvent.title === "Разбор", "панель не получила план: " + JSON.stringify(planEvent));
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(planSummaryValue)), { total: 2, done: 1, failed: 0 }, "сводка плана для предохранителя неверна: " + JSON.stringify(planSummaryValue));
+    assert.match(await tools.todoWrite({ tasks: [] }, {}), /план пуст/, "пустой план не отвергнут");
+
+    // 2. Миссия: файлы ложатся в рабочую папку, а роль и чат ПРОГОНА записаны внутрь —
+    // панель показывает работу в том чате, где она начата.
+    const started = await tools.missionStart({ goal: "разобрать заявки", steps: ["прочитать", "свести"], minutes: 30 }, {});
+    const id = (/миссия создана: ([^\s]+)/.exec(started) || [])[1];
+    assert.ok(id, "в ответе нет id миссии: " + started.slice(0, 80));
+    const rec = missionStore.missionLoad(work, id);
+    assert.ok(rec && rec.role === "manager" && rec.chatId === "chat-42", "миссия не помнит, кто её ведёт: " + JSON.stringify(rec && { role: rec.role, chatId: rec.chatId }));
+    assert.ok(fs.existsSync(path.join(work, ".agent", "missions", id)), "папки миссии нет на диске");
+    assert.ok(emitted.some((e) => e && e.type === "mission"), "панель не получила событие о миссии");
+
+    // 3. «Своя» миссия прогона важнее свежей: инструмент без id работает с миссией
+    // прогона, а не с самой свежей незакрытой — иначе агент закрывал чужую работу.
+    // Вторая миссия — как её заводит само приложение: БЕЗ steps (план не передан).
+    const second = await tools.missionStart({ goal: "чужая работа" }, {});
+    const secondId = (/миссия создана: ([^\s]+)/.exec(second) || [])[1];
+    runMissionId = id;
+    const status = await tools.missionStatus({}, {});
+    assert.ok(status.includes(id) && !status.includes(secondId), "инструмент без id взял не свою миссию: " + status.slice(0, 120));
+
+    // 4. Шаг: заметка и «дальше» доезжают до журнала на диске.
+    const step = await tools.missionStep({ next: "свести заявки", note: "прочитано 12 писем" }, {});
+    assert.ok(step.includes(id) && /OK — миссия/.test(step), "шаг миссии не назван: " + step.slice(0, 80));
+    const journal = fs.readFileSync(path.join(work, ".agent", "missions", id, "journal.md"), "utf8");
+    assert.ok(journal.includes("прочитано 12 писем"), "заметка шага не дошла до журнала");
+
+    // 4б. План панели становится планом МИССИИ. Живая беда: миссию заводит само
+    // приложение (без steps), агент пишет план через todoWrite — и карточка миссии
+    // навсегда оставалась «План не составлен», хотя план есть и работа идёт по нему.
+    assert.strictEqual(missionStore.missionLoad(work, secondId).steps.length, 0, "проверка не о том: у второй миссии уже был план");
+    runMissionId = secondId;
+    const mirrored = await tools.todoWrite(
+      { tasks: [{ text: "разобрать письма", status: "done" }, { text: "свести заявки", status: "in_progress" }, { text: "отчитаться" }] },
+      {}
+    );
+    assert.ok(mirrored.includes("План миссии «" + secondId + "» обновлён: 1/3"), "план не перенесён в миссию: " + mirrored.slice(-160));
+    const msRec = missionStore.missionLoad(work, secondId);
+    assert.deepStrictEqual(msRec.steps.map((s) => s.state), ["done", "doing", "todo"], "шаги миссии не совпали с планом: " + JSON.stringify(msRec.steps));
+    assert.strictEqual(msRec.next, "свести заявки", "«дальше» миссии не следует за планом: " + msRec.next);
+    assert.deepStrictEqual(missionStore.missionProgress(msRec), { total: 3, done: 1, failed: 0, left: 2, current: "свести заявки", percent: 33 }, "прогресс миссии не сходится с планом");
+    const msJournal = () => fs.readFileSync(path.join(work, ".agent", "missions", secondId, "journal.md"), "utf8");
+    assert.ok(/План \(3\): разобрать письма · свести заявки · отчитаться/.test(msJournal()), "план не записан в журнал миссии");
+    assert.ok(/✅ Шаг выполнен: разобрать письма/.test(msJournal()), "закрытый пункт плана не отмечен в журнале");
+    assert.ok(emitted.filter((e) => e && e.type === "mission").length >= 2, "панель миссии не обновилась после переноса плана");
+    // Дальше по тому же плану: переход пункта в «готово» пишет строку журнала ровно
+    // один раз — повторный вызов с тем же списком её не дублирует.
+    const donePlan = { tasks: [{ text: "разобрать письма", status: "done" }, { text: "свести заявки", status: "done" }, { text: "отчитаться", status: "in_progress" }] };
+    await tools.todoWrite(donePlan, {});
+    assert.strictEqual(msJournal().split("✅ Шаг выполнен: свести заявки").length - 1, 1, "переход пункта в «готово» не записан в журнал");
+    await tools.todoWrite(donePlan, {});
+    assert.strictEqual(msJournal().split("✅ Шаг выполнен: свести заявки").length - 1, 1, "повторный вызов плана продублировал журнал миссии");
+    const lastProgress = missionStore.missionProgress(missionStore.missionLoad(work, secondId));
+    assert.strictEqual(lastProgress.done, 2, "готовых пунктов после второго плана: " + lastProgress.done);
+    assert.strictEqual(lastProgress.current, "отчитаться", "текущий пункт миссии не следует за планом: " + lastProgress.current);
+    assert.strictEqual(lastProgress.percent, 67, "прогресс миссии не сходится с планом: " + lastProgress.percent);
+    runMissionId = id;
+
+    // 5. Закрытие: отчёт ложится файлом, а оставшаяся миссия снова находится.
+    const fin = await tools.missionFinish({ report: "всё сделано", status: "done" }, {});
+    assert.match(fin, /^OK — миссия /, "закрытие не названо: " + fin.slice(0, 80));
+    assert.ok(fs.readFileSync(path.join(work, ".agent", "missions", id, "report.md"), "utf8").includes("всё сделано"), "отчёт не лёг на диск");
+    runMissionId = "";
+    const nextStatus = await tools.missionStatus({}, {});
+    assert.ok(nextStatus.includes(secondId), "после закрытия своей миссии не нашлась оставшаяся: " + nextStatus.slice(0, 120));
+
+    // 6. Незакрытых больше нет: повторное закрытие обязано сказать «уже закрыта» и
+    // назвать прежний итог — иначе агент считает, что закрывать нечего, и повторяет.
+    await tools.missionFinish({ report: "и это тоже сделано", status: "done" }, {});
+    const again = await tools.missionFinish({ report: "ещё раз" }, {});
+    assert.ok(again.includes("уже закрыта") && again.includes("Отчёт: .agent/missions/"), "повторное закрытие не назвало прежнюю работу: " + again.slice(0, 140));
+    fs.rmSync(work, { recursive: true, force: true });
   });
 }
 // ── Разрез транспорта, часть 1: подключение к провайдеру ────────────────────
@@ -14774,6 +15175,15 @@ async function testProviderConfig() {
     assert.ok(!/\[object/.test(json), "в текст ошибки попал объект вместо текста: " + json);
     const plain = await pc.readApiError({ text: async () => "ошибка шлюза" });
     assert.strictEqual(plain, "ошибка шлюза", "обычный текст потерян");
+    // HTML-страница шлюза вместо JSON: в текст уходит короткая причина, а не теги.
+    const cf = await pc.readApiError({
+      text: async () =>
+        "<!DOCTYPE html><html><head><title>api.example.com | 524: A timeout occurred</title></head><body><p>Error 524</p></body></html>",
+    });
+    assert.ok(/HTML-страница вместо JSON/.test(cf), "HTML-страница шлюза не распознана: " + cf.slice(0, 120));
+    assert.ok(/524: A timeout occurred/.test(cf), "из страницы не взят заголовок с кодом: " + cf);
+    assert.strictEqual(cf.indexOf("<"), -1, "в текст ошибки уехали теги: " + cf.slice(0, 120));
+    assert.ok(cf.length < 300, "объяснение длиннее самой страницы: " + cf.length);
     const long = await pc.readApiError({ text: async () => "x".repeat(5000) });
     assert.strictEqual(long.length, 600, "длинное тело не обрезано: " + long.length);
     const broken = await pc.readApiError({ text: async () => { throw new Error("тело уже прочитано"); } });
@@ -15752,11 +16162,17 @@ async function testMissionGuard() {
       "призывы по-прежнему бьют по миссии на паузе"
     );
     assert.ok(/activeRunMissionId: \(\) => runMissionId/.test(mainSrc), "миссия прогона не отдана агентским инструментам");
-    const toolsSrc = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
+    const toolsSrc = toolsHomeSrc(); // миссии и план — уже своим модулем (часть 40, заход 6c)
     assert.ok(toolsSrc.indexOf("const missionOfRun = (dir)") > 0, "нет помощника «миссия прогона» в реестре инструментов");
     for (const call of ["missionOfRun(msDir2)", "missionOfRun(msDir3)", "missionOfRun(msDir4)"]) {
       assert.ok(toolsSrc.indexOf(call) > 0, "инструмент без id работает не со своей миссией: " + call);
     }
+    // План панели обязан доехать до файлов миссии: без этой проводки миссия, заведённая
+    // приложением без steps, так и остаётся «без плана» — хоть агент план и пишет.
+    assert.ok(/const planMission = missionOfRun\(planDir\);/.test(toolsSrc), "todoWrite не ищет миссию прогона");
+    assert.ok(/missionStore\.missionSetPlan\(planDir, planMission\.id, planTasks\)/.test(toolsSrc), "todoWrite не переносит план в миссию");
+    assert.ok(/План миссии «/.test(toolsSrc), "агент не видит, что план лёг в миссию");
+    assert.ok(/missionSetPlan,/.test(fs.readFileSync(path.join(ROOT, "src", "mission-store.js"), "utf8")), "missionSetPlan не вынесен наружу из хранилища");
     assert.ok(/Отчёт по ОДНОЙ И ТОЙ ЖЕ работе/.test(coreData()), "в промпте нет правила «отчёт присылается один раз»");
     // Человеческий путь «▶ Продолжить»: миссия возвращается в работу, запоминается
     // как просьба человека (пауза сама не подхватывается) и продолжается в СВОЁМ чате.
@@ -16153,7 +16569,7 @@ async function testMissions() {
 
   await test("миссии: инструменты, панель, настройки и мост на месте", () => {
     const main = mainOnlySrc();
-    const tools = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
+    const tools = toolsHomeSrc(); // миссии и план — уже своим модулем (часть 40, заход 6c)
     const policy = fs.readFileSync(path.join(ROOT, "src", "tool-policy.js"), "utf8");
     const core = coreData(); // ядро + его данные: prompts.js, tool-schemas.js
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
@@ -17172,11 +17588,21 @@ async function testVkFieldFixes() {
   });
 
   await test("writeFile: синтаксис и JSON проверяются, окружение названо", () => {
-    const src = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
+    // Помощники ищем ПО ИМЕНИ во всём доме инструментов: writeFile уехал вместе с ними
+    // в agent-tools-write.js (часть 40, заход 3b), и сторож обязан читать любой файл дома,
+    // а не тот, где код лежал раньше (эта ловушка ловилась уже трижды).
+    const homeDir = path.join(ROOT, "src");
+    const homeFiles = fs.readdirSync(homeDir).filter((f) => /^agent-tools.*\.js$/.test(f));
+    let src = "";
+    for (const f of homeFiles) {
+      const text = fs.readFileSync(path.join(homeDir, f), "utf8");
+      if (text.includes("const CHECK_CODE_EXT")) { src = text; break; }
+    }
     const start = src.indexOf("const CHECK_CODE_EXT");
-    const end = src.indexOf("function createAgentTools(deps) {");
-    assert.ok(start > 0 && end > start, "не нашёл хелперы проверки файла");
-    const mod = new Function("require", src.slice(start, end) + "\nreturn { checkWrittenFile, envNoteFor };")(require);
+    assert.ok(start >= 0, "не нашёл хелперы проверки файла");
+    // Хвост модуля берём целиком и отдаём ему поддельный module: так сторож не зависит
+    // от того, какой файл дома сейчас держит помощники (ни одного end-индекса не нужно).
+    const mod = new Function("require", "module", src.slice(start) + "\nreturn { checkWrittenFile, envNoteFor };")(require, { exports: {} });
     const os = require("os");
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wf-"));
     try {
@@ -17223,7 +17649,7 @@ async function testVkFieldFixes() {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
-    const toolsSrc = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
+    const toolsSrc = toolsHomeSrc(); // миссии и план — уже своим модулем (часть 40, заход 6c)
     assert.ok(/missionList\(msDir4, \{ limit: 1 \}\)/.test(toolsSrc), "повторный missionFinish не ищет последнюю миссию");
     assert.ok(/уже закрыта/.test(toolsSrc), "повторный missionFinish не говорит, что миссия закрыта");
     assert.ok(/missionStart\(goal, steps\)/.test(toolsSrc), "не подсказано, как начать новую миссию");

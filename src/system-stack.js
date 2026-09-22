@@ -458,6 +458,23 @@ function findInstallersIn(dir) {
   return out;
 }
 
+// Чем распаковывать скачанное: имя файла решает ПЕРВЫМ, тип — только как подсказка.
+// Так потому, что «application/gzip» СОДЕРЖИТ «zip»: от одной подстроки в типе
+// .tar.gz уезжал в ветку unzip и падал на любом сервере, который отдаёт tar.gz
+// стандартным типом. Нашёл живой прогон сети (часть 40, заход 6a), набор такого
+// не видел, потому что проверял текст, а не решение.
+function archiveKind(url, contentType) {
+  const pathLow = String(url || "").toLowerCase();
+  const ct = String(contentType || "").toLowerCase();
+  if (/\.zip$/.test(pathLow)) return "zip";
+  if (/\.(tar\.gz|tgz|tar\.bz2|tbz2|tar)$/.test(pathLow)) return "tar";
+  const ctTar = ct.includes("gzip") || ct.includes("tar");
+  const ctZip = ct.includes("zip") && !ctTar; // «gzip» — это НЕ zip
+  if (ctTar) return "tar";
+  if (ctZip) return "zip";
+  return "";
+}
+
 async function downloadAndExtractTo(url, destDir) {
   const u = String(url || "").trim();
   if (!/^https?:\/\//i.test(u)) return "Ошибка: укажи полный URL (https://…/archive.zip, .tar.gz и т.п.)";
@@ -477,9 +494,9 @@ async function downloadAndExtractTo(url, destDir) {
   if (buf.length > 300 * 1024 * 1024) return "Архив слишком большой (>300 МБ): " + buf.length + " байт.";
   const contentType = (res.headers.get("content-type") || "").toLowerCase();
   const pathLow = u.toLowerCase();
-  const isZip = pathLow.endsWith(".zip") || contentType.includes("zip");
-  const isTar = /\.(tar\.gz|tgz|tar\.bz2|tbz2|tar)$/.test(pathLow) || contentType.includes("gzip") || contentType.includes("tar");
-  if (!isZip && !isTar) return "Не похоже на архив (.zip / .tar.gz / .tgz): " + u + ". Скачивать обычные файлы через runCommand (curl / Invoke-WebRequest).";
+  const kind = archiveKind(u, contentType);
+  if (!kind) return "Не похоже на архив (.zip / .tar.gz / .tgz): " + u + ". Скачивать обычные файлы через runCommand (curl / Invoke-WebRequest).";
+  const isZip = kind === "zip";
   const tmpFile = path.join(os.tmpdir(), "ai-agent-dl-" + Date.now().toString(36) + (isZip ? ".zip" : ".tar"));
   try {
     fs.writeFileSync(tmpFile, buf);
@@ -492,7 +509,8 @@ async function downloadAndExtractTo(url, destDir) {
       const r = await spawnRaw(["unzip", "-q", "-o", tmpFile, "-d", destDir], { timeoutMs: 180000 });
       if (!r.ok) return "Не удалось распаковать (нужен unzip): " + ((r.err || r.out || "").trim() || "код " + r.code) + "\nВарианты: установи unzip (installSystemPackage) или скачай tar-архив (.tar.gz).";
     } else {
-      const flag = /\.(tar\.gz|tgz)$/.test(pathLow) ? "-xzf" : "-xf";
+      // -z ставим только там, где это точно gzip: лишний -z на несжатом tar ломает распаковку.
+      const flag = /\.(tar\.gz|tgz)$/.test(pathLow) || contentType.includes("gzip") ? "-xzf" : "-xf";
       const r = await spawnRaw(["tar", flag, tmpFile, "-C", destDir], { timeoutMs: 180000 });
       if (!r.ok) return "Не удалось распаковать: " + ((r.err || r.out || "").trim() || "код " + r.code);
     }
@@ -566,6 +584,9 @@ async function runAsAdmin(cmd) {
     installerGate,
     findInstallersIn,
     downloadAndExtractTo,
+    // Решение «zip или tar» — наружу: оно чистое, и его сторожит набор (живой
+    // прогон проверяет следствие — что настоящий .tar.gz РАСПАКОВАЛСЯ).
+    archiveKind,
     runAsAdmin,
   };
 }

@@ -1213,28 +1213,51 @@
     return parts.join("\n").slice(0, maxChars);
   }
 
-  // Отказ пула провайдера: 503 и «холодный» ответ (cache_only_cold у бесплатных пулов)
-  // — принимается только запрос с готовым кэшем либо пул перегружен. Наша вина тут
-  // косвенная (сменился префикс запроса), и лечится это повтором ТОГО ЖЕ раунда с
+  // Отказ на стороне ПРОВАЙДЕРА (запрос до модели не дошёл): 503 и «холодный» ответ
+  // (cache_only_cold у бесплатных пулов — принимается только запрос с готовым кэшем),
+  // коды ШЛЮЗА/CDN (Cloudflare 520–527, 504 upstream timeout, 530) и обрыв при чтении
+  // тела запроса. Наша вина тут косвенная, и лечится это повтором ТОГО ЖЕ раунда с
   // паузой: история не переписывается, поэтому повтор уже может попасть в кэш.
+  //
+  // Почему коды шлюза названы явно. Раньше ветку брали только 503/502/529 либо ответ
+  // со словом «overloaded/unavailable». Шлюзовые 524/520 в этот список не попадали и
+  // роняли прогон НАВСЕГДА: человек видел в чате HTML-страницу шлюза и писал
+  // «продолжай» руками — хотя весь отказ лечится ожиданием в 4–20 с. Теперь ожидание
+  // и повтор берут верх, а если провайдер молчит дольше, прогон честно говорит об
+  // этом словами, а не простынёй тегов.
   const UNAVAILABLE_WAITS = [4000, 10000, 20000];
   const UNAVAILABLE_MAX = UNAVAILABLE_WAITS.length;
+  // 520–527 — семейство Cloudflare, 530 — ошибка DNS у шлюза, 504 — таймаут до модели.
+  const GATEWAY_CODES = [502, 503, 504, 520, 521, 522, 523, 524, 525, 527, 530];
+  // Обрыв на шлюзе при чтении тела запроса: провайдер отвечает так (400/411/413), когда
+  // запрос до модели не дошёл. Формулировка узкая намеренно — «invalid request body»
+  // из-за наших же схем инструментов повтором не лечится и в эту ветку не попадёт.
+  const BODY_READ_RE = /could not read the request body|unable to read the request body|failed to read the request body|error reading the request body/i;
   function coldCacheInfo(status, detail, attempt) {
     const st = Number(status) || 0;
-    // Ветку берут только 5xx: 429, 402 и 400 разбираются своими правилами.
-    if (st && !(st >= 500 && st <= 599)) return null;
     const d = String(detail || "");
     const cold = /cache[ _-]?only/i.test(d);
     const busy = /overloaded|unavailable|capacity|too many requests|temporarily|try again/i.test(d);
-    if (!cold && !busy && st !== 503 && st !== 502 && st !== 529) return null;
+    // 5xx (и неизвестный код) — про отказ САМОГО провайдера; 429, 402 и 401
+    // разбираются своими ветками: там повтор бессмыслен. 500 без признаков сбоя
+    // по-прежнему НЕ повторяем — ждать впустую хуже, чем честно сказать.
+    const is5xx = st >= 500 && st <= 599;
+    const hint = (!st || is5xx) && (cold || busy);
+    const gateway = is5xx && GATEWAY_CODES.indexOf(st) >= 0;
+    const bodyRead = BODY_READ_RE.test(d) && (st === 400 || st === 411 || st === 413);
+    if (!hint && !gateway && !bodyRead) return null;
     const i = Math.max(0, Math.min(UNAVAILABLE_MAX - 1, (Number(attempt) || 1) - 1));
     const waitMs = UNAVAILABLE_WAITS[i];
+    const sec = Math.round(waitMs / 1000);
+    const why = cold ? "cold" : bodyRead ? "body" : "busy";
     const text = cold
       ? "⏳ Пул провайдера принял только запрос с готовым кэшем (cache_only_cold). Жду " +
-        Math.round(waitMs / 1000) + " с и повторяю тот же раунд — история не меняется, шанс попасть в кэш растёт."
-      : "⏳ Провайдер временно недоступен (" + st + "). Жду " + Math.round(waitMs / 1000) +
-        " с и повторяю тот же раунд.";
-    return { cold: cold, waitMs: waitMs, text: text };
+        sec + " с и повторяю тот же раунд — история не меняется, шанс попасть в кэш растёт."
+      : bodyRead
+      ? "⏳ Провайдер не смог прочитать тело запроса (" + st + "). Запрос до модели не дошёл — жду " +
+        sec + " с и повторяю тот же раунд."
+      : "⏳ Провайдер временно недоступен (" + st + "). Жду " + sec + " с и повторяю тот же раунд.";
+    return { cold: cold, waitMs: waitMs, text: text, why: why };
   }
 
   // Итоговый набор схем: база + липкие/найденные группы в КАНОНИЧЕСКОМ порядке.

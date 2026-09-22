@@ -54,7 +54,12 @@ function test(name, fn) {
 const read = (...p) => fs.readFileSync(path.join(ROOT, ...p), "utf8");
 const MODULE_SRC = read("src", "tool-registry.js");
 const MAIN_SRC = read("src", "main.js");
-const TOOLS_SRC = read("src", "agent-tools.js");
+// Обработчики инструментов разошлись по своим модулям (часть 40: облачные — в
+// agent-tools-cloud.js, git и GitHub — в agent-tools-git.js, файлы — в
+// agent-tools-files.js). Обратная проверка ниже спрашивает распаковку у ВСЕХ
+// модулей дома: иначе забытое в main.js значение опять перестало бы быть видно.
+const TOOLS_HOME = ["agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js"].map((f) => read("src", f));
+const TOOLS_SRC = TOOLS_HOME[0];
 
 /* Стенд: настоящий реестр, поддельные соседи. Назначение — коробка, по ней и видно,
    что модуль берёт ЖИВОЕ значение (экземпляр agent-env), а не своё. */
@@ -235,8 +240,8 @@ function providedToRegistry() {
   });
 
   await test("проводка: все имена инструментов переданы реестру (обратная проверка стража)", () => {
-    const needed = destructured(TOOLS_SRC);
-    assert.ok(needed.length > 100, "распаковка agent-tools.js разобрана подозрительно мало: " + needed.length);
+    const needed = [...new Set(TOOLS_HOME.flatMap((src) => destructured(src)))];
+    assert.ok(needed.length > 100, "распаковка дома инструментов разобрана подозрительно мало: " + needed.length);
     const provided = new Set(providedToRegistry());
     const missing = needed.filter((n) => !provided.has(n));
     assert.deepStrictEqual(missing, [], "инструменты не получили имён (инструмент ответит «is not defined»): " + missing.join(", "));
