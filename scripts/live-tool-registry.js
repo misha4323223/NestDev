@@ -182,7 +182,7 @@ function destructured(src) {
   // agent-tools-write.js, команды и оболочка — agent-tools-run.js), и сторож
   // обязан видеть каждый — иначе пропущенное в main.js значение снова станет невидимым.
   const needed = [...new Set(
-    ["agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js"]
+    ["agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js"]
       .flatMap((f) => destructured(fs.readFileSync(path.join(ROOT, "src", f), "utf8")))
   )];
   ok(needed.length > 100, "имён в распаковке: " + needed.length);

@@ -107,7 +107,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "project-brief.js", "chats-ipc.js", "memory-ipc.js", "git-stage.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "run-ipc.js", "tool-registry.js"]
+  return ["main.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "project-brief.js", "chats-ipc.js", "memory-ipc.js", "git-stage.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "run-ipc.js", "tool-registry.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -118,7 +118,7 @@ function backendSrc() {
 // уезжает, и тогда падает не текстом, а отсутствием строки (та же ловушка, что у
 // toolBodySelf — HANDOFF §4).
 function toolsHomeSrc() {
-  return ["agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js"]
+  return ["agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -14648,7 +14648,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14658,7 +14658,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
@@ -14931,6 +14931,115 @@ async function testAgentTools() {
     assert.ok(called.includes("live.agentEnv"), "значение берётся в момент вызова, а не копией");
   });
 
+  // Вложения и разработка — из модуля разработки (часть 40, заход 9). Проверяем ПО ФАКТУ
+  // на настоящей папке проекта: какие команды собираются и куда уходят, что агент видит
+  // про установку зависимостей и каким окружением пользуется клиент БД (выданным ему,
+  // а не всем набором переменных агента).
+  await test("разработка: команды собираются по проекту, а не наугад", async () => {
+    const { createDevTools } = require(path.join(ROOT, "src", "agent-tools-devtools.js"));
+    const dir = fs.mkdtempSync(path.join(require("os").tmpdir(), "devtools-"));
+    const ran = [];
+    const dev = createDevTools({
+      fs,
+      path,
+      agentWorkDir: () => dir,
+      resolvePath: (p) => path.resolve(String(p == null ? "" : p)),
+      detectPackageManager: () => ({ name: "bun", bin: "bun", add: "add", flagDev: "-d" }),
+      envFor: (cap) => {
+        ran.push("env:" + cap);
+        return { DB_TOKEN: "выданный" };
+      },
+      execFile: (bin, argv, opts, cb) => {
+        ran.push("execFile:" + bin);
+        ran.push("env-клиента:" + JSON.stringify(opts.env));
+        if (bin === "psql") return cb(Object.assign(new Error("нет клиента"), { code: "ENOENT" }), "", "");
+        return cb(null, "1 row", "");
+      },
+      explainExit: (code, cmd) => "код выхода " + code + " у «" + cmd + "»",
+      findProgram: (p) => (p === "git" ? { found: true, path: "/usr/bin/git", reason: "" } : { found: false, reason: "не найден в PATH" }),
+      hasLock: () => true,
+      runProgVersion: async () => "git version 2.4",
+      runTerminalCommand: async (cmd, cwd, timeoutMs) => {
+        ran.push(cmd + " @" + cwd + " " + timeoutMs);
+        return "вывод: " + cmd;
+      },
+      stripAnsi: (s) => String(s),
+      summarizeTestOutput: (out) => "итог по " + String(out).length + " симв.",
+      truncateText: (t, n) => String(t == null ? "" : t).slice(0, n || 4000),
+    });
+
+    ran.length = 0;
+    const built = await dev.dockerBuild({}, {});
+    assert.deepStrictEqual(ran, ["docker build . @" + dir + " 300000"], "сборка образа ушла не тем: " + ran.join(" | "));
+    assert.match(built, /вывод: docker build/, "вывод не отдан агенту: " + built);
+    const noDir = await dev.dockerBuild({ directory: path.join(dir, "нет-такой") }, {});
+    assert.match(noDir, /папка не найдена/, "несуществующая папка не названа: " + noDir);
+
+    ran.length = 0;
+    await dev.dockerRun({ image: "мой-образ", args: "-p 3000:3000" }, {});
+    assert.strictEqual(ran[0], "docker run -d -p 3000:3000 мой-образ @" + dir + " 120000", "запуск образа собран неверно: " + ran[0]);
+    ran.length = 0;
+    await dev.dockerExec({ container: "c1", command: "ls -la" }, {});
+    assert.strictEqual(ran[0], "docker exec c1 ls -la @" + dir + " 60000", "команда в контейнере собрана неверно: " + ran[0]);
+
+    ran.length = 0;
+    const installed = await dev.installPackage({ packageName: "express", dev: true }, {});
+    assert.strictEqual(ran[0], "bun add -d express @" + dir + " 300000", "пакет ставится не менеджером проекта: " + ran[0]);
+    assert.match(installed, /менеджер пакетов: bun/, "каким менеджером поставлено — не сказано: " + installed);
+
+    // Тесты: берём из package.json, а если его нет — по замку проекта.
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ scripts: { test: "node t.js" } }), "utf8");
+    ran.length = 0;
+    const withPkg = await dev.runTests({}, {});
+    assert.ok(ran[0].startsWith("npm test @"), "тесты запущены не скриптом проекта: " + ran[0]);
+    assert.match(withPkg, /итог по/, "итог тестов не сведён: " + withPkg);
+    fs.rmSync(path.join(dir, "package.json"));
+    ran.length = 0;
+    await dev.runTests({}, {});
+    assert.ok(ran[0].startsWith("bun test @"), "без package.json тесты идут не по замку проекта: " + ran[0]);
+
+    const nothing = await dev.lintProject({}, {});
+    assert.match(nothing, /Не нашёл конфигов проверки/, "пустая проверка не объяснена: " + nothing);
+    const nothingValid = await dev.validateProject({}, {});
+    assert.match(nothingValid, /Не нашёл, что проверять/, "проверка проекта не объяснена: " + nothingValid);
+
+    // Зависимости: видно, что объявлено и что реально лежит в node_modules.
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ dependencies: { lodash: "^4.0.0" }, devDependencies: { prettier: "^3.0.0" } }), "utf8");
+    fs.mkdirSync(path.join(dir, "node_modules", "lodash"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "node_modules", "lodash", "package.json"), JSON.stringify({ version: "4.17.21" }), "utf8");
+    const deps = await dev.getDependencies({}, {});
+    assert.match(deps, /lodash@\^4\.0\.0 → установлено 4\.17\.21/, "установленная зависимость названа неверно: " + deps);
+    assert.match(deps, /prettier@\^3\.0\.0 → НЕ установлено/, "неустановленная зависимость не названа: " + deps);
+
+    const fmt = await dev.formatCode({ path: path.join(dir, "package.json") }, {});
+    assert.match(fmt, /Prettier не установлен в проекте/, "отсутствие prettier не объяснено: " + fmt);
+
+    const bad = await dev.dbQuery({ connectionString: "sqlite://файл", sql: "select 1" }, {});
+    assert.match(bad, /postgres:\/\/\.\.\. и mysql:\/\/\.\.\./, "неподдерживаемое подключение не отклонено: " + bad);
+    ran.length = 0;
+    const db = await dev.dbQuery({ connectionString: "postgres://u:p@хост:5432/бд", sql: "select 1" }, {});
+    assert.ok(ran.includes("env:db.query"), "клиент БД не получил своё окружение: " + ran.join(" | "));
+    assert.ok(ran.some((r) => r.indexOf('env-клиента:{"DB_TOKEN":"выданный"}') === 0), "клиенту БД ушёл не выданный набор: " + ran.join(" | "));
+    assert.match(db, /Клиент psql не найден/, "отсутствие psql не объяснено: " + db);
+
+    const prog = await dev.checkInstalledProgram({ programName: "git" }, {});
+    assert.match(prog, /Версия: git version 2\.4/, "версия программы не проверена: " + prog);
+    const none = await dev.checkInstalledProgram({ programName: "docker" }, {});
+    assert.match(none, /installSystemPackage\("docker"\)/, "путь установки не подсказан: " + none);
+    const builtin = await dev.canExecute({ command: "cd /tmp" }, {});
+    assert.match(builtin, /встроенная команда оболочки/, "встроенная команда не распознана: " + builtin);
+    const explain = await dev.explainError({ exitCode: "127", command: "git push" }, {});
+    assert.match(explain, /код выхода 127 у «git push»/, "разбор кода выхода не дошёл до помощника: " + explain);
+  });
+
+  await test("разработка: модуль собран на своём месте и на живых зависимостях", () => {
+    const shellSrc = fs.readFileSync(path.join(ROOT, "src", "agent-tools.js"), "utf8");
+    assert.ok(/const devtools = createDevTools\(deps\);/.test(shellSrc), "модуль разработки собран не на deps — команды уйдут пустыми");
+    assert.ok(/const devtools = createDevTools/.test(shellSrc.slice(0, shellSrc.indexOf("return {"))), "модуль собран после реестра — ссылки будут пустыми");
+    for (const name of ["dockerBuild", "installPackage", "runTests", "lintProject", "formatCode", "dbQuery", "explainError", "checkInstalledProgram", "canExecute", "validateProject", "getDependencies", "dockerRun", "dockerExec"]) {
+      assert.ok(shellSrc.includes('"' + name + '": devtools.' + name + ","), "инструмент «" + name + "» не сослался на модуль");
+    }
+  });
   await test("реестр инструментов: откат меняет журнал через сеттер, а не копию", async () => {
     const file = path.join(tmp, "note.txt");
     fs.writeFileSync(file, "новое", "utf8");
