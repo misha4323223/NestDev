@@ -814,5 +814,9 @@
     missionFromEvent: missionFromEvent,
     renderTasks: renderTasks,
     initRolesAndTasks: initRolesAndTasks,
+    // Смена роли чата по кнопке из окна предложения (suggestRole) и из веб-режима:
+    // человек согласился — окно (chat-events/web-chat) зовёт это же действие, что
+    // и кнопка «Роль», чтобы путь смены был ОДИН.
+    setChatRole: setChatRole,
   };
 });

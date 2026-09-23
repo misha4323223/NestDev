@@ -82,13 +82,20 @@
     });
   }
 
-  function setPreset(p) {
+  // opts.keepFields — только ПОКАЗАТЬ выбор (подсветка чипа, поля Yandex/G4F), не трогая
+  // адрес и модель. Так открытие настроек встаёт на сохранённые значения: раньше
+  // определение пресета по адресу подставляло модель пресета и затирало выбранную
+  // человеком (у groq, cerebras, ollamacloud, mistral модель в PRESETS есть) —
+  // «сохранённая модель сама сбрасывалась на другую».
+  function setPreset(p, opts) {
     setCurrentPreset(p);
     // Только пресеты из настроек: селектор без [data-preset] задел бы чипы
     // приветственного экрана и переключил бы их «активный» вид.
     document.querySelectorAll(".chip[data-preset]").forEach((c) => c.classList.toggle("active", c.dataset.preset === p));
-    if (PRESETS[p] && PRESETS[p].url) $("s-openai-url").value = PRESETS[p].url;
-    if (PRESETS[p] && PRESETS[p].model) $("s-openai-model").value = PRESETS[p].model;
+    if (!(opts && opts.keepFields)) {
+      if (PRESETS[p] && PRESETS[p].url) $("s-openai-url").value = PRESETS[p].url;
+      if (PRESETS[p] && PRESETS[p].model) $("s-openai-model").value = PRESETS[p].model;
+    }
     // Поле «Yandex folder ID» — только для Yandex AI Studio
     const yandexField = $("yandex-project-field");
     if (yandexField) yandexField.classList.toggle("hidden", p !== "yandex");
@@ -280,18 +287,21 @@
     // нужна конкретная вкладка («Настройки: модель», «выбрать модель»), передают её явно.
     showSettingsTab(tab || getLastTab() || "model");
     setProviderUI(getSettings().provider || "openai");
-    setPreset(getPreset());
+    // Определение пресета ТОЛЬКО подсвечивает чип: адрес и модель окно берёт из
+    // сохранённых настроек (fillSettingsUI выше). Иначе подстановка модели пресета
+    // молча сбрасывала выбранную человеком модель при каждом открытии настроек.
+    setPreset(getPreset(), { keepFields: true });
     // Определяем пресет по сохранённому URL (если он не пустой и совпадает с известным)
     const url = (getSettings().openaiUrl || "").toLowerCase();
     let found = false;
     for (const [k, v] of Object.entries(PRESETS)) {
       if (v && url.includes(v.url.replace(/\/+$/, "").toLowerCase())) {
-        setPreset(k);
+        setPreset(k, { keepFields: true });
         found = true;
         break;
       }
     }
-    if (!found) setPreset(getSettings().openaiUrl ? "custom" : "deepseek");
+    if (!found) setPreset(getSettings().openaiUrl ? "custom" : "deepseek", { keepFields: true });
     renderModelHints(null, null); // прячем подсказки моделей (провайдер мог смениться)
     renderGithubSection();
     getYcPanel().refreshSettingsUI(); // Yandex Cloud: статус подключения, каталог, разрешения
@@ -551,10 +561,17 @@
       parts.push(r.contextDays && r.contextDays.length ? "дней контекста: " + r.contextDays.length : "контекст: памяток ещё нет");
       parts.push(r.missions ? "миссий: " + r.missions : "миссий: нет");
       if (r.bytes) parts.push("всего " + (r.bytes / 1024).toFixed(0) + " КБ");
+      // Где файлы лежат НА САМОМ ДЕЛЕ. Раньше здесь было написано «место: .agent/»
+      // на память — и после выбора своей папки панель показывала чужой путь.
+      const where = [
+        "миссии — " + (r.missionsCustom ? r.missionsRoot : ".agent/ в рабочей папке"),
+        "дела — " + (r.tasksCustom ? r.tasksRoot : "папка приложения"),
+      ].join("; ");
       el.textContent =
-        (r.exists ? "Папка .agent/ уже есть: " : "Папка .agent/ появится при первой записи. ") +
+        (r.exists ? "Файлы работы уже есть: " : "Файлов работы ещё нет — появятся при первой записи. ") +
         parts.join(" · ") +
-        " Место: .agent/ в рабочей папке (раздел «Проект»).";
+        " Место: " + where + "." +
+        (r.insideProject ? " Выбранная папка лежит внутри проекта — груз остаётся в папке проекта." : "");
     } catch {
       el.textContent = "Не удалось прочитать состояние папки работы.";
     }
@@ -654,6 +671,144 @@
     i.type = i.type === "password" ? "text" : "password";
   }
 
+  // ── Куда класть работу агента: миссии, прогоны и дела ────────────────────────
+  // Окно «Куда класть работу агента?» (#setup-overlay в разметке) показывается ОДИН раз
+  // при первом запуске: пусто в поле — прежние места (.agent/ рядом с проектом и папка
+  // приложения), выбрана папка — файлы уезжают туда. То же окно открывается потом
+  // кнопкой в настройках — выбор можно поменять.
+  //
+  // Почему выбор идёт своим каналом, а не полем формы настроек: раскладка и защита
+  // от «стёртого» выбора живут в главном процессе (src/settings-ipc.js, setup:state и
+  // setup:save). Объект настроек, загруженный ДО выбора, принёс бы прежние пустые
+  // значения и стёр бы выбор при обычном сохранении — та же болезнь, что у каталога
+  // Yandex Cloud и паролей сайтов.
+  //
+  // Уже лежащие файлы приложение НЕ переносит: раскладка действует с момента выбора,
+  // старое остаётся где было (человек сам решает, что со старым делать).
+  let setupShownThisRun = false; // приглашение уже показано — второй раз не пристаём
+
+  function fillSetupFields(missionsDir, tasksDir) {
+    if ($("setup-missions-dir")) $("setup-missions-dir").value = missionsDir || "";
+    if ($("setup-tasks-dir")) $("setup-tasks-dir").value = tasksDir || "";
+  }
+
+  async function openSetupFolders(firstRun) {
+    if (!isElectron || !api.setupState || !$("setup-overlay")) return false;
+    // Телефон папки на ПК не выбирает: раскладка — дело машины, где лежат файлы.
+    // Признак моста проверяем осторожно: модуль собирают и в проверках, где окна нет
+    // вовсе (там «window» не объявлен и голое обращение уронило бы сборку).
+    if (typeof window !== "undefined" && window.__mobileBridge) return false;
+    let st = null;
+    try {
+      st = await api.setupState();
+    } catch {}
+    const s = getSettings();
+    fillSetupFields((st && st.missionsDir) || s.missionsDir || "", (st && st.tasksDir) || s.tasksDir || "");
+    if ($("setup-title")) $("setup-title").textContent = firstRun ? "Куда класть работу агента?" : "Папки работы агента";
+    if ($("setup-text")) {
+      $("setup-text").textContent = firstRun
+        ? "Миссии, прогоны и дела агент держит файлами на диске: по ним видно, чем он занят, и по ним же работа поднимается заново после перезапуска приложения. Можно оставить как было или выбрать свои папки, чтобы не забивать папки проектов рабочим грузом."
+        : "Тот же выбор, что и при первом запуске — его можно поменять в любой момент.";
+    }
+    $("setup-overlay").classList.remove("hidden");
+    return true;
+  }
+
+  function closeSetupFolders() {
+    if ($("setup-overlay")) $("setup-overlay").classList.add("hidden");
+  }
+
+  // Показ при первом запуске: только пока человек не ответил (настройка firstRunSetup
+  // = "ask") и только если файлы работы вообще ведутся — при выключенной долгой
+  // работе и выключенных файлах спрашивать не о чем (включит — спросим в следующий раз).
+  async function maybeAskFolders() {
+    if (setupShownThisRun || !isElectron || !api.setupState) return;
+    setupShownThisRun = true;
+    const s = getSettings();
+    if (s.firstRunSetup === "done") return;
+    if (s.agentWorkFiles === false && s.longWork === false) return;
+    await openSetupFolders(true);
+  }
+
+  // Системный диалог выбора папки: вид ("missions" / "tasks") задаёт подпись окна и
+  // папку, с которой начинается выбор (src/settings-ipc.js).
+  async function pickSetupFolder(kind) {
+    if (!isElectron || !api.pickDirectory) return;
+    const p = await api.pickDirectory(kind);
+    if (!p) return;
+    if (kind === "tasks") fillSetupFields($("setup-missions-dir").value, p);
+    else fillSetupFields(p, $("setup-tasks-dir").value);
+  }
+
+  // Сохранение выбора. Пустой выбор ("Оставить как было", Esc или клик мимо окна) —
+  // это тоже ответ: папки остаются прежними, а вопрос закрывается навсегда.
+  async function saveSetupFolders(asIs) {
+    if (!isElectron || !api.setupSave) {
+      closeSetupFolders();
+      return;
+    }
+    const payload = asIs
+      ? {}
+      : { missionsDir: (($("setup-missions-dir") || {}).value || "").trim(), tasksDir: (($("setup-tasks-dir") || {}).value || "").trim() };
+    let r = null;
+    try {
+      r = await api.setupSave(payload);
+    } catch (e) {
+      setSettingsMsg("Не удалось сохранить папки работы: " + ((e && e.message) || e), true);
+      return;
+    }
+    if (!r || !r.ok) {
+      setSettingsMsg("Не удалось сохранить папки работы: " + ((r && r.error) || "неизвестная ошибка"), true);
+      return;
+    }
+    // Настройки в памяти окна обновляем теми же значениями: панели читают из них, и
+    // без этого они показывали бы прежние папки до перезапуска приложения.
+    getSettings().missionsDir = r.missionsDir || "";
+    getSettings().tasksDir = r.tasksDir || "";
+    getSettings().firstRunSetup = "done";
+    closeSetupFolders();
+    renderAgentFilesStatus();
+    if (asIs) toast("Оставил как было: работа агента остаётся в прежних папках");
+    else if (!r.missionsDir && !r.tasksDir) toast("Папки не выбраны: работа агента остаётся в прежних местах");
+    else toast("Папки работы сохранены — файлы будут писаться туда с этого момента, старое осталось где было");
+  }
+
+  // Сборка окна и кнопки-входа в него. Кнопка добавляется к строке «Файлы работы» в
+  // настройках: разметка настроек огромна, а вход в окно нужен ровно один.
+  let setupWired = false; // сборка окна ровно одна: повторная навесила бы вторые обработчики
+  function wireSetupFolders() {
+    if (!$("setup-overlay")) return;
+    if (setupWired) return;
+    setupWired = true;
+    $("btn-setup-save").onclick = () => saveSetupFolders(false);
+    $("btn-setup-skip").onclick = () => saveSetupFolders(true);
+    if ($("btn-setup-missions-pick")) $("btn-setup-missions-pick").onclick = () => pickSetupFolder("missions");
+    if ($("btn-setup-tasks-pick")) $("btn-setup-tasks-pick").onclick = () => pickSetupFolder("tasks");
+    if ($("btn-setup-missions-clear")) $("btn-setup-missions-clear").onclick = () => fillSetupFields("", $("setup-tasks-dir").value);
+    if ($("btn-setup-tasks-clear")) $("btn-setup-tasks-clear").onclick = () => fillSetupFields($("setup-missions-dir").value, "");
+    // Esc и клик мимо окна — это «оставить как было», а не «закрыть и спросить снова»:
+    // иначе вопрос возвращался бы при каждом запуске.
+    document.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape") return;
+      if ($("setup-overlay").classList.contains("hidden")) return;
+      saveSetupFolders(true);
+    });
+    $("setup-overlay").addEventListener("click", (e) => {
+      if (e.target === $("setup-overlay")) saveSetupFolders(true);
+    });
+    const row = $("btn-agent-files-open") && $("btn-agent-files-open").parentNode;
+    if (row && !$("btn-setup-folders") && typeof document.createElement === "function") {
+      const b = document.createElement("button");
+      b.id = "btn-setup-folders";
+      b.type = "button";
+      b.className = "btn btn-ghost btn-small";
+      b.title = "Выбрать, куда класть миссии, прогоны и дела (по умолчанию — .agent/ рядом с проектом и папка приложения)";
+      b.textContent = "🎯 Папки работы";
+      b.onclick = () => openSetupFolders(false);
+      row.appendChild(b);
+    }
+  }
+
   return {
     providerLabel: providerLabel,
     updateBadge: updateBadge,
@@ -675,6 +830,13 @@
     renderVisionDetect: renderVisionDetect,
     loadAuxModels: loadAuxModels,
     renderAgentFilesStatus: renderAgentFilesStatus,
+    // Куда класть работу агента: окно первого запуска и та же смена папок позже.
+    openSetupFolders: openSetupFolders,
+    closeSetupFolders: closeSetupFolders,
+    maybeAskFolders: maybeAskFolders,
+    saveSetupFolders: saveSetupFolders,
+    pickSetupFolder: pickSetupFolder,
+    wireSetupFolders: wireSetupFolders,
     renderMemoryStatus: renderMemoryStatus,
     renderBrowserProfileInfo: renderBrowserProfileInfo,
     renderBrowserConnectInfo: renderBrowserConnectInfo,

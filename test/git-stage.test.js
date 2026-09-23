@@ -24,7 +24,7 @@ const assert = require("assert");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { execFile } = require("child_process");
+const { spawn } = require("child_process");
 
 const ROOT = path.join(__dirname, "..");
 const { createPathsGit } = require(path.join(ROOT, "src", "paths-git.js"));
@@ -39,7 +39,9 @@ const pathsGit = createPathsGit({
   fs,
   path,
   os,
-  execFile,
+  // Запуск git идёт через spawn со СВОЕЙ ГРУППОЙ процессов (таймаут гасит дерево):
+  // прежний execFile здесь больше не собирает опции и потому не годится.
+  spawn,
   envFor: () => process.env,
   live: {
     lastAgentRepoDir: () => null,

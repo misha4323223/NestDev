@@ -20,7 +20,14 @@ contextBridge.exposeInMainWorld("api", {
   probeLocalModel: (ui) => ipcRenderer.invoke("ai:probeLocal", ui),
   g4fTest: (opts) => ipcRenderer.invoke("g4f:test", opts),
   g4fProbe: (opts) => ipcRenderer.invoke("g4f:probe", opts),
-  pickDirectory: () => ipcRenderer.invoke("dialog:pickDir"),
+  // Выбор папки в системном диалоге. Вид папки ("work", "missions", "tasks") задаёт
+  // подпись окна и папку, с которой начинается выбор: одна и та же папка выбирается
+  // и для проекта, и для работы агента, а разным диалог быть обязан.
+  pickDirectory: (kind) => ipcRenderer.invoke("dialog:pickDir", kind || ""),
+  // Куда класть работу агента (миссии, прогоны и дела): текущий выбор и его сохранение.
+  // Свои каналы, а не поле формы настроек — чтобы устаревший объект настроек не стёр выбор.
+  setupState: () => ipcRenderer.invoke("setup:state"),
+  setupSave: (p) => ipcRenderer.invoke("setup:save", p || {}),
   onAiEvent: (cb) => {
     ipcRenderer.on("ai:event", (_e, ev) => cb(ev));
   },

@@ -174,9 +174,11 @@ const MAIN_SRC = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
 
   await test("каналы объявлены ровно так, как их зовут окно и телефон", () => {
     const h = mk();
-    assert.deepStrictEqual([...h.handlers.keys()].sort(), ["dialog:pickDir", "policy:groups", "settings:get", "settings:set"]);
+    assert.deepStrictEqual([...h.handlers.keys()].sort(), [
+      "dialog:pickDir", "policy:groups", "settings:get", "settings:set", "setup:save", "setup:state",
+    ]);
     assert.deepStrictEqual([...h.listeners.keys()], [], "модуль завёл лишние слушатели");
-    for (const ch of ["settings:get", "settings:set", "policy:groups", "dialog:pickDir"]) {
+    for (const ch of ["settings:get", "settings:set", "policy:groups", "dialog:pickDir", "setup:state", "setup:save"]) {
       assert.ok(PRELOAD.includes(`"${ch}"`), "preload.js не знает канал " + ch);
       assert.ok(MOBILE.includes(`"${ch}"`), "mobile-api.js не знает канал " + ch);
     }
@@ -299,6 +301,89 @@ const MAIN_SRC = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
     const noWin = mk({ win: null });
     assert.strictEqual(await noWin.handlers.get("dialog:pickDir")(), "/picked/dir", "без живого окна выбор папки перестал работать");
     assert.strictEqual(noWin.opened[0].parent, undefined, "закрытое окно ушло родителем диалога");
+  });
+
+  // ── Куда класть работу агента: миссии, прогоны и дела (часть 45) ────────────
+  // Выбор папок идёт своим каналом и живёт в настройках, но НЕ в форме настроек:
+  // объект интерфейса, загруженный до выбора, принёс бы прежние пустые значения и
+  // стёр бы выбор (та же болезнь, что у каталога Yandex Cloud).
+
+  await test("setup:state отдаёт текущий выбор, а не снимок времени сборки", () => {
+    const h = mk({ current: { missionsDir: "D:/work", tasksDir: "D:/tasks", firstRunSetup: "done" } });
+    const st = h.handlers.get("setup:state")();
+    assert.strictEqual(st.ok, true);
+    assert.strictEqual(st.setupDone, true, "ответ человека не доехал до окна");
+    assert.strictEqual(st.missionsDir, "D:/work");
+    assert.strictEqual(st.tasksDir, "D:/tasks");
+
+    h.patch({ model: "llama3" });
+    assert.strictEqual(h.handlers.get("setup:state")().missionsDir, "D:/work", "канал помнит старые настройки");
+
+    const fresh = mk();
+    const none = fresh.handlers.get("setup:state")();
+    assert.strictEqual(none.setupDone, false, "приглашение первого запуска выдано за отвеченное: " + JSON.stringify(none));
+    assert.strictEqual(none.missionsDir, "", "пустое значение выдано за выбранную папку");
+  });
+
+  await test("setup:save сохраняет папки, чистит путь и закрывает вопрос навсегда", async () => {
+    const h = mk();
+    const r = await h.handlers.get("setup:save")(null, { missionsDir: "  D:/work/missions/ ", tasksDir: "D:/tasks" });
+    assert.strictEqual(r.ok, true, "выбор не сохранён: " + JSON.stringify(r));
+    assert.strictEqual(r.missionsDir, "D:/work/missions", "пробелы и хвостовой разделитель остались в пути: " + r.missionsDir);
+    assert.strictEqual(h.current.missionsDir, "D:/work/missions", "выбор не дошёл до хранилища");
+    assert.strictEqual(h.current.tasksDir, "D:/tasks");
+    assert.strictEqual(h.current.firstRunSetup, "done", "вопрос остался открытым — приглашение вернётся");
+    assert.strictEqual(h.saved.length, 1, "сохранение прошло мимо хранилища");
+  });
+
+  await test("setup:save без полей — «оставить как было»: папки не стираются", async () => {
+    // Пустой выбор — это тоже ответ. Он не имеет права превратиться в «стереть папки»:
+    // тогда миссии и дела молча вернулись бы в прежние места.
+    const h = mk({ current: { missionsDir: "D:/work", tasksDir: "D:/tasks", firstRunSetup: "ask" } });
+    const r = await h.handlers.get("setup:save")(null, {});
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(h.current.missionsDir, "D:/work", "папка миссий стёрта пустым выбором");
+    assert.strictEqual(h.current.tasksDir, "D:/tasks", "папка дел стёрта пустым выбором");
+    assert.strictEqual(h.current.firstRunSetup, "done", "вопрос не закрылся");
+    // А осознанная очистка (человек стёр поле) проходит: пусто — прежнее место.
+    const clear = await h.handlers.get("setup:save")(null, { missionsDir: "", tasksDir: "D:/tasks" });
+    assert.strictEqual(clear.missionsDir, "", "очистка поля не сработала");
+    assert.strictEqual(h.current.missionsDir, "");
+  });
+
+  await test("setup:state/setup:save: чужому рендереру — отказ, хранилище не тронуто", async () => {
+    const h = mk();
+    const st = h.handlers.get("setup:state")(fromAlien());
+    assert.strictEqual(st.ok, false, "чужому рендереру отдано состояние папок: " + JSON.stringify(st));
+    const save = await h.handlers.get("setup:save")(fromAlien(), { missionsDir: "/чужое" });
+    assert.strictEqual(save.ok, false, "чужой рендерер сохранил папки: " + JSON.stringify(save));
+    assert.deepStrictEqual(h.saved, [], "чужое сохранение дошло до хранилища");
+    assert.strictEqual(h.current.missionsDir, undefined, "настройки всё-таки изменились");
+  });
+
+  await test("обычное сохранение настроек НЕ стирает папки и не возвращает приглашение", async () => {
+    // Устаревший объект окна (или телефона), загруженный ДО выбора папок, приносит
+    // прежние пустые значения — и без защиты миссии с делами уехали бы обратно.
+    const h = mk({ current: { missionsDir: "D:/work", tasksDir: "D:/tasks", firstRunSetup: "done" } });
+    const merged = h.patch({ missionsDir: "", tasksDir: "", firstRunSetup: "ask", model: "llama3" });
+    assert.strictEqual(merged.missionsDir, "D:/work", "папка миссий стёрта обычным сохранением");
+    assert.strictEqual(merged.tasksDir, "D:/tasks", "папка дел стёрта обычным сохранением");
+    assert.strictEqual(merged.firstRunSetup, "done", "приглашение первого запуска вернулось");
+    assert.strictEqual(merged.model, "llama3", "обычное поле не сохранилось");
+    assert.strictEqual(h.current.firstRunSetup, "done", "на диске вопрос снова открыт");
+  });
+
+  await test("dialog:pickDir: вид папки задаёт подпись окна и папку начала выбора", async () => {
+    const h = mk({ current: { workingDir: "/proj", missionsDir: "D:/work" } });
+    await h.handlers.get("dialog:pickDir")(null, "missions");
+    assert.ok(/миссий/.test(h.opened[0].opts.title), "подпись диалога не про миссии: " + h.opened[0].opts.title);
+    assert.strictEqual(h.opened[0].opts.defaultPath, "D:/work", "выбор начался не с выбранной папки миссий");
+    await h.handlers.get("dialog:pickDir")(null, "tasks");
+    assert.ok(/дел/.test(h.opened[1].opts.title), "подпись диалога не про дела: " + h.opened[1].opts.title);
+    assert.strictEqual(h.opened[1].opts.defaultPath, "/proj", "без своей папки дел выбор начался не с рабочей");
+    // Прежний вызов без вида — рабочая директория, как было.
+    await h.handlers.get("dialog:pickDir")(null, "мусор");
+    assert.ok(/рабочую/.test(h.opened[2].opts.title), "незнакомый вид сломал прежний выбор папки: " + h.opened[2].opts.title);
   });
 
   // ── Секреты в настройках: окну — значения, телефону — заглушки ──────────────

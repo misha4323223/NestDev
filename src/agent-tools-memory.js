@@ -7,6 +7,8 @@
 
      • noteSave / noteRead / noteList / noteDelete — заметки проекта (переживают
        перезапуск и помогают продолжать работу в новых сессиях);
+     • diaryWrite / diaryRead — дневник агента человекочитаемым файлом в самом
+       проекте (.agent/AGENT.md): важные решения и «где остановились»;
      • taskAdd / taskList / taskUpdate / taskDone / taskDelete — дела со сроком,
        приоритетом и повтором (изменение сразу видно панели: emitTasksChanged);
      • memoryList / memorySearch — дневник памяток диалогов (включается галочкой
@@ -16,8 +18,9 @@
      • semanticSearch — поиск по смыслу по семантическому индексу проекта.
 
    Все помощники приходят в `deps` (agentStore, codeIndex, app, agentWorkDir,
-   userDataDir, emitTasksChanged, loadSettings, resolvePath, fs): модуль сам
-   ничего не достаёт и состояния не держит. Тела перенесены ПОБАЙТОВО, порядок
+   tasksDataDir, emitTasksChanged, loadSettings, resolvePath, fs): модуль сам
+   ничего не достаёт и состояния не держит. Папка дел спрашивается в момент
+   вызова (tasksDataDir): человек мог сменить её в открытых настройках. Тела перенесены ПОБАЙТОВО, порядок
    инструментов в реестре сохранён ссылками.
 
    `path` в deps НЕТ намеренно: разбор имени файла целиком на стороне *agentStore*
@@ -34,7 +37,7 @@ function createMemoryTools(deps) {
     app,
     agentStore,
     codeIndex,
-    userDataDir,
+    tasksDataDir,
     emitTasksChanged,
   } = deps;
 
@@ -67,8 +70,24 @@ function createMemoryTools(deps) {
         const ndR = agentStore.noteDelete(app.getPath("userData"), agentWorkDir(settings), ndKey);
         return ndR.ok ? "OK — " + ndR.message : "Ошибка: " + ndR.error;
     },
+    "diaryWrite": async (args, settings) => {
+        const dwR = agentStore.diaryAppend(agentWorkDir(settings), args.title, args.text);
+        return dwR.ok ? "OK — " + dwR.message : "Ошибка: " + dwR.error;
+    },
+    "diaryRead": async (args, settings) => {
+        const drTail = parseInt(args.tail, 10) || 0;
+        const drR = agentStore.diaryRead(agentWorkDir(settings), { tail: drTail });
+        if (!drR.ok) return "Ошибка: " + drR.error;
+        if (!drR.exists) {
+          return "Дневник агента пока пуст: файла " + drR.file + " ещё нет. Появится при первой записи (diaryWrite).";
+        }
+        return (
+          "Дневник агента (" + drR.file + ", " + drR.bytes + " симв.):\n\n" + drR.text +
+          (drR.truncated ? "\n\n…(показан конец файла; целиком — diaryRead без tail)" : "")
+        );
+    },
     "taskAdd": async (args, settings) => {
-        const taR = agentStore.tasksAdd(userDataDir(), {
+        const taR = agentStore.tasksAdd(tasksDataDir(), {
           title: args.title, due: args.due, priority: args.priority, project: args.project, note: args.note,
           repeat: args.repeat, auto: args.auto, prompt: args.prompt,
         });
@@ -77,7 +96,7 @@ function createMemoryTools(deps) {
         return "OK — " + taR.message + " Актуальный список — taskList.";
     },
     "taskList": async (args, settings) => {
-        const tlR = agentStore.tasksList(userDataDir(), { status: args.status, due: args.due, project: args.project });
+        const tlR = agentStore.tasksList(tasksDataDir(), { status: args.status, due: args.due, project: args.project });
         const tlS = tlR.summary.summary;
         const tlHead = "Дела: активных " + tlS.active + " · просрочено " + tlS.overdue + " · сегодня " + tlS.today +
           " · завтра " + tlS.tomorrow + " · на неделе " + tlS.week + " · без срока " + tlS.noDue + " · выполнено " + tlS.done;
@@ -85,7 +104,7 @@ function createMemoryTools(deps) {
         return tlHead + "\n" + agentStore.tasksFormatText(tlR.tasks, Date.now());
     },
     "taskUpdate": async (args, settings) => {
-        const tuR = agentStore.tasksUpdate(userDataDir(), args.key, {
+        const tuR = agentStore.tasksUpdate(tasksDataDir(), args.key, {
           title: args.title, due: args.due, priority: args.priority, status: args.status, project: args.project, note: args.note,
           repeat: args.repeat, auto: args.auto, prompt: args.prompt, snooze: args.snooze,
         });
@@ -94,13 +113,13 @@ function createMemoryTools(deps) {
         return "OK — " + tuR.message;
     },
     "taskDone": async (args, settings) => {
-        const tdR = agentStore.tasksDone(userDataDir(), args.key, args.done !== false);
+        const tdR = agentStore.tasksDone(tasksDataDir(), args.key, args.done !== false);
         if (!tdR.ok) return "Ошибка: " + tdR.error;
         emitTasksChanged();
         return "OK — " + (args.done === false ? "отметка снята: " : "выполнено: ") + agentStore.taskLine(tdR.task, Date.now());
     },
     "taskDelete": async (args, settings) => {
-        const txR = agentStore.tasksDelete(userDataDir(), args.key);
+        const txR = agentStore.tasksDelete(tasksDataDir(), args.key);
         if (!txR.ok) return "Ошибка: " + txR.error;
         emitTasksChanged();
         return "OK — " + txR.message;

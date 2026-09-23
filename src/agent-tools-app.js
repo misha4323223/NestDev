@@ -6,9 +6,9 @@
      • окно САМОГО приложения — appRead/appClick/appFill/appSelect/appPress/
        appWait/appScreenshot (работу делает app-ui-tools.js, модуль только
        передаёт ему живое окно);
-     • askUser — заглушка: этот инструмент обрабатывается отдельно, самим прогоном
-       (он ждёт ответа человека и подставляет его в историю), поэтому здесь только
-       честный отказ, если вызов дошёл до реестра;
+     • askUser / suggestRole — заглушки: эти инструменты обрабатываются отдельно,
+       самим прогоном (он ждёт ответа человека и подставляет его в историю), поэтому
+       здесь только честный отказ, если вызов дошёл до реестра;
      • буфер обмена (clipboardRead/clipboardWrite) и скриншот ЭКРАНА
        (screenshotDesktop) — системные возможности главного процесса;
      • openPath — открыть файл или папку системным приложением.
@@ -57,6 +57,9 @@ function createAppTools(deps, live) {
     },
     "askUser": async (args, settings) => {
         return "Ошибка: askUser обрабатывается отдельно — дождись ответа пользователя.";
+    },
+    "suggestRole": async (args, settings) => {
+        return "Ошибка: suggestRole обрабатывается отдельно — окно покажет кнопку смены роли, а прогон дождётся ответа человека.";
     },
     "clipboardWrite": async (args, settings) => {
         const text = String(args.text == null ? "" : args.text);

@@ -601,10 +601,42 @@
     </div>
   </div>
 
+  <!-- Куда класть работу агента: миссии, прогоны и дела. Это же окно показывается
+       один раз при первом запуске и вызывается позже кнопкой в настройках.
+       Раскладку считает главный процесс (src/agent-data.js), здесь только выбор. -->
+  <div id="setup-overlay" class="overlay hidden">
+    <div class="confirm-panel">
+      <div class="confirm-title" id="setup-title">Куда класть работу агента?</div>
+      <div class="confirm-text" id="setup-text">Миссии, прогоны и дела агент держит файлами на диске: по ним видно, чем он занят, и по ним же работа поднимается заново после перезапуска приложения.</div>
+      <div class="field">
+        <label>Миссии и прогоны</label>
+        <div class="input-row">
+          <input id="setup-missions-dir" placeholder=".agent/ рядом с проектом (по умолчанию)" spellcheck="false" autocomplete="off" />
+          <button id="btn-setup-missions-pick" class="btn btn-ghost" title="Выбрать папку">📁</button>
+          <button id="btn-setup-missions-clear" class="btn btn-ghost btn-small" title="Вернуть место по умолчанию">✕</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>Дела</label>
+        <div class="input-row">
+          <input id="setup-tasks-dir" placeholder="Папка приложения (по умолчанию)" spellcheck="false" autocomplete="off" />
+          <button id="btn-setup-tasks-pick" class="btn btn-ghost" title="Выбрать папку">📁</button>
+          <button id="btn-setup-tasks-clear" class="btn btn-ghost btn-small" title="Вернуть место по умолчанию">✕</button>
+        </div>
+      </div>
+      <div class="hint-block" id="setup-hint">В выбранной папке миссий заводится подпапка проекта — миссии разных проектов не смешиваются. Дела общие для всех проектов, поэтому уезжают в выбранную папку целиком. Уже лежащие файлы приложение не переносит: выбранная папка начинает заполняться с этого момента. Пусто в поле — прежнее место.</div>
+      <div class="confirm-btns">
+        <button id="btn-setup-skip" class="btn btn-ghost">Оставить как было</button>
+        <button id="btn-setup-save" class="btn btn-primary">Сохранить выбор</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Вопрос агента пользователю (askUser / план) -->
   <div id="ask-overlay" class="overlay hidden">
     <div class="ask-panel">
       <div class="ask-question" id="ask-question">?</div>
+      <div class="ask-options hidden" id="ask-options"></div>
       <textarea id="ask-input" rows="3" placeholder="Введи ответ..."></textarea>
       <div class="ask-btns">
         <button id="btn-ask-cancel" class="btn btn-ghost">Отмена</button>

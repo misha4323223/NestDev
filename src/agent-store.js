@@ -13,7 +13,9 @@
    кода поведения здесь нет. */
 
 const {
-  NOTE_MAX_LEN, NOTE_MAX_COUNT, memoryFile, noteSave, noteRead, noteDelete, checkpointsDir, checkpointSave, checkpointList, checkpointRollback,
+  NOTE_MAX_LEN, NOTE_MAX_COUNT, memoryFile, noteSave, noteRead, noteDelete,
+  DIARY_FILENAME, DIARY_MAX_BYTES, DIARY_MAX_ENTRY, diaryFile, diaryAppend, diaryRead,
+  checkpointsDir, checkpointSave, checkpointList, checkpointRollback,
 } = require("./notes-checkpoints.js");
 const {
   CTX_MEMO_MAX_CHARS, CTX_MEMO_DAY_KEEP, contextMemoryDir, sanitizeMemoMessages, contextMemorySave, contextMemoryDays, contextMemoryRead, contextMemorySearch, contextMemoryPrune, contextMemoryClear, contextMemoryStats,
@@ -32,6 +34,13 @@ module.exports = {
   noteSave,
   noteRead,
   noteDelete,
+  // дневник агента (.agent/AGENT.md) — читаемый человеком файл памяти в проекте
+  DIARY_FILENAME,
+  DIARY_MAX_BYTES,
+  DIARY_MAX_ENTRY,
+  diaryFile,
+  diaryAppend,
+  diaryRead,
   checkpointsDir,
   checkpointSave,
   checkpointList,

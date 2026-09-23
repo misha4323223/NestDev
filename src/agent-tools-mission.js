@@ -5,7 +5,9 @@
    обработчика длинной работы и один — плана:
 
      • missionStart — цель, план и лимиты ложатся файлами в рабочую папку
-       (.agent/missions/<id>/); прогон после этого идёт батчами и переживает
+       (по умолчанию .agent/missions/<id>/ рядом с проектом, а при выбранной
+       человеком папке — в её подпапке проекта; путь считает src/agent-data.js);
+       прогон после этого идёт батчами и переживает
        перезапуск: состояние читается с диска, а не из памяти окна;
      • missionStep / missionStatus / missionFinish — журнал шагов, прогресс,
        отчёт; повторный missionFinish честно говорит, что миссия уже закрыта;
@@ -91,7 +93,7 @@ function createMissionTools(deps, live) {
         return "OK — миссия " + msCur.id + ": " + msP2.done + "/" + msP2.total + " готово" +
           (msP2.failed ? ", сбоев " + msP2.failed : "") +
           (msP2.current ? ". Сейчас: " + msP2.current : "") +
-          "\nЖурнал: .agent/missions/" + msCur.id + "/journal.md";
+          "\nЖурнал: " + missionStore.missionsPathText(msDir2, msCur.id) + "journal.md";
     },
     "missionStatus": async (args, settings) => {
         const msDir3 = agentWorkDir(settings);
@@ -110,7 +112,7 @@ function createMissionTools(deps, live) {
           ? "\nПлан:\n" + msRec.steps.map((s, i) => (s.state === "done" ? "  [x] " : s.state === "failed" ? "  [!] " : s.state === "doing" ? "  [→] " : "  [ ] ") + (i + 1) + ". " + s.title + (s.note ? " — " + s.note : "")).join("\n")
           : "";
         const msJ = missionStore.missionJournalText(msDir3, msRec.id, { limit: Number(args.journal) || 20 });
-        return msHead + msPlan + "\nЖурнал (хвост):\n" + msJ + "\nФайлы: .agent/missions/" + msRec.id + "/";
+        return msHead + msPlan + "\nЖурнал (хвост):\n" + msJ + "\nФайлы: " + missionStore.missionsPathText(msDir3, msRec.id);
     },
     "missionFinish": async (args, settings) => {
         const msDir4 = agentWorkDir(settings);
@@ -128,7 +130,7 @@ function createMissionTools(deps, live) {
             "Миссия «" + msDone.title + "» (" + msDone.id + ") уже закрыта" +
             (msDone.finishedAt ? " " + new Date(msDone.finishedAt).toLocaleString() : "") +
             " — состояние: " + msDone.status + ", шагов: " + msDP.done + "/" + msDP.total + "." +
-            "\nОтчёт: .agent/missions/" + msDone.id + "/report.md" +
+            "\nОтчёт: " + missionStore.missionsPathText(msDir4, msDone.id) + "report.md" +
             (msDone.reason ? "\nИтог: " + String(msDone.reason).slice(0, 300) : "") +
             "\nЕсли нужна новая работа — missionStart(goal, steps)."
           );
@@ -140,7 +142,7 @@ function createMissionTools(deps, live) {
         notifyMission();
         const msP4 = missionStore.missionProgress(msR4.mission);
         return "OK — миссия " + msRec4.id + " закрыта (" + msR4.mission.status + "): " + msP4.done + "/" + msP4.total +
-          " шагов. Итог записан в .agent/missions/" + msRec4.id + "/report.md";
+          " шагов. Итог записан в " + missionStore.missionsPathText(msDir4, msRec4.id) + "report.md";
     },
     "todoWrite": async (args, settings) => {
         // План работ: приложение только нормализует и показывает его панелью-

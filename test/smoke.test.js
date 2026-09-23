@@ -30,6 +30,7 @@ const path = require("path");
 const crypto = require("crypto");
 const net = require("net");
 const { spawn, execFileSync } = require("child_process");
+const { EventEmitter } = require("events");
 
 const ROOT = path.join(__dirname, ".."); // корень проекта
 let passed = 0;
@@ -107,7 +108,7 @@ function mainOnlySrc() {
 }
 
 function backendSrc() {
-  return ["main.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "agent-tools-browser.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "project-brief.js", "chats-ipc.js", "memory-ipc.js", "git-stage.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "run-ipc.js", "tool-registry.js"]
+  return ["main.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "agent-tools-browser.js", "yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "project-brief.js", "chats-ipc.js", "memory-ipc.js", "git-stage.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "run-ipc.js", "tool-registry.js", "run-context.js", "ask-wait.js", "agent-data.js"]
     .map((f) => fs.readFileSync(path.join(ROOT, "src", f), "utf8"))
     .join("\n");
 }
@@ -409,7 +410,7 @@ async function testWebChat() {
       ],
       persistSettings: () => saved++,
       onEvent: (ev) => events.push(ev),
-      openAskModal: (q, cb) => cb("ответ агента"),
+      openAskModal: (q, options, cb) => (typeof options === "function" ? options : cb)("ответ агента"),
     });
     assert.deepStrictEqual(Object.keys(web), ["webSend"], "наружу торчит лишнее или чего-то не хватает");
 
@@ -730,7 +731,13 @@ async function testChatEvents() {
       persistChatsSoon: () => { spy.persisted++; },
       buildMessageEl: (m) => { spy.built.push(m.id); return mkNode("msg-" + m.id); },
       refreshMessage: (m) => spy.refreshed.push(m && m.id),
-      openAskModal: (q, cb) => spy.openAsk.push({ q: q, cb: cb }),
+      openAskModal: (q, options, cb) => {
+        if (typeof options === "function") {
+          cb = options;
+          options = [];
+        }
+        spy.openAsk.push({ q: q, options: options, cb: cb });
+      },
       closeAskModal: () => { spy.closedAsk++; },
       renderContext: (ev) => spy.context.push(ev),
       planFromModel: (chat, ev) => { spy.planFromModel.push(ev); return o.planFromModel === undefined ? true : o.planFromModel; },
@@ -891,8 +898,10 @@ async function testChatEvents() {
     assert.strictEqual(env.spy.context.length, 1, "событие контекста не дошло до отрисовки");
 
     // Вопрос агента, завершение и падение прогона.
-    env.onAiEvent({ type: "ask", question: "Какой файл?" });
+    env.onAiEvent({ type: "ask", question: "Какой файл?", options: ["a.txt", "b.txt"] });
     assert.strictEqual(env.spy.openAsk[0].q, "Какой файл?", "вопрос агента не показан");
+    assert.deepStrictEqual(env.spy.openAsk[0].options, ["a.txt", "b.txt"], "варианты ответа не доехали до окна");
+    assert.strictEqual(typeof env.spy.openAsk[0].cb, "function", "ответу некуда уйти: обработчик потерялся");
     env.spy.openAsk[0].cb("a.txt");
     assert.deepStrictEqual(env.spy.answer, ["a.txt"], "ответ на вопрос агента не ушёл в главный процесс");
     env.onAiEvent({ type: "done" });
@@ -6319,7 +6328,32 @@ async function testShellAndCdp() {
       fs,
       path,
       os,
-      execFile: (bin, args, opts, cb) => { setTimeout(() => cb(pendingErr, pendingErr ? "" : "ok", ""), 0); },
+      // Раздел сменил execFile на spawn (часть 43): стенд отдаёт фальшивый ПРОЦЕСС
+      // с потоками, а pendingErr решает, чем тот закончится — отказом запуска
+      // (событие error), кодом выхода (close) или молчанием (тогда ветку таймаута
+      // ведёт сам runGroup). Числовой code — это код выхода, строковый (EINVAL,
+      // ENOENT) — отказ запуска; «убит» стенд не изображает: -1 по таймауту обязана
+      // дать НАСТОЯЩАЯ таймерная ветка, а не подмена. pid у фальшивого процесса нет —
+      // killCommandTree без pid ничего не трогает.
+      spawn: (file, args, opts) => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        setTimeout(() => {
+          const err = pendingErr;
+          if (!err) {
+            child.stdout.emit("data", Buffer.from("ok"));
+            child.emit("close", 0, null);
+          } else if (err.killed) {
+            // молчит до таймаута — см. ветку timedOut в runGroup
+          } else if (typeof err.code === "number") {
+            child.emit("close", err.code, null);
+          } else {
+            child.emit("error", err);
+          }
+        }, 0);
+        return child;
+      },
       winPs: { exec: async () => ({ noSession: true, ok: true, code: 0, out: "", err: "" }) },
       probeEnv: () => ({ ...process.env }),
       stripAnsi: (x) => String(x || ""),
@@ -6336,12 +6370,14 @@ async function testShellAndCdp() {
       [{ code: "EPERM", message: "operation not permitted" }, "EPERM", /not permitted/],
       [{ code: 2, message: "exit 2" }, 2, /./],
       [{ code: "ENOENT", message: "spawn foo ENOENT" }, 127, /ENOENT/],
-      [{ killed: true, message: "killed" }, -1, /./],
+      // «убит по таймауту»: стенд молчит, и -1 даёт настоящий таймер runGroup
+      // (короткий timeoutMs, чтобы не ждать минуту) — код не подменяется вручную.
+      [{ killed: true, message: "killed" }, -1, /./, { timeoutMs: 50 }],
       [{ message: "непонятный сбой" }, 1, /непонятный сбой/],
     ];
-    for (const [err, wantCode, wantText] of cases) {
+    for (const [err, wantCode, wantText, opts] of cases) {
       pendingErr = err;
-      const r = await spawnRaw(["x"], {});
+      const r = await spawnRaw(["x"], opts || {});
       assert.strictEqual(r.ok, false);
       assert.strictEqual(r.code, wantCode, "код для " + JSON.stringify(err) + " → " + r.code + ", ждали " + wantCode);
       assert.ok(wantText.test(r.err), "текст ошибки потерян: «" + r.err + "»");
@@ -6628,9 +6664,9 @@ async function testShellAndCdp() {
       await new Promise((r) => server2.listen(0, "127.0.0.1", r));
       const dir2 = tmpdir("unpack-test-");
       try {
-        // Распаковка — НАСТОЯЩАЯ: у mkSystemStack() execFile подменён заглушкой, и
+        // Распаковка — НАСТОЯЩАЯ: у mkSystemStack() spawn подменён заглушкой, и
         // первый заход этого теста получил «OK — Файлов: 0» (tar не запускался вовсе).
-        const realStack = mkSystemStack({ execFile: require("child_process").execFile });
+        const realStack = mkSystemStack({ spawn });
         const res = await realStack.downloadAndExtractTo("http://127.0.0.1:" + server2.address().port + "/pkg.tar.gz", path.join(dir2, "out"));
         assert.ok(/^OK — скачано и распаковано/.test(res), ".tar.gz не распаковался: " + res);
         const f = path.join(dir2, "out", "progon.txt");
@@ -14666,7 +14702,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "agent-tools-browser.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "agent-tools-browser.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js", "run-context.js", "ask-wait.js", "agent-data.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14676,7 +14712,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "agent-tools-browser.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "agent-tools-browser.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js", "run-context.js", "ask-wait.js", "agent-data.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
@@ -14920,6 +14956,57 @@ async function testAgentTools() {
     }
   });
 
+  await test("контекст прогона: работа возвращается в следующий прогон, а не ищется заново", () => {
+    // Жалоба человека: после паузы агент заново выясняет, чем занимался. Модуль
+    // (src/run-context.js) сохраняет рабочую историю рядом с проектом, но прогон
+    // обязан СПРОСИТЬ его о ней — и спросить ДО сборки запроса.
+    const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    const runSrc = fs.readFileSync(path.join(ROOT, "src", "run-ai.js"), "utf8");
+    assert.ok(main.indexOf('require("./run-context.js")') >= 0, "модуль контекста прогона не подключён в оболочке");
+    assert.ok(main.indexOf("createRunContext,") >= 0, "модуль не передан прогону");
+    const from = runSrc.indexOf("const runCtx = createRunContext(");
+    assert.ok(from >= 0, "прогон не собирает контекст прогона");
+    const wiring = runSrc.slice(from, runSrc.indexOf("});", from));
+    for (const dep of ["dir:", "id:", "sanitizeToolPairs"]) {
+      assert.ok(wiring.indexOf(dep) >= 0, "в проводку контекста прогона не передан " + dep);
+    }
+    assert.ok(wiring.indexOf("dir: () => workDir") >= 0, "рабочая папка передана копией: чекпоинт лёг бы в прежний проект");
+    assert.ok(wiring.indexOf("id: live.activeRunChatId") >= 0, "чат прогона не взят из живого значения");
+    assert.ok(
+      runSrc.indexOf("runCtx.plan(runHistory)") < runSrc.indexOf("let canonical = ["),
+      "работа возвращается ПОСЛЕ сборки запроса — контекст до модели не доедет"
+    );
+    assert.ok(runSrc.indexOf("if (resumePlan.resumed)") >= 0, "решение о продолжении не проверяется");
+    assert.ok(runSrc.indexOf("runCtx.save(canonical);") >= 0, "рабочая история не фиксируется по ходу прогона");
+    assert.ok(runSrc.indexOf("if (!stopNote) runCtx.close();") >= 0, "финал не закрывает чекпоинт: сданная работа вернулась бы в контекст");
+    // Вызовы и их результаты обязаны дожить до запроса: без tool_call_id разбор пар
+    // выбрасывает результат как осиротевший, и продолжение снова пустое.
+    assert.ok(runSrc.indexOf("if (m.tool_calls) one.tool_calls = m.tool_calls;") >= 0, "вызовы инструментов теряются при сборке истории");
+    assert.ok(runSrc.indexOf("if (m.tool_call_id) one.tool_call_id = m.tool_call_id;") >= 0, "результат теряет свой tool_call_id");
+  });
+
+  await test("ожидание ответа: вопрос ждёт человека, а не «отвечается» старым таймером", () => {
+    // Жалоба человека: агент открыл окно с вопросом, а сам не остановился и продолжил
+    // работать. Причина — забытый таймер: он не снимался при ответе и через пять минут
+    // «отвечал» пустой строкой на СЛЕДУЮЩИЙ вопрос. Модуль ask-wait.js отвечает за это
+    // одним местом, и прогон обязан им пользоваться.
+    const main = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
+    const runSrc = fs.readFileSync(path.join(ROOT, "src", "run-ai.js"), "utf8");
+    const strictSrc = fs.readFileSync(path.join(ROOT, "src", "run-strict.js"), "utf8");
+    const moduleSrc = fs.readFileSync(path.join(ROOT, "src", "ask-wait.js"), "utf8");
+    assert.ok(main.indexOf('require("./ask-wait.js")') >= 0, "модуль ожидания ответа не подключён в оболочке");
+    assert.ok(/const \{ runAi \} = createRunAi\(\{[\s\S]{0,500}?createAskWait,/.test(main), "модуль не передан прогону");
+    assert.ok(/const askWait = createAskWait\(\{ emit, live \}\)/.test(runSrc), "прогон не собирает ожидание ответа");
+    assert.ok(runSrc.indexOf("300000") < 0, "в прогоне остался старый таймер на пять минут");
+    assert.ok(/askWait\.cancel\(\)/.test(runSrc), "конец прогона не снимает ожидание ответа");
+    // Варианты ответа доезжают от модели до окна: без этого человек снова печатает руками.
+    assert.ok(/await askUserWait\(question, c\.args && c\.args\.options\)/.test(strictSrc), "варианты не доходят до вопроса");
+    assert.ok(/clearT\(timer\)/.test(moduleSrc), "ответ больше не снимает таймер");
+    assert.ok(/live\.pendingAsk !== finish/.test(moduleSrc), "просроченный таймер может ответить за чужой вопрос");
+    const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
+    assert.ok(/id="ask-options"/.test(html), "в разметке нет полосы вариантов ответа");
+  });
+
   await test("реестр инструментов: буфер обмена и дела берут окружение из main.js", async () => {
     called.length = 0;
     const w = await tools.clipboardWrite({ text: "привет" }, {});
@@ -14931,7 +15018,7 @@ async function testAgentTools() {
     called.length = 0;
     const add = await tools.taskAdd({ title: "проверка" }, {});
     assert.match(add, /дело добавлено/, "дело занесено: " + add);
-    for (const need of ["userDataDir", "agentStore.tasksAdd", "emitTasksChanged"]) {
+    for (const need of ["tasksDataDir", "agentStore.tasksAdd", "emitTasksChanged"]) {
       assert.ok(called.includes(need), "дело проходит через " + need + " (званы: " + called.join(", ") + ")");
     }
     const list = await tools.taskList({}, {});
@@ -15446,6 +15533,8 @@ async function testAgentTools() {
     const agentStore = require(path.join(ROOT, "src", "agent-store.js"));
     const codeIndex = require(path.join(ROOT, "src", "code-index.js"));
     const userData = fs.mkdtempSync(path.join(os.tmpdir(), "memory-userData-"));
+    // Папка дел — своя, выбранная человеком: список дел не оседает в папке приложения.
+    const tasksHome = fs.mkdtempSync(path.join(os.tmpdir(), "memory-tasks-"));
     const work = fs.mkdtempSync(path.join(os.tmpdir(), "memory-work-"));
     const target = path.join(work, "сервер.js");
     fs.writeFileSync(target, "function validateLogin(user) { return !!user; }\n", "utf8");
@@ -15458,6 +15547,7 @@ async function testAgentTools() {
       app: { getPath: () => userData },
       agentWorkDir: () => work,
       userDataDir: () => userData,
+      tasksDataDir: () => tasksHome,
       emitTasksChanged: () => { tasksPinged++; },
       loadSettings: () => ({ contextMemory: true }),
       resolvePath: (p) => path.resolve(String(p == null ? "" : p)),
@@ -15482,6 +15572,8 @@ async function testAgentTools() {
     assert.ok(tasksPinged > 0, "панель дел не получила событие об изменении");
     assert.match(await tools.taskDone({ key: "Полить" }, {}), /^OK — /, "дело не отметилось выполненным");
     assert.match(await tools.taskDelete({ key: "Полить" }, {}), /удалено/, "дело не удалилось");
+    assert.ok(fs.existsSync(path.join(tasksHome, "tasks.json")), "список дел лёг не в выбранную папку дел");
+    assert.ok(!fs.existsSync(path.join(userData, "tasks.json")), "список дел осел в папке приложения");
 
     // 3. Чекпоинты: снимок → правка → откат. Проверяем РЕЗУЛЬТАТ на диске, иначе
     // предохранители отката не видит никто.
@@ -15500,6 +15592,7 @@ async function testAgentTools() {
     assert.match(await tools.semanticSearch({}, {}), /укажи query/, "пустой запрос не отвергнут");
 
     fs.rmSync(userData, { recursive: true, force: true });
+    fs.rmSync(tasksHome, { recursive: true, force: true });
     fs.rmSync(work, { recursive: true, force: true });
   });
 
@@ -16954,7 +17047,8 @@ async function testMissions() {
       missionStore: missionStore,
       loadSettings: () => ({ longWork: true, workingDir: dir, agentWorkFiles: true }),
       agentWorkDir: (s) => (s && s.workingDir) || dir,
-      userDataDir: () => path.join(dir, "userData"),
+      // Дела читаются в папке дел, а не в папке приложения (часть 44).
+      tasksDataDir: () => path.join(dir, "tasks"),
       emitTasksChanged: () => { calls.emitted++; },
       armTaskWake: () => { calls.armed++; },
       live: { missionClaim: () => claim, setMissionClaim: (v) => { claim = v; } },
@@ -17029,7 +17123,7 @@ async function testMissions() {
     assert.ok(wiringAt > 0, "main.js не собирает модуль дел и миссий");
     const wiring = mainSrc.slice(wiringAt, mainSrc.indexOf("\n});", wiringAt));
     for (const dep of ["ipcMain,", "fs,", "shell,", "agentStore,", "missionStore,", "loadSettings,",
-      "agentWorkDir,", "userDataDir,", "emitTasksChanged,", "armTaskWake,",
+      "agentWorkDir,", "tasksDataDir,", "emitTasksChanged,", "armTaskWake,",
       "missionClaim: () => missionClaim,", "setMissionClaim: (v) => { missionClaim = v; },"]) {
       assert.ok(wiring.includes(dep), "в проводку модуля не передан " + dep);
     }
@@ -17308,9 +17402,13 @@ async function testSecretScopes() {
       fs,
       path,
       os,
-      execFile: (bin, args, opts, cb) => {
+      spawn: (file, args, opts) => {
         seenEnv = opts && opts.env;
-        setTimeout(() => cb(null, "ok", ""), 0);
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        setTimeout(() => child.emit("close", 0, null), 0);
+        return child;
       },
       winPs: { exec: async () => ({ noSession: true, ok: true, code: 0, out: "", err: "" }) },
       probeEnv: () => ({ ...process.env }),

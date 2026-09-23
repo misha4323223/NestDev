@@ -104,6 +104,14 @@ ipcMain.handle("settings:set", (e, s0) => {
   merged.ycFolderId = prev.ycFolderId || "";
   merged.ycFolderName = prev.ycFolderName || "";
   merged.ycCloudId = prev.ycCloudId || "";
+  // Папки работы агента и приглашение первого запуска меняются ТОЛЬКО своими каналами
+  // (setup:state / setup:save). Причина та же, что у каталога Yandex Cloud: в форме
+  // настроек этих полей нет, а объект интерфейса (или телефона), загруженный ДО
+  // выбора папок, принёс бы прежние пустые значения и стёр выбор — миссии и дела
+  // молча вернулись бы в прежние места, а приглашение показалось бы снова.
+  merged.missionsDir = prev.missionsDir || "";
+  merged.tasksDir = prev.tasksDir || "";
+  merged.firstRunSetup = prev.firstRunSetup === "done" ? "done" : "ask";
   // При смене рабочей папки — сбрасываем локальную папку выбранного GitHub-репозитория,
   // чтобы не подхватывать старый путь от прошлой локации.
   if (s && s.workingDir && prev.workingDir !== s.workingDir) {
@@ -127,23 +135,75 @@ ipcMain.handle("settings:set", (e, s0) => {
   return maskedFor(e) ? secretMask.maskSecrets(merged) : merged;
 });
 
-// Выбор рабочей папки: окно спрашиваем в момент вызова — оно могло быть закрыто или
+// Что именно выбирает человек. Один канал на три случая НЕ ради экономии: значение,
+// присвоенное папке, и так одно и то же — путь на диске. Разным он должен быть в
+// диалоге: подпись окна и папка, с которой выбор начинается. Без вида («work") —
+// прежнее поведение: рабочая директория проекта, поэтому старые вызовы не меняются.
+const PICK_TITLES = {
+  work: "Выберите рабочую директорию",
+  missions: "Выберите папку для миссий и прогонов",
+  tasks: "Выберите папку для дел",
+};
+
+// Выбор папки: окно спрашиваем в момент вызова — оно могло быть закрыто или
 // пересоздано. Без живого окна диалог всё равно открывается, просто без родителя
 // (иначе на закрытом окне Electron бросил бы ошибку и выбор папки не работал бы вовсе).
-ipcMain.handle("dialog:pickDir", async (e) => {
+ipcMain.handle("dialog:pickDir", async (e, kind) => {
   const bad = deniedFor(e, "dialog:pickDir");
   if (bad) return null;
   const w = getWindow ? getWindow() : null;
   const parent = w && !w.isDestroyed() ? w : undefined;
   // Electron 43 перестал запоминать последнюю папку и открывает диалог в «Загрузках»
   // (это в его breaking changes). Раньше папку помнила сама система, и выбор начинался
-  // там, где человек остановился. Теперь называем папку явно — текущую рабочую:
-  // иначе каждый выбор начинался бы с «Загрузок».
+  // там, где человек остановился. Теперь называем папку явно: своя настройка, если она
+  // уже выбрана (человек меняет её осознанно), иначе текущая рабочая.
   const cur = loadSettings() || {};
-  const opts = { properties: ["openDirectory"], title: "Выберите рабочую директорию" };
-  if (cur.workingDir) opts.defaultPath = cur.workingDir;
+  const which = PICK_TITLES[kind] ? String(kind) : "work";
+  const opts = { properties: ["openDirectory"], title: PICK_TITLES[which] };
+  const start = (which === "missions" && cur.missionsDir) || (which === "tasks" && cur.tasksDir) || cur.workingDir;
+  if (start) opts.defaultPath = start;
   const r = await dialog.showOpenDialog(parent, opts);
   return r.canceled ? null : r.filePaths[0];
+});
+
+// ── Куда класть работу агента: миссии, прогоны и дела ──────────────────────
+// Раскладку считает src/agent-data.js, а здесь только её выбор и сохранение:
+// человек говорит в окне первого запуска, где держать работу, либо оставляет как
+// было. Пусто в настройке — ПРЕЖНИЕ места (.agent/ рядом с проектом и папка
+// приложения), и это осознанное правило: приложение НИКОГДА не переносит уже
+// лежащие файлы — обновление не имеет права терять работу на ровном месте.
+//
+// Путь — не секрет, но и не поле формы: его не должно быть можно стереть
+// сохранением устаревшего объекта настроек (см. защиту в settings:set). Путь
+// чистим: лишние пробелы и хвостовые разделители иначе выглядят в настройках
+// сломанным путём («D:\\work\\»).
+const cleanFolder = (v) => String(v == null ? "" : v).trim().replace(/[\\/]+$/, "");
+
+ipcMain.handle("setup:state", (e) => {
+  const bad = deniedFor(e, "setup:state");
+  if (bad) return { ok: false, error: bad };
+  const s = loadSettings();
+  return {
+    ok: true,
+    setupDone: s.firstRunSetup === "done",
+    missionsDir: s.missionsDir || "",
+    tasksDir: s.tasksDir || "",
+  };
+});
+
+// Сохранить выбор папок и закрыть вопрос навсегда. Поля, которых в запросе нет,
+// остаются прежними (пустой запрос = «оставить как было»), а не стираются: пустое
+// значение в настройке — это «прежние места», и получить его случайно нельзя.
+ipcMain.handle("setup:save", (e, payload) => {
+  const bad = deniedFor(e, "setup:save");
+  if (bad) return { ok: false, error: bad };
+  const p = payload || {};
+  const prev = loadSettings();
+  const missionsDir = p.missionsDir === undefined ? prev.missionsDir || "" : cleanFolder(p.missionsDir);
+  const tasksDir = p.tasksDir === undefined ? prev.tasksDir || "" : cleanFolder(p.tasksDir);
+  const merged = normalizeSettings({ ...prev, missionsDir: missionsDir, tasksDir: tasksDir, firstRunSetup: "done" });
+  saveSettings(merged);
+  return { ok: true, setupDone: true, missionsDir: merged.missionsDir || "", tasksDir: merged.tasksDir || "" };
 });
 }
 

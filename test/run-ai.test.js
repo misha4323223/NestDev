@@ -54,7 +54,8 @@ function mk(over) {
   const calls = {
     rounds: [], events: [], notifies: [], metrics: [],
     switched: 0, saves: 0, commits: 0, parallel: 0, strict: [], manages: [],
-    mission: [], brief: [], histories: [],
+    mission: [], brief: [], histories: [], asks: [],
+    ctxSaves: [], ctxClosed: 0, ctxDeps: null, ctxPlanned: [], askDeps: null, askCancels: 0,
   };
   const queue = (o.rounds || [{ text: "Готово." }]).slice();
   const win = {
@@ -139,6 +140,34 @@ function mk(over) {
       canRunParallel: (c) => !!o.parallel && c.length > 0,
       runParallel: async (c) => { calls.parallel += c.length; },
     }),
+    // Контекст прогона (src/run-context.js): работа, переживающая остановку.
+    // Здесь — заглушка (настоящий модуль пишет файлы), но она повторяет его
+    // договор: решение о продолжении ДО сборки запроса, фиксация по ходу,
+    // закрытие только на обычном финале.
+    createRunContext: (d) => {
+      calls.ctxDeps = d;
+      return {
+        plan: (h) => {
+          calls.ctxPlanned.push(h.length);
+          return o.resumeCtx ? { resumed: true, history: h.concat(o.resumeCtx), notice: "▶ Продолжаю с места остановки" } : { resumed: false, history: h };
+        },
+        save: (h) => { calls.ctxSaves.push(h.length); },
+        close: () => { calls.ctxClosed++; },
+      };
+    },
+    // Ожидание ответа человека (src/ask-wait.js): заглушка повторяет договор
+    // модуля — вопрос уходит с вариантами, ответ приходит один раз, конец
+    // прогона снимает ожидание.
+    createAskWait: (d) => {
+      calls.askDeps = d;
+      return {
+        askUserWait: (q, opts) => {
+          calls.asks.push({ q: q, opts: opts || [] });
+          return Promise.resolve(o.answer === undefined ? "Да" : o.answer);
+        },
+        cancel: () => { calls.askCancels++; return true; },
+      };
+    },
     createRunMission: () => mission,
     createRunNudge: (d) => { calls.nudgeDeps = d; return { decide: () => ({ action: "none" }) }; },
     createRunRetry: (d) => {
@@ -203,7 +232,8 @@ function mk(over) {
     toolPolicy: {},
     toolsAsText: () => "",
     truncateText: (s) => s,
-    userDataDir: () => "/userData",
+    // Папка дел — своя (часть 44): сводка берётся в папке дел, а не в папке приложения.
+    tasksDataDir: () => "/tasks",
     windowBudget: (p, b, w, opts) => { calls.windowBudget = { b, w, opts }; return o.windowed === undefined ? w : o.windowed; },
     live: live,
   };
@@ -234,7 +264,7 @@ const systemOf = (m) => String((m.calls.rounds[0] || {}).messages && (m.calls.ro
     assert.ok(/РОЛЬ: manager/.test(sys), "текст роли не доехал: " + sys.slice(0, 80));
     assert.ok(/Рабочая директория приложения.*\/work\/проект/s.test(sys), "рабочая папка не сказана");
     assert.ok(/САММАРИ ПРОЕКТА.*ВИЗИТКА ПРОЕКТА/s.test(sys), "визитка проекта потерялась");
-    assert.deepStrictEqual(m.calls.brief[0], ["/userData", 8], "сводка дел не взята у хранилища");
+    assert.deepStrictEqual(m.calls.brief[0], ["/tasks", 8], "сводка дел не взята у хранилища");
     assert.ok(/МОИ ДЕЛА.*Позвонить в банк/s.test(sys), "менеджер не получил свежую сводку дел");
   });
 
@@ -528,6 +558,64 @@ const systemOf = (m) => String((m.calls.rounds[0] || {}).messages && (m.calls.ro
     assert.strictEqual(quiet.calls.rounds[0].messages.length, 2, "в запрос ушло лишнее сообщение: " + quiet.calls.rounds[0].messages.length);
   });
 
+  await test("контекст прогона: оставленная работа возвращается в запрос, а не ищется заново", async () => {
+    // Жалоба человека: после паузы агент заново выясняет, чем занимался. Прогон
+    // обязан СПРОСИТЬ модуль о работе ДО сборки запроса и вернуть её целиком —
+    // вместе с вызовами и их результатами: без tool_call_id разбор пар выбрасывает
+    // результат как осиротевший, и продолжение снова пустое.
+    const left = [
+      { role: "assistant", content: "читаю файл", tool_calls: [{ id: "c1", type: "function", function: { name: "readFile", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "c1", content: "СОДЕРЖИМОЕ ФАЙЛА (тест)" },
+    ];
+    const m = mk({ resumeCtx: left });
+    await run(m);
+    const sent = m.calls.rounds[0].messages;
+    assert.ok(sent.some((x) => x && x.tool_call_id === "c1"), "результат прошлого шага не вернулся в запрос");
+    assert.ok(sent.some((x) => x && x.tool_calls), "вызовы инструментов потеряны при сборке истории");
+    assert.ok(sent.some((x) => x && /СОДЕРЖИМОЕ ФАЙЛА/.test(String(x.content))), "содержимое прошлого шага не дошло до модели");
+    const notices = m.calls.events.filter((e) => e.ev && e.ev.type === "notice").map((e) => String(e.ev.text));
+    assert.ok(notices.some((t) => /Продолжаю с места остановки/.test(t)), "человеку не сказали, что работа возвращена");
+    // Работа фиксируется по ходу: обрыв на ответе модели не должен её терять.
+    assert.ok(m.calls.ctxSaves.length >= 2, "работа не фиксируется по ходу прогона: " + m.calls.ctxSaves.length);
+    // Проводка: рабочая папка — ФУНКЦИЕЙ (её меняет клонирование и смена проекта),
+    // чат прогона — из живого значения, разбор пар — живой.
+    assert.strictEqual(typeof m.calls.ctxDeps.dir, "function", "рабочая папка передана копией: чекпоинт лёг бы в прежний проект");
+    assert.strictEqual(m.calls.ctxDeps.dir(), "/work/проект", "функция отдаёт не рабочую папку прогона");
+    assert.strictEqual(m.calls.ctxDeps.id, "chat-1", "чат прогона не взят из живого значения");
+    assert.strictEqual(typeof m.calls.ctxDeps.sanitizeToolPairs, "function", "разбор пар не передан модулю");
+    // Решение принято ДО того, как история поехала в запрос.
+    assert.deepStrictEqual(m.calls.ctxPlanned, [1], "история спрошена не один раз или не та: " + JSON.stringify(m.calls.ctxPlanned));
+  });
+
+  await test("сданная работа чекпоинт закрывает, пауза — оставляет", async () => {
+    // Обычный финал: работа доведена, возвращать нечего — иначе агент «продолжал» бы
+    // то, что уже сделано. Пауза — наоборот: человек нажмёт «Продолжить».
+    const done = mk();
+    await run(done);
+    assert.strictEqual(done.calls.ctxClosed, 1, "обычный финал не закрыл чекпоинт: " + done.calls.ctxClosed);
+    global.__agentPauseRequested = true;
+    try {
+      const paused = mk();
+      await run(paused);
+      assert.strictEqual(paused.calls.ctxClosed, 0, "пауза закрыла чекпоинт — продолжение потеряло бы работу");
+      assert.ok(paused.calls.ctxSaves.length >= 1, "пауза не оставила работу на диске");
+    } finally {
+      global.__agentPauseRequested = false;
+    }
+  });
+
+  await test("ожидание ответа: прогон зовёт модуль и снимает ожидание на финале", async () => {
+    // Тихая ошибка была бы такой: вопрос задан, а прогон идёт дальше. Здесь видно,
+    // что модуль ожидания собирается прогоном на ЖИВОМ состоянии окна (иначе ответ
+    // человека некуда приносить) и что финал снимает ожидание.
+    const m = mk();
+    await run(m);
+    assert.ok(m.calls.askDeps, "прогон не собрал ожидание ответа");
+    assert.strictEqual(typeof m.calls.askDeps.emit, "function", "ожиданию не передан вывод событий");
+    assert.strictEqual(m.calls.askDeps.live, m.live, "ожидание получило копию живого состояния: ответ не дошёл бы");
+    assert.strictEqual(m.calls.askCancels, 1, "финал не снял ожидание ответа: " + m.calls.askCancels);
+  });
+
   await test("в оболочке этого больше нет, а мост к живому состоянию на месте", () => {
     for (const gone of ["async function runAi(", "const AUTO_RETRY_LIMIT = 2;", "const endRun = async (fallbackText)",
       "const shrinkContext = async () =>", "const stopGraceful = () =>", "for (let round = 0; round < maxRounds; round++)"]) {
@@ -535,7 +623,7 @@ const systemOf = (m) => String((m.calls.rounds[0] || {}).messages && (m.calls.ro
     }
     const wiring = /const \{ createRunAi \} = require\("\.\/run-ai\.js"\);[\s\S]*?\n\}\);/.exec(MAIN_SRC);
     assert.ok(wiring, "не нашёл проводку прогона");
-    for (const dep of ["  createRunRound,", "  createRunMission,", "  executeTool:", "  SYSTEM_PROMPT,", "  live: {"]) {
+    for (const dep of ["  createRunRound,", "  createRunMission,", "  createRunContext,", "  executeTool:", "  SYSTEM_PROMPT,", "  live: {"]) {
       assert.ok(wiring[0].includes(dep), "в проводку не передано: " + dep.trim());
     }
     // Живое состояние оболочки держится сеттерами: часть его пишет и прогон.

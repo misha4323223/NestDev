@@ -3,7 +3,8 @@
 /* ─── Системные программы и окружение ─────────────────────────────────────────
    Раньше раздел жил внутри main.js, рядом с окном, IPC и деплоем. Здесь только
    система: PATH и его слияние, поиск программ (=инструмент canExecute),
-   запуск процессов с разбором кодов выхода (`spawnRaw`, `explainExit`),
+   запуск процессов с разбором кодов выхода (`spawnRaw` — в СВОЕЙ группе процессов,
+   чтобы таймаут гасил дерево, а не одну оболочку; `explainExit`),
    живая сессия PowerShell с коротким кэшем справок (`psScript`, `cachedPs`,
    `refreshEnvFromOS`), установка пакетов системными менеджерами
    (`installSystemPkg`), загрузка файлов и архивов (`downloadFileTo`,
@@ -24,7 +25,11 @@
 const crypto = require("crypto");
 
 function createSystemStack(deps) {
-  const { fs, path, os, execFile, winPs, probeEnv, stripAnsi, runTerminalCommand, live } = deps;
+  const { fs, path, os, spawn, winPs, probeEnv, stripAnsi, runTerminalCommand, live } = deps;
+  // Кто гасит дерево процессов — той же подстановкой, что у оболочек (shell-tools):
+  // иначе сторож не проверит ветку таймаута, не посылая сигналов чужим процессам.
+  // По умолчанию — настоящий убийца группы (killCommandTree ниже).
+  const killTree = deps.killTree || killCommandTree;
 
 // ═══════════════════ Системные программы и окружение ═══════════════════
 // Получить PATH (пробы секретов не получают) — на Windows ключ может быть «Path».
@@ -90,40 +95,167 @@ function findProgram(name) {
   return { found: false, reason: "«" + prog + "» не найден в PATH" + (process.platform === "win32" ? " и в типовых местах установки" : "") };
 }
 
-function runProgVersion(bin) {
+// ── Запуск команд в СВОЕЙ группе процессов ────────────────────────────────
+// Одна точка правды о запуске системного раздела. Здесь раньше стоял execFile:
+// он МОЛЧА игнорирует `detached` (сам собирает опции для spawn), своей группы у
+// команды не было, и по таймауту умирала одна оболочка — дети (shell внутри winget,
+// tar с детьми, powershell с детьми) оставались жить и держали порт, а в фоновых
+// процессах их не было — остановить их было нечем. Тот же класс, что закрыт у
+// runCommand (shell-tools, заход 4.1) и runCapture (деплой, фаза 1 поиска ошибок).
+// Предел вывода теперь наш, а не maxBuffer: сверх него команда гасится ДЕРЕВОМ.
+const MAX_RUN_BYTES = 16 * 1024 * 1024;
+const RUN_FALLBACK_MS = 1500; // во сколько отвечаем после гашения, если «close» не пришёл
+
+// Гасит команду ВМЕСТЕ С ДЕТЬМИ: у неё своя группа (detached), сигнал уходит
+// группе целиком. Обычный child.kill() бьёт только саму команду, а её дети
+// остаются жить. На Windows группы процессов свои — там дерево гасит taskkill /T /F.
+function killCommandTree(child) {
+  const pid = child && child.pid;
+  if (!pid) return;
+  try {
+    if (process.platform === "win32") {
+      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+    } else {
+      try { process.kill(-pid, "SIGTERM"); } catch {}
+      setTimeout(() => { try { process.kill(-pid, "SIGKILL"); } catch {} }, 1200);
+    }
+  } catch {}
+  try { child.kill(); } catch {}
+}
+
+// Запуск и сбор вывода. Возвращает ПОТОКИ и причину (таймаут, переполнение,
+// отказ запуска), а как превратить их в ответ — решает зовущий: у spawnRaw и
+// runProgVersion своя форма отказа, и смешивать их нельзя.
+function runGroup(file, args, o) {
+  const opt = o || {};
+  const limit = Number(opt.timeoutMs) > 0 ? Number(opt.timeoutMs) : 60000;
+  const maxBytes = Number(opt.maxBytes) > 0 ? Number(opt.maxBytes) : MAX_RUN_BYTES;
   return new Promise((resolve) => {
-    execFile(bin, ["--version"], { timeout: 8000, windowsHide: true, maxBuffer: 1024 * 1024, env: probeEnv() }, (err, stdout, stderr) => {
-      const text = stripAnsi((stdout || "") + "\n" + (stderr || "")).trim();
-      resolve(text ? text.split("\n")[0].slice(0, 180) : "");
-    });
+    const outChunks = [];
+    const errChunks = [];
+    let bytes = 0;
+    let overflow = false;
+    let timedOut = false;
+    let settled = false;
+    let spawnError = null;
+    let child = null;
+    let timer = null;
+    // Один выход на все ветки: завершение, отказ запуска, предел вывода, таймаут.
+    // Без него промис мог бы не разрешиться никогда — а это хуже любого отказа.
+    const done = (code, signal) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({
+        code: code == null ? null : code,
+        signal: signal || null,
+        timedOut,
+        overflow,
+        spawnError,
+        limitMs: limit,
+        // Буферы склеиваем уже здесь: посимвольная расшифровка кусками ломала бы
+        // многобайтовую кириллицу на границе чанков.
+        out: Buffer.concat(outChunks).toString("utf8"),
+        err: Buffer.concat(errChunks).toString("utf8"),
+      });
+    };
+    try {
+      child = spawn(file, args, {
+        cwd: opt.cwd, // не задан = унаследовать, как у прежнего execFile
+        env: opt.env,
+        // Своя группа — условие, по которому таймаут гасит ДЕРЕВО (ловушка 5).
+        detached: process.platform !== "win32",
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (e) {
+      // spawn бросает на негодных опциях (например, кривой cwd) — событие "error"
+      // уже не будет, и без этого ответа промис вис бы навсегда.
+      spawnError = e;
+      done(null, null);
+      return;
+    }
+    const collect = (arr) => (chunk) => {
+      if (overflow) return;
+      arr.push(chunk);
+      bytes += chunk.length;
+      if (bytes > maxBytes) {
+        overflow = true;
+        killTree(child);
+      }
+    };
+    if (child.stdout) child.stdout.on("data", collect(outChunks));
+    if (child.stderr) child.stderr.on("data", collect(errChunks));
+    // Отказ запуска (ENOENT у бинаря) приходит событием, а не кодом возврата.
+    child.on("error", (e) => { spawnError = e; done(null, null); });
+    child.on("close", (code, signal) => done(code, signal));
+    timer = setTimeout(() => {
+      timedOut = true;
+      killTree(child);
+      // Оболочка может не отреагировать на SIGTERM (или её уже нет): отвечаем не
+      // позже чем через полторы секунды — к тому времени группе ушёл SIGKILL.
+      // Таймер намеренно НЕ unref: обещание обязано быть разрешено.
+      setTimeout(() => done(null, null), RUN_FALLBACK_MS);
+    }, limit);
+  });
+}
+
+function runProgVersion(bin) {
+  return runGroup(bin, ["--version"], {
+    timeoutMs: 8000,
+    maxBytes: 1024 * 1024,
+    env: probeEnv(),
+  }).then((g) => {
+    // Договор прежний (execFile, байт в байт): текстом идёт stdout плюс stderr
+    // и РОВНО первая строка; если вывода нет (бинаря нет) — пустая строка, а не
+    // текст ошибки запуска: потребители (checkInstalledProgram) читают версию.
+    const text = stripAnsi((g.out || "") + "\n" + (g.err || "")).trim();
+    return text ? text.split("\n")[0].slice(0, 180) : "";
   });
 }
 
 function spawnRaw(args, opts) {
-  return new Promise((resolve) => {
-    const o = opts || {};
-    execFile(args[0], args.slice(1), {
-      cwd: o.cwd || os.homedir(),
-      timeout: o.timeoutMs || 60000,
-      maxBuffer: 16 * 1024 * 1024,
-      windowsHide: true,
-      env: { ...live.envFor(o.capability), GIT_TERMINAL_PROMPT: "0", FORCE_COLOR: "0" },
-    }, (err, stdout, stderr) => {
-      let code = 0;
-      let errText = stripAnsi(stderr || "");
-      if (err) {
-        if (typeof err.code === "number") code = err.code;
-        else if (err.killed) code = -1; // таймаут
-        else if (err.code === "ENOENT") code = 127;
-        // EINVAL, EPERM, EACCES и прочие системные коды — раньше все становились
-        // безликой «1» с пустым выводом, и диагноз был невозможен.
-        else if (typeof err.code === "string") code = err.code;
-        else code = 1;
-        // У ошибок запуска stderr пуст — отдаём сообщение, иначе агент видит пустоту.
-        if (!errText) errText = stripAnsi(String(err.message || err));
+  const o = opts || {};
+  const limit = o.timeoutMs || 60000;
+  return runGroup(args[0], args.slice(1), {
+    cwd: o.cwd || os.homedir(),
+    timeoutMs: limit,
+    maxBytes: MAX_RUN_BYTES,
+    env: { ...live.envFor(o.capability), GIT_TERMINAL_PROMPT: "0", FORCE_COLOR: "0" },
+  }).then((g) => {
+    // Таблица кодов ПРЕЖНЯЯ (её сторожит набор): errno строкой — как есть,
+    // ENOENT — 127, таймаут — -1, переполнение — ENOBUFS, прочее — 1.
+    let code = 0;
+    let ok = true;
+    let errText = g.err;
+    if (g.spawnError) {
+      ok = false;
+      const e = g.spawnError;
+      if (e.code === "ENOENT") code = 127;
+      // EINVAL, EPERM, EACCES и прочие системные коды нельзя терять в «1»:
+      // без них диагноз на отказе запуска невозможен.
+      else if (typeof e.code === "string") code = e.code;
+      else code = 1;
+      if (!errText) errText = String(e.message || e);
+    } else if (g.timedOut) {
+      ok = false;
+      code = -1; // таймаут
+      if (!errText) errText = "Команда не уложилась в " + g.limitMs + " мс — остановлена вместе с дочерними процессами.";
+    } else if (g.overflow) {
+      ok = false;
+      code = "ENOBUFS"; // прежний код переполнения maxBuffer у execFile
+      if (!errText) errText = "maxBuffer length exceeded";
+    } else if (g.code === 0) {
+      ok = true;
+      code = 0;
+    } else {
+      ok = false;
+      code = Number.isInteger(g.code) ? g.code : 1; // смерть от чужого сигнала
+      if (!errText) {
+        errText = g.signal ? "Процесс завершён сигналом " + g.signal + "." : "Команда завершилась с кодом " + code + ".";
       }
-      resolve({ ok: !err, code, out: stripAnsi(stdout || ""), err: errText });
-    });
+    }
+    return { ok, code, out: stripAnsi(g.out), err: stripAnsi(errText) };
   });
 }
 

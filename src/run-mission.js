@@ -75,6 +75,16 @@ function createRunMission(deps) {
   // только ожиданием пяти минут. Оболочка значение не передаёт.
   const now = typeof deps.now === "function" ? deps.now : () => Date.now();
 
+  // Где именно лежит работа прогона. Путь считает раскладка (src/mission-store.js →
+  // src/agent-data.js): когда человек выбрал свою папку, `.agent/` рядом с проектом
+  // уже не существует, и жёсткая приписка «.agent/missions/<id>/» отправила бы и
+  // человека, и модель искать журнал там, где его нет. Пустая папка не выбрана —
+  // прежняя запись байт в байт.
+  const folderText = (rec) => missionStore.missionsPathText(dir, rec && rec.id);
+  // Приписка «рядом с проектом» — правда только пока своя папка не выбрана: в
+  // выбранной папке миссия лежит в стороне от проекта, и обещать обратное нельзя.
+  const besideNote = () => (missionStore.agentRoot(dir) === missionStore.defaultRoot(dir) ? " (рядом с проектом)" : "");
+
   const state = {
     longWork: !!settings.longWork && !planMode,
     limits: {
@@ -196,8 +206,8 @@ function createRunMission(deps) {
       emit({
         type: "notice",
         text:
-          "📄 Длинная работа: завёл миссию «" + state.rec.title + "». Цель, план и журнал — в папке .agent/missions/" +
-          state.rec.id + "/ (рядом с проектом). Работа продолжится сама, если прогон оборвётся.",
+          "📄 Длинная работа: завёл миссию «" + state.rec.title + "». Цель, план и журнал — в папке " +
+          folderText(state.rec) + besideNote() + ". Работа продолжится сама, если прогон оборвётся.",
       });
     } catch {}
     return state.rec;
@@ -296,7 +306,7 @@ function createRunMission(deps) {
       }
     } catch {}
     state.stopReason = "пауза";
-    return { text: "⏸ Пауза. Работа сохранена: цель, план и журнал — в .agent/missions/. Продолжить — панель «Миссия» → «▶ Продолжить»." };
+    return { text: "⏸ Пауза. Работа сохранена: цель, план и журнал — в " + folderText(state.rec) + ". Продолжить — панель «Миссия» → «▶ Продолжить»." };
   };
   // Граница батча: продолжать долгую работу или остановиться. Жёсткий потолок
   // раундов больше не убивает работу: миссия живёт на диске, поэтому каждый батч —
@@ -321,7 +331,7 @@ function createRunMission(deps) {
       } catch {}
       return { finish: true, phase: "paused", message: message };
     };
-    const where = " Файлы: .agent/missions/" + r.id + "/ — цель, план и журнал на месте.";
+    const where = " Файлы: " + folderText(r) + " — цель, план и журнал на месте.";
     if (state.rounds >= state.limits.rounds) {
       return hardStop("лимит раундов", "⏹ Миссия " + title + " отработала лимит раундов (" + state.limits.rounds + ")." + where + " Продолжить — панель «Миссия» → «▶ Продолжить».");
     }
@@ -376,7 +386,7 @@ function createRunMission(deps) {
         "▶ Батч " + (state.batches + 1) + ": продолжаю миссию " + title + " — раундов " + state.rounds +
         ", шагов " + pr.done + "/" + pr.total + ", в работе " + Math.round(elapsedMin) + " мин.",
       historyMessage:
-        "Работа продолжается (миссия " + title + ", файлы .agent/missions/" + r.id + "/). Пройдено шагов: " +
+        "Работа продолжается (миссия " + title + ", файлы " + folderText(r) + "). Пройдено шагов: " +
         pr.done + " из " + pr.total + (pr.current ? ", сейчас: " + pr.current : "") + tailText +
         "\nНе пересказывай сделанное — вызови следующий инструмент и двигай работу дальше. " +
         "Состояние работы каждый раунд подставляется приложением (цель, план, прогресс, журнал). " +
@@ -608,7 +618,7 @@ function createRunMission(deps) {
         );
       }
     }
-    lines.push("Папка миссии: .agent/missions/" + r.id + "/ (цель, план, journal.md). Полный журнал и план: missionStatus(journal: 40).");
+    lines.push("Папка миссии: " + folderText(r) + " (цель, план, journal.md). Полный журнал и план: missionStatus(journal: 40).");
     lines.push("Правило: то, что должно пережить следующий вызов, клади в дело, а не в память — файлы на диске, envSet(...), startBackground(...); после каждого шага отмечай missionStep(done, next).");
     return lines;
   };    // Сводка уходит в КАЖДЫЙ запрос, поэтому у неё есть предел. Если она в него не

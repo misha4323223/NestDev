@@ -35,9 +35,11 @@ function createRunAi(deps) {
     coldCacheInfo,
     consumeProviderStream,
     contextBudget,
+    createAskWait,
     createContextManager,
     createRunBatch,
     createRunCalls,
+    createRunContext,
     createRunMission,
     createRunNudge,
     createRunRetry,
@@ -67,6 +69,7 @@ function createRunAi(deps) {
     rateLimiterFor,
     readApiError,
     resolvePath,
+    roleIdFromAny,
     rolePlan,
     routeTools,
     routerMaxTokens,
@@ -80,7 +83,7 @@ function createRunAi(deps) {
     toolPolicy,
     toolsAsText,
     truncateText,
-    userDataDir,
+    tasksDataDir,
     windowBudget,
   } = deps;
   // Живое состояние прогона: читаем по имени каждый раз — в оболочке те же значения
@@ -102,7 +105,7 @@ async function runAi(settings, messages, win, opts) {
   let tasksNote = "";
   if (role.id === "manager" && !planMode) {
     try {
-      tasksNote = "\n\n=== МОИ ДЕЛА (актуально на " + new Date().toLocaleString() + ") ===\n" + agentStore.tasksBrief(userDataDir(), 8);
+      tasksNote = "\n\n=== МОИ ДЕЛА (актуально на " + new Date().toLocaleString() + ") ===\n" + agentStore.tasksBrief(tasksDataDir(), 8);
     } catch {}
   }
   const emit = (ev) => {
@@ -274,6 +277,10 @@ async function runAi(settings, messages, win, opts) {
       finalText = said ? finalText + "\n\n" + stopNote : stopNote;
       emit({ type: "chunk", text: (said ? "\n\n" : "") + stopNote });
     }
+    // Обычный финал — работа доведена до конца, возвращать в работу нечего.
+    // Мягкая остановка миссии (stopNote) — наоборот: человек продолжит её кнопкой,
+    // и чекпоинт даст модели её же прошлые шаги, а не пересказ.
+    if (!stopNote) runCtx.close();
     if (!String(finalText || "").trim() && !abort.signal.aborted) {
       finalText =
         "⚠ Модель не прислала итоговый текст (вероятно, переполнен контекст). Изменения сохранены; нажми «↻ Перегенерировать» или напиши «продолжай».";
@@ -297,25 +304,23 @@ async function runAi(settings, messages, win, opts) {
         }).show();
       } catch {}
     }
+    // Прогон закончился — ждать ответа больше некому: поздний ответ в окно
+    // завершённого прогона не должен уезжать в следующий.
+    askWait.cancel();
     mission.emitState("end");
     emit({ type: "done" });
     return { ok: true, text: finalText };
   };
 
-  const askUserWait = (question) => {
-    emit({ type: "ask", question });
-    return new Promise((resolve) => {
-      live.pendingAsk = resolve;
-      // Если пользователь не ответит за 5 минут — продолжаем без ответа
-      setTimeout(() => {
-        if (live.pendingAsk) {
-          const r = live.pendingAsk;
-          live.pendingAsk = null;
-          r("");
-        }
-      }, 300000);
-    });
-  };
+  // Ожидание ответа человека (варианты кнопкой плюс своё поле) — своим модулем
+  // (src/ask-wait.js): там же объяснено, почему забытый таймер нельзя оставлять —
+  // он «отвечал» на СЛЕДУЮЩИЙ вопрос, и агент работал дальше, пока человек смотрел
+  // на открытое окно с вопросом.
+  const askWait = createAskWait({ emit, live });
+  const askUserWait = askWait.askUserWait;
+  // Предложение сменить роль (suggestRole) ждёт ответа тем же механизмом, что и
+  // вопрос: окно показывает кнопку, прогон стоит, пока человек не решит.
+  const roleSuggestWait = askWait.roleSuggestWait;
   const trimmedHistory = await ctxManager.manage(messages, tools.state.histBudget);
   emitContext(trimmedHistory);
   // Авто-разбор присланных картинок вспомогательной vision-моделью (второй ключ):
@@ -353,11 +358,42 @@ async function runAi(settings, messages, win, opts) {
   }
   // Канонические сообщения (OpenAI-стиль). Провайдер-специфику применяем на лету в buildChatRequest.
   const workDir = agentWorkDir(settings);
+  // ── Контекст прогона: работа, которая переживает остановку ────────────────
+  // Пауза, «Стоп» и закрытие приложения раньше теряли весь ход работы: в новый
+  // прогон уходили одни тексты реплик (результаты инструментов интерфейс не
+  // отправляет), и агент заново искал, чем занимался. Теперь рабочая история
+  // ложится рядом с проектом (.agent/runs/) и возвращается в работу, если прогон
+  // не был доведён до конца (см. src/run-context.js).
+  const runCtx = createRunContext({
+    dir: () => workDir,
+    id: live.activeRunChatId,
+    sanitizeToolPairs,
+  });
+  const resumePlan = runCtx.plan(runHistory);
+  if (resumePlan.resumed) {
+    runHistory = resumePlan.history;
+    emit({ type: "notice", text: resumePlan.notice });
+    emitContext(runHistory);
+  }
   const wdNote =
     "\n\nРабочая директория приложения (туда создаются файлы и там выполняются команды): " +
     workDir +
     (live.lastAgentRepoDir && live.lastAgentRepoDir !== workDir ? "\nАктивный репозиторий: " + live.lastAgentRepoDir : "") +
     '\nОтносительные пути вроде "test.txt" или "src/utils/helper.txt" резолвятся относительно рабочей директории.';
+  // Файлы миссий лежат там, где решил человек (настройка «миссии и прогоны»), а не
+  // обязательно в `.agent/` рядом с проектом. Модель обязана знать правду: иначе она
+  // станет искать журнал миссии не там и сочтёт уже сделанную работу потерянной.
+  // Когда папка не выбрана, приписки НЕТ — прежний промпт не меняется ни на байт.
+  let dataNote = "";
+  try {
+    const mRoot = missionStore.agentRoot(workDir);
+    if (mRoot !== missionStore.defaultRoot(workDir)) {
+      dataNote =
+        "\n\nРабота агента (миссии и прогоны) лежит в папке, выбранной в настройках: " +
+        missionStore.missionsPathText(workDir) +
+        " — не .agent/ рядом с проектом. Журнал, план и отчёт миссии ищи там (точные пути показывает missionStatus).";
+    }
+  } catch {}
   // Краткая «визитка» проекта — чтобы агент не начинал сессию вслепую
   // (buildProjectBrief: имя, скрипты, структура, начало README).
   const projectBrief = buildProjectBrief(workDir);
@@ -376,10 +412,24 @@ async function runAi(settings, messages, win, opts) {
   let canonical = [
     {
       role: "system",
-      content: SYSTEM_PROMPT + roleNote + tasksNote + wdNote + briefNote + cloneNote + (planMode ? "\n\nРЕЖИМ ПЛАНА: доступен только todoWrite — вызови его с планом работ (3–7 пунктов) и в тексте перечисли файлы, которые затронешь. НЕ изменяй файлы и НЕ выполняй другие инструменты. Жди команды пользователя." : ""),
+      content: SYSTEM_PROMPT + roleNote + tasksNote + wdNote + dataNote + briefNote + cloneNote + (planMode ? "\n\nРЕЖИМ ПЛАНА: доступен только todoWrite — вызови его с планом работ (3–7 пунктов) и в тексте перечисли файлы, которые затронешь. НЕ изменяй файлы и НЕ выполняй другие инструменты. Жди команды пользователя." : ""),
     },
-    ...sanitizeToolPairs(runHistory.map((m) => ({ role: m.role, content: m.content }))),
+    ...sanitizeToolPairs(
+      runHistory.map((m) => {
+        const one = { role: m.role, content: m.content };
+        // Рабочая история из чекпоинта приходит с вызовами и их результатами, и
+        // терять их нельзя: без tool_call_id результат инструмента становится
+        // «осиротевшим», разбор пар его выбрасывает — и пауза опять теряла бы
+        // работу, ради которой чекпоинт и заведён.
+        if (m.tool_calls) one.tool_calls = m.tool_calls;
+        if (m.tool_call_id) one.tool_call_id = m.tool_call_id;
+        return one;
+      })
+    ),
   ];
+  // Первый чекпоинт — сразу: если приложение закроется во время ответа модели,
+  // работа уже на диске.
+  runCtx.save(canonical);
 
   // Ужать историю при переполнении контекста: бюджет уменьшается, список пересобирается.
   // Ровно та же работа нужна и при сжатии между раундами, поэтому — одной точкой входа.
@@ -462,6 +512,8 @@ async function runAi(settings, messages, win, opts) {
     settings,
     emit,
     askUserWait,
+    roleSuggestWait,
+    roleIdFromAny,
     toolPolicy,
     describeToolArgs,
     executeTool,
@@ -570,6 +622,8 @@ async function runAi(settings, messages, win, opts) {
     if (digestMsg) canonical.splice(1, 0, digestMsg);
     // Индикатор контекста — ПОСЛЕ подстановки: иначе он врал бы про занятое место.
     emitContext(canonical);
+    // Чекпоинт перед запросом: обрыв на ответе модели оставляет работу на диске.
+    runCtx.save(canonical);
 
     // Один раунд (запрос, поток ответа, метрики) живёт в src/run-round.js: там же
     // объяснено, почему состав схем, бюджет и usage ошибаются тихо. Хозяином цикла
@@ -648,6 +702,7 @@ async function runAi(settings, messages, win, opts) {
     // порядок событий — в src/run-calls.js, остановка остаётся за прогоном.
     if (callPrep.canRunParallel(calls, planMode)) {
       await callPrep.runParallel(calls, canonical);
+      runCtx.save(canonical); // результаты шага уже в работе — фиксируем на диске
       if (global.__agentStopRequested) return stopGraceful();
       continue;
     }
@@ -655,7 +710,8 @@ async function runAi(settings, messages, win, opts) {
     // Строгая очередь (подтверждения, чекпоинт, аудит, журнал миссии) — в
     // src/run-strict.js. Сюда приходят вызовы, которые НЕЛЬЗЯ гнать пачкой:
     // запись, вопрос человеку, потенциально опасное. Остановка — за прогоном.
-    await strict.runStrict(calls, { planMode: planMode, history: canonical });
+    await strict.runStrict(calls, { planMode: planMode, history: canonical, role: role.id });
+    runCtx.save(canonical); // то же для строгой очереди: запись, правки, подтверждения
     // Остановка во время выполнения инструментов — завершаем без нового раунда.
     if (global.__agentStopRequested) return stopGraceful();
     mission.trackProgress(calls);

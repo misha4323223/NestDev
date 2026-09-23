@@ -379,6 +379,35 @@ function emit(w, event, args) {
     assert.ok(/require\("fs"\)/.test(mod) && /require\("path"\)/.test(mod), "модуль потерял fs/path");
   });
 
+  await test("имена снимков уникальны даже при остановившихся часах (два снимка не затирают друг друга)", async () => {
+    // Настоящая находка полного прогона: два снимка подряд в одну миллисекунду получали
+    // ОДНО имя, и второй молча затирал первый — модель читала чужой экран, а инструмент
+    // отдавал честный путь к уже другой картинке. Часы здесь останавливаем намеренно:
+    // иначе проверка ловила бы ошибку лишь иногда (когда два вызова случайно попадут в
+    // одну миллисекунду) и считалась бы зелёной, ничего не проверяя.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "screens-unique-"));
+    const s = createScreens({ BrowserWindow: makeWindow({}).BrowserWindow, userDataDir: dir });
+    const realNow = Date.now;
+    Date.now = () => 1700000000000;
+    try {
+      const a = s.saveScreenshotPng(Buffer.from("первый"), "page", "image/jpeg");
+      const b = s.saveScreenshotPng(Buffer.from("второй"), "page", "image/jpeg");
+      assert.notStrictEqual(a, b, "два снимка при одних часах получили одно имя: " + path.basename(a));
+      assert.strictEqual(fs.readFileSync(a).toString(), "первый", "первый снимок затёрло вторым");
+      assert.strictEqual(fs.readFileSync(b).toString(), "второй", "второй снимок записан не туда");
+      // Файл, оставшийся с прошлого запуска приложения, с тем же именем жертвой перезаписи
+      // быть не должен: имя сдвигается на шаг вперёд.
+      const stuck = path.join(dir, "screenshots", "page-1700000000002.jpg");
+      fs.writeFileSync(stuck, "старый снимок");
+      const c = s.saveScreenshotPng(Buffer.from("третий"), "page", "image/jpeg");
+      assert.notStrictEqual(c, stuck, "новый снимок лёг поверх старого с тем же именем");
+      assert.strictEqual(fs.readFileSync(stuck).toString(), "старый снимок", "старый снимок перезаписан");
+      assert.strictEqual(fs.readFileSync(c).toString(), "третий", "третий снимок записан не туда");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");
   process.exit(failed ? 1 : 0);
 })();

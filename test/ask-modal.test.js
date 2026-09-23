@@ -58,22 +58,34 @@ function buildAskModal() {
   const els = new Map();
   const calls = { focused: [], events: {} };
 
-  function mkEl(id) {
+  function mkEl(id, tag) {
     let cls = new Set();
+    const kids = [];
     const node = {
-      id: id, value: "", textContent: "", onclick: null,
+      id: id, tag: tag || "div", value: "", textContent: "", className: "", type: "",
+      onclick: null,
       listeners: {},
+      children: kids,
       classList: {
         add: (...c) => c.forEach((x) => cls.add(x)),
         remove: (...c) => c.forEach((x) => cls.delete(x)),
         contains: (c) => cls.has(c),
       },
+      appendChild(child) { kids.push(child); return child; },
       addEventListener(t, fn) { node.listeners[t] = fn; },
       focus() { calls.focused.push(id); },
       click() { if (node.onclick) return node.onclick(); },
     };
+    // innerHTML в браузере стирает детей — здесь ровно то же (кнопки вариантов).
+    Object.defineProperty(node, "innerHTML", {
+      get: () => kids.map((k) => k.textContent).join(""),
+      set: (v) => { if (!v) kids.length = 0; },
+    });
     return node;
   }
+
+  // Кнопки вариантов модуль создаёт сам — значит, нужен document.
+  const doc = { createElement: (tag) => mkEl("", tag) };
   for (const tag of HTML_SRC.matchAll(/<[^>]*id="([^"]+)"[^>]*>/g)) {
     const cls = /class="([^"]*)"/.exec(tag[0]);
     if (cls && /\bhidden\b/.test(cls[1])) {
@@ -100,6 +112,7 @@ function buildAskModal() {
   const box = {
     module: { exports: {} },
     self: {},
+    document: doc,
     console: { log() {}, warn() {}, error() {} },
     Object, Array, JSON, Date, Math, Promise, Error, String, RegExp, Number, Boolean, Set, Map,
     setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
@@ -242,6 +255,89 @@ function buildAskModal() {
     assert.doesNotThrow(() => env.$("btn-ask-send").onclick(), "кнопка ответа упала без ждущего");
     assert.doesNotThrow(() => env.$("btn-ask-cancel").onclick(), "кнопка отмены упала без ждущего");
     assert.ok(env.isHidden(), "окно осталось открытым");
+  });
+
+  console.log("\n[4] Варианты ответа: кнопка вместо набора текста");
+
+  await test("варианты показываются кнопками, поле остаётся для своего", () => {
+    const env = buildAskModal();
+    env.modal.wire();
+    env.modal.openAskModal("Какой сайт открыть?", ["Ozon", "Wildberries"], () => {});
+    const box = env.$("ask-options");
+    assert.strictEqual(box.children.length, 2, "кнопок вариантов не две: " + box.children.length);
+    assert.deepStrictEqual(box.children.map((b) => b.textContent), ["Ozon", "Wildberries"], "подписи кнопок не те");
+    assert.ok(box.children.every((b) => b.className === "ask-option"), "кнопки без общего класса — не будут видны как варианты");
+    assert.ok(!box.classList.contains("hidden"), "полоса вариантов осталась спрятанной");
+    assert.ok(/Своё/.test(env.$("ask-input").placeholder), "поле не подсказывает, что можно написать своё: " + env.$("ask-input").placeholder);
+  });
+
+  await test("нажатие варианта отдаёт его текст и закрывает окно один раз", () => {
+    const env = buildAskModal();
+    env.modal.wire();
+    const answers = [];
+    env.modal.openAskModal("Выполнить?", ["Да, выполнить", "Нет, пропустить"], (t) => answers.push(t));
+    env.$("ask-options").children[0].click();
+    assert.deepStrictEqual(answers, ["Да, выполнить"], "ответ кнопки не ушёл: " + JSON.stringify(answers));
+    assert.ok(env.isHidden(), "окно осталось открытым после нажатия варианта");
+    env.$("ask-options").children[1].click();
+    env.$("btn-ask-send").onclick();
+    assert.deepStrictEqual(answers, ["Да, выполнить"], "после ответа ушёл ещё один: " + JSON.stringify(answers));
+  });
+
+  await test("варианты прошлого вопроса не остаются у нового", () => {
+    const env = buildAskModal();
+    env.modal.wire();
+    const answers = [];
+    env.modal.openAskModal("Первый", ["Да", "Нет"], (t) => answers.push("первый:" + t));
+    env.modal.openAskModal("Второй (без вариантов)", (t) => answers.push("второй:" + t));
+    const box = env.$("ask-options");
+    assert.strictEqual(box.children.length, 0, "кнопки прошлого вопроса остались у нового: " + box.children.length);
+    assert.ok(box.classList.contains("hidden"), "пустая полоса вариантов осталась висеть");
+    assert.ok(!/Своё/.test(env.$("ask-input").placeholder), "подсказка про «своё» осталась без вариантов");
+    env.$("ask-input").value = "своё";
+    env.$("btn-ask-send").onclick();
+    assert.deepStrictEqual(answers, ["второй:своё"], "ответ ушёл не в последний вопрос: " + JSON.stringify(answers));
+
+    // И обратно: у вопроса с вариантами кнопки СБРАСЫВАЮТСЯ, а не добавляются к прежним.
+    env.modal.openAskModal("Третий", ["A", "B", "C"], () => {});
+    assert.strictEqual(box.children.length, 3, "кнопки не пересобраны: " + box.children.length);
+  });
+
+  await test("свой ответ вместе с вариантами: текст в поле важнее кнопок", () => {
+    const env = buildAskModal();
+    env.modal.wire();
+    const answers = [];
+    env.modal.openAskModal("Формат?", ["PDF", "DOCX"], (t) => answers.push(t));
+    env.$("ask-input").value = "  сделай оба  ";
+    env.$("btn-ask-send").onclick();
+    assert.deepStrictEqual(answers, ["сделай оба"], "свой ответ не ушёл: " + JSON.stringify(answers));
+  });
+
+  await test("мусор в вариантах и не-массив не превращаются в кнопки", () => {
+    const env = buildAskModal();
+    env.modal.wire();
+    env.modal.openAskModal("Вопрос", ["", "   ", null, "  Да  "], () => {});
+    const box = env.$("ask-options");
+    assert.strictEqual(box.children.length, 1, "пустые варианты стали кнопками: " + box.children.length);
+    assert.strictEqual(box.children[0].textContent, "Да", "текст варианта не обрезан: " + JSON.stringify(box.children[0].textContent));
+    env.modal.openAskModal("Вопрос", "Да", () => {});
+    assert.strictEqual(box.children.length, 0, "строка принята за список вариантов");
+    // Старый вызов (вопрос + обработчик) обязан работать: так зовёт веб-режим и события.
+    let got = null;
+    env.modal.openAskModal("Старый вызов", (t) => { got = t; });
+    env.$("ask-input").value = "ок";
+    env.$("btn-ask-send").onclick();
+    assert.strictEqual(got, "ок", "старый вызов без вариантов сломался");
+  });
+
+  await test("варианты едут из прогона в окно и в телефон", () => {
+    const events = read("src", "renderer", "chat-events.js");
+    assert.ok(/openAskModal\(ev\.question \|\| "Уточни, пожалуйста", ev\.options,/.test(events), "события агента не передают варианты в окно");
+    const web = read("src", "renderer", "web-chat.js");
+    assert.ok(/openAskModal\(question, \(c\.args && c\.args\.options\) \|\| \[\], resolve\)/.test(web), "веб-режим теряет варианты");
+    const schema = read("src", "renderer", "tool-schemas.js");
+    assert.ok(/options: \{[\s\S]{0,200}?type: "array"/.test(schema), "в схеме askUser нет вариантов ответа");
+    assert.ok(/options\.\.\./.test(schema) === false, "в схеме остался черновик");
   });
 
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");

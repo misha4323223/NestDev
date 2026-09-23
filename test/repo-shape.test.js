@@ -286,6 +286,117 @@ function walk(rel, out) {
     assert.deepStrictEqual(bad, [], "перехват по подстроке заглатывает несколько модулей — прогон слепнет или падает: " + bad.join(" | "));
   });
 
+  await test("живые прогоны знают настоящие имена депсов модулей, а не прежние", () => {
+    // Почему: стенд живого прогона собирает модуль САМ и передаёт ему по имени то же
+    // состояние, что main.js. Переименование депса (часть 44: userDataDir → tasksDataDir)
+    // стенд при этом не ловит: модуль падает только в момент ВЫЗОВА канала
+    // («tasksDataDir is not a function»), и так молчали два стенда — live-mission и
+    // live-reminders — до тех пор, пока живые прогоны не прогнали целиком. Здесь
+    // проверяется обратная сторона той же проводки и по имени: каждое имя, которое
+    // прогон передаёт модулю, обязано быть либо его депсом, либо живым значением моста,
+    // либо швом, который модуль читает сам (`deps.now`). Направление безопасное: не
+    // требуем передать ВСЁ, а запрещаем передавать несуществующее.
+    const { depsOf } = require(path.join(__dirname, "backend-wiring.js"));
+    const srcFiles = fs.readdirSync(path.join(ROOT, "src"));
+    const owner = new Map(); // имя сборщика → его модуль
+    for (const f of srcFiles) {
+      if (!/\.js$/.test(f)) continue;
+      const src = fs.readFileSync(path.join(ROOT, "src", f), "utf8");
+      for (const m of src.matchAll(/^(?:async )?function ((?:create|register)[A-Za-z0-9_]+)\s*\(/gm)) {
+        owner.set(m[1], { file: f, src: src });
+      }
+    }
+    // Блок аргументов от «{» до парной «}»: без этого ключи вложенных объектов
+    // (shell: { … }, live: { … }) смешались бы с именами депсов.
+    const callBlock = (text, at) => {
+      let depth = 0;
+      for (let i = at; i < text.length; i++) {
+        const c = text[i];
+        if (c === '"' || c === "'" || c === "`") {
+          const q = c;
+          i++;
+          while (i < text.length && text[i] !== q) { if (text[i] === "\\") i++; i++; }
+          continue;
+        }
+        if (c === "{" || c === "(" || c === "[") depth++;
+        else if (c === "}" || c === ")" || c === "]") { depth--; if (depth === 0) return text.slice(at, i + 1); }
+      }
+      return "";
+    };
+    // Ключи ТОЛЬКО первого уровня: { fs: fs, shell: { … }, tasksDataDir: () => ud }.
+    const topKeys = (block) => {
+      const inner = block.slice(1, -1);
+      const parts = [];
+      let depth = 0;
+      let cur = "";
+      for (let i = 0; i < inner.length; i++) {
+        const c = inner[i];
+        // Комментарии внутри сборки — не код: в них есть и запятые, и скобки, и
+        // двоеточия («Дела читаются в папке дел, а не в папке приложения (часть 44)»),
+        // и от них разбор ключей ломался (та же ловушка, что у разбора deps в
+        // test/backend-wiring.js — комментарии внутри блока убираются отдельно).
+        if (c === "/" && inner[i + 1] === "/") {
+          while (i < inner.length && inner[i] !== "\n") i++;
+          continue;
+        }
+        if (c === "/" && inner[i + 1] === "*") {
+          i += 2;
+          while (i < inner.length && !(inner[i] === "*" && inner[i + 1] === "/")) i++;
+          i++;
+          continue;
+        }
+        if (c === '"' || c === "'" || c === "`") {
+          const q = c;
+          cur += c;
+          i++;
+          while (i < inner.length && inner[i] !== q) { cur += inner[i]; if (inner[i] === "\\") { i++; cur += inner[i]; } i++; }
+          cur += q;
+          continue;
+        }
+        if (c === "{" || c === "(" || c === "[") depth++;
+        if (c === "}" || c === ")" || c === "]") depth--;
+        if (c === "," && depth === 0) { parts.push(cur); cur = ""; continue; }
+        cur += c;
+      }
+      parts.push(cur);
+      return parts
+        .map((p) => p.trim())
+        .filter(Boolean)
+        .map((p) => {
+          const m = p.match(/^([A-Za-z0-9_$]+)\s*:/);
+          if (m) return m[1];
+          return /^[A-Za-z0-9_$]+$/.test(p) ? p : null; // сокращённая запись: { fs, path }
+        })
+        .filter(Boolean);
+    };
+    const liveScripts = fs.readdirSync(path.join(ROOT, "scripts")).filter((f) => /^live-.*\.js$/.test(f));
+    const bad = [];
+    let checked = 0;
+    for (const f of liveScripts) {
+      const text = fs.readFileSync(path.join(ROOT, "scripts", f), "utf8");
+      for (const m of text.matchAll(/(?:^|[^.\w$])((?:create|register)[A-Za-z0-9_]+)\s*\(/g)) {
+        const own = owner.get(m[1]);
+        if (!own) continue;
+        const brace = text.indexOf("{", m.index + m[0].length - 1);
+        if (brace < 0) continue;
+        const block = callBlock(text, brace);
+        // Разлёт (`...base`) делает ключи невидимыми — такую сборку сторож не судит.
+        if (!block || block.indexOf("...") >= 0) continue;
+        const keys = topKeys(block);
+        const deps = depsOf(own.src);
+        if (!keys.length || !deps.size) continue; // распаковки нет — судить нечем
+        checked++;
+        const liveKeys = new Set([...own.src.matchAll(/\b(?:get|set)\s+([A-Za-z0-9_$]+)\s*\(/g)].map((x) => x[1]));
+        for (const k of keys) {
+          if (deps.has(k) || liveKeys.has(k) || new RegExp("deps\\." + k + "\\b").test(own.src)) continue;
+          bad.push(f + " → " + own.file + " («" + k + "»)");
+        }
+      }
+    }
+    assert.ok(checked >= 8, "сборок модулей в живых прогонах найдено подозрительно мало: " + checked);
+    assert.deepStrictEqual(bad, [], "живой прогон передаёт модулю имя, которого в нём нет — прогон упадёт в момент вызова: " + bad.join(" | "));
+  });
+
   await test("бюджет прямых чтений app.js в тестах не растёт", () => {
     // Разбор app.js идёт этапами: код уезжает в модули, и проверки должны находить его
     // через uiFile/uiAll/uiFind (test/smoke.test.js). Прямое чтение app.js остаётся
@@ -296,6 +407,12 @@ function walk(rel, out) {
     // «этого кода в оболочке больше нет». Без неё вынос можно считать завершённым,
     // а код — остаться в app.js двумя копиями. Больше одного чтения на модуль быть
     // не должно: всё остальное берётся через uiAll()/uiFile().
+    //
+    // Потолок поднят с 34 до 35 (часть 44, папки работы агента) — тем же правилом и с
+    // тем же смыслом: окно «Куда класть работу агента?» живёт в settings-panel.js, а
+    // один его шов лежит в оболочке — вопрос задаётся ПОСЛЕ загрузки настроек
+    // (afterLoad в chat-store + вызов сборки окна в app.js). Проверить этот шов можно
+    // только чтением app.js; второе чтение на эту же часть не добавлялось.
     // Считаем обе формы: и длинную (readFileSync(path.join(...))) и короткий помощник
     // read("src", "renderer", "app.js") из отдельных наборов — иначе чтение через
     // помощник осталось бы для сторожа невидимым.
@@ -307,7 +424,7 @@ function walk(rel, out) {
         (text.match(/readFileSync\(path\.join\(ROOT, "src", "renderer", "app\.js"\)/g) || []).length +
         (text.match(/\bread\("src", "renderer", "app\.js"\)/g) || []).length;
     }
-    assert.ok(n <= 34, "прямых чтений app.js стало " + n + " (потолок 34). Возьмите кусок через uiFile/uiAll/uiFind; если чтение действительно нужно — поднимите потолок здесь осознанно, с пояснением.");
+    assert.ok(n <= 35, "прямых чтений app.js стало " + n + " (потолок 35). Возьмите кусок через uiFile/uiAll/uiFind; если чтение действительно нужно — поднимите потолок здесь осознанно, с пояснением.");
   });
 
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");

@@ -184,6 +184,9 @@
     renderMessages: renderMessages,
     toast: toast,
     getProjectPanel: () => ProjectPanel,
+    // После загрузки настроек спрашиваем про папки работы агента — но только при
+    // первом запуске и один раз (см. settings-panel.js, maybeAskFolders).
+    afterLoad: () => { if (SettingsPanel && SettingsPanel.maybeAskFolders) SettingsPanel.maybeAskFolders(); },
   });
   // Сброс на диск при закрытии/сворачивании окна — на прежнем месте куска.
   ChatStore.wire();
@@ -495,6 +498,9 @@
     uid: uid,
     toast: toast,
     normalize: normalize,
+    // Роли нужны окну предложения сменить роль (событие role_suggest): чтобы не
+    // дублировать названия в разметке, подпись кнопки берётся из ядра.
+    AgentCore: AgentCore,
     getSettings: () => settings,
     setSettings: (s) => { settings = s; },
     getChatsData: () => chatsData,
@@ -693,6 +699,9 @@
     persistSettings: ChatStore.persistSettings,
     onEvent: ChatEvents.onAiEvent, // то же окно событий, что и у desktop-цикла
     openAskModal: AskModal.openAskModal,
+    // Предложение сменить роль (suggestRole) работает и в браузере: окно спрашивает,
+    // а меняет роль то же действие, что и кнопка «Роль».
+    setChatRole: TasksMission.setChatRole,
   });
 
   // ─────────────── Настройки ───────────────
@@ -1047,9 +1056,12 @@
       toast("Выбор папки доступен только в приложении на ПК");
       return;
     }
-    const p = await api.pickDirectory();
+    const p = await api.pickDirectory("work");
     if (p) $("s-workdir").value = p;
   };
+  // Куда класть работу агента (миссии, прогоны и дела): окно первого запуска и
+  // кнопка «🎯 Папки работы» в настройках — код в src/renderer/settings-panel.js.
+  SettingsPanel.wireSetupFolders();
 
   // Браузер агента: постоянный профиль (сессии сайтов) — очистка и обновление подписи
   if ($("btn-browser-profile-clear")) {

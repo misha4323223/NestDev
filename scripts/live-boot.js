@@ -19,6 +19,7 @@
      3. Проверяет, что ожидаемые модули объявились и панели повесили обработчики. */
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const vm = require("vm");
 
@@ -42,23 +43,53 @@ const ids = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
 const scripts = [...html.matchAll(/<script src="([^"]+)"><\/script>/g)].map((m) => m[1]);
 const assets = [...html.matchAll(/(?:src|href)="([^"/][^"]*\.(?:js|css))"/g)].map((m) => m[1]);
 
-// ── 1. Живой HTTP: мост отдаёт окно телефону ───────────────────────────────
+// ── 1. Живой мост: отдаёт окно телефону — и только по TLS ────────────────
+// Мост без сертификата НЕ поднимается (решение после работ по безопасности:
+// открытый http в локальной сети больше не вариант). Поэтому проверка идёт тем же
+// путём, что и телефон: настоящий самоподписанный сертификат и https.
+// Раньше здесь стоял обычный fetch по http и мост поднимался без certDir — после
+// тех работ start() молча выходил, сервер не слушал, и весь живой прогон окна
+// падал на первом же шаге с ECONNREFUSED (найдено при прогоне части 41).
 async function liveHttp() {
-  console.log("\n[1] Живой HTTP: мобильный мост отдаёт файлы окна");
+  console.log("\n[1] Живой HTTPS: мост отдаёт файлы окна телефону");
   const MobileBridge = require(path.join(ROOT, "src", "mobile-bridge.js"));
+  const httpsMod = require("https");
+  const httpMod = require("http");
   const port = 9187;
-  const b = new MobileBridge({ handlerMap: new Map() });
+  const certDir = fs.mkdtempSync(path.join(os.tmpdir(), "boot-tls-"));
+  const b = new MobileBridge({ handlerMap: new Map(), certDir: certDir });
   b.port = port;
   b.start();
   await new Promise((r) => setTimeout(r, 300));
+  // Первым делом — сам факт подъёма: без сертификата ответов не будет вовсе.
+  ok(!!b.server && !!b.tls, "мост поднялся с сертификатом" + (b.tlsError ? " (ошибка: " + b.tlsError + ")" : ""));
+  const get = (f) =>
+    new Promise((resolve, reject) => {
+      const req = httpsMod.get({ host: "127.0.0.1", port: port, path: "/" + f, rejectUnauthorized: false }, (res) => {
+        let body = "";
+        res.on("data", (c) => { body += c; });
+        res.on("end", () => resolve({ status: res.statusCode, body: body }));
+      });
+      req.on("error", reject);
+      req.setTimeout(5000, () => req.destroy(new Error("таймаут запроса")));
+    });
   try {
     for (const f of assets) {
-      const res = await fetch("http://127.0.0.1:" + port + "/" + f);
-      const body = await res.text();
-      ok(res.status === 200 && body.length > 0, "GET /" + f + " → " + res.status + ", " + body.length + " байт");
+      const res = await get(f);
+      ok(res.status === 200 && res.body.length > 0, "GET /" + f + " → " + res.status + ", " + res.body.length + " байт");
     }
+    // Обещание безопасности: по открытому HTTP то же окно не отдаётся.
+    const plain = await new Promise((resolve) => {
+      const req = httpMod.get({ host: "127.0.0.1", port: port, path: "/" + assets[0] }, (res) => resolve(res.statusCode || 0));
+      req.on("error", () => resolve(0));
+      req.setTimeout(3000, () => req.destroy(new Error("таймаут")));
+    });
+    ok(plain === 0 || plain >= 400, "по открытому HTTP окно не отдаётся (ответ: " + plain + ")");
   } finally {
     b.stop();
+    try {
+      fs.rmSync(certDir, { recursive: true, force: true });
+    } catch {}
   }
 }
 

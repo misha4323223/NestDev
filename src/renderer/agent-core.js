@@ -953,6 +953,48 @@
     return roleById(chat && chat.role).id;
   }
 
+  // ── Предложение сменить роль (инструмент suggestRole) ──────────────────
+  // Роль — режим ВСЕГО чата, и меняет её только человек: агент лишь предлагает,
+  // а окно показывает кнопку. Смысл не в иерархии ролей, а в наборе инструментов:
+  // у Разработчика он самый широкий, поэтому Ассистент, которому поручили код,
+  // честно говорит «это Разработчик» и предлагает переключиться, а не отказывается.
+  // Матрица ПОЛНАЯ: любая роль может предложить любую другую — выбор идёт по сути
+  // задачи, а не по «старшинству».
+  const ROLE_SUGGEST_REASONS = {
+    dev: "код, файлы, git и запуск проекта — это инструменты Разработчика",
+    assistant: "дела на этом ПК: файлы, документы, письма, сайты",
+    manager: "дела, сроки и напоминания",
+    researcher: "поиск и разбор источников",
+  };
+  const ROLE_ALIASES = {
+    разработчик: "dev", developer: "dev", dev: "dev", кодер: "dev", программист: "dev",
+    ассистент: "assistant", assistant: "assistant", помощник: "assistant",
+    менеджер: "manager", manager: "manager",
+    исследователь: "researcher", researcher: "researcher",
+  };
+
+  // Принимает id, русское название, синоним или иконку роли — модель присылает
+  // любое, и опечатка не должна молча включать роль по умолчанию.
+  function roleIdFromAny(v) {
+    const raw = String(v == null ? "" : v).trim().toLowerCase();
+    if (!raw) return "";
+    const direct = AGENT_ROLES.find((r) => r.id === raw);
+    if (direct) return direct.id;
+    const bare = raw.replace(/[^a-zа-яё]/g, "");
+    if (ROLE_ALIASES[bare]) return ROLE_ALIASES[bare];
+    const byAlias = AGENT_ROLES.find((r) => r.title.toLowerCase().replace(/[^a-zа-яё]/g, "") === bare);
+    return byAlias ? byAlias.id : "";
+  }
+
+  // Варианты предложения для текущей роли: все роли, кроме неё самой.
+  function roleSuggestOptions(fromId) {
+    const from = roleById(fromId).id;
+    return AGENT_ROLES.filter((r) => r.id !== from).map((r) => ({
+      id: r.id, icon: r.icon, title: r.title, hint: r.hint,
+      reason: ROLE_SUGGEST_REASONS[r.id] || r.hint,
+    }));
+  }
+
   const BASE_TOOL_NAMES = [
     // файлы и папки
     "createFolder", "readFile", "readFileLines", "writeFile", "editFile", "listDirectory",
@@ -963,7 +1005,8 @@
     // git-основы (приложение про репозитории — это обязательный минимум)
     "gitStatus", "gitDiff", "gitLog", "gitCommit", "gitBranch",
     // диалог, план, память
-    "askUser", "todoWrite", "memoryList", "memorySearch", "findTools",
+    "askUser", "suggestRole", "todoWrite", "memoryList", "memorySearch", "findTools",
+    "diaryWrite", "diaryRead",
     // web, картинки, ожидание
     "webSearch", "webFetch", "showImage", "analyzeImage", "generateImage", "waitUntil", "checkUrl",
   ];
@@ -1033,8 +1076,8 @@
       title: "заметки и точки возврата",
       keywords: ["заметк", "note", "чекпоинт", "checkpoint", "точку возврата", "точка возврата",
         "дневник", "памятк", "откатись"],
-      names: ["noteSave", "noteRead", "noteList", "noteDelete", "checkpointSave", "checkpointList",
-        "checkpointRollback"],
+      names: ["noteSave", "noteRead", "noteList", "noteDelete", "diaryWrite", "diaryRead",
+        "checkpointSave", "checkpointList", "checkpointRollback"],
     },
     {
       id: "tasks",
@@ -1460,6 +1503,9 @@
     rolesList,
     rolePlan,
     roleOfChat,
+    roleIdFromAny,
+    roleSuggestOptions,
+    ROLE_SUGGEST_REASONS,
     TOOL_GROUPS,
     BASE_TOOL_NAMES,
     groupOfTool,

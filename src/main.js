@@ -11,6 +11,7 @@ const {
   SYSTEM_PROMPT,
   TOOL_DEFINITIONS,
   rolePlan,
+  roleIdFromAny,
   createThinkingStripper,
   extractToolCallsFromText,
   normalizeToolName,
@@ -87,6 +88,8 @@ const { createRunCalls } = require("./run-calls.js"); // вызовы раунд
 const { createRunStrict } = require("./run-strict.js"); // строгая очередь вызовов: подтверждения, чекпоинт, аудит, журнал миссии
 const { createRunBatch } = require("./run-batch.js"); // решения после раунда: пустой отчёт, граница батча, закрытие работы
 const { createRunNudge } = require("./run-nudge.js"); // призывы по текстовому ответу: план не закрыт, сторож миссии
+const { createRunContext } = require("./run-context.js"); // рабочая история прогона: продолжение с места остановки
+const { createAskWait } = require("./ask-wait.js"); // ожидание ответа человека: варианты кнопкой и снятый таймер
 const unifiedPatch = require("./unified-patch.js"); // применение unified diff (applyPatch)
 const codeIndex = require("./code-index.js"); // семантический индекс кода (BM25 + стемминг)
 const yandexCloud = require("./yandex-cloud.js"); // Yandex Cloud REST API: авторизация, дашборд, создание ресурсов
@@ -252,7 +255,9 @@ const {
   fs,
   path,
   os,
-  execFile,
+  // Запуск git — через spawn со СВОЕЙ ГРУППОЙ процессов (ловушка 5 из HANDOFF:
+  // execFile молча теряет detached, и таймаут не мог погасить дерево git).
+  spawn,
   envFor,
   live: {
     lastAgentRepoDir: () => lastAgentRepoDir,
@@ -260,6 +265,27 @@ const {
     activeToolCapability: getCapability,
   },
 });
+
+
+// ── Где лежит работа агента: миссии, прогоны и дела — код в src/agent-data.js ──
+// Одна точка правды о раскладке. Пусто в настройке — ПРЕЖНЕЕ место: миссии и
+// прогоны в `.agent/` рядом с проектом, дела в папке приложения. Выбрана своя
+// папка — файлы уезжают туда, а у миссий внутри заводится подпапка проекта (иначе
+// миссии двух проектов смешались бы). Настройки читаются в момент вызова: папку
+// могут сменить в открытом окне, а копия «застыла» бы на прежней.
+// Хранилище миссий и прогонов спрашивает раскладку отсюда (missionStore через
+// agent-data), каналы дел — через tasksDataDir; своего счёта путей ни у кого нет.
+const agentData = require("./agent-data.js");
+const agentLayoutFor = (workDir) => {
+  const s = loadSettings();
+  // Пустая рабочая папка (не задана) — считаем по текущему проекту: у вызовов,
+  // которым папка не важна (зеркало дел), она взяться неоткуда.
+  const wd = String(workDir || "").trim() || agentWorkDir(s);
+  return agentData.layout(s, wd, app.getPath("userData"));
+};
+agentData.install(agentLayoutFor);
+// Папка данных дел: своя (выбрана человеком) или папка приложения, как было.
+const tasksDataDir = () => agentLayoutFor("").tasksRoot;
 
 
 // Директория, в которой агент выполняет git и команды: если недавно клонировали репозиторий — там,
@@ -439,7 +465,9 @@ const systemStack = createSystemStack({
   fs,
   path,
   os,
-  execFile,
+  // Запуск команд системного раздела — через spawn со СВОЕЙ ГРУППОЙ процессов:
+  // таймаут гасит дерево, а не одну оболочку (см. src/system-stack.js, runGroup).
+  spawn,
   winPs,
   probeEnv,
   stripAnsi,
@@ -502,6 +530,7 @@ const { userDataDir, emitTasksChanged, canNotify, notifyUser, armTaskWake,
   missionStore,
   loadSettings,
   agentWorkDir,
+  tasksDataDir,
   getWindow: () => mainWindow,
 });
 // ── Справочники по сайтам (agent-guides) — код в src/site-guides.js ──
@@ -564,6 +593,8 @@ const { runAi } = createRunAi({
   contextBudget,
   createContextManager,
   createRunBatch,
+  createRunContext,
+  createAskWait,
   createRunCalls,
   createRunMission,
   createRunNudge,
@@ -596,6 +627,7 @@ const { runAi } = createRunAi({
   rateLimiterFor,
   readApiError,
   resolvePath,
+  roleIdFromAny,
   rolePlan,
   routeTools,
   routerMaxTokens,
@@ -614,7 +646,7 @@ const { runAi } = createRunAi({
   toolPolicy,
   toolsAsText,
   truncateText,
-  userDataDir,
+  tasksDataDir,
   windowBudget,
   live: {
     get activeAbort() { return activeAbort; },
@@ -765,7 +797,7 @@ registerMissionIpc({
   missionStore,
   loadSettings,
   agentWorkDir,
-  userDataDir,
+  tasksDataDir,
   emitTasksChanged,
   armTaskWake,
   live: {
@@ -1159,6 +1191,7 @@ const { executeTool } = createToolRegistry({
   cachedPs,
   invalidatePsCache,
   refreshEnvFromOS,
+  tasksDataDir,
   userDataDir,
   emitTasksChanged,
   // фоновые процессы и снимки экрана

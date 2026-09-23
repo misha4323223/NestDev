@@ -5,8 +5,9 @@
 
    Здесь живёт всё, что происходит между списком дел и человеком:
 
-     • **зеркало списка в рабочей папке** (.agent/tasks.md) — человек видит дела
-       файлом рядом с проектом, а не только в панели приложения;
+     • **зеркало списка файлом** (`.agent/tasks.md` рядом с проектом или `tasks.md`
+       в выбранной человеком папке дел) — человек видит дела файлом на ПК, а не
+       только в панели приложения;
      • **напоминания по сроку** — системное уведомление (Notification) плюс тост в
        ленте чата. Дело помечается напомненным: пристаём один раз и только после
        смены срока;
@@ -25,9 +26,12 @@
    закрытое окно. */
 
 function createTasksReminders(deps) {
-  const { app, Notification, agentStore, missionStore, loadSettings, agentWorkDir, getWindow } = deps;
+  const { app, Notification, agentStore, missionStore, loadSettings, agentWorkDir, tasksDataDir, getWindow } = deps;
 
-// Хранилище приложения (дела, заметки): вне рабочей папки, поэтому в git не попадает.
+// Папка приложения: здесь живут справочники по сайтам и прочее хозяйство; дела же
+// лежат в папке данных дел (tasksDataDir) — она своя, если человек выбрал её в
+// настройках, и совпадает с папкой приложения, когда не выбрал. Функцию отдаём
+// наружу как есть: её берёт site-guides значением.
 function userDataDir() {
   return app.getPath("userData");
 }
@@ -43,8 +47,8 @@ function emitTasksChanged() {
   try {
     const s = loadSettings();
     if (s.agentWorkFiles === false) return;
-    const brief = agentStore.tasksBrief(userDataDir(), 40);
-    const board = agentStore.tasksBoard(userDataDir());
+    const brief = agentStore.tasksBrief(tasksDataDir(), 40);
+    const board = agentStore.tasksBoard(tasksDataDir());
     const sum = (board && board.summary) || {};
     missionStore.tasksMirror(
       agentWorkDir(s),
@@ -90,7 +94,7 @@ let taskWakeTimer = null;
 function armTaskWake() {
   if (taskWakeTimer) { clearTimeout(taskWakeTimer); taskWakeTimer = null; }
   let ms = 0;
-  try { ms = agentStore.tasksNextDue(userDataDir()); } catch { ms = 0; }
+  try { ms = agentStore.tasksNextDue(tasksDataDir()); } catch { ms = 0; }
   if (!ms) return;
   const delay = Math.max(1000, Math.min(ms + 250, 6 * 60 * 60 * 1000));
   taskWakeTimer = setTimeout(() => { taskWakeTimer = null; checkTaskReminders(); }, delay);
@@ -112,10 +116,10 @@ function checkTaskReminders() {
     autoOn = s.taskAuto !== false;
     // Автозадачи выключены галочкой — дело не должно молчать совсем: напоминаем
     // тостом, как обычное (иначе «ставлю время, и не происходит ничего»).
-    if (remindOn) due = agentStore.tasksTakeReminders(userDataDir(), undefined, { includeAuto: !autoOn }).tasks;
+    if (remindOn) due = agentStore.tasksTakeReminders(tasksDataDir(), undefined, { includeAuto: !autoOn }).tasks;
     // Автозадачи — это работа агента, а не тост: галочка напоминаний их не глушит.
     if (autoOn) {
-      const take = agentStore.tasksTakeAuto(userDataDir());
+      const take = agentStore.tasksTakeAuto(tasksDataDir());
       auto = take.tasks;
       failed = take.failed || [];
     }

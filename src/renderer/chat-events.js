@@ -23,7 +23,7 @@
   }
 })(typeof self !== "undefined" ? self : this, function (ChatEventsDeps) {
   const {
-    $, api, isElectron, uid, toast, normalize,
+    $, api, isElectron, uid, toast, normalize, AgentCore,
     getSettings, setSettings, getChatsData, getSession,
     setLastUndoCount, setPlanCollapsed, getRemoteRunNotified, setRemoteRunNotified,
     msgEls, autoQueue, flushAutoQueue, persistChatsSoon, buildMessageEl, refreshMessage,
@@ -182,8 +182,25 @@
       }
       case "ask": {
         // Агент задал вопрос (askUser) — показываем модалку и ждём ответа
-        openAskModal(ev.question || "Уточни, пожалуйста", (t) => {
+        openAskModal(ev.question || "Уточни, пожалуйста", ev.options, (t) => {
           if (isElectron && api.answerQuestion) api.answerQuestion(t);
+        });
+        break;
+      }
+      case "role_suggest": {
+        // Агент ПРЕДЛАГАЕТ сменить роль чата (suggestRole). Роль меняет человек —
+        // кнопкой; окно то же, что и у askUser, поэтому разметку не дублируем.
+        // Смена вступит в силу со следующего сообщения: текущий прогон идёт в своей
+        // роли (набор инструментов на ходу не меняется — ради кэша провайдера).
+        const rsId = String(ev.role || "");
+        const rsInfo = (AgentCore && AgentCore.roleById && AgentCore.roleById(rsId)) || { icon: "", title: rsId };
+        const rsSwitch = "Переключиться на " + (rsInfo.icon ? rsInfo.icon + " " : "") + (rsInfo.title || rsId);
+        const rsStay = "Остаться как есть";
+        const rsWhy = String(ev.reason || "").trim();
+        openAskModal((rsWhy ? rsWhy + "\n\n" : "") + "Переключить роль чата?", [rsSwitch, rsStay], (t) => {
+          const switched = String(t || "").trim() === rsSwitch;
+          if (switched) getTasksMission().setChatRole(rsId);
+          if (isElectron && api.answerQuestion) api.answerQuestion(switched ? rsId : "");
         });
         break;
       }

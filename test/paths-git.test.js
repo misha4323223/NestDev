@@ -23,7 +23,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const http = require("http");
-const { execFile } = require("child_process");
+const { spawn } = require("child_process");
 
 const ROOT = path.join(__dirname, "..");
 const { createPathsGit } = require(path.join(ROOT, "src", "paths-git.js"));
@@ -68,15 +68,46 @@ function makeLive(init) {
   };
 }
 
-/* Подставной execFile: записывает, с чем его позвали, и отвечает по сценарию. */
-function fakeExecFile(reply) {
+/* Подставной spawn: записывает, с чем его позвали, и отвечает по сценарию.
+   Сценарий — функция от (file, args, opts) или объект:
+     out / err   — что уйдёт в потоки (строки);
+     code        — код возврата в «close» (по умолчанию 0);
+     signal      — сигнал в «close»;
+     error       — событие «error» (отказ запуска, например ENOENT);
+     never       — процесс не завершается: проверяем ветку таймаута.
+   Подделываем именно spawn, а не execFile: так проверяется НАСТОЯЩИЙ путь
+   запуска (часть 43 — своя группа процессов у git). */
+function fakeSpawn(scenario) {
   const calls = [];
-  const fn = (file, args, opts, cb) => {
+  const fn = (file, args, opts) => {
     calls.push({ file, args, opts });
-    const r = typeof reply === "function" ? reply(file, args, opts) : reply;
-    process.nextTick(() => cb(r.err || null, r.stdout || "", r.stderr || ""));
+    const s = (typeof scenario === "function" ? scenario(file, args, opts) : scenario) || {};
+    const child = new (require("events").EventEmitter)();
+    child.pid = s.pid || 424242;
+    child.killed = false;
+    child.kill = () => { child.killed = true; return true; };
+    child.stdout = new (require("events").EventEmitter)();
+    child.stderr = new (require("events").EventEmitter)();
+    process.nextTick(() => {
+      if (s.error) { child.emit("error", s.error); return; }
+      if (s.out) child.stdout.emit("data", Buffer.from(String(s.out)));
+      if (s.err) child.stderr.emit("data", Buffer.from(String(s.err)));
+      if (s.never) return; // жив вечно — таймаут должен погасить его деревом
+      child.emit("close", s.code == null ? 0 : s.code, s.signal || null);
+    });
+    return child;
   };
   return { calls, fn };
+}
+
+/* Группа процессов pid (pgrp из /proc/<pid>/stat): поле 5 после закрывающей
+   скобки. Свой pid == своя группа — этого и добиваемся через detached (ловушка 5). */
+function pgidOf(pid) {
+  try {
+    const stat = fs.readFileSync("/proc/" + pid + "/stat", "utf8");
+    const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return Number(rest[2]);
+  } catch { return -1; }
 }
 
 function makePaths(over) {
@@ -92,7 +123,7 @@ function makePaths(over) {
     fs,
     path,
     os,
-    execFile: over && over.execFile ? over.execFile : execFile,
+    spawn: over && over.spawn ? over.spawn : spawn,
     envFor,
     live,
   });
@@ -207,10 +238,10 @@ fs.writeFileSync(plainFile, "x");
     // Ни токена, ни переменных агента — окружение процесса не подменяем вовсе:
     // иначе git получил бы урезанный набор и, например, потерял бы PATH.
     async function call(liveInit, settings) {
-      const f = fakeExecFile({ stdout: "ok", stderr: "" });
+      const f = fakeSpawn({ out: "ok" });
       const { box, live } = makeLive(liveInit);
       const api = createPathsGit({
-        fs, path, os, execFile: f.fn, live,
+        fs, path, os, spawn: f.fn, live,
         envFor: () => ({ ...box.agentEnv }), // как в жизни: выдача по назначению
       });
       await api.runGit(tmpRoot, ["status"], settings, "git.read");
@@ -231,9 +262,9 @@ fs.writeFileSync(plainFile, "x");
   await test("runGit: git не найден — понятная подсказка, а не «ENOENT»", async () => {
     const err = new Error("spawn git ENOENT");
     err.code = "ENOENT";
-    const f = fakeExecFile({ err });
+    const f = fakeSpawn({ error: err });
     const { live } = makeLive();
-    const api = createPathsGit({ fs, path, os, execFile: f.fn, envFor: () => ({}), live });
+    const api = createPathsGit({ fs, path, os, spawn: f.fn, envFor: () => ({}), live });
     const r = await api.runGit(tmpRoot, ["status"], {}, "git.read");
     assert.strictEqual(r.ok, false);
     assert.ok(/git-scm\.com/.test(r.err), "подсказка, где взять git: " + r.err);
@@ -298,7 +329,7 @@ fs.writeFileSync(plainFile, "x");
         throw e;
       },
     });
-    const api = createPathsGit({ fs: broke, path, os, execFile, envFor: () => ({}), live: makeLive().live });
+    const api = createPathsGit({ fs: broke, path, os, envFor: () => ({}), live: makeLive().live });
     const r = api.ensureWritableDir(dirA);
     assert.strictEqual(r.ok, false, "отказ прав пропущен: " + JSON.stringify(r));
     assert.ok(/Нет прав на запись/.test(r.error) && /Permission denied/.test(r.error), "причина отказа потеряна: " + r.error);
@@ -320,7 +351,7 @@ fs.writeFileSync(plainFile, "x");
         return fs.mkdirSync(p, o);
       },
     });
-    const api = createPathsGit({ fs: broke, path, os, execFile, envFor: () => ({}), live: makeLive().live });
+    const api = createPathsGit({ fs: broke, path, os, envFor: () => ({}), live: makeLive().live });
     const r = api.ensureWritableDir(dirA);
     assert.strictEqual(r.ok, false, "провал пробы записи прошёл за успех — git упадёт у пользователя");
     assert.ok(/git не сможет создать тут репозиторий/.test(r.error), "в отказе нет главного: git тут не сможет работать: " + r.error);
@@ -365,6 +396,117 @@ fs.writeFileSync(plainFile, "x");
     assert.ok(MODULE_SRC.indexOf("function ensureWritableDir(dir)") >= 0, "проверки записи нет в модуле путей");
     assert.ok(/\n  ensureWritableDir,\n/.test(bridge), "проверка записи не взята из модуля путей");
     assert.ok(/\n  ensureWritableDir,\n/.test(MAIN_SRC), "проверка записи не передана потребителям (каналы GitHub и проектов)");
+  });
+
+  // ── Часть 43: свой процессный групп у git ────────────────────────────
+  // Тот же класс, что закрыт у runCommand/runCapture: таймаут обязан гасить
+  // ВСЁ дерево потомков, иначе процесс команды остаётся жить мимо приложения.
+  await test("runGit: запуск идёт в СВОЕЙ группе процессов (detached), как runCommand", async () => {
+    const f = fakeSpawn({ out: "ok" });
+    const { live } = makeLive();
+    const api = createPathsGit({ fs, path, os, spawn: f.fn, envFor: () => ({}), live });
+    await api.runGit(tmpRoot, ["status"], {}, "git.read");
+    assert.strictEqual(f.calls.length, 1, "git не запустился");
+    const opts = f.calls[0].opts || {};
+    assert.strictEqual(f.calls[0].file, "git", "запускается не git");
+    assert.strictEqual(opts.detached, process.platform !== "win32",
+      "без своего лидера группы таймаут не гасит дерево (ловушка 5)");
+    assert.strictEqual(opts.stdio, "pipe", "вывод должен собираться, а не пропадать");
+  });
+
+  await test("runGit: настоящий git — свой pgrp подтверждён в /proc (реальный, не подделка)", async () => {
+    if (process.platform === "win32") return; // POSIX-проверка
+    let seen = null;
+    const { live } = makeLive();
+    const api = createPathsGit({
+      fs, path, os, envFor: () => ({}), live,
+      spawn: (file, args, opts) => {
+        const child = spawn(file, args, opts);
+        // Читаем СРАЗУ после spawn: ребёнок либо жив, либо зомби —
+        // libuv не успевает пересобрать (однопоточный цикл), пgrp уже тот.
+        seen = { pid: child.pid, pgid: pgidOf(child.pid) };
+        return child;
+      },
+    });
+    await api.runGit(tmpRoot, ["status"], {}, "git.read");
+    assert.ok(seen && seen.pid > 0, "настоящий git не запустился");
+    assert.strictEqual(seen.pgid, seen.pid,
+      "git не лидер собственной группы — дерево не гасится по таймауту");
+  });
+
+  await test("runGit: таймаут зовёт killTree (гасит ДЕРЕВО), промис не виснет", async () => {
+    const f = fakeSpawn({ never: true }); // процесс живёт вечно
+    const { live } = makeLive();
+    const killed = [];
+    const api = createPathsGit({
+      fs, path, os, spawn: f.fn, envFor: () => ({}), live,
+      // Контракт общий со всеми тремя модулями (shell-tools, system-stack,
+      // deploy-ipc): killTree получает ДИТЯ, а не голый pid — иначе дефолтный
+      // killCommandTree(child) внутри модуля не найдёт в pid поле .pid.
+      killTree: (child) => killed.push(child.pid),
+    });
+    const started = Date.now();
+    const r = await api.runGit(tmpRoot, ["status"], {}, "git.read", 600);
+    assert.ok(Date.now() - started < 3000, "промис завис после таймаута");
+    assert.deepStrictEqual(killed, [424242], "дерево не погашено — утечка команды");
+    assert.strictEqual(r.ok, false, "таймаут обязан быть честной ошибкой");
+    assert.ok(/мс/.test(r.err) || /остановлен/.test(r.err), "нет объяснения про таймаут: " + r.err);
+    assert.ok(f.calls[0].opts.detached, "гасить дерево можно только из-за своей группы");
+  });
+
+  await test("runGit: НАСТОЯЩЕЕ дерево гаснет по таймауту — внук не остаётся жить", async () => {
+    if (process.platform === "win32") return; // POSIX: обёртка PATH + /proc
+    const child_process = require("child_process");
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "fb-tree-"));
+    const bin = path.join(work, "bin");
+    fs.mkdirSync(bin);
+    const pidFile = path.join(work, "grandchild.pid");
+    // Обёртка «git»: записывает свой pid, рождает ВНУКА (живёт вечно) и усыпляет себя.
+    // Обёртка наследует наше окружение (opts.env не задан → родительское), поэтому
+    // PATH-трюк работает, а настоящий системный git не трогаем.
+    fs.writeFileSync(path.join(bin, "git"),
+      '#!/bin/sh\necho $$ > "' + work + '/self.pid"\n' +
+      "node -e 'require(\"fs\").writeFileSync(\"" + pidFile + "\", String(process.pid));setInterval(()=>{},1000)' >/dev/null 2>&1 &\n" +
+      "sleep 60\n", { mode: 0o755 });
+    const oldPath = process.env.PATH;
+    process.env.PATH = bin + ":" + oldPath;
+    try {
+      const { live } = makeLive();
+      const api = createPathsGit({ fs, path, os, spawn, envFor: () => ({}), live });
+      const r = await api.runGit(work, ["status"], {}, "git.read", 700);
+      assert.strictEqual(r.ok, false, "таймаут обязан вернуться ошибкой");
+      assert.ok(/мс/.test(r.err), "нет честного сообщения про останов: " + r.err);
+      // Дерево: и обёртка, и внук должны быть мертвы (grace-период runGit ≈ 1.6 с).
+      await new Promise((res) => setTimeout(res, 2000));
+      const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+      const selfPid = Number(fs.readFileSync(path.join(work, "self.pid"), "utf8").trim());
+      const grandPid = Number(fs.readFileSync(pidFile, "utf8").trim());
+      assert.strictEqual(alive(selfPid), false, "обёртка git пережила таймаут");
+      assert.strictEqual(alive(grandPid), false, "ВНУК остался жить — дерево не погашено (ловушка 5)");
+    } finally {
+      process.env.PATH = oldPath;
+      try { fs.rmSync(work, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  await test("части 43 в телах: system-stack на spawn+detached, оболочка передаёт spawn в git-модуль", async () => {
+    const STACK = fs.readFileSync(path.join(ROOT, "src", "system-stack.js"), "utf8");
+    assert.ok(STACK.indexOf('spawn(file, args, {') >= 0 && STACK.indexOf("detached:") >= 0,
+      "system-stack не переведён на spawn со своей группой");
+    // Ловим именно ВЫЗОВ execFile (с открывающей скобкой): упоминание «прежний
+    // execFile» в комментариях — история правки, а не запуск без группы.
+    assert.ok(STACK.indexOf("execFile(") < 0, "execFile остался в system-stack");
+    assert.ok(MODULE_SRC.indexOf('spawn("git", args, opts)') >= 0, "runGit не на spawn");
+    assert.ok(MODULE_SRC.indexOf("detached:") >= 0, "runGit без своей группы");
+    assert.ok(MODULE_SRC.indexOf("execFile(") < 0, "execFile остался в paths-git");
+    // Сверяем САМ вызов createPathsGit, а не весь файл: дальше по main.js есть
+    // `execFile,` у реестра инструментов, и ленивый регекс дотянулся бы до него
+    // — проверка прошла бы или упала мимо дела.
+    const at = MAIN_SRC.indexOf('const { createPathsGit } = require("./paths-git.js")');
+    assert.ok(at > 0, "модуль не подключён");
+    const call = MAIN_SRC.slice(at, MAIN_SRC.indexOf("\n});", at));
+    assert.ok(/createPathsGit\(\{[\s\S]*?spawn,/.test(call), "оболочка не передаёт spawn в модуль git");
+    assert.ok(!/createPathsGit\(\{[\s\S]*?execFile,/.test(call), "execFile всё ещё передаётся в git-модуль");
   });
 
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");

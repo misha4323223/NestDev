@@ -9,6 +9,10 @@
    mission:state/pause/stop/resume/finish/delete/open/list,
    agentfiles:status/openDir/clear.
 
+   Дела лежат не в userData напрямую, а в папке данных дел: она своя, если человек
+   выбрал её в настройках (src/agent-data.js), и папка приложения — если нет. Пути
+   раскладки сюда не вшиты: папку спрашиваем функцией tasksDataDir в момент вызова.
+
    Живое значение одно: missionClaim — id миссии, которую человек вернул в работу
    кнопкой «▶ Продолжить». Его переписывает и этот модуль, и прогон агента (отбор
    миссии в runAi), поэтому оно передано мостом live с чтением и записью: копия
@@ -23,7 +27,7 @@ function registerMissionIpc(deps) {
     missionStore,
     loadSettings,
     agentWorkDir,
-    userDataDir,
+    tasksDataDir,
     emitTasksChanged,
     armTaskWake,
   } = deps;
@@ -38,7 +42,7 @@ function registerMissionIpc(deps) {
     },
   };
 
-ipcMain.handle("tasks:board", () => agentStore.tasksBoard(userDataDir()));
+ipcMain.handle("tasks:board", () => agentStore.tasksBoard(tasksDataDir()));
 
 // ── Миссии (долгая работа агента) ──────────────────────────────────────────
 // Панель «Миссия» показывает цель, шаги, журнал и метрики; кнопки ставят работу
@@ -175,7 +179,21 @@ ipcMain.handle("mission:list", () => missionStateForUi());
 function agentFilesStatus() {
   const s = loadSettings();
   const dir = agentWorkDir(s);
-  let st = { dir: dir, root: missionStore.agentRoot(dir), exists: false, tasks: null, contextDays: [], missions: 0, bytes: 0 };
+  let st = {
+    dir: dir,
+    root: missionStore.agentRoot(dir),
+    exists: false,
+    tasks: null,
+    contextDays: [],
+    missions: 0,
+    bytes: 0,
+    missionsRoot: missionStore.agentRoot(dir),
+    missionsCustom: false,
+    tasksRoot: "",
+    tasksMirrorRoot: "",
+    tasksCustom: false,
+    insideProject: false,
+  };
   try {
     st = missionStore.mirrorStatus(dir);
   } catch {}
@@ -190,6 +208,15 @@ function agentFilesStatus() {
     contextDays: st.contextDays || [],
     missions: st.missions || 0,
     bytes: st.bytes || 0,
+    // Раскладка: панель показывает, ГДЕ файлы лежат на самом деле, а не «рядом с
+    // проектом» по памяти. Пусто в настройке — прежние места (.agent/ и папка
+    // приложения), и тогда панель говорит об этом словами, а не пустотой.
+    missionsRoot: st.missionsRoot || st.root || "",
+    missionsCustom: !!st.missionsCustom,
+    tasksRoot: st.tasksRoot || "",
+    tasksMirrorRoot: st.tasksMirrorRoot || "",
+    tasksCustom: !!st.tasksCustom,
+    insideProject: !!st.insideProject,
   };
 }
 ipcMain.handle("agentfiles:status", () => agentFilesStatus());
@@ -215,9 +242,9 @@ ipcMain.handle("agentfiles:clear", () => {
       : "Ошибка: " + r.error,
   };
 });
-ipcMain.handle("tasks:list", (_e, opts) => agentStore.tasksList(userDataDir(), opts || {}));
+ipcMain.handle("tasks:list", (_e, opts) => agentStore.tasksList(tasksDataDir(), opts || {}));
 ipcMain.handle("tasks:add", (_e, input) => {
-  const r = agentStore.tasksAdd(userDataDir(), input || {});
+  const r = agentStore.tasksAdd(tasksDataDir(), input || {});
   if (r.ok) {
     emitTasksChanged();
     armTaskWake(); // срок мог стать ближе — будильник перезаряжаем сразу
@@ -225,7 +252,7 @@ ipcMain.handle("tasks:add", (_e, input) => {
   return r;
 });
 ipcMain.handle("tasks:update", (_e, key, patch) => {
-  const r = agentStore.tasksUpdate(userDataDir(), key, patch || {});
+  const r = agentStore.tasksUpdate(tasksDataDir(), key, patch || {});
   if (r.ok) {
     emitTasksChanged();
     armTaskWake(); // срок мог стать ближе — будильник перезаряжаем сразу
@@ -233,7 +260,7 @@ ipcMain.handle("tasks:update", (_e, key, patch) => {
   return r;
 });
 ipcMain.handle("tasks:done", (_e, key, done) => {
-  const r = agentStore.tasksDone(userDataDir(), key, done !== false);
+  const r = agentStore.tasksDone(tasksDataDir(), key, done !== false);
   if (r.ok) {
     emitTasksChanged();
     armTaskWake(); // срок мог стать ближе — будильник перезаряжаем сразу
@@ -241,7 +268,7 @@ ipcMain.handle("tasks:done", (_e, key, done) => {
   return r;
 });
 ipcMain.handle("tasks:delete", (_e, key) => {
-  const r = agentStore.tasksDelete(userDataDir(), key);
+  const r = agentStore.tasksDelete(tasksDataDir(), key);
   if (r.ok) {
     emitTasksChanged();
     armTaskWake(); // срок мог стать ближе — будильник перезаряжаем сразу
@@ -251,7 +278,7 @@ ipcMain.handle("tasks:delete", (_e, key) => {
 // Подтверждение от окна: автозадача действительно пошла в прогон (ok) или не смогла.
 // Без этого окна планировщик повторяет попытку и в конце честно говорит о неудаче.
 ipcMain.handle("tasks:auto-ack", (_e, key, ok, error) => {
-  const r = agentStore.tasksAutoAck(userDataDir(), key, ok !== false, error || "");
+  const r = agentStore.tasksAutoAck(tasksDataDir(), key, ok !== false, error || "");
   if (r.ok) {
     emitTasksChanged();
     armTaskWake();
@@ -259,7 +286,7 @@ ipcMain.handle("tasks:auto-ack", (_e, key, ok, error) => {
   return r;
 });
 ipcMain.handle("tasks:auto-rearm", (_e, key) => {
-  const r = agentStore.tasksAutoRearm(userDataDir(), key);
+  const r = agentStore.tasksAutoRearm(tasksDataDir(), key);
   if (r.ok) {
     emitTasksChanged();
     armTaskWake();

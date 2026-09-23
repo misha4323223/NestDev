@@ -53,7 +53,23 @@
     renderMessages,
     toast,
     getProjectPanel,
+    afterLoad,
   } = ChatStoreDeps || {};
+
+  // Один раз после загрузки состояния зовём оболочку: ей есть что показать ПОСЛЕ
+  // того, как настройки прочитаны с диска. Так работает окно первого запуска
+  // «Куда класть работу агента» (settings-panel.js) — оно обязано появиться поверх
+  // готового окна, а не рядом с недочитанными настройками. Зовём ровно один раз:
+  // перечитывание истории с другого устройства не повод показывать его снова.
+  let afterLoadFired = false;
+  function fireAfterLoad() {
+    if (afterLoadFired) return;
+    afterLoadFired = true;
+    if (typeof afterLoad !== "function") return;
+    try {
+      afterLoad();
+    } catch {}
+  }
 
   // ─────────────── Хранилище ───────────────
   function loadState() {
@@ -62,6 +78,7 @@
         setSettings(normalize(s));
         setChatsData(sanitizeChats(c || { chats: [], activeId: null }));
         persistChats();
+        fireAfterLoad();
       });
     }
     try {
@@ -70,6 +87,7 @@
     try {
       setChatsData(sanitizeChats(JSON.parse(localStorage.getItem("chats") || "null") || { chats: [], activeId: null }));
     } catch {}
+    fireAfterLoad();
     return Promise.resolve();
   }
 

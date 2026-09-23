@@ -95,13 +95,32 @@ function createScreens(deps) {
     return { buf: png, mime: "image/png", ext: ".png" };
   }
 
+  // Отметки времени для имён снимков: строго возрастают даже внутри одной
+  // миллисекунды (см. saveScreenshotPng).
+  let lastShotStamp = 0;
+  function nextShotStamp() {
+    const now = Date.now();
+    lastShotStamp = now > lastShotStamp ? now : lastShotStamp + 1;
+    return lastShotStamp;
+  }
+
   // Сохранить скриншот на диск (расширение — по типу картинки). Агент читает его
   // через analyzeImage(path).
   function saveScreenshotPng(buf, baseName, mime) {
     const dir = path.join(userDataDir, "screenshots");
     fs.mkdirSync(dir, { recursive: true });
     const ext = String(mime || "").indexOf("jpeg") !== -1 ? ".jpg" : ".png";
-    const file = path.join(dir, String(baseName || "shot").replace(/[^\w.-]+/g, "_") + "-" + Date.now() + ext);
+    const base = String(baseName || "shot").replace(/[^\w.-]+/g, "_");
+    // Имя снимка обязано быть уникальным. Раньше в него шёл один Date.now(), и два
+    // снимка в одну миллисекунду (агент снимает несколько адресов подряд — это
+    // обычное дело) молча затирали друг друга: модель получала путь, а по нему
+    // лежала уже ДРУГАЯ картинка, и вся её работа шла по чужому экрану. Отметка
+    // времени строго растёт внутри процесса, а файл, оставшийся с прошлого запуска
+    // приложения, сдвигает имя на шаг вперёд — потеря снимка не тихая, а невозможная.
+    let file = "";
+    do {
+      file = path.join(dir, base + "-" + nextShotStamp() + ext);
+    } while (fs.existsSync(file));
     fs.writeFileSync(file, buf);
     return file;
   }

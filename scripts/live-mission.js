@@ -50,7 +50,10 @@ const mod = registerMissionIpc({
   missionStore: missionStore,
   loadSettings: () => Object.assign({}, settings),
   agentWorkDir: (s) => s.workingDir,
-  userDataDir: () => userData,
+  // Папка данных дел приходит ФУНКЦИЕЙ и спрашивается в момент вызова: она своя, если
+  // человек выбрал её в настройках (src/agent-data.js), и папка приложения — если нет.
+  // Стенд отдаёт папку приложения: без выбора человека это то же самое место.
+  tasksDataDir: () => userData,
   emitTasksChanged: () => { emitted++; },
   armTaskWake: () => { armed++; },
   live: { missionClaim: () => claim, setMissionClaim: (v) => { claim = v; } },

@@ -23,7 +23,7 @@
   }
 })(typeof self !== "undefined" ? self : this, function (WebChatDeps) {
   const {
-    AgentCore, getSettings, openaiProfilesArr, persistSettings, onEvent, openAskModal,
+    AgentCore, getSettings, openaiProfilesArr, persistSettings, onEvent, openAskModal, setChatRole,
   } = WebChatDeps || {};
   // ─────────────── Веб-режим: чат напрямую из браузера ───────────────
   // Единый цикл на общем транспорте AgentCore (те же правила, что и в Electron main).
@@ -55,7 +55,9 @@
       getSettings().openaiActiveProfile = next.id;
       getSettings().openaiUrl = next.url || getSettings().openaiUrl;
       getSettings().openaiApiKey = next.apiKey || "";
-      if (next.model) getSettings().openaiModel = next.model;
+      // Модель — принадлежность подключения: пустая у нового значит пустая, а не
+      // модель прошлого ключа (та же правка, что в switchOpenaiProfile).
+      getSettings().openaiModel = next.model || "";
       if (next.project !== undefined) getSettings().openaiProject = next.project || "";
       persistSettings();
       onEvent({ type: "profile_switched", name: next.name || next.id, id: next.id, error: String(errText || "").slice(0, 160) });
@@ -265,8 +267,36 @@
         if (c.name === "askUser") {
           // В веб-режиме askUser тоже работает: спрашиваем через модалку
           const question = (c.args && c.args.question) || "Уточни, пожалуйста";
-          result = await new Promise((resolve) => openAskModal(question, resolve));
+          result = await new Promise((resolve) => openAskModal(question, (c.args && c.args.options) || [], resolve));
           result = result && String(result).trim() ? String(result).trim() : "(пользователь не дал ответ)";
+        } else if (c.name === "suggestRole") {
+          // Предложение сменить роль: окно спрашивает кнопкой, а роль меняет то же
+          // действие, что и кнопка «Роль». Смена ждёт следующего сообщения — текущий
+          // прогон идёт в своей роли, поэтому говорим об этом модели прямо.
+          const wrRaw = c.args && c.args.role;
+          const wrWant = AgentCore.roleIdFromAny(wrRaw);
+          const wrCur = String(opts.role || "dev");
+          if (!wrWant) {
+            result = "Ошибка: неизвестная роль " + JSON.stringify(String(wrRaw == null ? "" : wrRaw)) +
+              ". Доступные: dev (Разработчик), assistant (Ассистент), manager (Менеджер), researcher (Исследователь).";
+          } else if (wrWant === wrCur) {
+            result = "Ошибка: роль уже «" + wrCur + "» — предлагать нечего, продолжай работу.";
+          } else {
+            const wrInfo = AgentCore.roleById(wrWant);
+            const wrSwitch = "Переключиться на " + wrInfo.icon + " " + wrInfo.title;
+            const wrStay = "Остаться как есть";
+            const wrWhy = String((c.args && c.args.reason) || "").trim();
+            const wrAns = await new Promise((resolve) =>
+              openAskModal((wrWhy ? wrWhy + "\n\n" : "") + "Переключить роль чата?", [wrSwitch, wrStay], resolve)
+            );
+            if (String(wrAns || "").trim() === wrSwitch) {
+              if (typeof setChatRole === "function") setChatRole(wrWant);
+              result = "Пользователь согласился и переключил роль чата на «" + wrWant +
+                "». Текущий прогон продолжается в прежней роли, новые инструменты будут доступны со следующего сообщения.";
+            } else {
+              result = "Пользователь решил остаться в текущей роли. Продолжай своими силами; если чего-то не хватает — прямо скажи.";
+            }
+          }
         } else if (c.name === "webSearch" || c.name === "webFetch") {
           // Веб-поиск и чтение страниц работают и в браузере: запрос идёт через
           // preview-сервер (/api/…), потому что DuckDuckGo и сайты блокируют CORS.
@@ -322,10 +352,10 @@
           // работают только в desktop-приложении (main-процесс Electron).
           result =
             "⚠️ Инструменты браузера (browserOpen и др.) и управления окном приложения (appRead/appClick и др.) доступны только в desktop-приложении. Запустите приложение на Windows (bun run dist:win).";
-        } else if (c.name && (c.name === "noteSave" || c.name === "noteRead" || c.name === "noteList" || c.name === "noteDelete" || c.name === "checkpointSave" || c.name === "checkpointList" || c.name === "checkpointRollback")) {
-          // Память проекта и точки отката работают только в desktop-приложении.
+        } else if (c.name && (c.name === "noteSave" || c.name === "noteRead" || c.name === "noteList" || c.name === "noteDelete" || c.name === "diaryWrite" || c.name === "diaryRead" || c.name === "checkpointSave" || c.name === "checkpointList" || c.name === "checkpointRollback")) {
+          // Память проекта, дневник агента и точки отката работают только в desktop-приложении.
           result =
-            "⚠️ Инструменты памяти проекта (noteSave/noteRead/noteList/noteDelete) и точек отката (checkpointSave/checkpointList/checkpointRollback) доступны только в desktop-приложении. Запустите приложение на Windows (bun run dist:win).";
+            "⚠️ Инструменты памяти проекта (noteSave/noteRead/noteList/noteDelete), дневника агента (diaryWrite/diaryRead) и точек отката (checkpointSave/checkpointList/checkpointRollback) доступны только в desktop-приложении. Запустите приложение на Windows (bun run dist:win).";
         } else if (c.name === "ycStatus" || c.name === "ycList" || c.name === "ycCreate" || c.name === "ycDelete" || c.name === "ycDeploy" || c.name === "ycLogs" || c.name === "ycContainer") {
           result =
             "⚠️ Инструменты Yandex Cloud (ycStatus/ycList/ycCreate/ycDelete) доступны только в desktop-приложении. Запустите приложение на Windows (bun run dist:win).";

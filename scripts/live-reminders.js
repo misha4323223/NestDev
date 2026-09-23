@@ -63,6 +63,10 @@ const api = createTasksReminders({
   missionStore: missionStore,
   loadSettings: () => Object.assign({}, settings),
   agentWorkDir: (s) => s.workingDir,
+  // Папка данных дел приходит ФУНКЦИЕЙ: она своя, если человек выбрал её в настройках
+  // (src/agent-data.js), и папка приложения — если нет. Стенд отдаёт папку приложения:
+  // без выбора человека это то же самое место.
+  tasksDataDir: () => userData,
   getWindow: () => win,
 });
 

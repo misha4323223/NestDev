@@ -3,11 +3,13 @@
 
    Зачем файлы, а не память процесса: агент, который работает часами, не имеет права
    терять задачу из-за перезапуска, обновления или обрыва связи. Поэтому цель, план,
-   шаги и журнал шагов лежат на диске — рядом с проектом, в папке `.agent/`:
+   шаги и журнал шагов лежат на диске — по умолчанию рядом с проектом, в папке
+   `.agent/`, а если человек выбрал свою папку (настройка «миссии и прогоны»),
+   в её подпапке проекта:
 
-     <рабочая папка>/.agent/
-       README.md              — что это за папка (создаётся один раз, для человека)
-       .gitignore             — `*`: журнал не должен попадать в коммиты проекта
+     <корень>/
+       README.md              — что это за папка (только у `.agent/`, один раз, для человека)
+       .gitignore             — `*`: журнал не должен попадать в коммиты (только у `.agent/`)
        tasks.md               — зеркало списка дел (читаемо, если включено в настройках)
        context/<ГГГГ-ММ-ДД>.md — зеркало памяток контекста за день
        missions/<id>/
@@ -15,6 +17,11 @@
          journal.md           — журнал человеческим языком (время · шаг · что сделано)
          journal.jsonl        — то же машинно: панель «Миссия» читает хвост
          report.md            — итог работы (когда миссия закрыта)
+       runs/<чат>.json        — рабочая история незавершённого прогона (src/run-context.js)
+
+   Где именно корень, решает src/agent-data.js: только он знает про выбранную
+   человеком папку и про ключ проекта, и все пути здесь считаются через него
+   (agentRoot). Пусто в настройке — прежнее место: `.agent/` рядом с проектом.
 
    Никаких зависимостей от Electron: рабочая папка приходит аргументом, поэтому модуль
    проверяется обычными тестами. Секреты маскируются тем же кодом, что и дневник
@@ -24,8 +31,8 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { redactSecrets, localDayKey } = require("./agent-store.js");
+const { AGENT_DIR, layoutOf } = require("./agent-data.js"); // раскладка: своя папка или .agent/
 
-const AGENT_DIR = ".agent";
 const MISSIONS_DIR = "missions";
 const MISSION_MAX_KEEP = 40; // сколько миссий храним (старые закрытые удаляются)
 const MISSION_MAX_STEPS = 200; // шагов в одной миссии
@@ -83,8 +90,27 @@ function atomicWriteText(file, text) {
 }
 
 // ── Пути ──────────────────────────────────────────────────────────────────────
-function agentRoot(workDir) {
+// Место по умолчанию: `.agent/` рядом с проектом. Оно же — место зеркал контекста
+// и защитных файлов, поэтому живёт отдельным именем: выбранная человеком папка его
+// НЕ заменяет.
+function defaultRoot(workDir) {
   return path.join(String(workDir || ""), AGENT_DIR);
+}
+
+// Корень миссий и прогонов. Считается раскладкой (src/agent-data.js): пусто в
+// настройке — `.agent/` рядом с проектом, выбрана папка — её подпапка проекта.
+function agentRoot(workDir) {
+  return layoutOf(workDir).missionsRoot;
+}
+
+// Как назвать папку миссий в текстах (человеку и модели). По умолчанию — прежняя
+// относительная запись `.agent/missions/<id>/`: она читается от рабочей папки.
+// Когда папка выбрана человеком, `.agent/` рядом с проектом уже нет — называем
+// полный путь, иначе и человек, и модель искали бы файлы не там.
+function missionsPathText(workDir, id) {
+  const tail = MISSIONS_DIR + "/" + (id ? String(id) + "/" : "");
+  if (!layoutOf(workDir).missionsCustom) return AGENT_DIR + "/" + tail;
+  return path.join(agentRoot(workDir), tail.slice(0, -1)) + path.sep;
 }
 
 function missionsDir(workDir) {
@@ -99,8 +125,10 @@ function missionFile(workDir, id) {
   return path.join(missionDirOf(workDir, id), "mission.json");
 }
 
-// Папка `.agent` создаётся один раз: README для человека и .gitignore (`*`), чтобы
-// рабочий журнал не попадал в коммиты проекта (авто-коммит агента делает git add -A).
+// README и `.gitignore` ставятся ТОЛЬКО у `.agent/` рядом с проектом: первый
+// объясняет папку человеку, второй закрывает её от коммитов (авто-коммит агента
+// делает git add -A). В папке, выбранной человеком, приложение ничего лишнего не
+// создаёт: она может быть чем угодно, и мусорить там нельзя.
 const AGENT_README = [
   "# .agent — рабочая папка агента",
   "",
@@ -109,6 +137,7 @@ const AGENT_README = [
   "- `missions/<id>/mission.json` — цель, план, шаги, этапы работы, состояние, метрики;",
   "- `missions/<id>/journal.md` — журнал шагов человеческим языком (в нём же строки «🧭 Этап …»);",
   "- `missions/<id>/report.md` — итог по завершении;",
+  "- `runs/<чат>.json` — рабочая история незавершённого прогона (продолжение с места остановки);",
   "- `tasks.md` — зеркало списка дел приложения (если включено в настройках);",
   "- `context/<дата>.md` — зеркало памяток контекста (если включена «Память диалогов»).",
   "",
@@ -117,8 +146,8 @@ const AGENT_README = [
   "",
 ].join("\n");
 
-function ensureAgentRoot(workDir) {
-  const root = agentRoot(workDir);
+function ensureDefaultRoot(workDir) {
+  const root = defaultRoot(workDir);
   fs.mkdirSync(root, { recursive: true });
   const readme = path.join(root, "README.md");
   if (!fs.existsSync(readme)) atomicWriteText(readme, AGENT_README);
@@ -127,6 +156,15 @@ function ensureAgentRoot(workDir) {
     // `*` в .gitignore внутри каталога исключает и сам файл — папка целиком вне git.
     atomicWriteText(gi, "*\n");
   }
+  return root;
+}
+
+// Папка миссий создаётся перед первой записью: и миссия, и прогон, и зеркало кладут
+// файлы через неё.
+function ensureAgentRoot(workDir) {
+  const root = agentRoot(workDir);
+  if (root === defaultRoot(workDir)) ensureDefaultRoot(workDir);
+  else fs.mkdirSync(root, { recursive: true });
   fs.mkdirSync(missionsDir(workDir), { recursive: true });
   return root;
 }
@@ -665,7 +703,7 @@ function missionResumeText(rec, journalText) {
   if (!rec) return "";
   const pr = missionProgress(rec);
   const lines = [
-    "Продолжи миссию «" + rec.title + "» (файлы: .agent/missions/" + rec.id + "/).",
+    "Продолжи миссию «" + rec.title + "» (файлы: " + missionsPathText(rec.workDir || "", rec.id) + ").",
     "Цель: " + rec.goal,
     "План: " + (rec.steps.length ? rec.steps.map((s, i) => (i + 1) + ") " + (s.state === "done" ? "✓ " : s.state === "failed" ? "⚠ " : "") + s.title).join("; ") : "не составлен"),
     "Прогресс: " + pr.done + " из " + pr.total + " готово" + (pr.failed ? ", не удалось: " + pr.failed : "") + ".",
@@ -676,15 +714,23 @@ function missionResumeText(rec, journalText) {
   return lines.filter(Boolean).join("\n");
 }
 
-// ── Зеркала: задачи и контекст рядом с проектом ───────────────────────────────
-// Дела живут в данных приложения (userData), но человек просил видеть их файлом на ПК.
+// ── Зеркала: дела и контекст ──────────────────────────────────────────────────
+// Дела живут в данных приложения (userData) или в своей папке, но человек просил
+// видеть их файлом на ПК: зеркало кладётся в папку дел (свою) или рядом с проектом
+// (в `.agent/` — как было). Памятки контекста остаются у `.agent/` рядом с проектом:
+// это зеркало разговора о проекте, и уезжать вместе с делами оно не просилось.
 function tasksMirror(workDir, text) {
   const dir = String(workDir || "").trim();
-  if (!dir) return { ok: false, error: "Не задана рабочая папка." };
+  const L = layoutOf(dir);
+  // Пустая рабочая папка без своей папки дел — писать некуда (как было). Своя папка
+  // дел делает зеркало независимым от проекта: пишем даже без рабочей папки.
+  if (!dir && !L.tasksCustom) return { ok: false, error: "Не задана рабочая папка." };
+  const root = L.tasksMirrorRoot || defaultRoot(dir);
   try {
-    ensureAgentRoot(dir);
-    atomicWriteText(path.join(agentRoot(dir), "tasks.md"), clip(text, 200000) + "\n");
-    return { ok: true };
+    if (root === defaultRoot(dir)) ensureDefaultRoot(dir);
+    else fs.mkdirSync(root, { recursive: true });
+    atomicWriteText(path.join(root, "tasks.md"), clip(text, 200000) + "\n");
+    return { ok: true, file: path.join(root, "tasks.md") };
   } catch (err) {
     return { ok: false, error: (err && err.message) || String(err) };
   }
@@ -697,8 +743,8 @@ function contextMirror(workDir, ts, text) {
   if (!body) return { ok: false, error: "Пустая памятка." };
   const t = Number(ts) || Date.now();
   try {
-    ensureAgentRoot(dir);
-    const cdir = path.join(agentRoot(dir), "context");
+    ensureDefaultRoot(dir);
+    const cdir = path.join(defaultRoot(dir), "context");
     fs.mkdirSync(cdir, { recursive: true });
     const file = path.join(cdir, localDayKey(t) + ".md");
     const head = "# Памятки контекста за " + localDayKey(t) + "\n";
@@ -734,30 +780,68 @@ function dirBytes(dir, depth) {
   return total;
 }
 
-// Что уже лежит рядом с проектом: для настроек («папка работы агента»).
+// Что уже лежит в папках работы: для настроек («папка работы агента»). Пустая
+// настройка — прежние места, поэтому по умолчанию всё считается как считалось.
 function mirrorStatus(workDir) {
   const dir = String(workDir || "").trim();
-  const out = { dir, root: agentRoot(dir), exists: false, tasks: null, contextDays: [], missions: 0, bytes: 0 };
-  if (!dir) return out;
+  const L = layoutOf(dir);
+  const droot = defaultRoot(dir);
+  const mroot = L.missionsRoot || droot;
+  const troot = L.tasksMirrorRoot || droot;
+  const out = {
+    dir: dir,
+    root: mroot,
+    defaultRoot: droot,
+    missionsRoot: mroot,
+    tasksRoot: L.tasksRoot || "",
+    tasksMirrorRoot: troot,
+    missionsCustom: !!L.missionsCustom,
+    tasksCustom: !!L.tasksCustom,
+    insideProject: !!(L.missionsCustom && L.missionsInsideProject) || !!(L.tasksCustom && L.tasksInsideProject),
+    exists: false,
+    tasks: null,
+    contextDays: [],
+    missions: 0,
+    bytes: 0,
+  };
+  if (!dir && !L.missionsCustom && !L.tasksCustom) return out;
+  const fileBytes = (f) => {
+    try {
+      const st = fs.statSync(f);
+      return st.isFile() ? st.size : 0;
+    } catch {
+      return 0;
+    }
+  };
   try {
-    out.exists = fs.existsSync(out.root);
-    if (!out.exists) return out;
-    const tf = path.join(out.root, "tasks.md");
+    out.exists =
+      (!!dir && fs.existsSync(droot)) ||
+      (mroot !== droot && fs.existsSync(mroot)) ||
+      (troot !== droot && fs.existsSync(troot));
+    const tf = path.join(troot, "tasks.md");
     if (fs.existsSync(tf)) {
       const st = fs.statSync(tf);
       out.tasks = { file: tf, bytes: st.size, mtime: st.mtimeMs };
     }
-    const cdir = path.join(out.root, "context");
-    if (fs.existsSync(cdir)) {
-      out.contextDays = fs
-        .readdirSync(cdir)
-        .filter((f) => /\.md$/.test(f))
-        .sort()
-        .reverse()
-        .slice(0, 30);
+    if (dir) {
+      const cdir = path.join(droot, "context");
+      if (fs.existsSync(cdir)) {
+        out.contextDays = fs
+          .readdirSync(cdir)
+          .filter((f) => /\.md$/.test(f))
+          .sort()
+          .reverse()
+          .slice(0, 30);
+      }
+      out.missions = missionList(dir, { limit: 100 }).length;
     }
-    out.missions = missionList(dir, { limit: 100 }).length;
-    out.bytes = dirBytes(out.root);
+    let bytes = dir ? dirBytes(droot) : 0;
+    if (mroot !== droot) bytes += dirBytes(mroot);
+    // В своей папке дел могут лежать и другие файлы человека: считаем только файлы
+    // дела (tasks.json и зеркало), иначе цифра «сколько занимает работа агента»
+    // врала бы в разы.
+    if (troot !== droot) bytes += fileBytes(tf) + fileBytes(path.join(troot, "tasks.json"));
+    out.bytes = bytes;
   } catch {}
   return out;
 }
@@ -766,18 +850,21 @@ function mirrorStatus(workDir) {
 // это работа агента, её удаляет человек сам в проводнике.
 function mirrorClear(workDir) {
   const dir = String(workDir || "").trim();
-  if (!dir) return { ok: false, error: "Не задана рабочая папка." };
+  const L = layoutOf(dir);
+  if (!dir && !L.tasksCustom) return { ok: false, error: "Не задана рабочая папка." };
   const removed = [];
   try {
-    const tf = path.join(agentRoot(dir), "tasks.md");
+    const tf = path.join(L.tasksMirrorRoot || defaultRoot(dir), "tasks.md");
     if (fs.existsSync(tf)) {
       fs.rmSync(tf, { force: true });
       removed.push("tasks.md");
     }
-    const cdir = path.join(agentRoot(dir), "context");
-    if (fs.existsSync(cdir)) {
-      fs.rmSync(cdir, { recursive: true, force: true });
-      removed.push("context/");
+    if (dir) {
+      const cdir = path.join(defaultRoot(dir), "context");
+      if (fs.existsSync(cdir)) {
+        fs.rmSync(cdir, { recursive: true, force: true });
+        removed.push("context/");
+      }
     }
   } catch (err) {
     return { ok: false, error: (err && err.message) || String(err) };
@@ -793,11 +880,14 @@ module.exports = {
   JOURNAL_KEEP_LINES,
   MISSION_STATUSES,
   STEP_STATES,
+  defaultRoot,
   agentRoot,
   missionsDir,
   missionDirOf,
   missionFile,
   ensureAgentRoot,
+  ensureDefaultRoot,
+  missionsPathText,
   slugify,
   missionCreate,
   missionLoad,

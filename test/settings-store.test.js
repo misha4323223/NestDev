@@ -284,6 +284,23 @@ const readRaw = (file) => (fs.existsSync(file) ? fs.readFileSync(file, "utf8") :
     assert.strictEqual(s.openaiProject, "pr2", "проект не переехал: " + s.openaiProject);
   });
 
+  await test("переключение: у нового подключения нет модели — чужая модель не остаётся", () => {
+    const env = build();
+    const s = {
+      openaiProfiles: [
+        { id: "p1", url: "u1", apiKey: "k1", model: "m1" },
+        { id: "p2", url: "u2", apiKey: "k2" },
+      ],
+      openaiActiveProfile: "p1",
+      openaiUrl: "u1",
+      openaiApiKey: "k1",
+      openaiModel: "m1",
+    };
+    const next = env.store.switchOpenaiProfile(s, {});
+    assert.ok(next && next.id === "p2", "переключение не случилось");
+    assert.strictEqual(s.openaiModel, "", "модель прошлого подключения осталась у нового: " + s.openaiModel);
+  });
+
   await test("провинившийся ключ отлеживается: следующий раз берётся другой, а не он же", () => {
     const env = build();
     const s = {

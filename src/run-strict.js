@@ -33,6 +33,10 @@ function createRunStrict(deps) {
     emit,
     // Вопрос человеку и ожидание ответа (askUser) — ведёт прогон.
     askUserWait,
+    // Предложение сменить роль (suggestRole): ждём ответа так же, а роль меняет окно.
+    roleSuggestWait,
+    // Разбор роли из аргументов модели (id, русское название) — живёт в ядре.
+    roleIdFromAny,
     // Что считать опасным — решает только политика (src/tool-policy.js).
     toolPolicy,
     describeToolArgs,
@@ -71,14 +75,39 @@ function createRunStrict(deps) {
         /^(да|yes|y|ok|го|ага|точно|конечно|давай|выполн)/i.test(String(answer || "").trim());
       if (c.name === "askUser") {
         const question = (c.args && c.args.question) || "Уточни, пожалуйста";
-        const answer = await askUserWait(question);
+        // options — варианты ответа кнопками (человек может выбрать или написать своё).
+        const answer = await askUserWait(question, c.args && c.args.options);
         result = answer && String(answer).trim() ? String(answer).trim() : "(пользователь не дал ответ)";
+      } else if (c.name === "suggestRole") {
+        // Предложение сменить роль. Роль — режим ВСЕГО чата, и меняет её человек
+        // кнопкой в окне; мы только ждём ответа. Смена вступит в силу со следующего
+        // сообщения (текущий прогон идёт в своей роли), поэтому говорим модели это
+        // прямо — иначе она решит, что инструменты уже другие, и начнёт ими звать.
+        const curRole = String(opts.role || "dev");
+        const wantRaw = c.args && c.args.role;
+        const want = roleIdFromAny(wantRaw);
+        if (!want) {
+          result = "Ошибка: неизвестная роль " + JSON.stringify(String(wantRaw == null ? "" : wantRaw)) +
+            ". Доступные: dev (Разработчик), assistant (Ассистент), manager (Менеджер), researcher (Исследователь).";
+        } else if (want === curRole) {
+          result = "Ошибка: роль уже «" + curRole + "» — предлагать нечего, продолжай работу своими инструментами.";
+        } else {
+          const answer = await roleSuggestWait(want, (c.args && c.args.reason) || "");
+          const switched = String(answer == null ? "" : answer).trim() === want;
+          decision = switched ? "approved" : "denied";
+          result = switched
+            ? "Пользователь согласился и переключил роль чата на «" + want + "». Текущий прогон продолжается в прежней роли, новые инструменты будут доступны со следующего сообщения: доведи текущий шаг тем, что есть, и коротко скажи об этом."
+            : "Пользователь решил остаться в текущей роли. Продолжай своими силами; если чего-то не хватает — прямо скажи, чего именно.";
+        }
       } else if (c.name === "runCommand" && toolPolicy.isDangerousCommand((c.args && c.args.command) || "")) {
         // Потенциально опасные команды выполняем только после явного подтверждения
         // (что считать опасным — решает политика: src/tool-policy.js).
         const cmd = String((c.args && c.args.command) || "");
+        // Подтверждение опасного — тоже выбор: кнопки «Да, выполнить» / «Нет, пропустить»
+        // (ответ кнопки проверяется тем же confirmYes).
         const answer = await askUserWait(
-          "⚠️ Команда потенциально опасна: «" + cmd.slice(0, 160) + "»\nВыполнить? (да / нет)"
+          "⚠️ Команда потенциально опасна: «" + cmd.slice(0, 160) + "»\nВыполнить?",
+          ["Да, выполнить", "Нет, пропустить"]
         );
         if (confirmYes(answer)) {
           decision = "approved";
@@ -91,7 +120,10 @@ function createRunStrict(deps) {
       } else if (toolPolicy.needsConfirm(c.name)) {
         // Инструмент с высоким риском и без своей защиты — спрашиваем пользователя.
         const desc = describeToolArgs(c.name, c.args);
-        const answer = await askUserWait("⚠️ Действие потенциально опасно: " + desc + "\nВыполнить? (да / нет)");
+        const answer = await askUserWait("⚠️ Действие потенциально опасно: " + desc, [
+          "Да, выполнить",
+          "Нет, пропустить",
+        ]);
         if (confirmYes(answer)) {
           decision = "approved";
           result = await executeTool(c.name, c.args, settings);

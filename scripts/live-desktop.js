@@ -245,6 +245,50 @@ function startFakeProvider(seen, rounds, rate, script) {
     check("запущен свежий код (imageAttempts на месте)", fresh, fresh ? "" : "окно не подняло ядро за 15 с (или порт занят старым экземпляром)");
     if (!fresh) throw new Error("к отладке подключился старый экземпляр приложения");
 
+    console.log("\n[1c] Окно первого запуска: где держать работу агента");
+    // Человек в новой версии видит этот вопрос ОДИН раз: миссии, прогоны и дела
+    // лежат файлами, и приложение спрашивает, где их держать. Проверяется это только
+    // в НАСТОЯЩЕМ окне (в Node такого не увидеть): окно показано, до ответа оно
+    // ПЕРЕКРЫВАЕТ интерфейс (человек отвечает первым делом — как раз поэтому стухший
+    // ответ означал бы, что настоящий клик по ленте не проходит), а ответ закрывает
+    // окно навсегда и оставляет прежние места.
+    const setup = await page.evaluate(() => {
+      const o = document.getElementById("setup-overlay");
+      const shown = !!o && !o.classList.contains("hidden");
+      const send = document.getElementById("btn-send");
+      let blocked = false;
+      if (shown && send) {
+        const r = send.getBoundingClientRect();
+        const top = document.elementFromPoint(Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2));
+        blocked = !!top && top !== send && !send.contains(top) && !send.contains(top.parentElement);
+      }
+      return {
+        shown: shown,
+        fields: ["setup-missions-dir", "setup-tasks-dir"].map((id) => !!document.getElementById(id)),
+        skip: !!document.getElementById("btn-setup-skip"),
+        blocked: blocked,
+      };
+    });
+    check("первый запуск спрашивает, где держать работу агента", setup.shown, setup.shown ? "" : "окно не показалось");
+    check("в окне обе папки — миссий и дел — и кнопка «оставить как было»", setup.fields.every(Boolean) && setup.skip, JSON.stringify(setup.fields) + " / " + setup.skip);
+    check("до ответа окно перекрывает интерфейс (человек отвечает первым делом)", setup.blocked, setup.blocked ? "" : "кнопка отправки доступна до ответа");
+    await page.click("#btn-setup-skip");
+    await sleep(400);
+    const afterSetup = await page.evaluate(() => {
+      const o = document.getElementById("setup-overlay");
+      const send = document.getElementById("btn-send");
+      const r = send.getBoundingClientRect();
+      const top = document.elementFromPoint(Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2));
+      return { hidden: !!o && o.classList.contains("hidden"), reachable: !!top && (top === send || send.contains(top)) };
+    });
+    check("ответ закрыл окно", afterSetup.hidden, afterSetup.hidden ? "" : "окно осталось на экране");
+    check("после ответа интерфейс снова доступен настоящему клику", afterSetup.reachable, afterSetup.reachable ? "" : "кнопка отправки всё ещё перекрыта");
+    let setupFile = null;
+    try { setupFile = JSON.parse(fs.readFileSync(path.join(workDir, "userdata", "settings.json"), "utf8")); } catch {}
+    check("ответ лёг в настройки — при следующем запуске не спросят", !!setupFile && setupFile.firstRunSetup === "done", setupFile ? String(setupFile.firstRunSetup) : "нет settings.json");
+    check("«оставить как было» не тронуло папки — прежние места", !!setupFile && !setupFile.missionsDir && !setupFile.tasksDir,
+      setupFile ? JSON.stringify({ m: setupFile.missionsDir, t: setupFile.tasksDir }) : "нет settings.json");
+
     console.log("\n[2] Настройки: вспомогательная модель смотрит на фейковый провайдер");
     const applied = await page.evaluate(async ({ p, dir }) => {
       const s = await window.api.setSettings({

@@ -58,6 +58,10 @@ function makeBatch(opts) {
         // когда его вообще не задавали (null — это осознанно пусто).
         return o.mission === undefined ? { title: "Проверка батчей" } : o.mission;
       },
+      // Путь папки миссии даёт раскладка (src/agent-data.js): конец батча не имеет
+      // права называть папку сам — при выбранной человеком папке `.agent/` рядом с
+      // проектом уже нет, и человек искал бы работу не там.
+      folderText: () => ".agent/missions/",
     },
     pauseMs: o.pauseMs === undefined ? 0 : o.pauseMs,
   });
@@ -178,7 +182,7 @@ const file = ROOT + "/src/run-batch.js";
     const src = fs.readFileSync(file, "utf8");
     assert.ok(!/require\(/.test(src), "модуль сам что-то требует вместо внедрения");
     assert.ok(!/app\.getPath|__dirname|ipcMain|process\.env/.test(src), "модуль достаёт состояние сам");
-    for (const glue of ["mission.afterBatch()", "mission.emitState", "mission.refresh()", 'emit({ type: "notice"']) {
+    for (const glue of ["mission.afterBatch()", "mission.emitState", "mission.refresh()", "mission.folderText(", 'emit({ type: "notice"']) {
       assert.ok(src.indexOf(glue) >= 0, "потеряна связка: " + glue);
     }
   });

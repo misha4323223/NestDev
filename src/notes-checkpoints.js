@@ -10,6 +10,12 @@
      <userData>/project-memory/<hash(workdir)>.json — ВНЕ проекта, чтобы
      не попадали в git и не мусорили в репозитории.
 
+   Дневник агента (diaryAppend/diaryRead):
+     человекочитаемый файл памяти в САМОМ проекте — <рабочая папка>/.agent/AGENT.md
+     (как AGENT.md в Codebuff / REPLIT.md в Replit). Записи дописываются снизу,
+     свежие — в конце; при разбухании файла старые вытесняются (DIARY_MAX_BYTES).
+     Файл в промпт автоматически не грузится: агент сам решает, когда читать.
+
    Точки отката (checkpointSave/checkpointList/checkpointRollback):
      полный снимок текстовых файлов рабочей директории перед серией рискованных
      правок; rollback восстанавливает их все разом. Хранятся в
@@ -19,6 +25,10 @@
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+// Имя папки агента (.agent) берём из раскладки: у нас одна точка правды о том,
+// где живёт рабочий груз агента (часть 44). Дневник намеренно остаётся в проекте:
+// человек выбрал `.agent/AGENT.md`, и файл может уехать в git вместе с кодом.
+const { AGENT_DIR } = require("./agent-data.js");
 
 // ── Заметки ────────────────────────────────────────────────────────────────
 const NOTE_KEY_RE = /^[A-Za-z0-9._-]{1,64}$/;
@@ -139,6 +149,111 @@ function noteDelete(userData, workdir, key) {
   delete data[k];
   memorySave(file, data);
   return { ok: true, message: "Заметка «" + k + "» удалена." };
+}
+
+// ── Дневник агента (.agent/AGENT.md) ────────────────────────────────────────
+// Заметки выше — машинная память: JSON в папке приложения, человек их не видит.
+// Дневник наоборот — ЧЕЛОВЕКОЧИТАЕМЫЙ файл в самом проекте (.agent/AGENT.md),
+// как AGENT.md в Codebuff или REPLIT.md в Replit: важные решения, договорённости
+// и «где остановились». Он дописывается снизу (свежие записи — в конце) и может
+// уехать в git. Файл не грузится в промпт автоматически: агент сам решает, когда
+// в него заглянуть (diaryRead) и когда записать (diaryWrite) — так контекст не
+// пухнет от старых записей, а память остаётся явной.
+const DIARY_FILENAME = "AGENT.md";
+const DIARY_MAX_BYTES = 200 * 1024; // потолок файла: старше — вытесняем
+const DIARY_MAX_ENTRY = 8000; // символов на одну запись
+const DIARY_HEADER =
+  "# AGENT.md — дневник агента\n\n" +
+  "> Тут агент записывает важное ДЛЯ СЕБЯ и для человека: решения, договорённости,\n" +
+  "> что сделано и где остановились. Файл лежит в проекте и может уехать в git.\n" +
+  "> Записи добавляются снизу; свежее — в конце файла.\n";
+
+function diaryFile(workDir) {
+  return path.join(String(workDir || ""), AGENT_DIR, DIARY_FILENAME);
+}
+
+// Отметка времени записи по часам пользователя: «2026-09-23 14:05».
+function diaryStamp(ts) {
+  const d = new Date(Number(ts) || Date.now());
+  const p = (n) => String(n).padStart(2, "0");
+  return (
+    d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " +
+    p(d.getHours()) + ":" + p(d.getMinutes())
+  );
+}
+
+// Обрезать файл, оставив хвост (свежие записи), — но только СВОЙ файл (с нашим
+// заголовком). Чужой AGENT.md не трогаем: удалить чужое хуже, чем большой файл.
+function diaryTrim(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return false;
+  }
+  if (text.indexOf(DIARY_HEADER) !== 0) return false;
+  const body = text.slice(DIARY_HEADER.length);
+  const keep = Math.floor(DIARY_MAX_BYTES * 0.75);
+  let cut = body.length > keep ? body.slice(body.length - keep) : body;
+  const firstSep = cut.indexOf("\n## ");
+  if (firstSep > 0) cut = cut.slice(firstSep);
+  fs.writeFileSync(file, DIARY_HEADER + "\n… (старые записи убраны, чтобы файл не разрастался)\n" + cut, "utf8");
+  return true;
+}
+
+// Дописать запись в дневник. Возвращает { ok, message, file, bytes } или { ok:false, error }.
+function diaryAppend(workDir, title, text) {
+  const wd = String(workDir || "").trim();
+  if (!wd) return { ok: false, error: "Не выбрана рабочая папка — некуда писать дневник." };
+  const body = String(text == null ? "" : text).trim();
+  if (!body) return { ok: false, error: "Укажи text — что записать в дневник (одна короткая запись)." };
+  const t = String(title == null ? "" : title).replace(/\s+/g, " ").trim().slice(0, 80) || "Запись";
+  const capped = body.length > DIARY_MAX_ENTRY ? body.slice(0, DIARY_MAX_ENTRY) : body;
+  const entry = "\n## " + diaryStamp(Date.now()) + " — " + t + "\n\n" + capped + "\n";
+  const file = diaryFile(wd);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (!fs.existsSync(file)) fs.writeFileSync(file, DIARY_HEADER, "utf8");
+    fs.appendFileSync(file, entry, "utf8");
+    let trimmed = false;
+    if (fs.statSync(file).size > DIARY_MAX_BYTES) trimmed = diaryTrim(file);
+    return {
+      ok: true,
+      file: file,
+      bytes: fs.statSync(file).size,
+      trimmed: trimmed,
+      message:
+        "Записано в дневник «" + t + "» (" + capped.length + " симв." +
+        (body.length > capped.length ? ", длинный текст обрезан" : "") +
+        (trimmed ? "; старые записи вытеснены" : "") + "). Файл: " + file,
+    };
+  } catch (e) {
+    return { ok: false, error: "Не удалось записать дневник: " + ((e && e.message) || e) };
+  }
+}
+
+// Прочитать дневник. opts.tail — сколько последних символов показать (0 — весь).
+function diaryRead(workDir, opts) {
+  const file = diaryFile(workDir);
+  let text;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return { ok: true, exists: false, text: "", file: file, bytes: 0, truncated: false };
+  }
+  const bytes = text.length;
+  let out = text;
+  let truncated = false;
+  if (out.length > DIARY_MAX_BYTES) {
+    out = out.slice(out.length - DIARY_MAX_BYTES);
+    truncated = true;
+  }
+  const tail = opts && Number(opts.tail) > 0 ? Number(opts.tail) : 0;
+  if (tail && out.length > tail) {
+    out = out.slice(out.length - tail);
+    truncated = true;
+  }
+  return { ok: true, exists: true, text: out, file: file, bytes: bytes, truncated: truncated };
 }
 
 // ── Точки отката (чекпоинты) ────────────────────────────────────────────────
@@ -313,6 +428,12 @@ module.exports = {
   noteSave,
   noteRead,
   noteDelete,
+  DIARY_FILENAME,
+  DIARY_MAX_BYTES,
+  DIARY_MAX_ENTRY,
+  diaryFile,
+  diaryAppend,
+  diaryRead,
   checkpointsDir,
   checkpointSave,
   checkpointList,

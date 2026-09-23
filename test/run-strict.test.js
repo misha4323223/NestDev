@@ -326,7 +326,9 @@ const file = ROOT + "/src/run-strict.js";
       assert.ok(mainSrc.indexOf(gone) < 0, "в main.js осталась строгая очередь: " + gone);
     }
     assert.ok(/const strict = createRunStrict\(\{/.test(runSrc), "модуль не собран в прогоне");
-    assert.ok(/await strict\.runStrict\(calls, \{ planMode: planMode, history: canonical \}\)/.test(runSrc), "раунд не ходит в модуль");
+    // Роль тоже уходит в очередь: предложение сменить роль (suggestRole) сверяется
+    // с ТЕКУЩЕЙ ролью прогона, иначе оно предлагало бы уже выбранное.
+    assert.ok(/await strict\.runStrict\(calls, \{ planMode: planMode, history: canonical, role: role\.id \}\)/.test(runSrc), "раунд не ходит в модуль");
     assert.ok(mainSrc.indexOf('require("./run-strict.js")') > 0, "модуль не подключён");
     assert.ok(runSrc.indexOf("mission.trackProgress(calls);") > 0, "счётчик прогресса миссии потерялся");
     // Остановка обязана идти ПОСЛЕ очереди: ищем первое вхождение начиная с вызова

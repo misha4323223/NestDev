@@ -10,8 +10,10 @@
      • repoNameFromUrl, stripUrlCreds — имя папки из git-URL и вычистка логина с
        токеном из адреса, чтобы он не застревал в .git/config;
      • runGit — единственная точка запуска git: она объявляет назначение операции
-       (какие переменные агента выдать команде) и подставляет Basic-авторизацию
-       из сохранённого токена. Именно эту функцию получают панели и инструменты.
+       (какие переменные агента выдать команде), подставляет Basic-авторизацию
+       из сохранённого токена и запускает git В СВОЕЙ ГРУППЕ процессов, чтобы
+       таймаут гасил дерево (дети git), а не одну задачу. Именно эту функцию
+       получают панели и инструменты.
 
    Живых значений три, поэтому они идут мостом live:
      • lastAgentRepoDir — его пишет клон репозитория (другой модуль), а читает
@@ -20,7 +22,11 @@
        и runGit выдал бы команде не то окружение, что видит чат. */
 
 function createPathsGit(deps) {
-  const { fs, path, os, execFile, envFor } = deps;
+  const { fs, path, os, spawn, envFor } = deps;
+  // Кто гасит дерево процессов — той же подстановкой, что у оболочек и системного
+  // раздела: иначе сторож не проверит ветку таймаута, не посылая сигналов чужим
+  // процессам. По умолчанию — настоящий убийца группы (killCommandTree ниже).
+  const killTree = deps.killTree || killCommandTree;
 
   // Мост живых значений: см. шапку модуля.
   const live = {
@@ -44,9 +50,44 @@ function resolvePath(p, settings) {
 
 // ─────────────────────────── Git ───────────────────────────
 // cwd — директория, в которой выполняется git; settings — для токена авторизации (OAuth / PAT).
-function runGit(cwd, args, settings, capability) {
+// Гасит команду ВМЕСТЕ С ДЕТЬМИ: у неё своя группа (detached), сигнал уходит
+// группе целиком. Обычный child.kill() бьёт только git, а его дети (hooks,
+// smudge-фильтры) остаются жить. На Windows дерево гасит taskkill /T /F.
+function killCommandTree(child) {
+  const pid = child && child.pid;
+  if (!pid) return;
+  try {
+    if (process.platform === "win32") {
+      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+    } else {
+      try { process.kill(-pid, "SIGTERM"); } catch {}
+      setTimeout(() => { try { process.kill(-pid, "SIGKILL"); } catch {} }, 1200);
+    }
+  } catch {}
+  try { child.kill(); } catch {}
+}
+
+// Запуск git идёт через spawn СО СВОЕЙ ГРУППОЙ процессов: у git бывают дети (hooks,
+// smudge-фильтры, pager), а по таймауту надо гасить ДЕРЕВО, а не одну задачу.
+// Прежний execFile молча теряет `detached` (сам собирает опции для spawn), поэтому
+// группы не было — тот же класс, что закрыт у runCommand (shell-tools, заход 4.1) и
+// runCapture (деплой, фаза 1). Пятый аргумент timeoutMs — для проверок: в приложении
+// таймаут прежний, 180 с.
+function runGit(cwd, args, settings, capability, timeoutMs) {
   return new Promise((resolve) => {
-    const opts = { cwd, timeout: 180000, maxBuffer: 16 * 1024 * 1024, windowsHide: true };
+    const limit = Number(timeoutMs) > 0 ? Number(timeoutMs) : 180000;
+    const maxBytes = 16 * 1024 * 1024; // вместо прежнего maxBuffer у execFile
+    const opts = {
+      cwd,
+      windowsHide: true,
+      // Своя группа — условие, по которому таймаут гасит ДЕРЕВО (ловушка 5):
+      // execFile молча теряет detached, поэтому опции собираются ЗДЕСЬ, а не в
+      // вызове spawn — и в теле остаётся ровно `spawn("git", args, opts)`.
+      detached: process.platform !== "win32",
+      // Прежний execFile собирал все три потока ("pipe" — его умолчание) —
+      // вывод обязан собираться, а не пропадать.
+      stdio: "pipe",
+    };
     // Git-операции объявляют своё назначение: инструмент git* — своим именем, а
     // авто-коммит и кнопки (не от инструмента) — git.commit и git.read.
     // Назначение: инструмент git* — своим именем, каналы панели приходят с явной
@@ -64,7 +105,10 @@ function runGit(cwd, args, settings, capability) {
     } else if (Object.keys(live.agentEnv).length) {
       opts.env = gitEnv;
     }
-    execFile("git", args, opts, (err, stdout, stderr) => {
+    // Старый обработчик execFile — дословно: как читаются потоки и как они
+    // превращаются в ответ, не меняется ни на строку (включая подсказку git-scm.com
+    // и предел 4000 символов на сообщение).
+    const reply = (err, stdout, stderr) => {
       const out = (stdout || "").toString();
       const errText = (stderr || "").toString();
       if (err) {
@@ -76,7 +120,75 @@ function runGit(cwd, args, settings, capability) {
       } else {
         resolve({ ok: true, out: out.trim(), err: errText.trim() });
       }
-    });
+    };
+
+    const outChunks = [];
+    const errChunks = [];
+    let bytes = 0;
+    let overflow = false;
+    let timedOut = false;
+    let settled = false;
+    let child = null;
+    let timer = null;
+    // Один выход на все ветки: завершение, отказ запуска, предел вывода, таймаут.
+    // Без него промис мог бы не разрешиться никогда — а это хуже любого отказа.
+    const finish = (code, signal, spawnError) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      const out = Buffer.concat(outChunks).toString("utf8");
+      const errText = Buffer.concat(errChunks).toString("utf8");
+      if (spawnError) return reply(spawnError, out, errText);
+      if (timedOut) {
+        // Прежний таймаут execFile тоже выглядел как отказ (err.killed): сообщение
+        // теперь честно говорит, что команда остановлена вместе с детьми.
+        return reply(Object.assign(new Error("git не уложился в " + limit + " мс — команда остановлена вместе с дочерними процессами."), { killed: true }), out, errText);
+      }
+      if (overflow) {
+        return reply(Object.assign(new Error("maxBuffer length exceeded"), { code: "ENOBUFS" }), out, errText);
+      }
+      if (!signal && code === 0) return reply(null, out, errText);
+      // При отказе в ответ идёт stderr, а не строка с аргументами (в них мог бы
+      // остаться заголовок Authorization с токеном — прежний message его нёс).
+      return reply(
+        Object.assign(new Error(signal ? "Процесс завершён сигналом " + signal + "." : "Команда завершилась с кодом " + code + "."), {
+          code: Number.isInteger(code) ? code : 1,
+        }),
+        out,
+        errText
+      );
+    };
+    const collect = (arr) => (chunk) => {
+      if (overflow) return;
+      arr.push(chunk);
+      bytes += chunk.length;
+      // Предел наш (вместо maxBuffer) — и за ним git гасится деревом.
+      if (bytes > maxBytes) {
+        overflow = true;
+        killTree(child);
+      }
+    };
+    try {
+      child = spawn("git", args, opts);
+    } catch (e) {
+      // spawn бросает на негодных опциях (например, кривой cwd) — событие "error"
+      // уже не будет, и без этого ответа промис вис бы навсегда.
+      finish(null, null, e);
+      return;
+    }
+    if (child.stdout) child.stdout.on("data", collect(outChunks));
+    if (child.stderr) child.stderr.on("data", collect(errChunks));
+    // Отказ запуска (git не найден) приходит событием, а не кодом возврата.
+    child.on("error", (e) => finish(null, null, e));
+    child.on("close", (code, signal) => finish(code, signal, null));
+    timer = setTimeout(() => {
+      timedOut = true;
+      killTree(child);
+      // Оболочка может не отреагировать на SIGTERM (или её уже нет): отвечаем не
+      // позже чем через полторы секунды — к тому времени группе ушёл SIGKILL.
+      // Таймер намеренно НЕ unref: обещание обязано быть разрешено.
+      setTimeout(() => finish(null, null, null), 1500);
+    }, limit);
   });
 }
 

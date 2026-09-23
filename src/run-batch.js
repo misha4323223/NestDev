@@ -69,7 +69,7 @@ function createRunBatch(deps) {
           kind: "end",
           message:
             "🏁 Работа закончена" + (mDone ? " — миссия «" + mDone.title + "» закрыта" : "") +
-            ". Цель, план, журнал и отчёт: .agent/missions/.",
+            ". Цель, план, журнал и отчёт: " + mission.folderText(mDone) + ".",
         };
       }
       return { kind: "break" };

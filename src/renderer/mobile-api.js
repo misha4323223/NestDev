@@ -163,6 +163,11 @@
     probeLocalModel: invoke("ai:probeLocal"), // замер локальной модели (с телефона тоже)
     policyGroups: invoke("policy:groups"), // группы выдачи секретов (настройки с телефона)
     pickDirectory: invoke("dialog:pickDir"),
+    // Куда класть работу агента: выбор папок делается на ПК (окно первого запуска),
+    // но список каналов у телефона тот же — иначе разъехавшееся имя ломает
+    // сохранение настроек молча.
+    setupState: invoke("setup:state"),
+    setupSave: invoke("setup:save"),
     onAiEvent: on("ai:event"),
     onChatsReload: on("chats:reload"),
 

@@ -132,6 +132,9 @@ function mk(over) {
       return o.settings || {};
     },
     agentWorkDir: () => "/work/project",
+    // Папка данных дел: своя, если человек выбрал её в настройках, иначе папка
+    // приложения. Хранилище дел обязано читаться здесь, а не в userDataDir.
+    tasksDataDir: () => (o.tasksDir === undefined ? "/user-data/tasks" : o.tasksDir),
     getWindow: () => win,
   };
   const api = createTasksReminders(deps);
@@ -151,7 +154,29 @@ function mk(over) {
 (async () => {
   await test("userDataDir: путь приходит из Electron, а не из рабочей папки", () => {
     const m = mk();
-    assert.strictEqual(m.userDataDir(), "/user-data/userData", "хранилище дел уехало из userData");
+    assert.strictEqual(m.userDataDir(), "/user-data/userData", "папка приложения уехала из userData");
+  });
+
+  await test("дела читаются в папке дел, а не в папке приложения", () => {
+    withClock(() => {
+      const m = mk({ tasksDir: "/my/tasks", nextDue: 0 });
+      m.checkTaskReminders();
+      assert.strictEqual(m.calls.takeReminders[0].ud, "/my/tasks", "напоминания взяты не из выбранной папки дел: " + m.calls.takeReminders[0].ud);
+    });
+    withClock(() => {
+      // Папка не выбрана — хранилище дел падает на папку приложения, а не молчит.
+      const plain = mk({ nextDue: 0 });
+      plain.checkTaskReminders();
+      assert.strictEqual(plain.calls.takeReminders[0].ud, "/user-data/tasks", "дела ушли мимо папки данных дел");
+    });
+    withClock((timers) => {
+      const m = mk({ tasksDir: "/my/tasks", nextDue: 60000 });
+      m.armTaskWake();
+      assert.strictEqual(timers.length, 1, "будильник поставлен мимо папки дел");
+    });
+    const m2 = mk({ tasksDir: "/my/tasks" });
+    m2.emitTasksChanged();
+    assert.strictEqual(m2.calls.mirrors.length, 1, "зеркало не записано с выбранной папкой дел");
   });
 
   await test("зеркало дел: событие окну, файл в рабочей папке и сводка в нём", () => {
@@ -399,7 +424,7 @@ function mk(over) {
     }
     const wiring = /const \{ createTasksReminders \} = require\("\.\/tasks-reminders\.js"\)[\s\S]*?\n\}\);/.exec(MAIN_SRC);
     assert.ok(wiring, "не нашёл проводку модуля");
-    for (const dep of ["  app,", "  Notification,", "  agentStore,", "  missionStore,", "  loadSettings,", "  agentWorkDir,", "  getWindow: () => mainWindow,"]) {
+    for (const dep of ["  app,", "  Notification,", "  agentStore,", "  missionStore,", "  loadSettings,", "  agentWorkDir,", "  tasksDataDir,", "  getWindow: () => mainWindow,"]) {
       assert.ok(wiring[0].includes(dep), "в проводку не передано: " + dep.trim());
     }
     assert.ok(/const \{ userDataDir, emitTasksChanged, canNotify, notifyUser, armTaskWake,/.test(MAIN_SRC),

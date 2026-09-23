@@ -50,7 +50,7 @@ const CAPABILITIES = [
     "readFile", "readFileLines", "readFileStructure", "listFiles", "listDirectory", "searchFile",
     "searchProject", "fileOutline", "semanticSearch", "findReferences", "explainCode", "explainError",
     "getDependencies", "diffView", "memoryList", "memorySearch", "noteRead", "noteList",
-    "checkpointList", "findTools", "agentGuide", "listPorts", "checkPort", "checkUrl",
+    "checkpointList", "diaryRead", "findTools", "agentGuide", "listPorts", "checkPort", "checkUrl",
     "listProcesses", "getSystemInfo", "checkInstalledProgram", "canExecute", "shellsStatus",
     "listBackground", "backgroundOutput", "todoWrite", "askUser",
   ]},
@@ -103,7 +103,10 @@ const CAPABILITIES = [
   // Миссии: файлы .agent/ в рабочей папке — это рабочий журнал агента, не код проекта.
   { cap: "mission.read", risk: RISK.LOW, tools: ["missionStatus"] },
   { cap: "mission.write", risk: RISK.LOW, tools: ["missionStart", "missionStep", "missionFinish"] },
-  { cap: "notes.write", risk: RISK.LOW, tools: ["noteSave", "noteDelete", "checkpointSave"] },
+  { cap: "notes.write", risk: RISK.LOW, tools: ["noteSave", "noteDelete", "checkpointSave", "diaryWrite"] },
+  // Предложение сменить роль чата: ничего не меняет само (роль выбирает человек
+  // кнопкой в окне), поэтому риск низкий.
+  { cap: "chat.role.suggest", risk: RISK.LOW, tools: ["suggestRole"] },
   // Откат чекпоинта перезаписывает файлы проекта — спрашиваем.
   { cap: "notes.restore", risk: RISK.MEDIUM, confirm: true, tools: ["checkpointRollback"] },
   // ── почта ──
