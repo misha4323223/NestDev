@@ -410,7 +410,7 @@
     gateEl.innerHTML = [
       '<div class="mg-wrap"><div class="mg-card">',
       '<div class="mg-top"><div class="mg-logo">A</div><div>',
-      '<div class="mg-name">AI Developer Agent</div>',
+      '<div class="mg-name">NestDev</div>',
       '<div class="mg-sub">PIN из Настроек на ПК → «Мобильный доступ»</div>',
       "</div></div>",
       '<input id="mobile-pin" class="mg-pin" type="tel" inputmode="numeric" pattern="[0-9]*"',

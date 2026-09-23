@@ -5,8 +5,8 @@ publish:
   releaseType: release
 
 appId: com.local.aiagent
-productName: AI Developer Agent
-copyright: Copyright © 2024 AI Developer Agent
+productName: NestDev
+copyright: Copyright © 2024 NestDev
 directories:
   output: dist
   buildResources: build
@@ -15,7 +15,7 @@ files:
   - assets/**/*
   - package.json
   - server.js
-# Playwright запускает свой драйвер и Chromium как дочерние процессы — из app.asar
+# Драйвер браузера (playwright) при необходимости распаковывается рядом — из app.asar
 # это невозможно (spawn не умеет виртуальную ФС asar). Распаковываем пакеты целиком
 # в app.asar.unpacked; require автоматически подхватывает распакованные пути.
 asarUnpack:
@@ -46,7 +46,7 @@ nsis:
   perMachine: false
   createDesktopShortcut: always
   createStartMenuShortcut: true
-  shortcutName: AI Developer Agent
+  shortcutName: NestDev
   installerIcon: assets/icon.ico
   uninstallerIcon: assets/icon.ico
   installerHeaderIcon: assets/icon.ico

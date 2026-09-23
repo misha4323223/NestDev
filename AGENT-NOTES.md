@@ -192,7 +192,24 @@ spawn+detached, оболочка передаёт spawn в git-модуль». `
 правка фикстур.
 
 **Версия и набор.** 1.5.211 → **1.5.212**; `node scripts/make-ota.js --unsigned` (набор
-**1.5.216**, 174 файла, 157 JS проверены по синтаксису). Сверено: sha256 из
+**1.5.216**, 174 файла, 157 JS проверены по синтаксису).
+
+**Переименование приложения в «NestDev» — правила (23.09.2026, запомнить).**
+Видимое имя «AI Developer Agent» → «NestDev»: 45 вхождений в 27 файлах (заголовок окна,
+`index.html`, `electron-builder.yml`, `setup.iss`, системный промпт, мост/письма/облако),
+плюс 4 теста, сверяющие точную строку (`app-window`, `ota-ipc`, `bridge-tls`, `smoke`).
+Внутренности НЕ трогать: локальный `remote.origin.url` остался `local-ai-agent.git`, но
+репозиторий на GitHub УЖЕ переименован в **`NestDev`** (проверено через API: и
+`misha4323223/local-ai-agent`, и `misha4323223/NestDev` отвечают `NestDev` — старый путь
+редиректится, пуш работает; `publish.repo: NestDev` в `electron-builder.yml` уже стоит).
+Также не трогать: `appId: com.local.aiagent`; OTA-id `ai-agent` (фильтр `src/ota.js:100`
+отвергает чужие манифесты — менять только синхронной связкой `ota/manifest.json` +
+`scripts/make-ota.js` + `src/ota.js` + `test/ota-sign.test.js` + `test/smoke.test.js`);
+ключ подписи `~/.ai-agent-ota-key.pem`; имя файла ассета `ai_agent-*` (artifactName).
+Клиентов пока нет — appId и OTA-id менять можно. Playwright удалён из зависимостей,
+копия для отката — `backup-playwright/` (в .gitignore): скажи «восстанови» — верну всё.
+Релиз НЕСЁТ видимое имя: заголовок релиза на GitHub, заголовок `RELEASE-NOTES.md`,
+`productName`/`copyright`/`shortcutName` в установщике (см. `publish-release.js:176`).. Сверено: sha256 из
 `ota/manifest.json` совпал с sha256 файла `ota/bundle.json`, `codeVersion` = 1.5.212, и в
 самом наборе `src/system-stack.js` содержит `runGroup`, `src/paths-git.js` — `detached`
 (бандл хранит файлы base64 — проверять надо декодированием, иначе легко получить ложное
@@ -203,7 +220,7 @@ spawn+detached, оболочка передаёт spawn в git-модуль». `
 ## Общение
 - Пользователь пишет по-русски и просит отвечать **исключительно на русском языке** (записано 6 сентября 2026). Все ответы — на русском, даже если код/сообщения системы на английском.
 
-## Проект: AI Developer Agent (Electron)
+## Проект: NestDev (Electron)
 - Приложение: чат с AI-агентом (Ollama / OpenAI-совместимые / Anthropic), файловые операции, git, GitHub.
 - Файлы: `src/main.js` (главный процесс Electron), `src/preload.js` (мост), `src/renderer/` (UI: app.js, index.html, styles.css, agent-core.js, markdown.js).
 - Сервер предпросмотра: `node server.js` (bun run preview, порт 8080) — только UI чата; полный функционал (файлы, git, клонирование) работает в десктоп-приложении.

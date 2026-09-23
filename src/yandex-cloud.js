@@ -984,7 +984,7 @@ async function ensureServiceAccount(oauthToken, folderId, name) {
   const j = await fetchJson(base + "/iam/v1/serviceAccounts", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
-    body: JSON.stringify({ folderId, name, description: "Создан приложением AI Developer Agent для Serverless Containers" }),
+    body: JSON.stringify({ folderId, name, description: "Создан приложением NestDev для Serverless Containers" }),
   }, 30000);
   await waitOperation(oauthToken, j && j.id, 120000);
   return findServiceAccount(oauthToken, folderId, name);

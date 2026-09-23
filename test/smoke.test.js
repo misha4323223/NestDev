@@ -3172,7 +3172,7 @@ async function testAppUiRefs() {
 
   const makeWin = (elements, title) => {
     const doc = {
-      title: title || "AI Developer Agent",
+      title: title || "NestDev",
       body: { innerText: "Текст окна для агента" },
       activeElement: null,
       querySelectorAll: (sel) => elements.filter((el) => !el._gone && matches(el, sel)),

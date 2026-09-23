@@ -1,8 +1,8 @@
-; Inno Setup скрипт для AI Developer Agent
+; Inno Setup скрипт для NestDev
 ; Используется скриптом scripts/dist-win.mjs (bun run dist:win:installer)
 ; или вручную: iscc scripts/setup.iss
 
-#define MyAppName "AI Developer Agent"
+#define MyAppName "NestDev"
 #define MyAppVersion "1.0.0"
 #define MyAppPublisher "AI Dev"
 #define MyAppExeName "ai_agent.exe"

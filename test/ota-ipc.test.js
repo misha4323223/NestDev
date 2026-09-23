@@ -209,7 +209,7 @@ function mkOta(over) {
     // с «загрузка…», хотя ничего не грузится.
     listeners.get("download-progress")({ percent: 99 });
     listeners.get("error")(new Error("сеть недоступна"));
-    assert.strictEqual(seen.titles[seen.titles.length - 1], "AI Developer Agent", "после ошибки заголовок не сброшен: " + JSON.stringify(seen.titles.slice(-2)));
+    assert.strictEqual(seen.titles[seen.titles.length - 1], "NestDev", "после ошибки заголовок не сброшен: " + JSON.stringify(seen.titles.slice(-2)));
 
     // Окно закрылось: события не летят в мёртвый объект, но и падения нет.
     win.destroyed = true;

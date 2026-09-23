@@ -132,7 +132,7 @@ let openPathAnswer = "";
 const createdWins = [];
 function makeWin() {
   const doc = {
-    title: "AI Developer Agent",
+    title: "NestDev",
     body: { innerText: "Текст окна для агента" },
     activeElement: null,
     querySelectorAll: (sel) => elements.filter((el) => !el._gone && matches(el, sel)),

@@ -2,8 +2,8 @@
   "name": "ai-agent",
   "version": "1.5.214",
   "private": true,
-  "description": "AI Developer Agent — чат с AI-агентом (Ollama / Groq / внешние API), файловые операции и git",
-  "author": "AI Developer Agent",
+  "description": "NestDev — чат с AI-агентом (Ollama / Groq / внешние API), файловые операции и git",
+  "author": "NestDev",
   "main": "src/bootstrap.js",
   "scripts": {
     "start": "electron .",
@@ -71,7 +71,6 @@
     "sharp": "^0.35.4"
   },
   "dependencies": {
-    "electron-updater": "^6.8.9",
-    "playwright": "^1.49.1"
+    "electron-updater": "^6.8.9"
   }
 }

@@ -27,7 +27,7 @@ function createWindow() {
     height: 800,
     minWidth: 900,
     minHeight: 600,
-    title: "AI Developer Agent",
+    title: "NestDev",
     backgroundColor: "#0f1115",
     autoHideMenuBar: true,
     webPreferences: {
@@ -48,7 +48,7 @@ function createWindow() {
   // дополнительно транслируются клиентам мобильного моста по WebSocket.
   // Windows: без AppUserModelID уведомления приходят «от Electron» (или не приходят).
   if (process.platform === "win32") {
-    try { app.setAppUserModelId("AI Developer Agent"); } catch {}
+    try { app.setAppUserModelId("NestDev"); } catch {}
   }
 
   const _wcSend = win.webContents.send.bind(win.webContents);

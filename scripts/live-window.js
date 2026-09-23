@@ -122,7 +122,7 @@ require(path.join(ROOT, "src", "main.js"));
   ok(fs.existsSync(win.loadedFile), "окно грузит настоящую разметку: " + win.loadedFile);
   ok(/renderer[\\/]index\.html$/.test(win.loadedFile), "разметка взята из папки окна");
   ok(win.opts.webPreferences.contextIsolation === true && win.opts.webPreferences.nodeIntegration === false, "изоляция окна на месте");
-  ok(win.opts.title === "AI Developer Agent" && win.opts.minWidth === 900, "параметры окна на месте: " + win.opts.title + ", минимум " + win.opts.minWidth);
+  ok(win.opts.title === "NestDev" && win.opts.minWidth === 900, "параметры окна на месте: " + win.opts.title + ", минимум " + win.opts.minWidth);
 
   console.log("\n[2] События доходят до окна, ai:event получает метку запуска");
   events.length = 0;

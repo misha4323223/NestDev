@@ -287,7 +287,7 @@ async function read(args, win) {
   const snap = await snapshot(win);
   const items = mapItems(snap && snap.items);
   const lines = [];
-  lines.push("Окно: " + ((snap && snap.title) || "AI Developer Agent"));
+  lines.push("Окно: " + ((snap && snap.title) || "NestDev"));
   if (snap && snap.panels && snap.panels.length) lines.push("Видимые панели: " + snap.panels.join(" · "));
   lines.push(
     "Элементы окна (" + items.length + ") — действуй по ref (например e12) или по видимому тексту; " +

@@ -1,4 +1,4 @@
-# AI Developer Agent
+# NestDev
 
 Десктоп-приложение (Windows / macOS / Linux) — чат с AI-агентом, который умеет создавать папки и файлы, читать их и работать с git-репозиториями.
 
@@ -19,7 +19,7 @@ bun run dist:win:installer  # только установщик (NSIS)
 ```
 
 Результат в папке `dist/`:
-- `dist/AI Developer Agent Setup-x.y.z.exe` — установщик (ставит в Program Files, создаёт ярлык)
+- `dist/NestDev Setup-x.y.z.exe` — установщик (ставит в Program Files, создаёт ярлык)
 - `dist/ai_agent-windows-x.y.z.zip` — переносная версия (распаковал и запускай)
 
 Без Bun можно тем же способом через Node: `npm install && npm run dist:win`.

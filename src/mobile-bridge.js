@@ -214,7 +214,7 @@ const MIME = {
 
 const MANIFEST = JSON.stringify(
   {
-    name: "AI Developer Agent — мобильный доступ",
+    name: "NestDev — мобильный доступ",
     short_name: "AI Agent",
     description: "Управляй своим AI-агентом с телефона: чат, консоль, превью, файлы и git.",
     start_url: "/",

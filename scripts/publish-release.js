@@ -173,7 +173,7 @@ const argv = [
   "release", "create", tag,
   "--repo", target.slug,
   "--target", "main",
-  "--title", "AI Developer Agent " + latest.version,
+  "--title", "NestDev " + latest.version,
   "--notes-file", notesPath,
 ].concat(assets);
 

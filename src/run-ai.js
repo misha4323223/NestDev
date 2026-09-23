@@ -299,7 +299,7 @@ async function runAi(settings, messages, win, opts) {
       try {
         const snippet = String(finalText || "").trim().slice(0, 140);
         new Notification({
-          title: "AI Developer Agent",
+          title: "NestDev",
           body: "Ответ агента готов" + (snippet ? ": " + snippet : ""),
         }).show();
       } catch {}

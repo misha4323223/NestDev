@@ -122,7 +122,7 @@ function withTimers(fn) {
     assert.strictEqual(env.win, w, "собранное окно не отдано оболочке");
     assert.strictEqual(w.opts.width, 1280, "ширина окна не та");
     assert.strictEqual(w.opts.minWidth, 900, "минимальная ширина не та");
-    assert.strictEqual(w.opts.title, "AI Developer Agent", "заголовок окна не тот");
+    assert.strictEqual(w.opts.title, "NestDev", "заголовок окна не тот");
     assert.strictEqual(w.opts.autoHideMenuBar, true, "меню окна больше не скрыто");
     assert.strictEqual(w.opts.webPreferences.contextIsolation, true, "изоляция контекста выключена");
     assert.strictEqual(w.opts.webPreferences.nodeIntegration, false, "в окно пущен node");

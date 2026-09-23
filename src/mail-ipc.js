@@ -87,7 +87,7 @@ ipcMain.handle("mail:testSend", async () => {
       fromName: cfg.fromName,
       to: cfg.address,
       subject: "Проверка почты от AI-агента",
-      text: "Это тестовое письмо. Если ты его видишь — отправка писем настроена верно.\n\n— AI Developer Agent",
+      text: "Это тестовое письмо. Если ты его видишь — отправка писем настроена верно.\n\n— NestDev",
     }
   );
   return r;

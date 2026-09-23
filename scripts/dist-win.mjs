@@ -1,4 +1,4 @@
-// Скрипт сборки Windows-версии AI Developer Agent.
+// Скрипт сборки Windows-версии NestDev.
 // Запуск: bun run dist:win        (или: bun run dist:win:installer)
 //
 // Что делает:
@@ -47,7 +47,7 @@ function findIscc() {
 }
 
 console.log('==============================================');
-console.log('  Сборка Windows-версии AI Developer Agent');
+console.log('  Сборка Windows-версии NestDev');
 console.log('==============================================');
 
 // 1. Зависимости

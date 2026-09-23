@@ -56,45 +56,45 @@ function initAutoUpdater(deps) {
 
   autoUpdater.on("checking-for-update", () => {
     const w = aliveWindow();
-    if (w) w.setTitle("AI Developer Agent — проверка обновлений…");
+    if (w) w.setTitle("NestDev — проверка обновлений…");
   });
   autoUpdater.on("update-available", (info) => {
     const w = aliveWindow();
     if (w) {
-      w.setTitle("AI Developer Agent — доступно обновление");
+      w.setTitle("NestDev — доступно обновление");
       w.webContents.send("ai:event", { type: "update:available", info });
     }
     // Спрашиваем: скачать?
     new Notification({
-      title: "AI Developer Agent",
+      title: "NestDev",
       body: `Доступна версия ${info.version}. Скачать и установить?`,
     }).show();
     autoUpdater.downloadUpdate().catch((e) => console.error("[updater] download error", e));
   });
   autoUpdater.on("update-not-available", () => {
     const w = aliveWindow();
-    if (w) w.setTitle("AI Developer Agent");
+    if (w) w.setTitle("NestDev");
   });
   autoUpdater.on("download-progress", (p) => {
     const pct = Math.round(p.percent);
     const w = aliveWindow();
-    if (w) w.setTitle(`AI Developer Agent — загрузка ${pct}%`);
+    if (w) w.setTitle(`NestDev — загрузка ${pct}%`);
   });
   autoUpdater.on("update-downloaded", () => {
     const w = aliveWindow();
     if (w) {
-      w.setTitle("AI Developer Agent — обновление готово");
+      w.setTitle("NestDev — обновление готово");
       w.webContents.send("ai:event", { type: "update:downloaded" });
     }
     new Notification({
-      title: "AI Developer Agent",
+      title: "NestDev",
       body: "Обновление скачано. Применится при следующем перезапуске.",
     }).show();
   });
   autoUpdater.on("error", (e) => {
     console.error("[updater]", e.message);
     const w = aliveWindow();
-    if (w) w.setTitle("AI Developer Agent");
+    if (w) w.setTitle("NestDev");
   });
 
   // Проверка раз в час

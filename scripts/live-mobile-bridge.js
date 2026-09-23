@@ -253,7 +253,7 @@ function phone(url) {
       });
       s.on("error", reject);
     });
-    ok(!!peer && /AI Developer Agent/.test(String(peer.subject && peer.subject.CN)), "телефон получает от моста свой сертификат (рукопожатие с доверенным корнем): " + JSON.stringify(peer && peer.subject));
+    ok(!!peer && /NestDev/.test(String(peer.subject && peer.subject.CN)), "телефон получает от моста свой сертификат (рукопожатие с доверенным корнем): " + JSON.stringify(peer && peer.subject));
   }
   ok(typeof st.pair === "string" && st.pair.length >= 16, "ПК получил одноразовый токен пары для QR-кода");
   ok(st.pairUsed === false, "свежий токен пары ещё не использован");

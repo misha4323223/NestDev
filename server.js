@@ -167,5 +167,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log("AI Developer Agent preview: http://" + HOST + ":" + PORT + " (serving src/renderer)");
+  console.log("NestDev preview: http://" + HOST + ":" + PORT + " (serving src/renderer)");
 });

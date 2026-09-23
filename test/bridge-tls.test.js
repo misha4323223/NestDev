@@ -153,7 +153,7 @@ function wsHandshake(port, cert, key) {
   await test("сертификат: читается X509Certificate, подписан сам собой, SAN на месте", () => {
     const c = bridgeTls.createCert(IPS, NAMES);
     const x = new crypto.X509Certificate(c.cert);
-    assert.ok(/AI Developer Agent/.test(x.subject), "не то имя владельца: " + x.subject);
+    assert.ok(/NestDev/.test(x.subject), "не то имя владельца: " + x.subject);
     assert.strictEqual(x.subject, x.issuer, "сертификат не самоподписанный");
     assert.ok(x.verify(crypto.createPublicKey(c.cert)), "подпись сертификата самим собой не сходится");
     // Подпись чужим ключом (например, подменённый сертификат) обязана не проходить.

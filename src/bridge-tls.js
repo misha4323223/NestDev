@@ -35,8 +35,8 @@ const path = require("path");
 const DAY = 24 * 60 * 60 * 1000;
 const CERT_DAYS = 365; // срок действия
 const RENEW_DAYS = 30; // за сколько до конца срока пересоздаём
-const SUBJECT_CN = "AI Developer Agent (mobile bridge)";
-const SUBJECT_O = "AI Developer Agent";
+const SUBJECT_CN = "NestDev (mobile bridge)";
+const SUBJECT_O = "NestDev";
 
 // ─── ASN.1 DER: минимум, которого хватает для X.509 ──────────────────────────
 function derLen(n) {
