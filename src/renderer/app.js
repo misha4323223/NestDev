@@ -1178,6 +1178,7 @@
   };
   // Поиск по списку моделей в настройках: сужает уже загруженный список.
   if ($("model-search")) $("model-search").addEventListener("input", () => SettingsPanel.refilterModelHints());
+  if ($("model-free-only")) $("model-free-only").addEventListener("change", () => SettingsPanel.refilterModelHints());
   $("btn-probe-ollama").onclick = () => {
     SettingsPanel.probeLocalModelUI();
   };

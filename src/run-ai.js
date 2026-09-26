@@ -71,6 +71,7 @@ function createRunAi(deps) {
     resolvePath,
     roleIdFromAny,
     rolePlan,
+    roleMismatchNote,
     routeTools,
     routerMaxTokens,
     routerTaskText,
@@ -99,6 +100,10 @@ async function runAi(settings, messages, win, opts) {
   // в системный промпт каждый раунд, а её группы инструментов включены с первого раунда:
   // набор схем не меняется на ходу, префикс запроса стабилен, каждый раунд дешевле.
   const role = rolePlan(opts.role);
+  // Просьба не по роли: «просят код, а роль — Ассистент». Признак считает ядро по
+  // тексту последней просьбы (src/renderer/agent-core.js), а не сама модель: правило
+  // «предложи переключить роль» слабые модели пропускают, и окна с кнопкой не было.
+  const mismatchNote = roleMismatchNote(messages, role.id);
   // Рассуждения (Low/High/Max) — выбор человека из плашки у поля ввода. Идёт
   // живой строкой до самого запроса: в шкалу провайдера его переводит транспорт.
   const reasoning = String((opts && opts.reasoning) || "off");
@@ -425,7 +430,7 @@ async function runAi(settings, messages, win, opts) {
   let canonical = [
     {
       role: "system",
-      content: SYSTEM_PROMPT + roleNote + tasksNote + wdNote + dataNote + briefNote + cloneNote + (planMode ? "\n\nРЕЖИМ ПЛАНА: доступен только todoWrite — вызови его с планом работ (3–7 пунктов) и в тексте перечисли файлы, которые затронешь. НЕ изменяй файлы и НЕ выполняй другие инструменты. Жди команды пользователя." : ""),
+      content: SYSTEM_PROMPT + roleNote + mismatchNote + tasksNote + wdNote + dataNote + briefNote + cloneNote + (planMode ? "\n\nРЕЖИМ ПЛАНА: доступен только todoWrite — вызови его с планом работ (3–7 пунктов) и в тексте перечисли файлы, которые затронешь. НЕ изменяй файлы и НЕ выполняй другие инструменты. Жди команды пользователя." : ""),
     },
     ...sanitizeToolPairs(
       runHistory.map((m) => {
@@ -604,6 +609,7 @@ async function runAi(settings, messages, win, opts) {
     termEmit,
     mission,
     getPlanSummary: () => live.activePlanSummary,
+    getRoleMismatch: () => mismatchNote,
   });
 
   const maxRounds = planMode ? 3 : 25;

@@ -152,6 +152,8 @@ function buildModelPopup(world) {
         calls.browserList.push({ cfg, opts });
         return listModelsResult();
       },
+      // Признак бесплатности — как в настоящем ядре: «:free» или локальный сервер.
+      isFreeModel: (id, s) => /:free$/i.test(String(id || "")) || !!(s && s.provider === "ollama"),
     },
     toast: (t) => calls.msgs.push(t),
     persistSettings: () => { calls.saved++; },
@@ -262,6 +264,25 @@ const lastMsg = (env) => env.calls.msgs[env.calls.msgs.length - 1] || "";
     const other = buildModelPopup({ settings: { provider: "свой-провайдер", model: "" }, cachedModels: {} });
     other.popup.toggleModelPopup();
     assert.strictEqual(other.$("mp-title").textContent, "Модель · свой-провайдер", "неизвестный провайдер потерял имя: " + other.$("mp-title").textContent);
+  });
+
+  await test("попап модели: бесплатные модели помечены меткой free", () => {
+    const env = buildModelPopup({ cachedModels: { openai: ["openai/gpt-4o", "cohere/north-mini-code:free"] } });
+    env.popup.toggleModelPopup();
+    const free = items(env).find((b) => b.textContent === "cohere/north-mini-code:free");
+    assert.ok(free && free.className.includes("free"), "бесплатная модель не помечена: " + (free && free.className));
+    assert.ok(/🆓/.test(free.title), "в подсказке нет пометки бесплатности");
+    const paid = items(env).find((b) => b.textContent === "openai/gpt-4o");
+    assert.ok(paid && !paid.className.includes("free"), "платная модель помечена бесплатной");
+  });
+
+  await test("бесплатность: признак общий — «:free» или локальный сервер, у любого провайдера", () => {
+    const AgentCore = require(path.join(ROOT, "src", "renderer", "agent-core.js"));
+    assert.strictEqual(AgentCore.isFreeModel("cohere/north-mini-code:free", { provider: "openai", openaiUrl: "https://openrouter.ai/api/v1" }), true, "суффикс :free не распознан");
+    assert.strictEqual(AgentCore.isFreeModel("какая-то-модель", { provider: "ollama" }), true, "локальная Ollama не бесплатна");
+    assert.strictEqual(AgentCore.isFreeModel("local/thing", { provider: "openai", openaiUrl: "http://localhost:1234/v1" }), true, "локальный сервер не бесплатен");
+    assert.strictEqual(AgentCore.isFreeModel("openai/gpt-4o", { provider: "openai", openaiUrl: "https://api.openai.com/v1" }), false, "платная модель помечена бесплатной");
+    assert.strictEqual(AgentCore.isFreeModel("", { provider: "openai", openaiUrl: "https://api.openai.com/v1" }), false, "пустой id");
   });
 
   await test("попап модели: поиск сужает список, пустой результат объясняется", () => {

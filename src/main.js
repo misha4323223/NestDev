@@ -631,6 +631,7 @@ const { runAi } = createRunAi({
   resolvePath,
   roleIdFromAny,
   rolePlan,
+  roleMismatchNote,
   routeTools,
   routerMaxTokens,
   routerTaskText,

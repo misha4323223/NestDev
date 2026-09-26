@@ -220,6 +220,9 @@ function mk(over) {
     readApiError: () => "",
     resolvePath: (p) => p,
     rolePlan: (id) => ({ id: id || "developer", prompt: "РОЛЬ: " + (id || "developer") }),
+    // Подсказка «просьба не по роли»: живёт в ядре, в заглушке — управляемая строка
+    // (её проверяет отдельный набор test/role-mismatch.test.js).
+    roleMismatchNote: () => (o.mismatch ? "ПОДСКАЗКА РОЛИ" : ""),
     routeTools: () => [],
     routerMaxTokens: 100,
     routerTaskText: () => "",

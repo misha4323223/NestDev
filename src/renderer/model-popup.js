@@ -72,11 +72,21 @@
     // показывались только первые 30 — нужную модель было просто не найти. Поиск
     // над списком сужает его по названию.
     for (const name of models) {
+      // Бесплатность — общий признак для всех провайдеров (agent-core.isFreeModel):
+      // «:free»-суффикс или локальный сервер. Помечаем меткой, чтобы человек сразу
+      // видел, за что не спишут.
+      const isFree = !!(AgentCore && AgentCore.isFreeModel && AgentCore.isFreeModel(name, getSettings()));
       const b = document.createElement("button");
       b.type = "button";
-      b.className = "mp-item" + (name === cur ? " active" : "");
+      b.className = "mp-item" + (name === cur ? " active" : "") + (isFree ? " free" : "");
       b.textContent = name;
-      b.title = "Выбрать модель " + name;
+      b.title = (isFree ? "🆓 бесплатная — " : "") + "Выбрать модель " + name;
+      if (isFree) {
+        const badge = document.createElement("span");
+        badge.className = "mp-free";
+        badge.textContent = "free";
+        b.appendChild(badge);
+      }
       b.onclick = () => selectModelQuick(provider, name);
       list.appendChild(b);
     }

@@ -93,8 +93,14 @@
     let webFitWarned = false; // про «запрос не влезал» говорим один раз за прогон
     let webNarrowWarned = false; // и про тесное окно — тоже один раз: иначе шум в каждом раунде
     // Системный промпт уезжает в КАЖДЫЙ запрос — считаем его один раз.
+    // Роль чата едет и в веб-режиме: без её текста «РЕЖИМ» здесь терялся, и в
+    // мобильном чате Ассистент/Менеджер вели себя как Разработчик. Подсказка
+    // «просьба не по роли» считается тем же ядром, что и в приложении.
+    const webRole = AgentCore.rolePlan(opts.role || "dev");
     const systemText =
       AgentCore.SYSTEM_PROMPT +
+      (webRole.prompt ? "\n\n" + webRole.prompt : "") +
+      AgentCore.roleMismatchNote(messages, webRole.id) +
       (getSettings().workingDir ? "\n\nРабочая директория: " + getSettings().workingDir : "") +
       (planMode
         ? "\n\nРЕЖИМ ПЛАНА: сейчас НЕ выполняй инструменты и НЕ изменяй файлы. Составь пошаговый план работ и перечисли файлы, которые затронешь. Жди команды пользователя."

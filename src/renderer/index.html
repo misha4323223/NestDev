@@ -924,6 +924,10 @@
           <div class="field">
             <label>Модели провайдера <span class="hint">(весь список с сервера; начни вводить — отфильтруется)</span></label>
             <input id="model-search" placeholder="Поиск модели…" spellcheck="false" autocomplete="off" />
+            <label class="check-row" title="Показывать только бесплатные: ID с суффиксом :free и модели локальных серверов (Ollama, LM Studio, G4F) — за них платить не нужно.">
+              <input id="model-free-only" type="checkbox" />
+              <span class="check-row-text"><b>Только бесплатные</b><small>🆓 модели с :free и локальные серверы</small></span>
+            </label>
           </div>
           <div id="model-hints" class="model-hints hidden"></div>
         </div>

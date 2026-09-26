@@ -65,6 +65,8 @@ function makeNudge(opts) {
       },
     },
     getPlanSummary: () => plan,
+    // Подсказка «просьба не по роли»: ядро считает её по тексту просьбы, здесь — заглушка.
+    getRoleMismatch: () => (o.roleMismatch ? String(o.roleMismatch) : ""),
   });
   return {
     nudge: nudge,
@@ -117,6 +119,45 @@ const plan = (done, total, failedCount) => ({ done: done, total: total, failed: 
       const history = [];
       assert.deepStrictEqual(env.nudge.decide(history, textOnly), { action: "none" }, "призыв без плана: " + JSON.stringify(p));
     }
+  });
+
+  await test("просьба не по роли: агент ответил текстом без suggestRole — один призыв предложить роль", () => {
+    const env = makeNudge({ plan: null, canNudge: false, roleMismatch: "⚠ ПРОСЬБА НЕ ПО РОЛИ" });
+    const history = [];
+    const r = env.nudge.decide(history, textOnly);
+    assert.deepStrictEqual(r, { action: "repeat" }, "раунд не повторяется: " + JSON.stringify(r));
+    assert.strictEqual(history.length, 1, "просьба не ушла модели");
+    assert.ok(/suggestRole/.test(history[0].content), "в призыве нет suggestRole: " + history[0].content.slice(0, 80));
+    assert.ok(/role: \"dev\"/.test(history[0].content), "призыв не называет роль «dev»: " + history[0].content.slice(0, 80));
+    assert.strictEqual(env.seen.metrics.length, 1, "человеку не сказано о призыве");
+    assert.ok(/смену роли/.test(env.seen.metrics[0].text), "метрика не про смену роли: " + env.seen.metrics[0].text);
+    assert.strictEqual(env.seen.seeds.length, 0, "сторож миссии спрошен зря");
+  });
+
+  await test("просьба не по роли: призыв ОДИН — дальше человеку виднее, петли нет", () => {
+    const env = makeNudge({ plan: null, canNudge: false, roleMismatch: "⚠ ПРОСЬБА НЕ ПО РОЛИ" });
+    assert.strictEqual(env.nudge.decide([], textOnly).action, "repeat", "первый призыв не ушёл");
+    assert.deepStrictEqual(env.nudge.decide([], textOnly), { action: "none" }, "второй призыв — петля");
+    assert.strictEqual(env.seen.metrics.length, 1, "попыток не одна: " + env.seen.metrics.length);
+  });
+
+  await test("просьба не по роли важнее плана: сначала предлагаем роль, потом работу", () => {
+    const env = makeNudge({ plan: plan(0, 3), canNudge: false, roleMismatch: "⚠ ПРОСЬБА НЕ ПО РОЛИ" });
+    const history = [];
+    assert.strictEqual(env.nudge.decide(history, textOnly).action, "repeat", "роль не предложена");
+    assert.ok(/suggestRole/.test(history[0].content), "в призыве нет suggestRole");
+    // После единственного призыва по роли план снова главный — работа не потеряна.
+    const after = env.nudge.decide([], textOnly);
+    assert.strictEqual(after.action, "repeat", "после роли план не призвал: " + JSON.stringify(after));
+    assert.ok(/План не закрыт/.test(env.seen.metrics[1].text), "после роли призыв по плану не вернулся: " + env.seen.metrics.map((m) => m.text));
+  });
+
+  await test("роль уже предложена (в раунде был вызов) — призыва нет", () => {
+    const env = makeNudge({ plan: null, canNudge: false, roleMismatch: "⚠ ПРОСЬБА НЕ ПО РОЛИ" });
+    const history = [];
+    const o = { toolCalls: [{ id: "c1", name: "suggestRole" }], planMode: false, text: "", aborted: false };
+    assert.deepStrictEqual(env.nudge.decide(history, o), { action: "none" }, "призыв поверх suggestRole — лишний круг");
+    assert.strictEqual(history.length, 0, "история тронута зря");
   });
 
   await test("есть вызовы, режим плана или «Стоп» — призывов нет вовсе", () => {

@@ -330,47 +330,59 @@
       box.classList.add("hidden");
       return;
     }
+    // Бесплатность — общий признак для ВСЕХ провайдеров (agent-core.isFreeModel):
+    // ID с «:free» или локальный сервер (Ollama, LM Studio, G4F). Считаем один раз.
+    const free = (m) => !!(AgentCore && AgentCore.isFreeModel && AgentCore.isFreeModel(m, getSettings()));
+    const freeCount = models.filter(free).length;
+
     const searchBox = $("model-search");
     const q = String((searchBox && searchBox.value) || "").trim().toLowerCase();
-    const shown = q ? models.filter((m) => String(m).toLowerCase().indexOf(q) !== -1) : models;
+    const matched = q ? models.filter((m) => String(m).toLowerCase().indexOf(q) !== -1) : models;
+    const freeOnly = $("model-free-only");
+    const shown = freeOnly && freeOnly.checked ? matched.filter(free) : matched;
+    const cur = getSettings()[MODEL_KEY[provider]] || getSettings().model || "";
+
     const label = document.createElement("span");
     label.className = "hint-label";
-    label.textContent = q
-      ? "Найдено " + shown.length + " из " + models.length + ":"
-      : "Модели (" + models.length + ", клик — вставить):";
+    const countText = freeCount
+      ? "Модели (" + models.length + ", бесплатных " + freeCount + "):"
+      : "Модели (" + models.length + "):";
+    label.textContent = q ? "Найдено " + shown.length + " из " + models.length + ":" : countText;
     box.appendChild(label);
-    if (!shown.length) {
-      const none = document.createElement("span");
-      none.className = "hint";
-      none.textContent = "ничего не найдено";
-      box.appendChild(none);
-      box.classList.remove("hidden");
-      return;
-    }
+
+    // Компактно: выпадающий список вместо облака кнопок. 🆓 отмечает бесплатные.
+    const sel = document.createElement("select");
+    sel.className = "select model-select";
+    sel.title = "Выбрать модель провайдера (🆓 — бесплатная)";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = shown.length ? "— выбери модель —" : "ничего не найдено";
+    sel.appendChild(placeholder);
     for (const name of shown) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "chip" + (name === (getSettings()[MODEL_KEY[provider]] || getSettings().model) ? " active" : "");
-      b.textContent = name;
-      b.title = "Вставить модель " + name;
-      b.onclick = () => {
-        // На пресете G4F в поле модели может стоять маршрут «Провайдер:» — не затираем его:
-        // модель дописывается после двоеточия, иначе теряется выбранный провайдер.
-        const input = $(MODEL_INPUT[provider]);
-        const curVal = (input.value || "").trim();
-        const g4fPrefix = /^[A-Za-z0-9_]+:\s*$/.test(curVal) ? curVal.replace(/:+$/, "") + ":" : "";
-        const finalName = g4fPrefix + name;
-        input.value = finalName;
-        getSettings()[MODEL_KEY[provider]] = finalName;
-        getSettings().model = finalName;
-        persistSettings();
-        updateBadge();
-        setSettingsMsg("Модель выбрана: " + finalName + ". Нажми «Сохранить настройки» и общайся.", false);
-        renderModelHints(provider, models);
-        if (getPreset() === "g4f") renderG4fProviderList();
-      };
-      box.appendChild(b);
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = (free(name) ? "🆓 " : "") + name;
+      if (name === cur) opt.selected = true;
+      sel.appendChild(opt);
     }
+    sel.onchange = () => {
+      if (!sel.value) return;
+      // На пресете G4F в поле модели может стоять маршрут «Провайдер:» — не затираем его:
+      // модель дописывается после двоеточия, иначе теряется выбранный провайдер.
+      const input = $(MODEL_INPUT[provider]);
+      const curVal = (input.value || "").trim();
+      const g4fPrefix = /^[A-Za-z0-9_]+:\s*$/.test(curVal) ? curVal.replace(/:+$/, "") + ":" : "";
+      const finalName = g4fPrefix + sel.value;
+      input.value = finalName;
+      getSettings()[MODEL_KEY[provider]] = finalName;
+      getSettings().model = finalName;
+      persistSettings();
+      updateBadge();
+      setSettingsMsg("Модель выбрана: " + finalName + ". Нажми «Сохранить настройки» и общайся.", false);
+      renderModelHints(provider, models);
+      if (getPreset() === "g4f") renderG4fProviderList();
+    };
+    box.appendChild(sel);
     box.classList.remove("hidden");
   }
 
