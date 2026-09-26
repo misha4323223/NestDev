@@ -55,6 +55,31 @@
 .ykc-table tr:hover td { background: var(--bg-hover); }
 .ykc-actions { white-space: nowrap; }
 
+/* Секрет Lockbox: новая версия — пары «ключ → значение» */
+.ykc-secret { display: flex; flex-direction: column; gap: 7px; background: var(--bg-card);
+  border: 1px solid var(--border-soft); border-radius: 11px; padding: 9px 10px; }
+.ykc-secret-rows { display: flex; flex-direction: column; gap: 5px; }
+.ykc-secret-row { display: flex; align-items: center; gap: 5px; }
+.ykc-secret-row input { min-width: 0; background: var(--bg-input); border: 1px solid var(--border-soft);
+  border-radius: 7px; color: var(--text); font-family: inherit; font-size: 12px; padding: 5px 8px; outline: none; }
+.ykc-secret-row input:focus { border-color: var(--accent); }
+.ykc-secret-key { flex: 0 0 38%; font-family: var(--mono); text-transform: uppercase; }
+.ykc-secret-val { flex: 1; }
+.ykc-secret-btns { display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
+
+/* Зона DNS: новая запись — имя, тип, TTL и значения */
+.ykc-record { display: flex; flex-direction: column; gap: 7px; background: var(--bg-card);
+  border: 1px solid var(--border-soft); border-radius: 11px; padding: 9px 10px; }
+.ykc-record-line { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.ykc-record input, .ykc-record select { min-width: 0; background: var(--bg-input); border: 1px solid var(--border-soft);
+  border-radius: 7px; color: var(--text); font-family: inherit; font-size: 12px; padding: 5px 8px; outline: none; }
+.ykc-record input:focus, .ykc-record select:focus { border-color: var(--accent); }
+.ykc-rec-name { flex: 1 1 160px; font-family: var(--mono); }
+.ykc-rec-type { flex: 0 0 76px; }
+.ykc-rec-ttl { flex: 0 0 76px; }
+.ykc-rec-value { font-family: var(--mono); }
+.ykc-record-btns { display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
+
 /* Состояния */
 .ykc-loading, .ykc-hint, .ykc-path { font-size: 11.5px; color: var(--text-faint); }
 .ykc-path { font-family: var(--mono); font-size: 10.5px; word-break: break-all; }
@@ -64,6 +89,10 @@
   white-space: pre-wrap; line-height: 1.5; }
 .ykc-warn { font-size: 11.5px; color: var(--warn); background: rgba(217, 180, 91, 0.08);
   border: 1px solid rgba(217, 180, 91, 0.26); border-radius: 10px; padding: 7px 10px; }
+/* Публичный доступ к бакету: строка о состоянии и кнопка под ней. */
+.ykc-access { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+.ykc-access .ykc-warn { align-self: stretch; }
+.ykc-bucket-access { font-size: 12px; }
 
 @media (max-width: 900px) {
   .ykc-field { flex-direction: column; gap: 2px; }

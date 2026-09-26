@@ -106,6 +106,7 @@
         $("s-yc-allow-create").checked = !!st.allowCreate;
         $("s-yc-allow-delete").checked = !!st.allowDelete;
         $("s-yc-allow-update").checked = !!st.allowUpdate;
+        $("s-yc-allow-public").checked = !!st.allowPublic;
         // Встроенный yc CLI: показываем, стоит ли он (и где) — настройка живёт в папке приложения.
         if (isElectron && api.ycCliStatus) {
           api.ycCliStatus()
@@ -523,14 +524,15 @@
     toast("Каталог: " + (f && f.name ? f.name : sel.value));
     ycLoadDashboard(true);
   };
-  // Одна точка сохранения разрешений: чекбоксов три, а вызов один — иначе легко
-  // забыть передать третье поле и молча сбросить его в false.
+  // Одна точка сохранения разрешений: чекбоксов четыре, а вызов один — иначе
+  // легко забыть передать последнее поле и молча сбросить его в false.
   function saveYcPerms() {
     const create = $("s-yc-allow-create").checked;
     const del = $("s-yc-allow-delete").checked;
     const upd = $("s-yc-allow-update").checked;
-    api.ycSetPermissions(create, del, upd);
-    return { create, del, upd };
+    const pub = $("s-yc-allow-public").checked;
+    api.ycSetPermissions(create, del, upd, pub);
+    return { create, del, upd, pub };
   }
   $("s-yc-allow-create").onchange = () => {
     toast(saveYcPerms().create ? "Агенту разрешено создавать ресурсы" : "Создание агентом выключено");
@@ -541,6 +543,9 @@
   $("s-yc-allow-update").onchange = () => {
     const p = saveYcPerms();
     toast(p.upd ? "Агенту разрешено менять контейнеры и деплоить ревизии" : "Правка контейнеров агентом выключена");
+  };
+  $("s-yc-allow-public").onchange = () => {
+    toast(saveYcPerms().pub ? "Агенту разрешено открывать бакет для чтения из интернета" : "Публичный доступ к бакету агентом выключен");
   };
   if ($("btn-yc-install-cli")) {
     $("btn-yc-install-cli").onclick = async () => {

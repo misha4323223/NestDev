@@ -39,7 +39,7 @@
     getActiveChat, createChat,
     getSettings, getChatsData, getStreaming,
     getPlanToggleOn, setPlanToggleOn,
-    getPendingImage, setLastUndoCount,
+    getPendingImage, getPendingFiles, getReasoning, setLastUndoCount,
     setSession, getWebAbort, setWebAbort,
     getChatFeed, getPlanPanel, getSettingsPanel,
     getChatEvents, getChatRun, getAutoTasks, getWebChat,
@@ -81,6 +81,7 @@
     getChatFeed().scrollBottom();
     ChatStore.persistChats();
     getChatRun().setStreaming(true);
+    getChatRun().hideResume(); // новый прогон — старая кнопка «Продолжить» не нужна
 
     // История уходит в main ЦЕЛИКОМ: там её держат в бюджете модели, а при переполнении
     // голова уходит в памятку (сжатие). Раньше история обрезалась здесь по ПОЛНОМУ бюджету
@@ -99,11 +100,11 @@
     setSession({ chatId: chat.id, assistantId: assistantMsg.id, segmentIds: [assistantMsg.id] });
     try {
       if (isElectron) {
-        await api.sendMessage(history, { plan: usePlan, role: chat.role || "dev", chatId: chat.id });
+        await api.sendMessage(history, { plan: usePlan, role: chat.role || "dev", chatId: chat.id, reasoning: getReasoning ? getReasoning() : "off" });
       } else {
         setWebAbort(new AbortController());
         try {
-          await getWebChat().webSend(history, getChatEvents().onAiEvent, getWebAbort().signal, { plan: usePlan, role: chat.role || "dev", chatId: chat.id });
+          await getWebChat().webSend(history, getChatEvents().onAiEvent, getWebAbort().signal, { plan: usePlan, role: chat.role || "dev", chatId: chat.id, reasoning: getReasoning ? getReasoning() : "off" });
         } catch (e) {
           if (e.name !== "AbortError") getChatEvents().onAiEvent({ type: "error", message: e.message || String(e) });
         }
@@ -143,9 +144,15 @@
       setPlanToggleOn(false);
       $("btn-plan").classList.remove("active");
     }
-    const content = getPendingImage()
-      ? [{ type: "text", text }, { type: "image_url", image_url: { url: getPendingImage() } }]
+    // Вложения: картинка уходит отдельной частью (image_url), а текстовые файлы —
+    // прямо в текст сообщения: у модели без зрения другого способа увидеть файл нет.
+    const files = (getPendingFiles && getPendingFiles()) || [];
+    const body = files.length
+      ? text + "\n\n" + files.map((f) => "--- Файл: " + f.name + " ---\n" + f.text).join("\n\n")
       : text;
+    const content = getPendingImage()
+      ? [{ type: "text", text: body }, { type: "image_url", image_url: { url: getPendingImage() } }]
+      : body;
     hideAttachBar();
     input.value = "";
     autoResize();

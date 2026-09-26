@@ -99,6 +99,9 @@ async function runAi(settings, messages, win, opts) {
   // в системный промпт каждый раунд, а её группы инструментов включены с первого раунда:
   // набор схем не меняется на ходу, префикс запроса стабилен, каждый раунд дешевле.
   const role = rolePlan(opts.role);
+  // Рассуждения (Low/High/Max) — выбор человека из плашки у поля ввода. Идёт
+  // живой строкой до самого запроса: в шкалу провайдера его переводит транспорт.
+  const reasoning = String((opts && opts.reasoning) || "off");
   const roleNote = role.prompt ? "\n\n" + role.prompt : "";
 
   // Менеджеру сразу даём свежую сводку дел — чтобы он не гадал и не звал taskList впустую.
@@ -141,6 +144,12 @@ async function runAi(settings, messages, win, opts) {
     live: live,
   });
 
+  // «Работа остановлена, но не потеряна» — событие для кнопки «▶ Продолжить» в окне:
+  // раньше человек писал «продолжай» руками, хотя работа лежит на диске, а чекпоинт
+  // прогона открыт. Кнопка отправляет ту же просьбу, что писал человек, — прогон
+  // получает свой же прошлый ход (см. src/run-context.js) и продолжает с места.
+  const resumeReady = (reason) => emit({ type: "resume", reason: String(reason || "") });
+
   // Пауза по кнопке: работа не теряется — миссия гасится на диске модулем, а
   // показ, откат и «готово» делает оболочка. Порядок событий прежний.
   const stopForPause = () => {
@@ -152,6 +161,7 @@ async function runAi(settings, messages, win, opts) {
     live.lastUndoLog = live.activeRunUndo.slice();
     persistUndo();
     if (live.lastUndoLog.length) emit({ type: "undo_available", count: live.lastUndoLog.length });
+    resumeReady("пауза миссии");
     emit({ type: "done" });
     return { ok: true, text: finalText };
   };
@@ -265,7 +275,7 @@ async function runAi(settings, messages, win, opts) {
   // ── Завершение прогона — одна точка входа ──────────────────────────────────
   // И обычный финал, и мягкая остановка миссии (лимит раундов/времени, зацикливание)
   // проходят здесь: пользователь получает объяснение, а не «ошибку API».
-  const endRun = async (fallbackText) => {
+  const endRun = async (fallbackText, info) => {
     // Мягкая остановка миссии (лимит раундов/времени, зацикливание, закрытие) —
     // это объяснение человеку, а не «ошибка API». Раньше оно подставлялось только
     // вместо ПУСТОГО ответа: если модель успела напечатать текст в последнем раунде,
@@ -279,12 +289,15 @@ async function runAi(settings, messages, win, opts) {
     }
     // Обычный финал — работа доведена до конца, возвращать в работу нечего.
     // Мягкая остановка миссии (stopNote) — наоборот: человек продолжит её кнопкой,
-    // и чекпоинт даст модели её же прошлые шаги, а не пересказ.
+    // и чекпоинт даст модели её же прошлые шаги, а не пересказ. «▶ Продолжить» горит
+    // только там, где продолжать ЕСТЬ что: закрытая миссия её не показывает (resume: false).
     if (!stopNote) runCtx.close();
+    else if (!info || info.resume !== false) resumeReady("работа остановлена");
     if (!String(finalText || "").trim() && !abort.signal.aborted) {
       finalText =
-        "⚠ Модель не прислала итоговый текст (вероятно, переполнен контекст). Изменения сохранены; нажми «↻ Перегенерировать» или напиши «продолжай».";
+        "⚠ Модель не прислала итоговый текст (вероятно, переполнен контекст). Изменения сохранены; нажми «▶ Продолжить» или «↻ Перегенерировать».";
       emit({ type: "chunk", text: finalText });
+      resumeReady("модель не прислала итоговый текст");
     }
     live.lastUndoLog = live.activeRunUndo.slice();
     persistUndo();
@@ -475,6 +488,7 @@ async function runAi(settings, messages, win, opts) {
     emitThink,
     getBudget: () => budget,
     getModelWindow: () => modelWin,
+    getReasoning: () => reasoning,
     getCompactions: () => ctxManager.compactions(),
     noTools: noTools,
     localEndpoint: localEndpoint,
@@ -549,12 +563,13 @@ async function runAi(settings, messages, win, opts) {
     // следующая сессия видела бы «работа шла», но не знала, где остановилась.
     mission.stage("остановка человеком");
     if (!String(finalText || "").trim()) {
-      finalText = "⏹ Остановлено пользователем. Изменения сохранены; напиши «продолжай», чтобы доработать.";
+      finalText = "⏹ Остановлено пользователем. Изменения сохранены; нажми «▶ Продолжить», чтобы доработать.";
       emit({ type: "chunk", text: finalText });
     }
     live.lastUndoLog = live.activeRunUndo.slice();
     persistUndo();
     if (live.lastUndoLog.length) emit({ type: "undo_available", count: live.lastUndoLog.length });
+    resumeReady("остановлено пользователем");
     emit({ type: "done" });
     return { ok: true, text: finalText };
   };
@@ -719,17 +734,24 @@ async function runAi(settings, messages, win, opts) {
   // Конец батча: граница батча, закрытие миссии и напоминание живут в
   // src/run-batch.js. Завершение и выход из цикла — решение прогона.
   const after = await batchCtl.afterRound(canonical);
-  if (after.kind === "end") return await endRun(after.message);
+  if (after.kind === "end") return await endRun(after.message, { resume: after.resume });
   if (after.kind === "break") break;
   }
+  resumeReady("лимит раундов");
   throw Object.assign(
     new Error(
       "Превышено максимальное число раундов вызова инструментов (" + maxRounds + "). " +
-      "(Действия на диске сохранены.) Напиши «продолжай» — агент получит тот же контекст и продолжит с текущего места."
+      "(Действия на диске сохранены.) Нажми «▶ Продолжить» или напиши «продолжай» — агент получит тот же контекст и продолжит с текущего места."
     ),
     { fatal: true }
   );
   } catch (e) {
+    // «Стоп» посреди запроса: транспорт прерывает чтение (AbortError), и раньше это
+    // выглядело ОШИБКОЙ «⏹ Генерация остановлена» — без мягкой остановки и без
+    // признака продолжения, хотя работа на диске цела. Остановка человека — не сбой
+    // прогона: закрываем отрезок работы и зажигаем «▶ Продолжить», как это уже
+    // делается между раундами (stopGraceful).
+    if (global.__agentStopRequested) return stopGraceful();
     const fatal = (e && e.name === "AbortError") || (e && e.fatal) || global.__agentStopRequested || (e && e.message && /Не выбрана модель/.test(e.message));
     // Миссия и сбой: обычные ошибки (сеть, 5xx, обрыв) не повод бросать долгую работу.
     // Ждём и продолжаем, пока миссия жива и не исчерпан запас авто-продолжений.
@@ -746,6 +768,19 @@ async function runAi(settings, messages, win, opts) {
         type: "metrics",
         text: "Провайдер отверг stream_options — повторяю запрос без метрик токенов.",
       });
+    }
+    // Провайдер не знает поля рассуждений (reasoning_effort / think) — снимаем его
+    // на весь прогон: это наша добавка, и из-за неё раунд падать не должен.
+    if (retry.state.reasoning && /reasoning|reasoning_effort|\bthink\b/i.test(errText)) {
+      retry.state.reasoning = false;
+      termEmit({
+        type: "metrics",
+        text: "Провайдер не принял настройку рассуждений — повторяю без неё.",
+      });
+      // Отказ приходит и этим путём (ошибка внутри потока, а не код на заголовках):
+      // окно запоминает отказ по модели и убирает плашку 🧠 — иначе каждый запуск
+      // повторял бы ту же ошибку, хотя ответ уже известен (см. run-retry.js).
+      emit({ type: "reasoning_unsupported", key: provider + "|" + String(settings.model || "") });
     }
     // Авто-переключение на следующее сохранённое OpenAI-подключение: ошибка ключа/
     // баланса/лимита/сети — пробуем другой ключ вместо бессмысленных повторов.

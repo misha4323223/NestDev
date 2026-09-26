@@ -91,6 +91,7 @@
     modelWindow,
     ollamaModelInfo,
     ollamaNumCtx,
+    reasoningSupport,
     probeLocalModel,
     toolsAsText,
     withTextTools,
@@ -1076,7 +1077,7 @@
       title: "заметки и точки возврата",
       keywords: ["заметк", "note", "чекпоинт", "checkpoint", "точку возврата", "точка возврата",
         "дневник", "памятк", "откатись"],
-      names: ["noteSave", "noteRead", "noteList", "noteDelete", "diaryWrite", "diaryRead",
+      names: ["noteSave", "noteRead", "noteList", "noteDelete",
         "checkpointSave", "checkpointList", "checkpointRollback"],
     },
     {
@@ -1128,17 +1129,17 @@
       id: "cloud",
       title: "Yandex Cloud",
       keywords: ["yandex", "яндекс", "облак", "cloud", "серверлес", "serverless", "бакет", "s3"],
-      names: ["ycStatus", "ycList", "ycContainer", "ycCosts", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"],
+      names: ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycDb", "ycCosts", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"],
     },
   ];
 
   // Потолок «веса» выбранных схем (в токенах): база + группы должны укладываться сюда.
-  // База стоит ~5 900 (36 схем), «браузер» ~5 570, «система» ~2 270, «проект» ~1 950.
-  // 15 000 = база + 2–3 группы: тихая задача остаётся ~5.9k вместо 24.5k, а нужные
+  // База стоит ~6 950 (40 схем), «браузер» ~7 085, «система» ~2 270, «проект» ~1 950.
+  // 16 500 = база + 2–3 группы: тихая задача остаётся ~6.9k вместо 30.5k, а нужные
   // группы почти всегда помещаются. Если потолок всё же срезал группу — main.js
   // пишет об этом в «Консоль» (dropped), а предохранители A/B доберут её при работе.
   // База не режется никогда: без файлов/терминала/git агент не работает.
-  const ROUTER_MAX_TOKENS = 15000;
+  const ROUTER_MAX_TOKENS = 16500;
 
   const _toolByGroupName = new Map(); // имя → id группы (для предохранителя A)
   const _groupNames = new Map();      // id → [имена]
@@ -1309,7 +1310,9 @@
   // сколько токенов окна можно отдать схемам, не оставив диалог без истории.
   // Раньше граница была жёсткой (12 000) и на локальном окне 8–32k съедала весь
   // остаток — группы схем срезались всегда, то есть роли и справочники не работали.
-  const MIN_HISTORY_TOKENS = 1500;
+  // Жёсткие 1500 на окне 22k не влезали: 22000−6743−1500 = 13757 было меньше
+  // базы+браузера 14033 на 276 токенов — группа срезалась всегда.
+  const MIN_HISTORY_TOKENS = 1000;
   // Потолок веса схем: не больше ROUTER_MAX_TOKENS и не больше того, что реально
   // остаётся от окна после системного промпта и минимальной истории.
   function routerMaxTokens(budget, systemWeight, baseWeight) {
@@ -1394,7 +1397,9 @@
   }
 
   // ── Окно модели и параметры Ollama — в src/renderer/provider-transport.js ──
-  // modelWindow, ollamaModelInfo, ollamaNumCtx и OLLAMA_KEEP_ALIVE живут там же.
+  // modelWindow, ollamaModelInfo, ollamaNumCtx и OLLAMA_KEEP_ALIVE живут там же,
+  // и умеет ли модель рассуждать (reasoningSupport) — тоже там: по этому ответу
+  // окно прячет плашку 🧠 у моделей, которым она ни к чему.
 
   // ── Компакция старых витков — в src/renderer/context-window.js ──
   // Сжатие истории в памятку берётся оттуда (см. начало раздела «Контекст»).
@@ -1514,6 +1519,7 @@
     modelWindow,
     ollamaModelInfo,
     ollamaNumCtx,
+    reasoningSupport,
     probeLocalModel,
     isLocalEndpoint,
     compactRemote,

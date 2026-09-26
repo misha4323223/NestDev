@@ -86,6 +86,12 @@ body {
 .btn-ghost { background: transparent; }
 .btn-block { width: 100%; }
 .btn-small { padding: 3px 9px; font-size: 12.5px; border-radius: 8px; }
+/* Значки кнопок — только SVG: эмодзи рисовались шрифтом системы, поэтому в
+   каждом окне были своего размера и цвета, а рядом с линиями иконок смотрелись
+   вставкой. Один класс задаёт и размер, и выравнивание во всех кнопках окна. */
+.btn-ic { width: 14px; height: 14px; flex: 0 0 auto; display: block; }
+/* Одиночная иконка без подписи: квадрат вместо растянутой текстовой кнопки. */
+.btn-icon { width: 26px; height: 26px; padding: 0; border-radius: 7px; flex: 0 0 auto; }
 .icon-btn {
   width: 38px; height: 38px; padding: 0;
   display: inline-flex; align-items: center; justify-content: center;
@@ -308,6 +314,9 @@ body {
 .dots i:nth-child(3) { animation-delay: 0.4s; }
 @keyframes blink { 0%, 80%, 100% { opacity: 0.25; transform: scale(0.9); } 40% { opacity: 1; transform: scale(1.1); } }
 
+/* ─── Кнопка «Продолжить» после остановки агента ─── */
+.resume-bar { display: flex; align-items: center; gap: 8px; padding: 0 8% 8px; }
+
 /* ─── Композер ─── */
 #input-bar { padding: 8px 8% 14px; border-top: 1px solid var(--border-soft); flex-shrink: 0; }
 .composer {
@@ -325,19 +334,31 @@ body {
   max-height: 160px; font-family: inherit; line-height: 1.45;
 }
 #input::placeholder { color: var(--text-faint); }
-.composer-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+/* Строка композера: подсказка сжимается первой и уходит с точками, ряд кнопок —
+   он и переносится, а не выдавливает главное действие за край колонки. */
+.composer-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
 .input-hint {
   font-size: 11px; color: var(--text-faint); user-select: none;
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.composer-btns { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+/* Ряд кнопок композера. min-width: 0 — обязателен: колонка чата сжимается,
+   когда открыта правая рабочая область, и без этого ряд не давал уменьшаться
+   (flex-потомки по умолчанию не сжимаются), из-за чего кнопка «Отправить»
+   выезжала ЗА пределы колонки и оказывалась под панелью — то есть на экране
+   человек видел кнопку, а нажать её было нельзя. */
+.composer-btns { display: flex; align-items: center; gap: 4px; margin-left: auto; min-width: 0; flex-wrap: wrap; justify-content: flex-end; }
 /* Кнопки композера — одной высоты и одной формы: строка не «пляшет»,
-   подписи компактные, а главное действие чуть крупнее остальных. */
-.composer-btns > .btn { height: 30px; padding: 0 10px; border-radius: 9px; font-size: 12px; gap: 5px; }
-.composer-btns > .btn.icon-btn { width: 30px; padding: 0; }
-.composer-btns > #btn-attach-file { width: 30px; font-size: 13.5px; color: var(--text-dim); }
+   подписи компактные, а главное действие чуть крупнее остальных.
+   Высота 28px и зазор 4px — строка стала ниже и плотнее, а иконки внутри
+   маленькие (14px) и с одинаковым отступом от края. */
+.composer-btns > .btn { height: 28px; padding: 0 9px; border-radius: 8px; font-size: 11.5px; gap: 5px; }
+.composer-btns > .btn.icon-btn { width: 28px; padding: 0; }
+.composer-btns > #btn-attach-file { width: 28px; padding: 0; color: var(--text-dim); }
+/* Пилюля модели — в один рост с кнопками и с тем же радиусом: строка читается
+   одним рядом, а не набором разнокалиберных плашек. */
+.composer-btns > .badge { height: 28px; padding: 0 11px; border-radius: 8px; font-size: 11.5px; }
 .composer-btns > #btn-send,
-.composer-btns > #btn-stop { width: 34px; height: 34px; border-radius: 10px; }
+.composer-btns > #btn-stop { width: 30px; height: 30px; border-radius: 9px; }
 .composer-btns #btn-send { background: var(--gradient); border-color: transparent; color: #fff; box-shadow: 0 4px 14px rgba(34, 211, 238, 0.3); }
 .composer-btns #btn-send:hover { filter: brightness(1.12); }
 .composer-btns #btn-stop { border-color: rgba(242, 92, 84, 0.5); color: var(--danger); }
@@ -512,15 +533,20 @@ body {
   border-bottom: 1px solid var(--border-soft);
   background: var(--bg-soft);
 }
-/* Вкладки разделов внутри панели — только на телефоне (там рельса скрыта).
-   На широком экране единственная навигация — рельса слева. */
+/* Лента вкладок рабочей области (как в Replit): шапка правой панели — это
+   полоса вкладок, активная показывает, какой раздел сейчас на экране.
+   Раньше вкладки были спрятаны на широком экране ради «одной навигации»
+   (переключала только рельса), но у Replit рабочая зона — именно лента
+   вкладок, поэтому они видны везде. Подсветка при этом одна: и рельса,
+   и вкладки ходят через markPanelButtons/openSidePanel. */
 .sp-switch {
-  display: none;
-  gap: 4px;
-  padding: 4px;
-  background: var(--bg-input);
-  border: 1px solid var(--border-soft);
-  border-radius: 12px;
+  display: flex;
+  gap: 2px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  overflow-x: auto;
 }
 .sp-btn {
   display: inline-flex;
@@ -539,9 +565,12 @@ body {
   user-select: none;
 }
 .sp-btn:hover { color: var(--text); }
-/* Название раздела в шапке панели: на широком экране вкладки скрыты,
-   потому что переключает разделы рельса, а шапка показывает, где мы. */
+/* Название раздела в шапке панели больше не показывается: его роль взяла
+   активная вкладка ленты (она подсвечена и подписана). Элемент остаётся в
+   разметке, и openSidePanel по-прежнему пишет в него текст — на случай,
+   если понадобится вернуть подпись. */
 .sp-title {
+  display: none;
   font-size: 12.5px; font-weight: 650; letter-spacing: 0.02em;
   color: var(--text-dim); text-transform: uppercase;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -2844,8 +2873,8 @@ body::after {
   .sp-title { display: none; }
   /* Подсказка про Enter на телефоне бессмысленна — там клавиатура экранная. */
   .input-hint { display: none; }
-  .composer-btns { gap: 5px; }
-  .composer-btns > .btn { font-size: 11.5px; padding: 0 9px; }
+  .composer-btns { gap: 3px; }
+  .composer-btns > .btn { font-size: 11px; padding: 0 8px; }
   /* Шапка на телефоне плотнее: там же теперь и все иконки разделов, и модель. */
   .header-btns { gap: 5px; }
   .header-btns .icon-btn { width: 34px; height: 34px; }
@@ -2920,34 +2949,19 @@ body::after {
 }
 
 /* ─── Индикатор заполняемости контекста ─── */
+/* Показываем только слово и процент (как у Freebuff): полоска отнимала ширину
+   и читалась как второй индикатор загрузки. Цвет уровня переехал на подпись. */
 .ctx-indicator {
   display: none;
   align-items: center;
-  gap: 8px;
   padding: 0 12px 4px;
   font-size: 11px;
   color: #8892a4;
   user-select: none;
 }
 .ctx-indicator.visible { display: flex; }
-.ctx-bar {
-  flex: 1;
-  height: 3px;
-  border-radius: 2px;
-  background: rgba(255,255,255,0.06);
-  overflow: hidden;
-  min-width: 40px;
-  max-width: 120px;
-}
-.ctx-fill {
-  height: 100%;
-  border-radius: 2px;
-  width: 0%;
-  transition: width .3s ease, background .3s ease;
-  background: #22c55e;
-}
-.ctx-fill.warn { background: #f59e0b; }
-.ctx-fill.danger { background: #ef4444; }
+.ctx-text.warn { color: #f59e0b; }
+.ctx-text.danger { color: #ef4444; }
 
 /* ─── Drag-and-drop поверх composer ─── */
 .composer.drag-over {

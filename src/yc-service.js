@@ -40,6 +40,7 @@ function ycConfig(s) {
     allowCreate: !!s.ycAllowAgentCreate,
     allowDelete: !!s.ycAllowAgentDelete,
     allowUpdate: !!s.ycAllowAgentUpdate,
+    allowPublic: !!s.ycAllowAgentPublic,
   };
 }
 

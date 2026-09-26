@@ -308,42 +308,44 @@
 
   // ─── PIN-гейт ───
   /* Оформление страницы входа: один инжектируемый <style>, без inline-стилей.
-     Плоская монохромная тема — как monochrome.css в приложении (там же 
-     глобально выключены тени и градиенты). Ключевое — высота и прокрутка
-     по visualViewport: на телефоне клавиатура перекрывает низ экрана, и
-     фиксированная центрированная карточка «прятала» кнопку «Подключиться».
-     Теперь карточка центрируется через margin:auto в скроллируемом контейнере
-     и потому остаётся доступной при любой высоте видимой области. */
+     Тёмная тема «Replit» — как replit-theme.css в приложении (тёмно-синие
+     поверхности, синее главное действие, оранжевый только в логотипе;
+     тени и градиенты выключены)…
+     Ключевое — высота и прокрутка по visualViewport: на телефоне клавиатура
+     перекрывает низ экрана, и фиксированная центрированная карточка «прятала»
+     кнопку «Подключиться». Теперь карточка центрируется через margin:auto в
+     скроллируемом контейнере и потому остаётся доступной при любой высоте
+     видимой области. */
   var GATE_CSS = [
     "#mobile-gate{position:fixed;left:0;right:0;top:0;z-index:99999;overflow:auto;-webkit-overflow-scrolling:touch;",
-    "background:#0a0a0b;color:#f4f4f5;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;",
+    "background:#0d0d0f;color:#f4f4f5;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;",
     "font-size:15px;line-height:1.4;-webkit-text-size-adjust:100%;}",
     "#mobile-gate .mg-wrap{display:flex;min-height:100%;box-sizing:border-box;",
     "padding:max(12px,env(safe-area-inset-top)) 16px max(14px,env(safe-area-inset-bottom));}",
     "#mobile-gate .mg-card{margin:auto;width:min(100%,340px);box-sizing:border-box;",
-    "background:#141417;border:1px solid #2b2b30;border-radius:18px;padding:16px 15px 12px;}",
+    "background:#18181b;border:1px solid #2a2a2f;border-radius:18px;padding:16px 15px 12px;}",
     "#mobile-gate .mg-top{display:flex;align-items:center;gap:10px;margin-bottom:12px;}",
-    "#mobile-gate .mg-logo{flex:0 0 auto;width:34px;height:34px;border-radius:10px;background:#f4f4f5;color:#0a0a0b;",
+    "#mobile-gate .mg-logo{flex:0 0 auto;width:34px;height:34px;border-radius:10px;background:#f26207;color:#ffffff;",
     "display:flex;align-items:center;justify-content:center;font-weight:700;font-size:17px;}",
     "#mobile-gate .mg-name{font-size:14.5px;font-weight:600;letter-spacing:.1px;}",
-    "#mobile-gate .mg-sub{font-size:11.5px;color:#a3a3ab;margin-top:2px;}",
+    "#mobile-gate .mg-sub{font-size:11.5px;color:#9da2b3;margin-top:2px;}",
     "#mobile-gate .mg-pin{display:block;width:100%;box-sizing:border-box;text-align:center;",
     "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:23px;font-weight:600;",
-    "letter-spacing:.3em;text-indent:.3em;padding:10px 6px;border-radius:12px;border:1px solid #2b2b30;",
-    "background:#0d0d0f;color:#f4f4f5;outline:none;-webkit-appearance:none;appearance:none;}",
-    "#mobile-gate .mg-pin::placeholder{color:#45454d;}",
-    "#mobile-gate .mg-pin:focus{border-color:#f4f4f5;}",
-    "#mobile-gate .mg-err{min-height:15px;margin-top:7px;font-size:12px;color:#ff6b6b;}",
+    "letter-spacing:.3em;text-indent:.3em;padding:10px 6px;border-radius:12px;border:1px solid #2a2a2f;",
+    "background:#131315;color:#f4f4f5;outline:none;-webkit-appearance:none;appearance:none;}",
+    "#mobile-gate .mg-pin::placeholder{color:#6e7684;}",
+    "#mobile-gate .mg-pin:focus{border-color:#2563eb;box-shadow:0 0 0 2px rgba(37,99,235,.4);}",
+    "#mobile-gate .mg-err{min-height:15px;margin-top:7px;font-size:12px;color:#ee5a5a;}",
     "#mobile-gate .mg-btn{display:block;width:100%;margin-top:5px;padding:13px;border:none;border-radius:12px;",
-    "cursor:pointer;background:#f4f4f5;color:#0a0a0b;font-size:15px;font-weight:600;font-family:inherit;",
+    "cursor:pointer;background:#2563eb;color:#ffffff;font-size:15px;font-weight:600;font-family:inherit;",
     "touch-action:manipulation;-webkit-tap-highlight-color:transparent;}",
-    "#mobile-gate .mg-btn:active{background:#fff;}",
+    "#mobile-gate .mg-btn:active{background:#3b82f6;}",
     "#mobile-gate .mg-btn:disabled{opacity:.5;}",
-    "#mobile-gate .mg-status{min-height:15px;margin-top:9px;font-size:11.5px;color:#6d6d75;}",
+    "#mobile-gate .mg-status{min-height:15px;margin-top:9px;font-size:11.5px;color:#6e7684;}",
     "#mobile-gate .mg-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;",
-    "margin-top:6px;font-size:11px;color:#6d6d75;}",
+    "margin-top:6px;font-size:11px;color:#6e7684;}",
     "#mobile-gate .mg-host{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}",
-    "#mobile-gate .mg-link{background:none;border:none;padding:4px 0;color:#a3a3ab;font-size:11px;",
+    "#mobile-gate .mg-link{background:none;border:none;padding:4px 0;color:#9da2b3;font-size:11px;",
     "font-family:inherit;text-decoration:underline;cursor:pointer;touch-action:manipulation;}",
     "@media (max-height:430px){#mobile-gate .mg-card{margin:auto auto 0;}}",
     "#mobile-gate.hide{display:none;}",

@@ -7,6 +7,9 @@
    Yandex Cloud отвечает подменённый сервер, поэтому проверка честная от начала
    до конца: интерфейс → IPC → src/yc-console.js → HTTP → разбор → отрисовка.
 
+   Отдельно проверяется, что таблицы базы YDB панель спрашивает у Document API
+   САМОЙ базы (операцией в заголовке) — в консольном API их просто нет.
+
    Отдельно проверяются три вещи, которые легко сделать «на вид работает»:
      • связь, которой нет в API, показывает причину, а не пустой список;
      • форма пути подбирается (DNS принимает только вторую форму);
@@ -41,6 +44,8 @@ function freePort() {
 // ── Подменённый Yandex Cloud API ────────────────────────────────────────────
 const seen = [];
 const calls = { rollback: 0 };
+// Запросы Document API базы YDB: операция — в заголовке, не в пути.
+const docCalls = [];
 const created = []; // что реально ушло на создание (по имени сервиса)
 
 function startFakeYc() {
@@ -127,6 +132,26 @@ function startFakeYc() {
         return json(200, { id: "op1", done: true, metadata: { "@type": "yandex.cloud.serverless.containers.v1.RollbackContainerRevisionMetadata" } });
       }
 
+      // YDB: база и её таблицы. Таблиц в КОНСОЛЬНОМ API нет — их отдаёт
+      // Document API самой базы (адрес лежит в её же documentApiEndpoint).
+      // Операция идёт заголовком X-Amz-Target: если панель пойдёт REST-путём,
+      // проверка это поймает.
+      if (p === "/ydb/v1/databases") {
+        return json(200, { databases: [{
+          id: "etn1", name: "app-db", folderId: "f1", status: "RUNNING",
+          endpoint: "grpcs://ydb.serverless.yandexcloud.net:2135/ru-central1/b1g/etn1",
+          documentApiEndpoint: "http://" + (req.headers.host || "127.0.0.1") + "/ru-central1/b1g/etn1",
+        }] });
+      }
+      if (p === "/ydb/v1/databases/etn1") {
+        return json(200, { id: "etn1", name: "app-db", folderId: "f1", status: "RUNNING" });
+      }
+      if (p === "/ru-central1/b1g/etn1") {
+        const target = String(req.headers["x-amz-target"] || "");
+        docCalls.push({ target: target, auth: req.headers.authorization || "", path: p });
+        if (target === "DynamoDB_20120810.ListTables") return json(200, { TableNames: ["pets", "orders"] });
+        return json(200, {});
+      }
       // Остальные сервисы дашборда: пустые списки (карточки без ошибок).
       if (req.method === "GET") return json(200, {});
       json(200, {});
@@ -471,7 +496,40 @@ function hasXvfb() {
     check("бесплатный ресурс создаётся без лишнего вопроса", free.ok === true, free.error.slice(0, 90));
     check("оба запроса на создание дошли до API", created.join(",") === "dns,vpc", "создано: " + created.join(", "));
 
-    console.log("\n[10] Ошибки страницы");
+    console.log("\n[10] База YDB: таблицы видны в консоли (через Document API базы)");
+    const ydb = await page.evaluate(async () => {
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      await window.YcConsole.open({ serviceKey: "ydb", title: "Managed Service for YDB", item: { id: "etn1", name: "app-db" }, folderId: "f1" });
+      await wait(1500);
+      const chip = [...document.querySelectorAll("#yc-console .ykc-rel")].find((c) => c.textContent.includes("Таблицы"));
+      if (!chip) {
+        return { chip: "", rows: [], heads: [], path: "", err: "" };
+      }
+      const chipText = chip.textContent.replace(/\s+/g, " ").trim();
+      chip.click();
+      await wait(1500);
+      return {
+        chip: chipText,
+        rows: [...document.querySelectorAll("#yc-console .ykc-table tbody tr")].map((tr) => [...tr.querySelectorAll("td")].map((td) => td.textContent).join(" | ")),
+        heads: [...document.querySelectorAll("#yc-console .ykc-table th")].map((th) => th.textContent),
+        path: (document.querySelector("#yc-console .ykc-path") || {}).textContent || "",
+        err: (document.querySelector("#yc-console .ykc-err") || {}).textContent || "",
+      };
+    });
+    check("в карточке базы есть связь «Таблицы» со счётчиком", /Таблицы\s*2/.test(ydb.chip), ydb.chip || ydb.err.split("\n")[0]);
+    check("таблицы базы показаны человеку", ydb.rows.length === 2 && /pets/.test(ydb.rows.join(" ")) && /orders/.test(ydb.rows.join(" ")), ydb.rows.join(" / ") || ydb.err.slice(0, 90));
+    check("колонка таблиц осмысленная", ydb.heads.join("|") === "Название", ydb.heads.join(" | "));
+
+    // Отдельно проверяем ПРОТОКОЛ: таблиц нет в консольном API, значит панель
+    // обязана сходить в Document API базы операцией в заголовке. Иначе список
+    // был бы пустым у настоящей базы.
+    const docList = docCalls.filter((c) => c.target === "DynamoDB_20120810.ListTables");
+    check("панель спросила таблицы у Document API базы (операция в заголовке)", docList.length > 0, docList.length ? docList[0].path + " · " + docList[0].target : "запросов: " + docCalls.length);
+    check("запрос ушёл с IAM-токеном, а не с подписью AWS", docList.every((c) => /^Bearer /.test(c.auth)), ((docList[0] || {}).auth || "").slice(0, 12));
+    check("в панели назван путь запроса", /Document API/.test(ydb.path) && /ListTables/.test(ydb.path), ydb.path.slice(0, 80));
+    check("в консольный API за таблицами не ходили", !seen.some((s) => /\/ydb\/v1\/databases\/etn1\/tables/.test(s)), "запросов: " + seen.filter((s) => /ydb/.test(s)).join(", ") || "нет");
+
+    console.log("\n[11] Ошибки страницы");
     const real = pageErrs.filter((e) => !/favicon|net::ERR_FILE_NOT_FOUND/i.test(e));
     check("нет ошибок JS и консоли", real.length === 0, real.slice(0, 3).join(" | ") || "чисто");
   } catch (e) {

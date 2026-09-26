@@ -120,7 +120,7 @@ async function startServer(port) {
     // 404 по ним означает, что в окне агент стартует без правил и без инструментов.
     // yc-panel.js — панель Yandex Cloud (этап 2 разбора app.js): без неё app.js не
     // соберёт панель, и раздел «облако» в окне молча перестанет работать.
-    for (const f of ["app.js", "provider-config.js", "provider-transport.js", "context-window.js", "web-tools.js", "image-tools.js", "prompts.js", "tool-schemas.js", "agent-core.js", "yc-panel.js", "chat-actions.js", "styles.css", "monochrome.css"]) {
+    for (const f of ["app.js", "provider-config.js", "provider-transport.js", "context-window.js", "web-tools.js", "image-tools.js", "prompts.js", "tool-schemas.js", "agent-core.js", "yc-panel.js", "chat-actions.js", "styles.css", "monochrome.css", "panels.css", "replit-theme.css", "reasoning.js"]) {
       const rr = await fetch(BASE + "/" + f);
       check("GET /" + f + " → 200", rr.status === 200);
     }

@@ -24,7 +24,7 @@
 })(typeof self !== "undefined" ? self : this, function (SidePanelDeps) {
   const {
     $, api, isElectron, toast, AgentCore, esc, persistSettings, getSettings,
-    getProjectPanel, getYcPanel, getChatsData, getStreaming, getActiveChat,
+    getProjectPanel, getYcPanel, getChatsData, getStreaming, getActiveChat, confirmModal,
     persistChatsNow, selectChat, renderSidebar, sendMessage, startAutoRunNow, autoResize,
   } = SidePanelDeps || {};
 
@@ -108,8 +108,21 @@
   function openSidePanel(tab) {
     sideTab = tab || sideTab;
     $("side-panel").classList.remove("hidden");
+    // Раскладку запоминаем: открытая область и её раздел — часть привычного
+    // рабочего места, как и свёрнутый список чатов рядом.
+    try {
+      localStorage.setItem("sidePanelOpen", "1");
+      localStorage.setItem("sidePanelTab", sideTab);
+    } catch {}
     for (const b of document.querySelectorAll(".sp-btn")) {
-      b.classList.toggle("active", b.dataset.sp === sideTab);
+      const on = b.dataset.sp === sideTab;
+      b.classList.toggle("active", on);
+      // Лента вкладок не влезает в панель целиком (шесть разделов шире 460px),
+      // поэтому она прокручивается. Активную вкладку подтягиваем в видимую
+      // часть: раздел открывают и с рельсы, а тогда вкладка осталась бы за краем.
+      if (on && typeof b.scrollIntoView === "function") {
+        b.scrollIntoView({ block: "nearest", inline: "nearest" });
+      }
     }
     $("sp-console").classList.toggle("hidden", sideTab !== "console");
     $("sp-preview").classList.toggle("hidden", sideTab !== "preview");
@@ -146,6 +159,7 @@
 
   function closeSidePanel() {
     $("side-panel").classList.add("hidden");
+    try { localStorage.setItem("sidePanelOpen", "0"); } catch {}
     // Панель закрыта — снимаем всю подсветку разделов одним движением.
     markPanelButtons();
   }
@@ -156,8 +170,11 @@
 
   // ── Роли чата, дела и миссия — код в src/renderer/tasks-mission.js ──
   // Отдельные модули интерфейса (консоль Yandex Cloud) — в своём файле и не видят
-  // замыкание app.js. Тост отдаём наружу явно, а не дублируем его реализацию.
+  // замыкание app.js. Тост и подтверждение отдаём наружу явно, а не дублируем их
+  // реализацию: удаление образа реестра или записи DNS необратимо и должно
+  // спрашивать модальным окном, а не одним тостом.
   window.uiToast = toast;
+  window.uiConfirm = confirmModal;
   const TasksMission = window.TasksMission({
     $: $,
     api: api,
@@ -345,6 +362,27 @@
     } catch {}
     syncRail();
   })();
+
+  // Правая рабочая область при первом запуске ОТКРЫТА. Это половина рабочего
+  // места (раздел, превью, консоль — как у Replit), и пока она закрыта, человек
+  // не видит даже, что она есть. Кто закрыл — у того останется закрытой:
+  // выбор лежит в localStorage рядом со свёрнутым списком чатов.
+  //
+  // Зовётся ПОСЛЕ чтения настроек (afterLoad), а не при сборке модуля, и это не
+  // придирка порядка: открытие раздела «превью» подтягивает сохранённый адрес
+  // через previewOpen, а тот пишет настройки ЦЕЛИКОМ. Пока настройки не прочитаны,
+  // в памяти лежат умолчания — запись затирала ими настоящие (модель «сбрасывалась»
+  // на пустую сразу после запуска; найдено живым прогоном окна).
+  function restoreSidePanel() {
+    try {
+      // На телефоне та же панель — выезжающая поверх окна на 94vw: там она сама
+      // открываться не должна, иначе первый запуск закрыл бы собой чат.
+      if (window.innerWidth > 900 && localStorage.getItem("sidePanelOpen") !== "0") {
+        const saved = localStorage.getItem("sidePanelTab");
+        openSidePanel(saved && SP_TITLES[saved] ? saved : "preview");
+      }
+    } catch {}
+  }
   $("btn-sp-close").onclick = closeSidePanel;
   document.querySelectorAll(".sp-btn").forEach((b) => {
     b.onclick = () => switchSideTab(b.dataset.sp);
@@ -404,6 +442,7 @@
     sidePanelVisible: sidePanelVisible,
     getSideTab: () => sideTab,
     switchSideTab: switchSideTab,
+    restoreSidePanel: restoreSidePanel,
     syncRail: syncRail,
     termAppend: termAppend,
     termReset: termReset,

@@ -32,6 +32,12 @@
   function toggleModelPopup() {
     const popup = $("model-popup");
     const willShow = popup.classList.contains("hidden");
+    // Плашка Reasoning стоит на том же месте: два открытых попапа перекрылись бы
+    // (в reasoning.js обратная связь уже есть, здесь её не хватало).
+    if (willShow) {
+      const rp = $("reasoning-popup");
+      if (rp) rp.classList.add("hidden");
+    }
     popup.classList.toggle("hidden", !willShow);
     if (willShow) renderModelPopup();
   }
@@ -74,8 +80,11 @@
   async function refreshModelsQuick() {
     const provider = getSettings().provider || "openai";
     const btn = $("mp-refresh");
+    // Подпись — отдельный span: запись textContent в саму кнопку стёрла бы её
+    // значок (он теперь SVG в разметке).
+    const label = $("mp-refresh-label");
     btn.disabled = true;
-    btn.textContent = "Загружаю...";
+    if (label) label.textContent = "Загружаю...";
     try {
       const cfg = { ...getSettings(), provider, model: "" };
       const res = isElectron ? await api.listModels(cfg) : await AgentCore.listModels(cfg, { fromBrowser: true });
@@ -91,7 +100,7 @@
       toast("Ошибка: " + (e.message || e));
     } finally {
       btn.disabled = false;
-      btn.textContent = "↻ Обновить";
+      if (label) label.textContent = "Обновить";
     }
   }
 

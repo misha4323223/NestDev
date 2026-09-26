@@ -102,6 +102,11 @@ const NOT_FOR_PHONE = new Map([
   ["yc:console:overview", "консоль Yandex Cloud есть только в окне на ПК"],
   ["yc:console:list", "консоль Yandex Cloud есть только в окне на ПК"],
   ["yc:console:rollback", "откат через консоль Yandex Cloud делается с ПК"],
+  ["yc:console:secretVersion", "новая версия секрета Lockbox — только из окна на ПК"],
+  ["yc:console:dnsRecord", "записи DNS в консоли Yandex Cloud меняются с ПК"],
+  ["yc:console:registryImage", "чистка образов реестра — только из окна на ПК"],
+  ["yc:console:storageObject", "файлы в объектном хранилище убираются с ПК"],
+  ["yc:console:bucketAccess", "публичный доступ к бакету включается с ПК"],
 ]);
 
 // Одноразовый токен пары и сеансы устройств. Токен пары живёт в QR-коде на
@@ -141,6 +146,8 @@ const STATIC_FILES = new Set([
   "boot-guard.js",
   "styles.css",
   "monochrome.css",
+  "panels.css",
+  "replit-theme.css",
   "app.js",
   "provider-config.js",
   "provider-transport.js",
@@ -188,6 +195,7 @@ const STATIC_FILES = new Set([
   "g4f-panel.js",
   "auto-tasks.js",
   "model-popup.js",
+  "reasoning.js",
   "ask-modal.js",
   "chat-rename.js",
   "chat-store.js",

@@ -57,7 +57,9 @@ function createRunBatch(deps) {
     const afterBatch = await mission.afterBatch();
     if (afterBatch.finish) {
       mission.emitState(afterBatch.phase);
-      return { kind: "end", message: afterBatch.message };
+      // Работа сохранена, но не закончена (лимит, время, зацикливание): в окне
+      // загорится «▶ Продолжить» — раньше человек писал «продолжай» руками.
+      return { kind: "end", message: afterBatch.message, resume: true };
     }
     if (!afterBatch.continue) {
       // Миссия закрыта — это НЕ исчерпание счётчика раундов: завершаем обычным
@@ -70,6 +72,8 @@ function createRunBatch(deps) {
           message:
             "🏁 Работа закончена" + (mDone ? " — миссия «" + mDone.title + "» закрыта" : "") +
             ". Цель, план, журнал и отчёт: " + mission.folderText(mDone) + ".",
+          // Миссия закрыта — продолжать нечего: кнопка «▶ Продолжить» не показывается.
+          resume: false,
         };
       }
       return { kind: "break" };

@@ -32,6 +32,10 @@ const KNOWN_ENDPOINTS = {
   "lockbox": "https://lockbox.api.cloud.yandex.net",
   "storage": "https://storage.api.cloud.yandex.net",
   "storage-api": "https://storage.api.cloud.yandex.net",
+  // Объекты бакета — не в консольном (storage-api), а в S3-совместимом API.
+  // Авторизация там IAM-токеном работает БЕЗ подписи запроса
+  // (Authorization: Bearer <IAM>), поэтому статический ключ доступа не нужен.
+  "storage-s3": "https://storage.yandexcloud.net",
   "dns": "https://dns.api.cloud.yandex.net",
   "apigateway": "https://apigateway.api.cloud.yandex.net",
   "serverless-apigateway": "https://serverless-apigateway.api.cloud.yandex.net",
@@ -1007,6 +1011,102 @@ async function addRoleOnFolder(oauthToken, folderId, saId, roleId) {
   return true;
 }
 
+// ── Cloud DNS: записи зоны ──────────────────────────────────────────────────
+// Сверено с документацией: dns/api-ref/DnsZone/updateRecordSets. Метод СТРОГИЙ:
+// удаление несуществующей записи — ошибка, добавление поверх уже существующей
+// пары «имя+тип» — тоже ошибка. Поэтому «поставить значение» сделано как
+// чтение зоны → удаление прежнего набора → добавление нового: иначе второй
+// такой вызов по тому же имени падал бы с «record already exists».
+async function dnsBase(oauthToken) {
+  return (await endpoint("dns")) || KNOWN_ENDPOINTS.dns;
+}
+
+// Одна запись в том виде, в каком её ждёт API: ttl — строка секунд (int64),
+// data — непустой массив строк. Имя зоны в Cloud DNS — FQDN с точкой на конце,
+// поэтому точку добавляем сами: без неё API отвечает ошибкой валидации.
+function normalizeRecordSet(v) {
+  const o = v || {};
+  let name = String(o.name == null ? "" : o.name).trim();
+  if (name && name !== "." && name.slice(-1) !== ".") name += ".";
+  // Значения называют по-разному: в API это data, человек и агент говорят
+  // «value» и «values». Принимаем все три, чтобы запись не теряла значения
+  // на ровном месте (и не падала «нет значений» там, где значение передали).
+  const src = o.data != null ? o.data : o.values != null ? o.values : o.value;
+  const raw = Array.isArray(src) ? src : src == null || src === "" ? [] : [src];
+  const data = raw.map((d) => String(d == null ? "" : d).trim()).filter(Boolean);
+  const ttlNum = parseInt(o.ttl, 10);
+  return {
+    name: name,
+    type: String(o.type == null ? "" : o.type).trim().toUpperCase(),
+    ttl: String(ttlNum > 0 ? ttlNum : 600),
+    data: data,
+    description: o.description == null ? "" : String(o.description),
+  };
+}
+
+async function listRecordSets(oauthToken, zoneId) {
+  const id = String(zoneId || "").trim();
+  if (!id) throw new Error("Не указан id DNS-зоны.");
+  const token = await getIamToken(oauthToken);
+  const base = await dnsBase(oauthToken);
+  const path = "/dns/v1/zones/" + encodeURIComponent(id) + ":getRecordSets";
+  let j = null;
+  try {
+    j = await fetchJson(base + path, { headers: { Authorization: "Bearer " + token } }, 20000);
+  } catch (e) {
+    // Часть шлюзов принимает только POST (в proto у метода есть и POST-привязка) —
+    // это тот же случай, что в консоли панели: пробуем вторую форму, а не гадаем.
+    j = await fetchJson(base + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: "{}",
+    }, 20000);
+  }
+  return pickList(j, "recordSets").map(normalizeRecordSet).filter((r) => r.name && r.type);
+}
+
+// Одна операция изменения: deletions применяются первыми, additions — после.
+async function updateRecordSets(oauthToken, zoneId, body) {
+  const id = String(zoneId || "").trim();
+  if (!id) throw new Error("Не указан id DNS-зоны.");
+  const deletions = ((body && body.deletions) || []).map(normalizeRecordSet);
+  const additions = ((body && body.additions) || []).map(normalizeRecordSet);
+  if (!deletions.length && !additions.length) throw new Error("Нечего менять: список записей пуст.");
+  const token = await getIamToken(oauthToken);
+  const base = await dnsBase(oauthToken);
+  const j = await fetchJson(base + "/dns/v1/zones/" + encodeURIComponent(id) + ":updateRecordSets", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+    body: JSON.stringify({ deletions: deletions, additions: additions }),
+  }, 30000);
+  await waitOperation(oauthToken, j && j.id, 120000);
+  return true;
+}
+
+// Поставить значения для пары «имя+тип»: есть — заменяем, нет — добавляем.
+async function upsertRecordSet(oauthToken, zoneId, rec) {
+  const want = normalizeRecordSet(rec);
+  if (!want.name || want.name === ".") throw new Error("У записи нужно имя: вершина зоны — само имя зоны (example.com.), поддомен — www.example.com.");
+  if (!want.type) throw new Error("У записи нужен тип: A, AAAA, CNAME, TXT, MX, NS, SRV…");
+  if (!want.data.length) throw new Error("У записи нет значений: для A это IP, для CNAME — домен, для TXT — текст.");
+  const existing = (await listRecordSets(oauthToken, zoneId)).find((r) => r.name === want.name && r.type === want.type) || null;
+  await updateRecordSets(oauthToken, zoneId, { deletions: existing ? [existing] : [], additions: [want] });
+  return { name: want.name, type: want.type, ttl: want.ttl, values: want.data.length, replaced: !!existing };
+}
+
+// Удалить ВЕСЬ набор значений пары «имя+тип» (строгий API требует точного
+// совпадения, поэтому удаляем ровно то, что лежит в зоне).
+async function deleteRecordSet(oauthToken, zoneId, opts) {
+  const o = opts || {};
+  const name = normalizeRecordSet({ name: o.name }).name;
+  const type = String(o.type == null ? "" : o.type).trim().toUpperCase();
+  if (!name || name === "." || !type) throw new Error("Для удаления нужны имя и тип записи.");
+  const existing = (await listRecordSets(oauthToken, zoneId)).find((r) => r.name === name && r.type === type) || null;
+  if (!existing) throw new Error("В зоне нет записи " + name + " " + type + " — удалять нечего.");
+  await updateRecordSets(oauthToken, zoneId, { deletions: [existing], additions: [] });
+  return { name: name, type: type, values: existing.data.length };
+}
+
 // ── Lockbox: секреты приложения ─────────────────────────────────────────────
 // Зачем: значения секретов не должны ехать через модель и не должны лежать
 // в образе открытым текстом (imageSpec.environment). Секрет живёт в Lockbox, а
@@ -1072,12 +1172,34 @@ async function listSecretVersions(oauthToken, secretId) {
     .sort((a, b) => String((b && b.createdAt) || "").localeCompare(String((a && a.createdAt) || "")));
 }
 
+// Пары «ключ → значение» принимаем в обоих видах, в которых они приходят:
+// списком объектов (форма в панели облака) и обычным объектом (так пишет модель).
+function normalizeSecretEntries(v) {
+  const out = [];
+  if (Array.isArray(v)) {
+    for (const e of v) {
+      if (!e || typeof e !== "object") continue;
+      const key = String(e.key == null ? "" : e.key).trim();
+      if (!key) continue;
+      out.push({ key: key, value: e.value == null ? "" : String(e.value) });
+    }
+    return out;
+  }
+  if (v && typeof v === "object") {
+    for (const key of Object.keys(v)) {
+      const k = String(key).trim();
+      if (!k) continue;
+      out.push({ key: k, value: v[key] == null ? "" : String(v[key]) });
+    }
+  }
+  return out;
+}
 // Новая версия секрета со значениями. Значения НЕ возвращаются и НЕ попадают
 // ни в отчёт, ни в состояние: наружу уходят только ключи и id версии.
 async function putSecretVersion(oauthToken, secretId, entries) {
   const id = String(secretId || "").trim();
   if (!id) throw new Error("Не указан id секрета Lockbox.");
-  const list = (entries || []).map((e) => ({ key: String(e && e.key), textValue: String(e && e.value == null ? "" : e.value) })).filter((e) => e.key);
+  const list = normalizeSecretEntries(entries).map((e) => ({ key: e.key, textValue: e.value }));
   if (!list.length) throw new Error("Нет ни одной пары «ключ → значение» для версии секрета.");
   const bad = list.find((e) => !/^[-_./\\@0-9a-zA-Z]+$/.test(e.key));
   if (bad) throw new Error("Ключ «" + bad.key + "» не годится для Lockbox: допустимы латиница, цифры и знаки - _ . / \\ @.");
@@ -1132,6 +1254,20 @@ async function listRegistryImages(oauthToken, registryId) {
   return Array.isArray(j && j.images) ? j.images : [];
 }
 
+// Найти образ по id, тегу или digest. Нужно и панели, и агенту: человек называет
+// образ тегом («удали app:v1.2»), а Delete принимает ровно id образа.
+async function findRegistryImage(oauthToken, registryId, ref) {
+  const want = String(ref || "").trim();
+  if (!want) return null;
+  const images = await listRegistryImages(oauthToken, registryId);
+  return (
+    images.find((i) => i && i.id === want) ||
+    images.find((i) => i && Array.isArray(i.tags) && i.tags.indexOf(want) >= 0) ||
+    images.find((i) => i && i.digest === want) ||
+    null
+  );
+}
+
 async function deleteRegistryImage(oauthToken, imageId) {
   const id = String(imageId || "").trim();
   if (!id) throw new Error("Не указан id образа.");
@@ -1143,6 +1279,309 @@ async function deleteRegistryImage(oauthToken, imageId) {
   }, 30000);
   await waitOperation(oauthToken, j && j.id, 120000);
   return true;
+}
+
+// ── Object Storage: объекты бакета (S3-совместимый API) ─────────────────────
+// Бакет в приложении было чем СОЗДАТЬ, а положить в него файл — нечем: список
+// бакетов читался, а сами объекты не открывались нигде, кроме консоли облака.
+// Между тем бакет и создаётся «для файлов и статики»: без объектов это пустая
+// полка. Объекты живут в S3-совместимом API (storage.yandexcloud.net), и его
+// главная особенность — авторизация IAM-токеном работает БЕЗ подписи запроса
+// (Authorization: Bearer <IAM>), ровно как у остальных сервисов каталога.
+// Поэтому ни статический ключ доступа, ни подпись AWS здесь не нужны.
+//
+// Ответы этого API — XML (JSON-варианта у S3 нет), поэтому разбор здесь свой и
+// намеренно маленький: списку объектов нужны четыре поля.
+const S3_OBJECTS_LIMIT = 1000; // столько ключей просим у API за раз
+const S3_MAX_BYTES = 64 * 1024 * 1024; // столько кладём и забираем одним запросом
+
+async function s3Base() {
+  return (await endpoint("storage-s3")) || KNOWN_ENDPOINTS["storage-s3"];
+}
+
+// Раскодировать текст XML. Значения приходят экранированными (&amp; и т.п.),
+// а ключ объекта — это имя файла пользователя, его нельзя показывать как есть.
+function xmlText(s) {
+  return String(s == null ? "" : s)
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+function xmlTag(xml, tag) {
+  const m = new RegExp("<" + tag + ">([\\s\\S]*?)</" + tag + ">").exec(String(xml || ""));
+  return m ? xmlText(m[1]) : "";
+}
+
+// Список объектов: каждое содержимое идёт блоком <Contents>. «Папки» Object
+// Storage — это тоже ключи (нулевой размер и слеш на конце), поэтому отдельной
+// ветки для них нет: что API отдал, то и показываем.
+function parseObjectList(xml) {
+  const out = [];
+  const re = /<Contents>([\s\S]*?)<\/Contents>/g;
+  let m;
+  while ((m = re.exec(String(xml || "")))) {
+    const one = m[1];
+    out.push({
+      key: xmlTag(one, "Key"),
+      size: Number(xmlTag(one, "Size")) || 0,
+      lastModified: xmlTag(one, "LastModified"),
+      etag: xmlTag(one, "ETag").replace(/^"/, "").replace(/"$/, ""),
+      storageClass: xmlTag(one, "StorageClass"),
+    });
+  }
+  return out;
+}
+
+// Ошибка S3 приходит XML-ом: вытаскиваем Code и Message и объясняем то, что
+// случается чаще всего. Без этого человек видел бы «<?xml version…» целиком.
+function s3Error(status, xml, where) {
+  const code = xmlTag(xml, "Code") || "HTTP " + status;
+  const msg = xmlTag(xml, "Message") || String(xml || "").slice(0, 200);
+  const hints = {
+    NoSuchBucket: "Бакета с таким именем нет в каталоге — проверь имя (ycList service storage).",
+    NoSuchKey: "Такого объекта в бакете нет.",
+    AccessDenied: "Нет прав: у аккаунта нет роли на этот бакет (нужна storage.viewer / storage.uploader), либо у бакета закрыт доступ по IAM-токену.",
+    InvalidBucketName: "Имя бакета не годится: только латиница в нижнем регистре, цифры, дефис и точка (3–63 символа).",
+    EntityTooLarge: "Файл больше допустимого для одного запроса.",
+    KeyTooLong: "Слишком длинный ключ объекта (путь в бакете).",
+    SignatureDoesNotMatch: "Облако не приняло подпись запроса — приложению подпись не нужна, оно ходит с IAM-токеном; похоже, запрос ушёл не на тот адрес.",
+  };
+  const text = hints[code] ? hints[code] + " (" + msg + ")" : code + ": " + msg;
+  const e = new Error(text + (where ? " [" + where + "]" : ""));
+  e.status = status;
+  return e;
+}
+
+// Один запрос к S3: путь собирается из бакета и ключа, а ключ не кодируется
+// целиком — иначе слеши в пути стали бы частью имени файла.
+async function s3Fetch(oauthToken, opts) {
+  const o = opts || {};
+  const bucket = String(o.bucket || "").trim();
+  if (!bucket) throw new Error("Не указан бакет.");
+  const key = String(o.key == null ? "" : o.key).replace(/^\/+/, "");
+  const base = await s3Base();
+  const token = await getIamToken(oauthToken);
+  const path = "/" + encodeURIComponent(bucket) + (key ? "/" + key.split("/").map(encodeURIComponent).join("/") : "");
+  const query = o.query ? (String(o.query).indexOf("?") === 0 ? String(o.query) : "?" + o.query) : "";
+  const headers = { Authorization: "Bearer " + token };
+  if (o.contentType) headers["Content-Type"] = o.contentType;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), o.timeoutMs || 60000);
+  try {
+    const res = await fetch(base + path + query, {
+      method: o.method || "GET",
+      headers: headers,
+      body: o.body,
+      signal: ctrl.signal,
+    });
+    if (res.ok && o.raw) {
+      const len = Number(res.headers.get("content-length"));
+      if (isFinite(len) && len > S3_MAX_BYTES) {
+        throw new Error("Объект больше " + Math.round(S3_MAX_BYTES / 1048576) + " МБ — целиком в приложение его не забрать. Возьми файл из консоли облака или сожми его.");
+      }
+      return { status: res.status, body: Buffer.from(await res.arrayBuffer()), text: "", headers: res.headers };
+    }
+    const text = await res.text().catch(() => "");
+    if (!res.ok) throw s3Error(res.status, text, hostOf(base) + path);
+    return { status: res.status, body: null, text: text, headers: res.headers };
+  } catch (e) {
+    // Сбои «запрос не дошёл» объясняем так же, как у остальных сервисов: видно и
+    // адрес, и причину (иначе отказ S3 выглядел бы как «fetch failed»).
+    if (isNetworkError(e)) throw new Error(serviceError(e, base, path));
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function listBucketObjects(oauthToken, opts) {
+  const o = opts || {};
+  const limit = Math.min(Math.max(parseInt(o.limit, 10) || S3_OBJECTS_LIMIT, 1), S3_OBJECTS_LIMIT);
+  const prefix = String(o.prefix || "").replace(/^\/+/, "");
+  const query = "list-type=2&max-keys=" + limit + (prefix ? "&prefix=" + encodeURIComponent(prefix) : "");
+  const r = await s3Fetch(oauthToken, { bucket: o.bucket, query: query });
+  const items = parseObjectList(r.text);
+  return {
+    items: items,
+    count: items.length,
+    truncated: /<IsTruncated>true<\/IsTruncated>/i.test(r.text),
+    prefix: prefix,
+  };
+}
+
+// Тип содержимого по расширению. S3 хранит ровно то, что мы прислали, и от этого
+// заголовка зависит, покажет браузер картинку или скачает файл: без него статика
+// в бакете открывается «скачиванием».
+const CONTENT_TYPES = {
+  html: "text/html; charset=utf-8",
+  htm: "text/html; charset=utf-8",
+  css: "text/css; charset=utf-8",
+  js: "text/javascript; charset=utf-8",
+  mjs: "text/javascript; charset=utf-8",
+  json: "application/json; charset=utf-8",
+  map: "application/json; charset=utf-8",
+  txt: "text/plain; charset=utf-8",
+  md: "text/markdown; charset=utf-8",
+  xml: "application/xml; charset=utf-8",
+  csv: "text/csv; charset=utf-8",
+  svg: "image/svg+xml",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  avif: "image/avif",
+  ico: "image/x-icon",
+  woff: "font/woff",
+  woff2: "font/woff2",
+  ttf: "font/ttf",
+  otf: "font/otf",
+  pdf: "application/pdf",
+  zip: "application/zip",
+  gz: "application/gzip",
+  wasm: "application/wasm",
+  mp4: "video/mp4",
+  webm: "video/webm",
+  mp3: "audio/mpeg",
+};
+
+function contentTypeFor(key) {
+  const m = /\.([a-z0-9]+)$/i.exec(String(key || ""));
+  const ext = m ? m[1].toLowerCase() : "";
+  return CONTENT_TYPES[ext] || "application/octet-stream";
+}
+
+// Открытый адрес объекта. Работает для всех, только если у бакета разрешено
+// анонимное чтение; у закрытого бакета адрес вернёт отказ — и это правда, о
+// которой лучше сказать человеку, чем обещать рабочую ссылку.
+function objectPublicUrl(bucket, key) {
+  const b = String(bucket || "").trim();
+  const k = String(key || "").replace(/^\/+/, "");
+  return "https://storage.yandexcloud.net/" + b + "/" + k;
+}
+
+async function putBucketObject(oauthToken, opts) {
+  const o = opts || {};
+  const key = String(o.key || "").replace(/^\/+/, "");
+  if (!key) throw new Error("Не указан ключ объекта (key).");
+  const body = Buffer.isBuffer(o.body) ? o.body : Buffer.from(String(o.body == null ? "" : o.body), "utf8");
+  if (!body.length) {
+    throw new Error("Пустое содержимое: объект нулевого размера не отправляем — в бакете появилась бы пустышка вместо файла.");
+  }
+  if (body.length > S3_MAX_BYTES) {
+    throw new Error("Файл больше " + Math.round(S3_MAX_BYTES / 1048576) + " МБ — одним запросом такое не залить.");
+  }
+  const r = await s3Fetch(oauthToken, {
+    method: "PUT",
+    bucket: o.bucket,
+    key: key,
+    body: body,
+    contentType: o.contentType || contentTypeFor(key),
+    timeoutMs: 120000,
+  });
+  return {
+    bucket: String(o.bucket || "").trim(),
+    key: key,
+    size: body.length,
+    etag: String(r.headers.get("etag") || "").replace(/^"/, "").replace(/"$/, ""),
+    url: objectPublicUrl(o.bucket, key),
+  };
+}
+
+async function getBucketObject(oauthToken, opts) {
+  const o = opts || {};
+  const key = String(o.key || "").replace(/^\/+/, "");
+  if (!key) throw new Error("Не указан ключ объекта (key).");
+  const r = await s3Fetch(oauthToken, { bucket: o.bucket, key: key, raw: true, timeoutMs: 120000 });
+  return {
+    bucket: String(o.bucket || "").trim(),
+    key: key,
+    body: r.body,
+    size: r.body.length,
+    contentType: String(r.headers.get("content-type") || "") || contentTypeFor(key),
+  };
+}
+
+async function deleteBucketObject(oauthToken, opts) {
+  const o = opts || {};
+  const key = String(o.key || "").replace(/^\/+/, "");
+  if (!key) throw new Error("Не указан ключ объекта (key).");
+  await s3Fetch(oauthToken, { method: "DELETE", bucket: o.bucket, key: key });
+  return { bucket: String(o.bucket || "").trim(), key: key };
+}
+
+// ── Публичный доступ к бакету ──────────────────────────────────────────────
+// Файл, положенный в бакет, по умолчанию виден ТОЛЬКО владельцу: открытый адрес
+// storage.yandexcloud.net/<бакет>/<ключ> у другого человека вернёт отказ. Агент
+// при этом честно обещает ссылку — и она не работает. Включается это не ACL, а
+// флагом анонимного доступа бакета (anonymousAccessFlags) через КОНСОЛЬНЫЙ API
+// хранилища: PATCH /storage/v1/buckets/{name} с updateMask=anonymousAccessFlags.
+//
+// Почему не S3-путь с заголовком X-Amz-Acl: ACL бакета тоже ставятся через
+// консольный API, и запись ACL — это PUT ?acl, который в S3-совместимом API
+// означал бы ещё и подпись запроса. Флаг anonymousAccessFlags — ровно то, что
+// включает галочка «Публичный доступ» в консоли Yandex Cloud, и ходит тем же
+// IAM-токеном, как остальное.
+//
+// Флагов три, и их нельзя путать:
+//   read       — прочитать объект по прямой ссылке (то, что нужно для сайта);
+//   list       — перечислить содержимое бакета анонимно (сколько файлов и какие
+//                имена — это уже разведка содержимого, поэтому по умолчанию OFF);
+//   configRead — прочитать настройки бакета (CORS, жизненный цикл, статика).
+// Включаем ТОЛЬКО read: этого хватает, чтобы ссылка открылась, и не выдаёт
+// наружу список файлов.
+const BUCKET_ACCESS_FIELDS = ["read", "list", "configRead"];
+
+function readAnonymousFlags(bucketJson) {
+  const f = (bucketJson && bucketJson.anonymousAccessFlags) || {};
+  return { read: !!f.read, list: !!f.list, configRead: !!f.configRead };
+}
+
+// Текущее состояние публичного доступа бакета (GET /storage/v1/buckets/{name}).
+async function getBucketAccess(oauthToken, bucketName) {
+  const name = String(bucketName || "").trim();
+  if (!name) throw new Error("Не указан бакет.");
+  const token = await getIamToken(oauthToken);
+  const base = (await endpoint("storage-api")) || KNOWN_ENDPOINTS["storage-api"];
+  const j = await fetchJson(base + "/storage/v1/buckets/" + encodeURIComponent(name), {
+    headers: { Authorization: "Bearer " + token },
+  }, 30000);
+  return { bucket: name, flags: readAnonymousFlags(j) };
+}
+
+// Включить (publicOn=true) или снять анонимное чтение бакета. updateMask
+// обязателен: без него сервис обнулит ВСЕ остальные поля бакета — потеря
+// настроек статики или CORS была бы неприятным сюрпризом.
+async function setBucketPublicAccess(oauthToken, bucketName, publicOn) {
+  const name = String(bucketName || "").trim();
+  if (!name) throw new Error("Не указан бакет.");
+  const on = !!publicOn;
+  const token = await getIamToken(oauthToken);
+  const base = (await endpoint("storage-api")) || KNOWN_ENDPOINTS["storage-api"];
+  await fetchJson(base + "/storage/v1/buckets/" + encodeURIComponent(name), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+    body: JSON.stringify({
+      updateMask: "anonymousAccessFlags",
+      anonymousAccessFlags: { read: on, list: false, configRead: false },
+    }),
+  }, 60000);
+  // Проверяем результат, а не факт отправки: без этого «сделал публичным» осталось
+  // бы обещанием при отказе по правам (нужна роль storage.admin или storage.editor).
+  const after = await getBucketAccess(oauthToken, name);
+  if (after.flags.read !== on) {
+    const e = new Error(
+      "Публичный доступ к бакету не изменился: анонимное чтение " +
+        (on ? "не включилось" : "не выключилось") +
+        ". Нужна роль storage.admin или storage.editor на бакете (у viewer прав на изменение нет)."
+    );
+    e.status = 403;
+    throw e;
+  }
+  return { bucket: name, flags: after.flags, public: after.flags.read };
 }
 
 module.exports = {
@@ -1181,6 +1620,12 @@ module.exports = {
   containerInfo,
   listContainerAccessBindings,
   setContainerPublicAccess,
+  normalizeRecordSet,
+  listRecordSets,
+  updateRecordSets,
+  upsertRecordSet,
+  deleteRecordSet,
+  normalizeSecretEntries,
   listSecrets,
   findSecret,
   ensureLockboxSecret,
@@ -1190,6 +1635,18 @@ module.exports = {
   grantSecretAccess,
   listRegistryImages,
   deleteRegistryImage,
+  findRegistryImage,
+  parseObjectList,
+  contentTypeFor,
+  objectPublicUrl,
+  listBucketObjects,
+  putBucketObject,
+  getBucketObject,
+  deleteBucketObject,
+  getBucketAccess,
+  setBucketPublicAccess,
+  BUCKET_ACCESS_FIELDS,
+  S3_MAX_BYTES,
   getContainer,
   updateContainer,
   listRevisions,

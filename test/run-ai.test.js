@@ -132,7 +132,7 @@ function mk(over) {
     consumeProviderStream: async () => {},
     contextBudget: () => 100000,
     createContextManager: () => ctxManager,
-    createRunBatch: () => ({ askForReport: () => false, afterRound: async () => ({ kind: "break" }) }),
+    createRunBatch: () => ({ askForReport: () => false, afterRound: async () => o.afterRound || ({ kind: "break" }) }),
     createRunCalls: () => ({
       fromText: () => {},
       normalize: (c) => (o.dropCalls ? [] : c),
@@ -614,6 +614,103 @@ const systemOf = (m) => String((m.calls.rounds[0] || {}).messages && (m.calls.ro
     assert.strictEqual(typeof m.calls.askDeps.emit, "function", "ожиданию не передан вывод событий");
     assert.strictEqual(m.calls.askDeps.live, m.live, "ожидание получило копию живого состояния: ответ не дошёл бы");
     assert.strictEqual(m.calls.askCancels, 1, "финал не снял ожидание ответа: " + m.calls.askCancels);
+  });
+
+  await test("кнопка «Продолжить»: остановка с сохранённой работой — событие resume", async () => {
+    // Прерывание чтения потока «Стопом» приходит как AbortError — так его отдаёт
+    // транспорт (src/renderer/provider-transport.js): это и есть остановка человека.
+    const abortError = () => {
+      const e = new Error("Прерывание запроса: остановлено человеком");
+      e.name = "AbortError";
+      return e;
+    };
+    // Обычный финал: возвращаться некуда — кнопка гореть не должна.
+    const done = mk();
+    await run(done);
+    assert.ok(!done.calls.events.some((e) => e.ev && e.ev.type === "resume"), "обычный финал зажёг кнопку «Продолжить»");
+
+    // «Стоп»: работа лежит на диске, чекпоинт открыт — кнопка нужна, и признак идёт
+    // ДО «done»: окно показывает её вместе с завершением ответа, а не после.
+    const mkStop = () => mk({
+      parallel: true,
+      rounds: [{
+        text: "работаю",
+        toolCalls: [{ name: "readFile", args: {} }],
+        onRun: () => { global.__agentStopRequested = true; },
+      }],
+    });
+    try {
+      const stopped = mkStop();
+      await run(stopped);
+      const types = stopped.calls.events
+        .filter((e) => e.ev && (e.ev.type === "resume" || e.ev.type === "done"))
+        .map((e) => e.ev.type);
+      assert.deepStrictEqual(types, ["resume", "done"], "«Стоп» не зажёг кнопку продолжения или порядок событий другой: " + JSON.stringify(types));
+      const reason = stopped.calls.events.find((e) => e.ev && e.ev.type === "resume").ev.reason;
+      assert.ok(/остановлено пользователем/.test(reason), "у кнопки нет причины остановки: " + reason);
+    } finally {
+      global.__agentStopRequested = false;
+    }
+
+    // «Стоп» ПОСРЕДИ запроса: транспорт прерывает чтение, и это по-прежнему
+    // остановка человека — мягкая, с сохранённой работой и кнопкой продолжения.
+    // Раньше здесь человек видел ошибку «⏹ Генерация остановлена» и продолжал руками.
+    try {
+      global.__agentStopRequested = true;
+      const midStop = mk({ parallel: true, rounds: [{ error: abortError() }] });
+      await run(midStop);
+      const midTypes = midStop.calls.events
+        .filter((e) => e.ev && (e.ev.type === "resume" || e.ev.type === "done"))
+        .map((e) => e.ev.type);
+      assert.deepStrictEqual(midTypes, ["resume", "done"], "«Стоп» посреди запроса не завершился мягко: " + JSON.stringify(midTypes));
+      assert.ok(!midStop.calls.events.some((e) => e.ev && e.ev.type === "error"), "остановка человека ушла в чат ошибкой");
+      assert.ok(midStop.calls.mission.some((s) => /stage:остановка человеком/.test(s)), "отрезок работы не закрыт причиной остановки: " + JSON.stringify(midStop.calls.mission));
+    } finally {
+      global.__agentStopRequested = false;
+    }
+    // Обратная сторона: прерывание БЕЗ остановки человека (закрытие приложения,
+    // сбой транспорта) остаётся сбоем прогона — кнопка не горит зря.
+    const lost = mk({ parallel: true, rounds: [{ error: abortError() }] });
+    await assert.rejects(() => run(lost), (e) => e && e.name === "AbortError", "прерывание без остановки перестало быть сбоем");
+    assert.ok(!lost.calls.events.some((e) => e.ev && e.ev.type === "resume"), "сбой транспорта зажёг кнопку продолжения");
+
+    // Пауза миссии по кнопке — то же самое.
+    global.__agentPauseRequested = true;
+    try {
+      const paused = mk();
+      await run(paused);
+      assert.ok(paused.calls.events.some((e) => e.ev && e.ev.type === "resume" && /пауза/.test(e.ev.reason)),
+        "пауза не зажгла кнопку продолжения");
+    } finally {
+      global.__agentPauseRequested = false;
+    }
+
+    // Лимит раундов: прогон падает фатальным отказом — человек видит кнопку, а не
+    // только текст «напиши продолжай» руками.
+    const limited = mk({ parallel: true, rounds: [], defaultStep: { toolCalls: [{ name: "readFile", args: {} }], text: "" } });
+    await assert.rejects(() => run(limited), /Превышено максимальное число раундов/);
+    assert.ok(limited.calls.events.some((e) => e.ev && e.ev.type === "resume" && /лимит раундов/.test(e.ev.reason)),
+      "лимит раундов не зажёг кнопку продолжения");
+  });
+
+  await test("кнопка «Продолжить»: закрытая миссия её не показывает, мягкая остановка — показывает", async () => {
+    // Мягкая остановка миссии (лимит/время/цикл) приходит решением батча с признаком
+    // resume: продолжать есть что, и чекпоинт остаётся открытым.
+    const work = { toolCalls: [{ name: "readFile", args: {} }], text: "работаю" };
+    const stop = mk({ parallel: true, rounds: [], defaultStep: work, afterRound: { kind: "end", message: "⏹ Миссия отработала лимит раундов.", resume: true } });
+    await run(stop);
+    assert.ok(stop.calls.events.some((e) => e.ev && e.ev.type === "resume" && /остановлена/.test(e.ev.reason)), "мягкая остановка миссии не зажгла кнопку");
+    assert.strictEqual(stop.calls.ctxClosed, 0, "мягкая остановка закрыла чекпоинт — продолжение потеряло бы работу");
+
+    // Закрытая миссия — работа доведена: кнопка не показывается (resume: false).
+    const closed = mk({
+      parallel: true,
+      rounds: [],
+      defaultStep: work,
+      afterRound: { kind: "end", message: "🏁 Работа закончена — миссия закрыта.", resume: false },
+    });
+    await run(closed);
+    assert.ok(!closed.calls.events.some((e) => e.ev && e.ev.type === "resume"), "закрытая миссия зажгла кнопку «Продолжить»");
   });
 
   await test("в оболочке этого больше нет, а мост к живому состоянию на месте", () => {

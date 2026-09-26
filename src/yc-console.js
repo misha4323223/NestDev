@@ -20,6 +20,21 @@
    Модуль ничего не выдумывает: все поля — то, что вернул API Yandex Cloud. */
 
 const yc = require("./yandex-cloud.js");
+const { createYcDb } = require("./yc-db.js");
+
+// Таблицы базы YDB живут в другом протоколе — HTTP Document API самой базы
+// (DynamoDB-совместимый). Обслуживает его yc-db.js; помощники облака (IAM-токен,
+// адрес сервиса, разбор сетевых отказов) берём те же, что у остальных запросов.
+const ycdb = createYcDb({
+  getIamToken: yc.getIamToken,
+  fetchJson: yc._fetchJson,
+  endpoint: yc.endpoint,
+  listService: yc.listService,
+  serviceByKey: yc.serviceByKey,
+  hostOf: yc.hostOf,
+  serviceError: yc.serviceError,
+  isNetworkError: yc.isNetworkError,
+});
 
 const PAGE_SIZE = 200; // столько объектов показываем в связанном списке
 const LIST_TIMEOUT_MS = 20000;
@@ -68,6 +83,19 @@ const RELATIONS = {
         { path: (c) => "/dns/v1/zones/" + enc(c.id) + ":getRecordSets" },
         { path: (c) => "/dns/v1/zones/" + enc(c.id) + ":getRecordSets", method: "POST", body: {} },
       ] },
+  ],
+  storage: [
+    // Единственная связь НЕ через консольный API: объекты бакета живут в
+    // S3-совместимом API (storage.yandexcloud.net), который отвечает XML-ом.
+    // Поэтому у неё свой путь запроса — см. ветку rel.s3 в relationList.
+    { key: "objects", title: "Объекты", icon: "🗂", listKey: "objects", s3: true,
+      attempts: [{ path: (c) => "/" + enc(c.name) + "?list-type=2&max-keys=1000" }] },
+  ],
+  ydb: [
+    // Вторая связь НЕ через консольный API: таблицы отдаёт HTTP Document API
+    // САМОЙ базы (адрес — в её же documentApiEndpoint). Поэтому у связи свой
+    // путь запроса — см. ветку rel.docApi в relationList.
+    { key: "tables", title: "Таблицы", icon: "📋", listKey: "tables", docApi: true, attempts: [] },
   ],
 };
 
@@ -121,6 +149,7 @@ const FIELD_LABELS = {
   status: "Статус",
   createdAt: "Создано",
   updatedAt: "Изменено",
+  lastModified: "Изменён",
   expiresAt: "Действует до",
   description: "Описание",
   folderId: "Каталог",
@@ -245,7 +274,7 @@ function humanSec(n) {
   return m < 60 ? m + " мин" : Math.floor(m / 60) + " ч " + (m % 60 ? (m % 60) + " мин" : "");
 }
 
-const TIME_KEYS = new Set(["createdAt", "updatedAt", "expiresAt", "deletedAt", "lastUsedAt", "startedAt", "finishedAt"]);
+const TIME_KEYS = new Set(["createdAt", "updatedAt", "expiresAt", "deletedAt", "lastUsedAt", "startedAt", "finishedAt", "lastModified"]);
 const BYTE_KEYS = new Set(["size", "storageSize", "used"]);
 const SEC_KEYS = new Set(["timeout", "executionTimeout", "ttl", "duration"]);
 
@@ -350,6 +379,8 @@ const RELATION_COLUMNS = {
   "iam:apiKeys": ["id", "createdAt", "expiresAt"],
   "lockbox:versions": ["id", "status", "createdAt"],
   "dns:recordSets": ["name", "type", "ttl", "data"],
+  "storage:objects": ["key", "size", "lastModified"],
+  "ydb:tables": ["name"],
 };
 
 // Таблица для интерфейса: колонки + уже отформатированные строки. Форматирование
@@ -434,6 +465,74 @@ async function relationList(oauthToken, opts) {
     name: String(o.name || "").trim(),
     folderId: String(o.folderId || "").trim(),
   };
+  // Объекты бакета — единственная связь не через консольный API: их отдаёт
+  // S3-совместимый API (storage.yandexcloud.net) и отвечает он XML-ом. Запрос
+  // идёт через yandex-cloud.js, где авторизация и разбор уже есть, — иначе
+  // пришлось бы заводить здесь второй вид запроса ради одного списка.
+  if (rel.s3) {
+    try {
+      const r = await yc.listBucketObjects(oauthToken, { bucket: ctx.name, prefix: "", limit: PAGE_SIZE });
+      const table = buildTable(serviceKey, relationKey, r.items, Date.now());
+      return {
+        ok: true,
+        key: rel.key,
+        title: rel.title,
+        icon: rel.icon,
+        count: r.count,
+        items: r.items,
+        columns: table.columns,
+        rows: table.rows,
+        truncated: r.truncated || r.count > PAGE_SIZE,
+        path: "S3 /" + ctx.name + "?list-type=2",
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        key: rel.key,
+        title: rel.title,
+        icon: rel.icon,
+        count: 0,
+        items: [],
+        error: "Не удалось прочитать «" + rel.title + "» (показываю причину, а не пустой список):\n" + ((e && e.message) || String(e)),
+      };
+    }
+  }
+  // Таблицы базы YDB — вторая связь не через консольный API: их отдаёт HTTP
+  // Document API самой базы (операция идёт заголовком, значения типизированы).
+  // Запрос идёт через yc-db.js, где уже есть адрес базы, IAM и разбор отказов.
+  if (rel.docApi) {
+    try {
+      const found = await ycdb.findDatabase(oauthToken, ctx.folderId, ctx.id || ctx.name);
+      if (!found.db) {
+        throw new Error("База «" + (ctx.name || ctx.id) + "» не нашлась в каталоге — возможно, её удалили.");
+      }
+      const r = await ycdb.listDocumentTables(oauthToken, found.db);
+      const items = r.tables.map((name) => ({ name: name }));
+      const table = buildTable(serviceKey, relationKey, items, Date.now());
+      return {
+        ok: true,
+        key: rel.key,
+        title: rel.title,
+        icon: rel.icon,
+        count: items.length,
+        items: items,
+        columns: table.columns,
+        rows: table.rows,
+        truncated: false,
+        path: "Document API " + r.endpoint + " ListTables",
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        key: rel.key,
+        title: rel.title,
+        icon: rel.icon,
+        count: 0,
+        items: [],
+        error: "Не удалось прочитать «" + rel.title + "» (показываю причину, а не пустой список):\n" + ((e && e.message) || String(e)),
+      };
+    }
+  }
   const headers = await headersFor(oauthToken);
   const base = await baseFor(serviceKey);
   const memoKey = serviceKey + ":" + relationKey;
@@ -589,6 +688,112 @@ async function rollbackRevision(oauthToken, opts) {
   return { ok: true, containerId: containerId, revisionId: revisionId };
 }
 
+// ── Версия секрета Lockbox: карточка секрета в панели ────────────────────────
+// Раньше секрет можно было создать (ycCreate), и на этом всё заканчивалось:
+// версий у него не было, а без версии секрет бесполезен — ревизия контейнера
+// ссылается на ключ, которого нет. Здесь — единственная недостающая операция.
+//
+// Новая версия секрета. Значения уходят в облако и НЕ возвращаются: наружу
+// отдаём только id версии и имена ключей — они попадают и в ответ агенту,
+// и в сообщение панели, и в логи.
+async function putSecretVersion(oauthToken, opts) {
+  const o = opts || {};
+  const secretId = String(o.secretId || o.id || "").trim();
+  if (!secretId) throw new Error("Нужен id секрета. Открой карточку секрета в панели «☁️ Cloud» (список: ycList(service: \"lockbox\")).");
+  // Разбор «ключ → значение» и проверка ключей — в yandex-cloud.js: тем же
+  // кодом пользуется агент, и две копии разъехались бы на первой правке.
+  const entries = o.entries || o.payload || o.values;
+  const r = await yc.putSecretVersion(oauthToken, secretId, entries);
+  return { ok: true, secretId: secretId, versionId: (r && r.versionId) || "", keys: (r && r.keys) || [] };
+}
+
+// ── Записи DNS-зоны: карточка зоны в панели ──────────────────────────────────
+// Раньше зону можно было создать (ycCreate), а записи — только читать: домен
+// подключить было нечем. Строгость API (нельзя удалить несуществующее и
+// добавить поверх существующего) разобрана в yandex-cloud.js — здесь только
+// разбор того, что пришло из формы, и понятные ошибки.
+async function upsertRecord(oauthToken, opts) {
+  const o = opts || {};
+  const zoneId = String(o.zoneId || o.id || "").trim();
+  if (!zoneId) throw new Error("Нужен id DNS-зоны. Открой карточку зоны в панели «☁️ Cloud» (список: ycList(service: \"dns\")).");
+  const type = String(o.type || "").trim().toUpperCase();
+  const values = Array.isArray(o.values) ? o.values : (o.value == null ? [] : [o.value]);
+  const r = await yc.upsertRecordSet(oauthToken, zoneId, {
+    name: o.name,
+    type: type,
+    ttl: o.ttl,
+    data: values,
+  });
+  return { ok: true, zoneId: zoneId, name: r.name, type: r.type, ttl: r.ttl, values: r.values, replaced: r.replaced };
+}
+
+async function deleteRecord(oauthToken, opts) {
+  const o = opts || {};
+  const zoneId = String(o.zoneId || o.id || "").trim();
+  if (!zoneId) throw new Error("Нужен id DNS-зоны.");
+  const r = await yc.deleteRecordSet(oauthToken, zoneId, { name: o.name, type: o.type });
+  return { ok: true, zoneId: zoneId, name: r.name, type: r.type, values: r.values };
+}
+
+// ── Container Registry: чистка образов ────────────────────────────────────
+// Образы копятся: каждая выкатка добавляет новый, а прежние остаются и занимают
+// место в платном хранилище. Удаление образа забирает и его теги, поэтому образ
+// ищем по id, тегу или digest: человек называет тег, а Delete принимает id.
+async function deleteRegistryImage(oauthToken, opts) {
+  const o = opts || {};
+  const registryId = String(o.registryId || "").trim();
+  if (!registryId) throw new Error("Нужен id реестра. Открой карточку реестра в панели «☁️ Cloud» (список: ycList(service: \"containerRegistry\")).");
+  const ref = String(o.imageId || o.tag || o.image || o.ref || "").trim();
+  if (!ref) throw new Error("Не указан образ: нужен id образа или его тег.");
+  const img = await yc.findRegistryImage(oauthToken, registryId, ref);
+  if (!img) throw new Error("В реестре нет образа «" + ref + "» — возможно, его уже удалили.");
+  await yc.deleteRegistryImage(oauthToken, img.id);
+  return {
+    ok: true,
+    registryId: registryId,
+    imageId: img.id,
+    name: String(img.name || ""),
+    tags: Array.isArray(img.tags) ? img.tags : [],
+  };
+}
+
+// ── Object Storage: объект в бакете ───────────────────────────────────────
+// Файлы в бакете не открывались в панели вообще: карточка бакета показывала
+// только его самого. Список даёт связь storage:objects, а отсюда идёт удаление
+// объекта — тем же путём, что у образов реестра и записей DNS (свой код в
+// yandex-cloud.js, где лежат строгости S3-совместимого API).
+async function deleteBucketObject(oauthToken, opts) {
+  const o = opts || {};
+  const bucket = String(o.bucket || o.bucketName || "").trim();
+  if (!bucket) throw new Error("Нужно имя бакета. Открой карточку бакета в панели «☁️ Cloud» (список: ycList(service: \"storage\")).");
+  const key = String(o.key || o.object || "").replace(/^\/+/, "");
+  if (!key) throw new Error("Не указан объект: нужен ключ (путь файла в бакете).");
+  const r = await yc.deleteBucketObject(oauthToken, { bucket: bucket, key: key });
+  return { ok: true, bucket: r.bucket, key: r.key };
+}
+
+// ── Object Storage: публичный доступ к бакету ─────────────────────────────
+// Бакет по умолчанию закрыт, и это правильно, но из карточки не было видно, что
+// именно он закрыт: ссылка «открытый адрес объекта» возвращала отказ, и человек
+// искал причину в консоли Yandex Cloud. Теперь состояние читается и меняется
+// прямо здесь — тем же console-API, что и список бакетов (объекты лежат в
+// S3-совместимом API, а права на бакет — в консольном).
+async function getBucketAccessFlags(oauthToken, bucket) {
+  const name = String(bucket || "").trim();
+  if (!name) throw new Error("Нужно имя бакета. Открой карточку бакета в панели «☁️ Cloud» (список: ycList(service: \"storage\")).");
+  const r = await yc.getBucketAccess(oauthToken, name);
+  return { ok: true, bucket: r.bucket, flags: r.flags };
+}
+
+async function setBucketPublicAccess(oauthToken, opts) {
+  const o = opts || {};
+  const name = String(o.bucket || o.bucketName || "").trim();
+  if (!name) throw new Error("Нужно имя бакета. Открой карточку бакета в панели «☁️ Cloud» (список: ycList(service: \"storage\")).");
+  const on = o.publicOn == null ? !!(o.public || o.on) : !!o.publicOn;
+  const r = await yc.setBucketPublicAccess(oauthToken, name, on);
+  return { ok: true, bucket: r.bucket, flags: r.flags, public: r.public };
+}
+
 // Что модуль умеет — для карточки «нет данных» и для справки агенту.
 function capabilities() {
   const out = [];
@@ -609,6 +814,13 @@ module.exports = {
   SERVICE_ENDPOINT,
   relationList,
   rollbackRevision,
+  putSecretVersion,
+  upsertRecord,
+  deleteRecord,
+  deleteRegistryImage,
+  deleteBucketObject,
+  getBucketAccessFlags,
+  setBucketPublicAccess,
   overview,
   buildFields,
   buildTable,

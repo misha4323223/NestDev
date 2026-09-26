@@ -13,9 +13,15 @@
   <link rel="stylesheet" href="monochrome.css" />
   <link rel="stylesheet" href="yc-console.css" />
   <link rel="stylesheet" href="deploy-panel.css" />
+  <!-- Выезд правых панелей: скрытие сжимает ширину вместо display:none,
+       поэтому чат раздвигается плавно, а не панель исчезает рывком. -->
+  <link rel="stylesheet" href="panels.css" />
+  <!-- Тема «Replit»: палитра и зачистка остатков неона. Подключается ПОСЛЕДНЕЙ,
+       поэтому перекрывает styles.css, monochrome.css и панельные слои. -->
+  <link rel="stylesheet" href="replit-theme.css" />
   <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-  <meta name="theme-color" content="#0a0a0b" />
+  <meta name="theme-color" content="#0d0d0f" />
 </head>
 <body>
   <div id="app">
@@ -84,10 +90,10 @@
       <button id="btn-new-chat" class="btn btn-primary btn-block">
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
         <span>Новый чат</span>
-      </button>
-      <button id="btn-continue-chat" class="btn btn-ghost btn-block" title="Начать новый чат с контекстом предыдущего">
-        <span>🔄 Продолжить контекст</span>
-      </button>
+      </button>        <button id="btn-continue-chat" class="btn btn-ghost btn-block" title="Начать новый чат с контекстом предыдущего">
+          <svg class="btn-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16" /><path d="M3 21v-5h5" /></svg>
+          <span>Продолжить контекст</span>
+        </button>
 
       <div class="search-wrap">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7" /><path d="m21 21-4.3-4.3" /></svg>
@@ -109,7 +115,6 @@
           <button id="btn-mobile-menu" class="btn btn-ghost icon-btn" title="Меню (чаты)">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18" /></svg>
           </button>
-          <button id="model-badge" class="badge" title="Провайдер и модель — нажми, чтобы изменить">—</button>
           <button id="btn-toggle-console" class="btn btn-ghost icon-btn hdr-dupe" title="Консоль — логи сервера и команды (как в Replit)">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6" /><path d="M12 19h8" /></svg>
           </button>
@@ -129,14 +134,6 @@
           <button id="btn-toggle-panel" class="btn btn-ghost icon-btn hdr-dupe" title="Панель проекта: файлы, коммиты, откат изменений">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg>
           </button>
-        </div>
-        <div id="model-popup" class="model-popup hidden">
-          <div class="mp-head"><span id="mp-title">Модель</span><button id="mp-close" class="btn btn-ghost btn-small">✕</button></div>
-          <div id="mp-list" class="mp-list"></div>
-          <div class="mp-foot">
-            <button id="mp-refresh" class="btn btn-ghost btn-small">↻ Обновить</button>
-            <button id="mp-settings" class="btn btn-ghost btn-small">⚙️ Настройки</button>
-          </div>
         </div>
       </header>
 
@@ -204,23 +201,35 @@
       <!-- Живая панель действий агента: инструменты, правки кода — над полем ввода -->
       <div id="work-panel"></div>
 
+      <!-- Кнопка «Продолжить» после остановки агента (лимит раундов, «Стоп», пауза
+           миссии): прогон остановился с сохранённой работой — продолжаем нажатием,
+           а не набором «продолжай» руками. Показывается событием прогона resume. -->
+      <div id="resume-bar" class="resume-bar hidden">
+        <button id="btn-resume" type="button" class="btn btn-primary btn-small" title="Продолжить с того места, где остановился">▶ Продолжить</button>
+      </div>
+
       <footer id="input-bar">
         <div class="composer">
           <div id="attach-bar" class="attach-bar hidden">
             <img id="attach-thumb" alt="" />
             <span id="attach-name" class="attach-name">Скриншот — отправится с сообщением</span>
-            <button id="btn-attach-remove" type="button" class="btn btn-ghost btn-small" title="Убрать вложение">✕</button>
+            <button id="btn-attach-remove" type="button" class="btn btn-ghost btn-icon" title="Убрать вложение"><svg class="btn-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg></button>
           </div>
           <div id="role-chips" class="role-chips hidden"></div>
           <textarea id="input" rows="1" placeholder="Напиши, что сделать..."></textarea>
-          <div id="ctx-indicator" class="ctx-indicator" title="Заполняемость контекста модели"><span id="ctx-text"></span><div id="ctx-bar" class="ctx-bar"><div id="ctx-fill" class="ctx-fill"></div></div></div>
+          <!-- Заполняемость контекста — только слово и процент (как у Freebuff).
+               Полоска убрана: она отнимала ширину и читалась как второй индикатор
+               загрузки, а точные числа всё равно лежат в подсказке. -->
+          <div id="ctx-indicator" class="ctx-indicator" title="Заполняемость контекста модели"><span id="ctx-text"></span></div>
           <div class="composer-row">
             <span class="input-hint">Enter — отправить · Shift+Enter — новая строка</span>
             <div class="composer-btns">
               <input type="file" id="file-input" class="hidden" multiple accept="image/*,.txt,.js,.ts,.py,.json,.md,.html,.css,.csv,.log,.yaml,.yml,.xml,.sql,.sh,.dart,.go,.rs,.java,.cpp,.c,.rb,.php" />
-              <button id="btn-attach-file" class="btn btn-ghost btn-small" title="Прикрепить файл или изображение">📎</button>
-              <button id="btn-role" class="btn btn-ghost btn-small role-btn" title="Роль чата: как агент себя ведёт">🛠 Разработчик</button>
-              <button id="btn-plan" class="btn btn-ghost btn-small plan-toggle" title="Режим плана: сначала агент составит план и спросит разрешение, потом выполнит">📋 План</button>
+              <button id="btn-attach-file" class="btn btn-ghost btn-small" title="Прикрепить файл или изображение. Можно перетащить файл в поле или вставить его из буфера (Ctrl+V)"><svg class="btn-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg></button>
+              <button id="btn-role" class="btn btn-ghost btn-small role-btn" title="Роль чата: как агент себя ведёт"><svg class="btn-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></svg><span id="role-label">Разработчик</span></button>
+              <button id="model-badge" class="badge" title="Провайдер и модель — нажми, чтобы изменить">—</button>
+              <button id="btn-plan" class="btn btn-ghost btn-small plan-toggle" title="Режим плана: сначала агент составит план и спросит разрешение, потом выполнит"><svg class="btn-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect width="8" height="4" x="8" y="2" rx="1" /><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" /><path d="M12 11h4" /><path d="M12 16h4" /><path d="M8 11h.01" /><path d="M8 16h.01" /></svg>План</button>
+              <button id="btn-reasoning" class="btn btn-ghost btn-small reasoning-btn" title="Рассуждения модели: сколько думать перед ответом"><svg class="btn-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5" /><path d="M9 18h6" /><path d="M10 22h4" /></svg><span id="reasoning-label">Рассуждения</span></button>
               <button id="btn-stop" class="btn btn-danger icon-btn hidden" title="Остановить">
                 <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2.5" /></svg>
               </button>
@@ -230,6 +239,24 @@
             </div>
             <div id="role-popover" class="role-popover hidden"></div>
           </div>
+        </div>
+        <!-- Пилюля модели живёт в композере (как в Replit), а попап открывается ВВЕРХ
+             над ним: раньше он висел в шапке чата и после переезда пилюли оказался бы
+             далеко от своей кнопки. Позицию задаёт replit-theme.css. -->
+        <div id="model-popup" class="model-popup hidden">
+          <div class="mp-head"><span id="mp-title">Модель</span><button id="mp-close" class="btn btn-ghost btn-icon" title="Закрыть"><svg class="btn-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg></button></div>
+          <div id="mp-list" class="mp-list"></div>
+          <div class="mp-foot">
+            <button id="mp-refresh" class="btn btn-ghost btn-small"><svg class="btn-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16" /><path d="M3 21v-5h5" /></svg><span id="mp-refresh-label">Обновить</span></button>
+            <button id="mp-settings" class="btn btn-ghost btn-small"><svg class="btn-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" /></svg>Настройки</button>
+          </div>
+        </div>
+        <!-- Reasoning effort (как у Freebuff): плашка рядом с полем ввода.
+             Позицию и вид берёт у .model-popup — они стоят на одном месте. -->
+        <div id="reasoning-popup" class="model-popup reasoning-popup hidden">
+          <div class="mp-head"><span id="rp-title">Рассуждения модели</span><button id="rp-close" class="btn btn-ghost btn-icon" title="Закрыть"><svg class="btn-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg></button></div>
+          <div id="rp-list" class="mp-list rp-list"></div>
+          <div class="mp-foot"><span class="rp-note">Меньше рассуждений — быстрее.</span></div>
         </div>
       </footer>
 
@@ -242,6 +269,7 @@
           <button class="sp-btn active" data-sp="preview" role="tab" title="Превью — сайт проекта, мобильный вид, новая вкладка">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" /><circle cx="12" cy="12" r="3" /></svg>
             <span>Превью</span>
+          </button>
           <button class="sp-btn" data-sp="mission" role="tab" title="Миссия — долгая работа агента: цель, план, журнал">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 22V4a1 1 0 0 1 1-1h9l1 2h5a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-6l-1-2H6v8z" /></svg>
             <span>Миссия</span>
@@ -250,7 +278,6 @@
           <button class="sp-btn" data-sp="tasks" role="tab" title="Дела — задачи и сроки, панель менеджера">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6h11" /><path d="M9 12h11" /><path d="M9 18h11" /><path d="m3 6 1.5 1.5L7 5" /><path d="m3 12 1.5 1.5L7 11" /><path d="m3 18 1.5 1.5L7 17" /></svg>
             <span>Дела</span>
-          </button>
           </button>
           <button class="sp-btn" data-sp="console" role="tab" title="Консоль — логи сервера и команды в рабочей директории">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6" /><path d="M12 19h8" /></svg>
@@ -1248,6 +1275,13 @@
                   <small>Ревизии, откат, имя/описание/метки. Новая ревизия сразу идёт в бой. Выключено по умолчанию.</small>
                 </span>
               </label>
+              <label class="check-row" title="Агент сможет включать и выключать публичный доступ к бакету (ycStorage: action public / private). После включения содержимое бакета читает кто угодно из интернета, кто знает ссылку, и оно становится видно поисковикам. Закрытым данным сюда не место — для них есть Lockbox.">
+                <input id="s-yc-allow-public" type="checkbox" />
+                <span class="check-row-text">
+                  <b>Разрешить агенту делать бакет публичным</b>
+                  <small>Открывает файлы бакета для чтения из интернета. Пароли и личные файлы сюда класть нельзя. Выключено по умолчанию.</small>
+                </span>
+              </label>
               <div class="yc-cli-row">
                 <button id="btn-yc-install-cli" class="btn btn-ghost btn-small" title="Скачать официальный yc CLI прямо в папку приложения (системных прав не требует) и добавить в PATH всех команд агента">⬇️ Установить yc CLI</button>
                 <span id="yc-cli-status" class="hint">не проверено</span>
@@ -1429,6 +1463,7 @@
   <script src="g4f-panel.js"></script>
   <script src="auto-tasks.js"></script>
   <script src="model-popup.js"></script>
+  <script src="reasoning.js"></script>
   <script src="ask-modal.js"></script>
   <script src="chat-rename.js"></script>
   <script src="chat-store.js"></script>

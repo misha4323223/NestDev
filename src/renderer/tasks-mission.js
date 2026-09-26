@@ -40,7 +40,11 @@
     const btn = $("btn-role");
     if (!btn) return;
     const role = chatRole();
-    btn.textContent = role.icon + " " + role.title;
+    // Значок кнопки — SVG в разметке, поэтому подпись живёт в отдельном span:
+    // запись textContent в саму кнопку стёрла бы иконку. Лицо роли по-прежнему
+    // видно в её карточках в попапе — там эмодзи уместны, это не строка кнопок.
+    const label = $("role-label");
+    if (label) label.textContent = role.title;
     btn.classList.toggle("active", role.id !== "dev");
     btn.title = role.hint + " · клик — сменить роль";
   }

@@ -245,8 +245,18 @@ function installLayout(settings, userDataDir) {
     assert.ok(/wireSetupFolders: wireSetupFolders/.test(PANEL_SRC), "панель настроек не отдаёт сборку окна");
     assert.ok(/maybeAskFolders: maybeAskFolders/.test(PANEL_SRC), "панель настроек не отдаёт вопрос первого запуска");
     assert.ok(/SettingsPanel\.wireSetupFolders\(\);/.test(APP_SRC), "окно выбора папок не собирается при запуске окна");
-    assert.ok(/afterLoad: \(\) => \{ if \(SettingsPanel && SettingsPanel\.maybeAskFolders\)/.test(APP_SRC),
+    // В заходе «правая рабочая область при первом запуске» afterLoad вырос до блока:
+    // к вопросу о папках добавилось восстановление раскладки правой панели. Порядок
+    // здесь не украшение — открытие раздела «превью» пишет настройки целиком, и до их
+    // чтения оно затирало бы умолчаниями настоящие (живой прогон окна это поймал).
+    assert.ok(/afterLoad: \(\) => \{\s*if \(SettingsPanel && SettingsPanel\.maybeAskFolders\)/.test(APP_SRC),
       "вопрос первого запуска не задаётся после загрузки настроек");
+    assert.ok(/SidePanel\.restoreSidePanel\(\)/.test(APP_SRC),
+      "правая рабочая область восстанавливается не после загрузки настроек");
+    assert.ok(
+      /restoreSidePanel: restoreSidePanel/.test(fs.readFileSync(path.join(ROOT, "src", "renderer", "side-panel.js"), "utf8")),
+      "панель не отдаёт восстановление раскладки"
+    );
     assert.ok(/fireAfterLoad\(\)/.test(STORE_SRC), "мост «после загрузки» не зовётся хранилищем");
     for (const ch of ["setup:state", "setup:save"]) {
       assert.ok(PRELOAD_SRC.includes('"' + ch + '"'), "preload.js не знает канал " + ch);

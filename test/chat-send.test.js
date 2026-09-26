@@ -71,6 +71,7 @@ function buildChatSend(opts) {
   const log = {
     toasts: [], sidebar: 0, persistChats: 0, scroll: 0, setStreaming: [],
     finishStream: [], flushed: 0, autoResize: 0, hideAttach: 0, selectChat: [],
+    resumeHidden: 0, resume: [],
     settingsMsg: [], openedSettings: [], planRendered: 0, events: [],
     sent: [], webSent: [], created: 0,
   };
@@ -158,6 +159,10 @@ function buildChatSend(opts) {
     getChatRun: () => ({
       setStreaming: (v) => log.setStreaming.push(v),
       finishStream: (chat, msg) => log.finishStream.push({ chat, msg }),
+      // Кнопка «▶ Продолжить»: прогон её зажигает событием resume и гасит на новой
+      // отправке (иначе она висела бы поверх чужого ответа).
+      showResume: (reason) => log.resume.push(reason),
+      hideResume: () => { log.resumeHidden++; },
     }),
     getAutoTasks: () => ({ flushAutoQueue: () => { log.flushed++; } }),
     getWebChat: () => ({
@@ -281,6 +286,7 @@ function makeChat(title) {
     assert.strictEqual(env.log.autoResize, 1, "поле ввода не подогнано после очистки");
     assert.strictEqual(env.log.hideAttach, 1, "вложение не убрано после отправки");
     assert.strictEqual(env.state.lastUndoCount, 0, "счётчик отката не обнулён на новом запуске");
+    assert.strictEqual(env.log.resumeHidden, 1, "новый прогон не погасил прежнюю кнопку «Продолжить»");
   });
 
   await test("отправка: длинное имя чата обрезается, короткое — нет", async () => {

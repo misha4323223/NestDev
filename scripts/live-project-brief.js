@@ -77,9 +77,16 @@ const { buildProjectBrief } = createProjectBrief({
 const brief = buildProjectBrief(ROOT);
 
 console.log("\n[1] мусор в структуру не попадает");
-ok(brief.indexOf("node_modules") < 0, "node_modules попал в визитку");
-ok(brief.indexOf(".git/") < 0 && brief.indexOf("📄 .git") < 0, "служебные папки попали в визитку");
-ok(brief.indexOf("dist/") < 0, "сборка попала в визитку");
+// Проверяем ИМЕНА ЗАПИСЕЙ структуры, а не подстроку во всём тексте. Рядом с проектом
+// может лежать своя папка (у владельца — `backup-playwright/` с файлом
+// `node_modules-playwright.tar.gz`; в репозиторий она не едет, в .gitignore),
+// и подстрочный поиск краснел бы на ЧУЖОМ имени файла, ничего не говоря о проекте.
+const briefEntryHas = (name) =>
+  (brief.match(/\n(?:📁|📄) [^\n]+/g) || [])
+    .some((l) => l.replace(/^\s*(?:📁|📄)\s*/, "").split("/").includes(name));
+ok(!briefEntryHas("node_modules"), "node_modules попал в визитку");
+ok(!briefEntryHas(".git"), "служебные папки попали в визитку");
+ok(!briefEntryHas("dist"), "сборка попала в визитку");
 
 console.log("\n[2] обход не глубже двух уровней");
 ok(/📁 src\//.test(brief) || /📁 assets\//.test(brief), "верхний уровень проекта в визитке есть");

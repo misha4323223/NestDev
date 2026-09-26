@@ -24,13 +24,13 @@
 })(typeof self !== "undefined" ? self : this, function (ChatEventsDeps) {
   const {
     $, api, isElectron, uid, toast, normalize, AgentCore,
-    getSettings, setSettings, getChatsData, getSession,
+    getSettings, setSettings, getChatsData, getSession, getReasoning,
     setLastUndoCount, setPlanCollapsed, getRemoteRunNotified, setRemoteRunNotified,
     msgEls, autoQueue, flushAutoQueue, persistChatsSoon, buildMessageEl, refreshMessage,
     openAskModal, closeAskModal, renderContext, planFromModel, planTextAdvance,
     planTextFinish, planToolOutcome, tryPlanFromRunText, renderPlanPanel,
     ChatSegments, ChatFeed, ChatThinking, ChatWork,
-    getSidePanel, getTasksMission, getProjectPanel,
+    getSidePanel, getTasksMission, getProjectPanel, getChatRun,
   } = ChatEventsDeps || {};
   function onAiEvent(ev) {
     // Служебная заметка прогона (например, ожидание лимита провайдера). Показываем тостом:
@@ -272,6 +272,15 @@
         toast("🔄 Попытка " + (ev.attempt || 2) + " из " + (ev.total || 3) + " после сбоя" + (rErr ? ": " + rErr : ""));
         break;
       }
+      case "reasoning_unsupported": {
+        // Провайдер сам сказал, что поля рассуждений (reasoning_effort / think) не знает.
+        // Запоминаем это по модели: плашка 🧠 у неё пропадёт, и следующий запуск не будет
+        // тратить раунд на ту же ошибку. Молча — объяснение уже ушло в «Консоль» строкой
+        // метрик от самого прогона, человеку здесь делать нечего.
+        const rMod = getReasoning && getReasoning();
+        if (rMod && rMod.markUnsupported) rMod.markUnsupported(ev.key);
+        break;
+      }
       case "profile_switched": {
         // Авто-переключение между сохранёнными подключениями при ошибке ключа/баланса/лимита
         const pName = ev.name || "?";
@@ -295,6 +304,13 @@
         toast("🔄 Переключено на подключение «" + pName + "»");
         break;
       }
+      case "resume":
+        // Остановка с сохранённой работой (лимит раундов, «Стоп», пауза миссии) —
+        // в окне загорается «▶ Продолжить»: раньше человек писал «продолжай» руками.
+        // Признак приходит СВОИМ событием, а не разбором текста ответа: кнопка не
+        // должна гореть после любой реплики со словом «продолжай».
+        getChatRun().showResume(ev.reason);
+        break;
       case "done":
         // План, написанный моделью текстом (или в размышлениях), разбираем и на финише,
         // а его текущий пункт закрываем: запуск завершён.

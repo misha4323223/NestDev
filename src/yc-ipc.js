@@ -35,6 +35,7 @@ ipcMain.handle("yc:status", async () => {
     allowCreate: cfg.allowCreate,
     allowDelete: cfg.allowDelete,
     allowUpdate: cfg.allowUpdate,
+    allowPublic: cfg.allowPublic,
     oauthUrl: YANDEX_OAUTH_URL,
     clouds: [],
     folders: [],
@@ -126,12 +127,13 @@ ipcMain.handle("yc:setFolder", (_e, folderId, folderName, cloudId) => {
   return { ok: true };
 });
 
-ipcMain.handle("yc:setPermissions", (_e, allowCreate, allowDelete, allowUpdate) => {
+ipcMain.handle("yc:setPermissions", (_e, allowCreate, allowDelete, allowUpdate, allowPublic) => {
   const merged = {
     ...loadSettings(),
     ycAllowAgentCreate: !!allowCreate,
     ycAllowAgentDelete: !!allowDelete,
     ycAllowAgentUpdate: !!allowUpdate,
+    ycAllowAgentPublic: !!allowPublic,
   };
   saveSettings(merged);
   return { ok: true };
@@ -203,6 +205,119 @@ ipcMain.handle("yc:console:rollback", async (_e, args) => {
   const a = args || {};
   try {
     return await ycConsole.rollbackRevision(cfg.oauth, { containerId: a.containerId, revisionId: a.revisionId });
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
+// Новая версия секрета Lockbox из карточки в панели. Разрешение агента здесь не
+// спрашиваем намеренно: галочки в настройках называются «Разрешить АГЕНТУ…» и
+// ограничивают модель, а не человека, который сам открыл свой секрет и нажал
+// «Сохранить версию». Те же правила у соседних yc:create / yc:delete.
+// Значения не возвращаются и не логируются — наружу уходят id версии и ключи.
+ipcMain.handle("yc:console:secretVersion", async (_e, args) => {
+  const s = loadSettings();
+  const cfg = ycConfig(s);
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках." };
+  const a = args || {};
+  try {
+    return await ycConsole.putSecretVersion(cfg.oauth, {
+      secretId: a.secretId || a.id,
+      entries: a.entries,
+    });
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
+// Записи DNS-зоны из карточки в панели: op «upsert» — поставить значения для
+// пары «имя+тип» (есть — заменить, нет — добавить), op «delete» — удалить набор.
+// Разрешение агента здесь не спрашиваем по той же причине, что у версии секрета:
+// галочки ограничивают модель, а здесь действует человек в своём окне.
+ipcMain.handle("yc:console:dnsRecord", async (_e, args) => {
+  const s = loadSettings();
+  const cfg = ycConfig(s);
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках." };
+  const a = args || {};
+  const op = String(a.op || "upsert").trim().toLowerCase();
+  try {
+    if (op === "delete") return await ycConsole.deleteRecord(cfg.oauth, { zoneId: a.zoneId || a.id, name: a.name, type: a.type });
+    if (op !== "upsert") return { ok: false, error: "Неизвестная операция с записью: " + op + ". Доступно: upsert, delete." };
+    return await ycConsole.upsertRecord(cfg.oauth, {
+      zoneId: a.zoneId || a.id,
+      name: a.name,
+      type: a.type,
+      ttl: a.ttl,
+      values: a.values || a.value,
+    });
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
+// Чистка Container Registry: удалить образ (вместе с его тегами) из карточки
+// реестра. Образ ищем по id или тегу — id возвращает список образов, а человек
+// и модель называют тег. Разрешение агента не спрашиваем по той же причине, что
+// у записи DNS и версии секрета: галочки ограничивают модель, а здесь действует
+// человек в своём окне, к тому же с подтверждением в интерфейсе.
+ipcMain.handle("yc:console:registryImage", async (_e, args) => {
+  const s = loadSettings();
+  const cfg = ycConfig(s);
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках." };
+  const a = args || {};
+  const op = String(a.op || "delete").trim().toLowerCase();
+  if (op !== "delete") return { ok: false, error: "Неизвестная операция с образом: " + op + ". Доступно: delete." };
+  try {
+    return await ycConsole.deleteRegistryImage(cfg.oauth, {
+      registryId: a.registryId || a.registry || a.id,
+      imageId: a.imageId,
+      tag: a.tag,
+    });
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
+// Файлы в бакете из карточки бакета: удаление объекта. Разрешение агента здесь не
+// спрашиваем по той же причине, что у образов реестра, записи DNS и версии
+// секрета: галочки ограничивают модель, а здесь действует человек в своём окне —
+// к тому же с подтверждением в интерфейсе.
+ipcMain.handle("yc:console:storageObject", async (_e, args) => {
+  const s = loadSettings();
+  const cfg = ycConfig(s);
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках." };
+  const a = args || {};
+  const op = String(a.op || "delete").trim().toLowerCase();
+  if (op !== "delete") return { ok: false, error: "Неизвестная операция с объектом: " + op + ". Доступно: delete." };
+  try {
+    return await ycConsole.deleteBucketObject(cfg.oauth, {
+      bucket: a.bucket || a.bucketName,
+      key: a.key,
+    });
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
+// Публичный доступ к бакету из карточки бакета. Разрешение агента здесь НЕ
+// спрашиваем — по той же причине, что у удаления объекта: галочки в настройках
+// называются «Разрешить АГЕНТУ…» и ограничивают модель, а здесь действует человек
+// в своём окне, к тому же с подтверждением в интерфейсе.
+ipcMain.handle("yc:console:bucketAccess", async (_e, args) => {
+  const s = loadSettings();
+  const cfg = ycConfig(s);
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках." };
+  const a = args || {};
+  const op = String(a.op || "get").trim().toLowerCase();
+  try {
+    if (op === "get") {
+      return await ycConsole.getBucketAccessFlags(cfg.oauth, a.bucket || a.bucketName || a.name);
+    }
+    if (op === "set") {
+      if (a.public == null) return { ok: false, error: "Не указано, делать бакет публичным (public: true) или закрытым (public: false)." };
+      return await ycConsole.setBucketPublicAccess(cfg.oauth, { bucket: a.bucket || a.bucketName || a.name, publicOn: !!a.public });
+    }
+    return { ok: false, error: "Неизвестная операция с бакетом: " + op + ". Доступно: get, set." };
   } catch (e) {
     return { ok: false, error: (e && e.message) || String(e) };
   }

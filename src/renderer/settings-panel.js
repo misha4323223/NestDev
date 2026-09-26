@@ -22,7 +22,8 @@
 })(typeof self !== "undefined" ? self : this, function (SettingsPanelDeps) {
   const {
     $, api, isElectron, getSettings, getPreset, setCurrentPreset, setSbVersion,
-    cachedModels, persistSettings, updateStatusBar, updateModelNeeded, refreshProject,
+    cachedModels, persistSettings, updateStatusBar, updateReasoning, updateModelNeeded,
+    refreshProject,
     toast, esc, renderGithubSection, probeG4fPort, renderG4fProviderList,
     search, getLastTab, setLastTab, getMobilePanel,
     AgentCore, SecretsPanel, getYcPanel, OpenaiProfiles,
@@ -40,6 +41,10 @@
     $("model-badge").title = getSettings().model
       ? "Провайдер и модель — нажми, чтобы изменить"
       : "Модель не выбрана — нажми, чтобы настроить";
+    // Плашка 🧠 живёт по модели: у модели без рассуждений её нет вовсе, у остальных —
+    // есть. ВСЕ смены провайдера и модели проходят через этот значок, поэтому
+    // показывать/прятать плашку надо здесь, а не в каждом месте по отдельности.
+    if (updateReasoning) updateReasoning();
     updateStatusBar();
   }
 

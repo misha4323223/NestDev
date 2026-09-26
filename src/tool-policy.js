@@ -139,7 +139,7 @@ const CAPABILITIES = [
   { cap: "clipboard.read", risk: RISK.MEDIUM, tools: ["clipboardRead"] },
   { cap: "clipboard.write", risk: RISK.MEDIUM, tools: ["clipboardWrite"] },
   // ── Yandex Cloud ──
-  { cap: "cloud.read", risk: RISK.LOW, tools: ["ycStatus", "ycList", "ycContainer", "ycLogs", "ycCosts"] },
+  { cap: "cloud.read", risk: RISK.LOW, tools: ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycDb", "ycLogs", "ycCosts"] },
   // Создание/удаление/деплой в облаке: свои чекбоксы ycAllowAgent*, подтверждение не дублируем.
   { cap: "cloud.create", risk: RISK.HIGH, tools: ["ycCreate"] },
   { cap: "cloud.delete", risk: RISK.HIGH, tools: ["ycDelete"] },

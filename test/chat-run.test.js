@@ -50,6 +50,8 @@ const BRIDGE_SRC = read("src", "mobile-bridge.js");
 // Начало и конец прогона вынесены своим модулем (этап A, часть 9): спрашиваем их там,
 // а у app.js — только сборку самих модулей.
 const SEND_SRC = read("src", "renderer", "chat-send.js");
+const EVENTS_SRC = read("src", "renderer", "chat-events.js");
+const STYLES_SRC = read("src", "renderer", "styles.css");
 
 // Игрушечная разметка: элементы ищутся по id, а вложенные — по классу (как в модуле:
 // el.querySelector(".bubble") и el.querySelector(".ai-actions")).
@@ -431,6 +433,62 @@ function buildChatRun(opts) {
     empty.mod.maybeRestoreUndoButton();
     await new Promise((r) => setImmediate(r));
     assert.strictEqual(empty.msgEls.get("a1").querySelector(".ai-actions"), null, "кнопка появилась без чекпоинта");
+  });
+
+  console.log("\n[5] Кнопка «Продолжить» после остановки");
+
+  await test("кнопка продолжения: модуль умеет показать, скрыть и отправить", () => {
+    const env = buildChatRun({});
+    // Игрушечный DOM не знает разметки: «скрыта по умолчанию» проверяется отдельным
+    // тестом по самому index.html, а здесь — поведение показа, скрытия и отправки.
+    env.mod.showResume("лимит раундов");
+    assert.strictEqual(env.$("resume-bar").classList.contains("hidden"), false, "кнопка не показана по событию прогона");
+    assert.ok(/лимит раундов/.test(env.$("btn-resume").title), "в подсказке нет причины остановки: " + env.$("btn-resume").title);
+    env.mod.hideResume();
+    assert.strictEqual(env.$("resume-bar").classList.contains("hidden"), true, "кнопка не скрыта");
+
+    // Нажатие: просьба уходит тем же путём, что и обычное сообщение.
+    env.mod.showResume("");
+    env.mod.resume();
+    assert.strictEqual(env.log.sent, 1, "нажатие не отправило продолжение");
+    assert.strictEqual(env.$("input").value, env.mod.RESUME_TEXT, "в поле ввода ушёл не тот текст");
+    assert.strictEqual(env.log.autoResize, 1, "поле ввода не подогнано под текст");
+    assert.strictEqual(env.$("resume-bar").classList.contains("hidden"), true, "кнопка осталась после нажатия");
+
+    // Во время прогона кнопка не отправляет второй запрос и не прячется сама.
+    const busy = buildChatRun({});
+    busy.mod.showResume("пауза миссии");
+    busy.state.streaming = true;
+    busy.mod.resume();
+    assert.strictEqual(busy.log.sent, 0, "во время прогона ушёл второй запрос");
+    assert.strictEqual(busy.$("resume-bar").classList.contains("hidden"), false, "кнопка спряталась во время прогона");
+  });
+
+  await test("кнопка продолжения: её текст — служебный, а не «уточнение к цели» миссии", () => {
+    // Текст кнопки узнаёт хранилище миссии (missionStore.isResumeText) — иначе каждый
+    // клик добавлял бы миссии уточнение цели, и журнал заполнился бы одинаковыми строками.
+    const missionStore = require(path.join(ROOT, "src", "mission-store.js"));
+    const env = buildChatRun({});
+    env.mod.resume();
+    const text = env.$("input").value;
+    assert.ok(text.length > 40, "текст кнопки подозрительно короткий: " + text);
+    assert.strictEqual(missionStore.isResumeText(text), true, "текст кнопки не узнан как служебный: " + text);
+    assert.strictEqual(missionStore.isResumeText("Продолжи миссию «Разбор» (файлы: x)"), true, "прежний служебный текст перестал узнаваться");
+    assert.strictEqual(missionStore.isResumeText("добавь ещё плитку на кухне"), false, "обычная просьба человека принята за служебную");
+  });
+
+  await test("кнопка продолжения: зажигается событием прогона, а не текстом ответа", () => {
+    // Признак продолжения приходит СВОИМ событием: кнопка не должна гореть после
+    // любой реплики со словом «продолжай» и не должна теряться при остановке.
+    assert.ok(/case "resume":[\s\S]{0,500}getChatRun\(\)\.showResume\(ev\.reason\);/.test(EVENTS_SRC), "событие resume не зажигает кнопку");
+    const wiring = APP_SRC.slice(APP_SRC.indexOf("  const ChatEvents = window.ChatEvents({"), APP_SRC.indexOf("  // ─── Правая панель"));
+    assert.ok(wiring.includes("getChatRun: () => ChatRun,"), "в проводку событий не передан модуль прогона");
+    assert.ok(APP_SRC.includes('$("btn-resume").onclick = ChatRun.resume;'), "кнопка не подключена к продолжению");
+    assert.ok(APP_SRC.includes("ChatRun.hideResume();"), "смена чата не гасит чужую кнопку");
+    assert.ok(SEND_SRC.includes("getChatRun().hideResume();"), "новый прогон не гасит старую кнопку");
+    assert.ok(/id="resume-bar"/.test(HTML_SRC) && /id="btn-resume"/.test(HTML_SRC), "в разметке нет полосы и кнопки продолжения");
+    assert.ok(/class="resume-bar hidden"/.test(HTML_SRC), "полоса кнопки видна сразу, без остановки");
+    assert.ok(/\.resume-bar\s*\{/.test(STYLES_SRC), "нет стилей полосы кнопки");
   });
 
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");

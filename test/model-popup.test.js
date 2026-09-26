@@ -279,7 +279,7 @@ const lastMsg = (env) => env.calls.msgs[env.calls.msgs.length - 1] || "";
     assert.strictEqual(lastMsg(env), "Модель: qwen-3-32b", "о смене модели не сказано: " + lastMsg(env));
   });
 
-  console.log("\n[3] «↻ Обновить»: живой список и ошибки");
+  console.log("\n[3] «Обновить»: живой список и ошибки");
 
   await test("попап модели: обновление занято на время и наполняет кэш", async () => {
     const env = buildModelPopup({ listPending: true });
@@ -288,13 +288,16 @@ const lastMsg = (env) => env.calls.msgs[env.calls.msgs.length - 1] || "";
     const btn = env.$("mp-refresh");
     const done = btn.onclick(); // ответ ещё не пришёл — кнопка обязана быть занята
     assert.strictEqual(btn.disabled, true, "кнопка не занята во время загрузки");
-    assert.strictEqual(btn.textContent, "Загружаю...", "кнопка не сказала, что загружает: " + btn.textContent);
+    // Подпись живёт в своём span: значок кнопки — SVG в разметке, и запись в
+    // textContent самой кнопки стёрла бы его.
+    const refreshLabel = env.$("mp-refresh-label");
+    assert.strictEqual(refreshLabel.textContent, "Загружаю...", "кнопка не сказала, что загружает: " + refreshLabel.textContent);
     assert.strictEqual(env.calls.desktopList.length, 1, "за списком не пошли в главный процесс");
     env.resolveList();
     await tick();
     await tick();
     assert.strictEqual(btn.disabled, false, "кнопка осталась занятой после ответа");
-    assert.strictEqual(btn.textContent, "↻ Обновить", "кнопка не вернула подпись: " + btn.textContent);
+    assert.strictEqual(refreshLabel.textContent, "Обновить", "кнопка не вернула подпись: " + refreshLabel.textContent);
     assert.deepStrictEqual(plain(env.state.cachedModels.openai), ["m1", "m2"], "живой список не попал в кэш");
     assert.strictEqual(items(env).length, 2, "попап не перерисован после загрузки: " + items(env).length);
     assert.strictEqual(lastMsg(env), "Моделей: 2", "о числе моделей не сказано: " + lastMsg(env));

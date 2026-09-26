@@ -37,6 +37,9 @@ function createRunRound(deps) {
     getBudget,
     getModelWindow,
     getCompactions,
+    // Уровень рассуждений (Low/High/Max) — тоже живое значение: человек может
+    // переключить его между раундами того же прогона.
+    getReasoning,
     noTools,
     localEndpoint,
     // Объекты прогона с общим состоянием: схемы и справочники, восстановление
@@ -88,6 +91,8 @@ function createRunRound(deps) {
       modelWindow: getModelWindow(),
       // Модель без инструментов: схемы не отправляем, вместо них текстовый каталог.
       noTools: noTools,
+      // Сколько думать: «off» — как раньше, поле в запрос не попадает.
+      reasoning: getReasoning ? getReasoning() : "off",
     });
     // Темп провайдера: пауза выдерживается ЗАРАНЕЕ, если лимит уже известен (429 —
     // потерянный раунд). Решение и текст — в src/run-retry.js.

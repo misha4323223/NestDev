@@ -26,7 +26,10 @@
        оставляют в миссии, сколько длился отрезок, какие файлы в нём появились и на
        чём именно встали; после «▶ Продолжить» и после новой просьбы человека путь
        виден модели целиком, а служебный текст кнопки в цель НЕ записывается;
-     • конец прогона — мягкая остановка с сохранением, а не «превышено раундов».
+     • конец прогона — мягкая остановка с сохранением, а не «превышено раундов»;
+     • «Стоп» посреди запроса и пауза миссии завершают прогон МЯГКО и зажигают
+       кнопку «▶ Продолжить» (событие resume с причиной, без ошибки в чате), а
+       обычный финал кнопку не зажигает и текст кнопки не становится уточнением цели.
 
    Негативные контроли: --break=<имя> ломает одну проводку и прогон обязан упасть. */
 
@@ -69,6 +72,10 @@ const BREAKS = {
   nostage: ["src/run-mission.js", "      missionStore.missionStage(dir, r.id, { rounds: state.rounds, batches: state.batches, next: r.next });\n", ""],
   noamend: ["src/run-mission.js", "        const add = missionStore.missionGoalNote(dir, had.id, goalSeed);\n", ""],
   missionId: ["src/main.js", "        runMissionId = v;\n", '        runMissionId = "мусор";\n'],
+  // Кнопка «▶ Продолжить»: без признака остановки кнопка не горит, без мягкого
+  // завершения «Стопа» посреди запроса прогон падает ошибкой.
+  noresume: ["src/run-ai.js", '    resumeReady("остановлено пользователем");\n', ""],
+  stopabort: ["src/run-ai.js", "    if (global.__agentStopRequested) return stopGraceful();\n    const fatal =", "    const fatal ="],
 };
 let brokenFile = null;
 if (BREAK) {
@@ -128,11 +135,21 @@ const asked = [];
 // и проверить это можно только тут (см. раздел [9]).
 const chatBodies = [];
 let served = 0; // сколько раз провайдер отдал ответ чата
+let answerDelayMs = 0; // темп ответа: чтобы человек успел нажать «Стоп» посреди запроса
+let plainAnswer = false; // ответ без вызовов инструментов: обычный финал прогона
 const sse = (chunks) => chunks.map((c) => "data: " + JSON.stringify(c) + "\n\n").join("") + "data: [DONE]\n\n";
 
 function chatAnswer() {
   served++;
   const n = served;
+  // Обычный финал: модель ответила текстом и работой больше не занимается —
+  // кнопка «▶ Продолжить» гореть не должна (проверка 12.4).
+  if (plainAnswer) {
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Работа закончена: всё на месте." } }] },
+      { choices: [], usage: { prompt_tokens: 100, completion_tokens: 12 } },
+    ]);
+  }
   const call = (index, id, name, args) => ({
     index: index,
     id: id,
@@ -184,8 +201,11 @@ const provider = http.createServer((req, res) => {
     }
     if (u.pathname.endsWith("/chat/completions")) {
       chatBodies.push({ n: served + 1, body: body });
+      const answer = chatAnswer();
       res.writeHead(200, { "Content-Type": "text/event-stream" });
-      return res.end(chatAnswer());
+      // Неспешный ответ: с ним человек успевает нажать «Стоп» посреди запроса.
+      if (answerDelayMs) return void setTimeout(() => res.end(answer), answerDelayMs);
+      return res.end(answer);
     }
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: { message: "нет такого пути" } }));
@@ -475,7 +495,133 @@ const ROUND_LIMIT = 50;
   ok(run3.every((h) => h.indexOf("а именно: сложи все заметки в папку notes/done") >= 0), "в сводке есть текст новой просьбы");
   ok(run3.every((h) => h.indexOf("этап 1 ·") >= 0 && h.indexOf("этап 3 ·") >= 0), "в сводке третьего запуска — весь путь: от первого отрезка до последнего");
 
-  console.log("\n[12] Ничего не осталось висеть");
+  console.log("\n[12] Кнопка «▶ Продолжить»: остановка зажигает её, обычный финал — нет");
+  // Проверяем ПРОВОДКУ, а не текст: событие resume уходит в окно (его там ловит
+  // chat-events.js и зажигает кнопку), причина видна в подсказке, а прогон после
+  // кнопки продолжается тем же путём, что и обычная просьба. Текст кнопки берём у
+  // самого модуля окна (src/renderer/chat-run.js), а не выдумываем здесь.
+  const RESUME_TEXT = require(path.join(ROOT, "src", "renderer", "chat-run.js"))({}).RESUME_TEXT;
+  ok(
+    missionStore.isResumeText(RESUME_TEXT),
+    "текст кнопки «▶ Продолжить» узнаётся как служебный: " + JSON.stringify(String(RESUME_TEXT).slice(0, 60)) + "…"
+  );
+
+  // 12.1. «Стоп» посреди запроса: прогон встаёт мягко, а не падает ошибкой.
+  await call("settings:set", { longWorkRounds: 25 });
+  // Миссию возвращаем в работу ДО остановки — так же, как это делает человек
+  // кнопкой в панели: пауза новым прогоном не подхватывается, а проверяем мы
+  // остановку ЖИВОЙ работы (её потом и продолжает кнопка).
+  const backToWork = await call("mission:resume");
+  ok(backToWork && backToWork.ok === true, "перед остановкой миссия возвращена в работу: " + JSON.stringify(backToWork && backToWork.id));
+  const stopResumesBefore = kind("resume").length;
+  const stopErrorsBefore = kind("error").length;
+  const servedBeforeStop = served;
+  answerDelayMs = 60; // неспешный провайдер: успеваем нажать «Стоп» посреди запроса
+  const stopPromise = call("ai:send", [{ role: "user", content: "Сделай ещё заметок" }], { chatId: "chat-live", role: "developer" });
+  await sleep(700); // заметный кусок работы: человека останавливает идущий прогон
+  await call("ai:stop");
+  const stoppedRes = await stopPromise;
+  answerDelayMs = 0;
+  const stopResumes = kind("resume");
+  ok(stoppedRes && stoppedRes.ok === true, "«Стоп» завершил прогон мягко, а не ошибкой: " + JSON.stringify(stoppedRes));
+  ok(stopResumes.length === stopResumesBefore + 1, "«Стоп» зажёг кнопку продолжения: событий resume " + stopResumes.length);
+  ok(
+    /остановлено пользователем/.test((stopResumes[stopResumes.length - 1] || {}).ev.reason),
+    "у кнопки причина остановки: " + JSON.stringify((stopResumes[stopResumes.length - 1] || {}).ev.reason)
+  );
+  ok(
+    kind("error").length === stopErrorsBefore,
+    "остановка человека не ушла в чат ошибкой: " + JSON.stringify(kind("error").map((e) => e.ev.message).slice(-2))
+  );
+  ok(served - servedBeforeStop <= 16, "прогон встал на остановке, а не отработал лимит: запросов " + (served - servedBeforeStop));
+  const recStop = missionStore.missionLoad(workDir, missionId);
+  const stopStage = ((recStop && recStop.stages) || []).slice(-1)[0] || {};
+  ok(stopStage.reason === "остановка человеком", "отрезок работы закрыт причиной остановки: " + JSON.stringify(stopStage.reason));
+
+  // 12.2. Кнопка продолжает прерванную работу. Окно шлёт прогону ВСЮ историю чата
+  // (как в жизни) — по ней прогон узнаёт в чекпоинте свою оборванную работу и
+  // возвращает её себе, а служебный текст кнопки не становится «уточнением цели».
+  const goalNotesBefore = ((missionStore.missionLoad(workDir, missionId) || {}).goalNotes || []).length;
+  const noticesBefore = kind("notice").length;
+  const beforeButtonRun = chatBodies.length;
+  await call("settings:set", { longWorkRounds: 2 });
+  const buttonRes = await call(
+    "ai:send",
+    [
+      { role: "user", content: "Сделай 50 заметок в папке notes" },
+      { role: "user", content: "Сделай ещё заметок" },
+      { role: "user", content: RESUME_TEXT },
+    ],
+    { chatId: "chat-live", role: "developer" }
+  );
+  ok(buttonRes && buttonRes.ok === true, "прогон после кнопки прошёл: " + JSON.stringify(buttonRes));
+  const backNotice = kind("notice")
+    .slice(noticesBefore)
+    .find((e) => e.ev.text && e.ev.text.indexOf("▶ Продолжаю с места остановки") >= 0);
+  ok(
+    !!backNotice,
+    "прогон вернул прерванный ход (чекпоинт): " + JSON.stringify(kind("notice").slice(noticesBefore).map((e) => String(e.ev.text).slice(0, 60)))
+  );
+  const recButton = missionStore.missionLoad(workDir, missionId);
+  ok(
+    ((recButton && recButton.goalNotes) || []).length === goalNotesBefore,
+    "текст кнопки не стал уточнением цели: " + JSON.stringify(recButton && recButton.goalNotes)
+  );
+  ok(
+    !((recButton && recButton.goalNotes) || []).some((n) => /Продолжи работу с того места/.test(n.text || "")),
+    "служебный текст кнопки записан в цель работы"
+  );
+  const buttonReqs = chatBodies.slice(beforeButtonRun).map((b) => {
+    try {
+      return JSON.parse(b.body);
+    } catch {
+      return {};
+    }
+  });
+  const withTools = buttonReqs.filter((r) => Array.isArray(r.messages) && r.messages.some((m) => m.role === "tool"));
+  ok(
+    buttonReqs.length > 0 && withTools.length === buttonReqs.length,
+    "кнопка вернула работе результаты инструментов: " + withTools.length + " из " + buttonReqs.length
+  );
+  ok(
+    buttonReqs.some((r) => (r.messages || []).some((m) => m.role === "tool" && /notes\/round-\d+/.test(String(m.content || "")))),
+    "в запросе после кнопки есть работа, сделанная ДО остановки"
+  );
+
+  // 12.3. Пауза миссии (кнопка ⏸ в панели) — то же самое: кнопка продолжения.
+  await call("settings:set", { longWorkRounds: 25 });
+  const pauseResumesBefore = kind("resume").length;
+  const pauseErrorsBefore = kind("error").length;
+  const servedBeforePause = served;
+  answerDelayMs = 60;
+  const pausePromise = call("ai:send", [{ role: "user", content: "Продолжай заметки" }], { chatId: "chat-live", role: "developer" });
+  await sleep(260);
+  await call("mission:pause");
+  const pausedRes = await pausePromise;
+  answerDelayMs = 0;
+  const pauseResumes = kind("resume");
+  ok(pausedRes && pausedRes.ok === true, "пауза завершила прогон мягко: " + JSON.stringify(pausedRes));
+  ok(
+    pauseResumes.length === pauseResumesBefore + 1 && /пауза/.test((pauseResumes[pauseResumes.length - 1] || {}).ev.reason),
+    "пауза зажгла кнопку продолжения: " + JSON.stringify(pauseResumes.map((e) => e.ev.reason).slice(-2))
+  );
+  ok(kind("error").length === pauseErrorsBefore, "пауза не ушла в чат ошибкой");
+  ok(served - servedBeforePause <= 6, "прогон встал на паузе: запросов " + (served - servedBeforePause));
+  ok(
+    kind("chunk").map((e) => e.ev.text).join("").indexOf("⏸ Пауза") >= 0,
+    "человеку сказано, что работа на паузе"
+  );
+
+  // 12.4. Обычный финал: возвращаться некуда — кнопка НЕ зажигается.
+  await call("settings:set", { longWorkRounds: 25 });
+  const plainResumesBefore = kind("resume").length;
+  plainAnswer = true;
+  const plainRes = await call("ai:send", [{ role: "user", content: "Проверь, что всё на месте" }], { chatId: "chat-live", role: "developer" });
+  plainAnswer = false;
+  ok(plainRes && plainRes.ok === true, "обычный финал прошёл: " + JSON.stringify(plainRes));
+  ok(kind("resume").length === plainResumesBefore, "обычный финал зажёг кнопку продолжения");
+
+  console.log("\n[13] Ничего не осталось висеть");
   ok(global.__agentRunning === false, "признак прогона снят");
   ok(global.__agentStopRequested === false && global.__agentPauseRequested === false, "флаги остановки сняты");
 

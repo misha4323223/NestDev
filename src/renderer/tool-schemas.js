@@ -2385,6 +2385,105 @@ const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "ycSecret",
+      description:
+        "Yandex Cloud: секреты Lockbox — список, версии и наполнение. action: list (секреты каталога) | versions (версии секрета: id, дата и ИМЕНА ключей) | putversion (новая версия со значениями). secret — имя или id секрета (список: action list). putversion требует разрешения «Разрешить агенту создавать ресурсы» и явной просьбы пользователя. Значения секретов обратно не читаются — наружу уходят только имена ключей. Секрет без версии бесполезен: ревизия контейнера ссылается на ключ, которого нет, поэтому сначала putversion, а потом ycContainer (action deploy) с полем secrets — id, key, environmentVariable.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "list | versions | putversion" },
+          secret: { type: "string", description: "Имя или id секрета (для action versions и putversion)" },
+          entries: { type: "object", description: "Пары «ключ → значение» для новой версии: { API_KEY: значение, DB_URL: значение }. Можно списком объектов: [{ key: API_KEY, value: значение }]. Ключ — латиница, цифры и знаки - _ . / и @" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "ycDns",
+      description:
+        "Yandex Cloud: записи зоны Cloud DNS — посмотреть, поставить и удалить. action: records (записи зоны) | add (поставить значения для пары «имя+тип»: есть — заменит, нет — добавит) | delete (удалить все значения пары «имя+тип»). zone — имя или id зоны (список: ycList service dns); без zone работает, только если зона в каталоге одна. name — FQDN с точкой на конце: вершина зоны — само её имя (example.com.), поддомен — www.example.com. type — A, AAAA, CNAME, TXT, MX, NS, SRV. value — строка или массив строк (для MX: 10 mx.example.com.). ttl — секунды. add требует чекбокса «Разрешить агенту создавать ресурсы», delete — «Разрешить агенту удалять ресурсы». Помни разницу: имя ЗОНЫ при создании — домен БЕЗ точки, имя ЗАПИСИ — С точкой.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "records | add | delete" },
+          zone: { type: "string", description: "Имя или id DNS-зоны (необязательно, если в каталоге одна зона)" },
+          name: { type: "string", description: "Имя записи — FQDN с точкой на конце: www.example.com., а для вершины зоны — само её имя example.com." },
+          type: { type: "string", description: "Тип записи: A | AAAA | CNAME | TXT | MX | NS | SRV" },
+          value: { type: "string", description: "Значение записи (несколько — через запятую или полем values)" },
+          values: { type: "array", items: { type: "string" }, description: "Несколько значений одной записи (необязательно)" },
+          ttl: { type: "integer", description: "TTL в секундах (по умолчанию 600)" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "ycRegistry",
+      description:
+        "Yandex Cloud: образы Container Registry — посмотреть и почистить. action: images (образы реестра: имя, теги, размер, id) | delete (удалить образ ВМЕСТЕ со всеми его тегами). registry — имя или id реестра (список: ycList service containerRegistry); без registry работает, только если реестр в каталоге один. image — id образа (из action images) или его тег. Образы копятся с каждой выкаткой и занимают платное хранилище, но delete необратим: спрашивай пользователя перед удалением и не удаляй тег, на который ссылается работающий контейнер. delete требует чекбокса «Разрешить агенту удалять ресурсы».",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "images | delete" },
+          registry: { type: "string", description: "Имя или id реестра (необязательно, если в каталоге один реестр)" },
+          image: { type: "string", description: "id образа или его тег (можно также imageId или tag)" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "ycDb",
+      description:
+        "Yandex Cloud: таблицы и записи ДОКУМЕНТНОЙ базы YDB (создать базу: ycCreate service ydb). action: tables (список таблиц) | create (создать таблицу) | describe (структура и число записей) | put (положить запись) | get (одна запись по key) | scan (показать записи) | delete (убрать запись) | drop (удалить таблицу вместе с записями, необратимо). database — имя или id базы (без него работает, только если база в каталоге одна). keys — поля первичного ключа, например { \"id\": \"S\" } (первый — ключ поиска, остальные — сортировки, тип S/N/B). item и key — обычные пары «поле → значение»; типы API ставит сам. create и put требуют чекбокса «Разрешить агенту создавать ресурсы», delete и drop — «Разрешить агенту удалять ресурсы». Это только документные таблицы (Document API, DynamoDB-совместимый): обычные SQL-таблицы YQL этот интерфейс не обслуживает.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "tables | create | describe | put | get | scan | delete | drop" },
+          database: { type: "string", description: "Имя или id базы YDB (необязательно, если в каталоге одна база)" },
+          table: { type: "string", description: "Имя таблицы. Обязательно для всех действий, кроме tables" },
+          keys: { type: "object", description: "Для create: поля первичного ключа, например { \"id\": \"S\" }" },
+          item: { type: "object", description: "Для put: запись полями, например { \"id\": \"1\", \"name\": \"Tom\", \"price\": 10.5 }" },
+          key: { type: "object", description: "Для get/delete: значения полей первичного ключа записи" },
+          limit: { type: "integer", description: "Для scan: сколько записей показать (по умолчанию 20, максимум 100)" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "ycStorage",
+      description:
+        "Yandex Cloud: файлы в бакете Object Storage — посмотреть, положить, забрать, убрать и открыть наружу. action: list (что лежит в бакете, можно prefix — «папка») | upload (положить файл) | download (забрать объект к себе) | delete (убрать объект) | public (открыть бакет для чтения из интернета) | private (закрыть обратно). bucket — имя или id бакета (список: ycList service storage); без bucket работает, только если бакет в каталоге один. key — путь объекта в бакете (site/index.html), file — путь файла на ПК от рабочей папки, content — готовый текст вместо файла, to — куда сохранить скачанное. Для public/private key не нужен — права меняются у всего бакета. upload требует чекбокса «Разрешить агенту создавать ресурсы», delete — «Разрешить агенту удалять ресурсы», public/private — «Разрешить агенту делать бакет публичным». Тип содержимого ставится по расширению ключа. Важно: открытый адрес объекта (https://storage.yandexcloud.net/<бакет>/<ключ>) работает у других, только если у бакета включён публичный доступ на чтение. Про action public: файлы станет читать кто угодно из интернета и они будут видны поисковикам — поэтому вызывай его ТОЛЬКО по явной просьбе пользователя и никогда для бакета с паролями или личными файлами (для закрытых данных есть ycSecret).",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "list | upload | download | delete | public | private" },
+          bucket: { type: "string", description: "Имя или id бакета (необязательно, если в каталоге один бакет)" },
+          key: { type: "string", description: "Путь объекта в бакете, например site/index.html (можно также object)" },
+          file: { type: "string", description: "Для upload: путь файла от рабочей папки. Для download: куда сохранить (можно to)" },
+          content: { type: "string", description: "Для upload: готовое содержимое вместо файла с ПК" },
+          to: { type: "string", description: "Для download: путь, куда сохранить объект (по умолчанию — имя объекта в рабочей папке)" },
+          prefix: { type: "string", description: "Для list: показывать только объекты с таким началом ключа («папка»)" },
+          limit: { type: "integer", description: "Для list: сколько объектов показать (по умолчанию 1000)" },
+          contentType: { type: "string", description: "Для upload: тип содержимого вручную (по умолчанию по расширению ключа)" },
+        },
+        required: ["action"],
+      },
+    },
+  },
 ];
   return { TOOL_DEFINITIONS };
 });

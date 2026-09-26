@@ -119,7 +119,13 @@ const file = ROOT + "/src/run-batch.js";
   await test("миссия просит закончить — прогон завершается её текстом", async () => {
     const env = makeBatch({ afterResult: { finish: true, phase: "failed", message: "🏁 Предел работы" } });
     const r = await env.batch.afterRound([]);
-    assert.deepStrictEqual(r, { kind: "end", message: "🏁 Предел работы" }, "не завершение с текстом миссии: " + JSON.stringify(r));
+    // resume: true — мягкая остановка работы: она сохранена, но не закончена,
+    // поэтому в окне загорается «▶ Продолжить» (раньше человек писал «продолжай»).
+    assert.deepStrictEqual(
+      r,
+      { kind: "end", message: "🏁 Предел работы", resume: true },
+      "не завершение с текстом миссии: " + JSON.stringify(r)
+    );
     assert.deepStrictEqual(env.seen.states, ["failed"], "состояние миссии не показано человеку");
   });
 
@@ -130,6 +136,7 @@ const file = ROOT + "/src/run-batch.js";
     assert.ok(/Работа закончена/.test(r.message), "нет человеческого финала: " + r.message);
     assert.ok(/Уборка/.test(r.message), "в финале нет названия миссии: " + r.message);
     assert.ok(/\.agent\/missions\//.test(r.message), "финал не говорит, где отчёт");
+    assert.strictEqual(r.resume, false, "закрытая миссия зажгла кнопку «Продолжить»");
     assert.strictEqual(env.seen.refreshes, 1, "миссия не перечитана перед финалом");
   });
 
@@ -198,7 +205,10 @@ const file = ROOT + "/src/run-batch.js";
     assert.ok(/const batchCtl = createRunBatch\(\{ emit, mission, pauseMs: 1500 \}\)/.test(runSrc), "модуль не собран в прогоне");
     assert.ok(runSrc.indexOf("batchCtl.askForReport(canonical, {") > 0, "пустой ответ не спрашивает модуль");
     assert.ok(/const after = await batchCtl\.afterRound\(canonical\)/.test(runSrc), "граница батча не спрашивает модуль");
-    assert.ok(runSrc.indexOf('if (after.kind === "end") return await endRun(after.message);') > 0, "финал потерял текст модуля");
+    assert.ok(
+      runSrc.indexOf('if (after.kind === "end") return await endRun(after.message, { resume: after.resume });') > 0,
+      "финал потерял текст модуля или признак продолжения (кнопку «▶ Продолжить»)"
+    );
     assert.ok(runSrc.indexOf("reportRetried = true;") > 0, "флаг повторного отчёта потерялся");
     assert.ok(runSrc.indexOf("for (let batch = 1; ; batch++)") > 0, "внешний цикл батчей потерялся");
     assert.ok(mainSrc.indexOf("const batch = createRunBatch") < 0, "проводка названа batch — её перекрыл бы счётчик цикла");

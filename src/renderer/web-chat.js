@@ -95,6 +95,17 @@
     ];
     const maxRounds = planMode ? 3 : 10;
     let finalText = "";
+    // «Стоп» в веб-режиме: прерывание запроса — остановка человека, а не сбой. Раньше
+    // AbortError просто уходил наружу: ответ обрывался молча, и продолжать было нечем.
+    // Теперь это та же мягкая остановка, что в приложении: «▶ Продолжить» зажигается,
+    // а её просьба возвращает прогону его же прошлый ход.
+    const stopGraceful = (partial) => {
+      if (!String(partial || "").trim()) {
+        onEvent({ type: "chunk", text: "⏹ Остановлено пользователем. Нажми «▶ Продолжить», чтобы доработать работу." });
+      }
+      onEvent({ type: "resume", reason: "остановлено пользователем" });
+      onEvent({ type: "done" });
+    };
     // Лимит провайдера (429) в веб-режиме: ждём сами до потолка, как в приложении.
     // Раньше здесь 429 сразу завершал прогон ошибкой и требовал «напиши продолжай».
     const RATE_WAIT_BUDGET_MS = 10 * 60 * 1000;
@@ -120,12 +131,15 @@
         messages: apiMessages,
         tools: planMode ? AgentCore.PLAN_MODE_TOOL_DEFINITIONS : AgentCore.TOOL_DEFINITIONS,
         fromBrowser: true,
+        // Рассуждения (Low/High/Max) — из плашки рядом с полем ввода. «off» —
+        // поле в запрос не попадает.
+        reasoning: opts.reasoning || "off",
       });
       let res;
       try {
         res = await fetch(req.url, { method: "POST", headers: req.headers, body: req.body, signal });
       } catch (e) {
-        if (e.name === "AbortError") throw e;
+        if (e.name === "AbortError") return stopGraceful(collected);
         if (tryWebAutoSwitch(e.message)) { round--; continue; }
         onEvent({ type: "error", message: "Сетевая ошибка: " + e.message });
         return;
@@ -182,19 +196,25 @@
         return;
       }
 
-      await AgentCore.consumeProviderStream({
-        response: res,
-        provider,
-        onText: (text) => {
-          const vis = stripper.push(text);
-          if (vis) {
-            collected += vis;
-            onEvent({ type: "chunk", text: vis });
-          }
-        },
-        onToolCall: (tc) => toolCalls.push(tc),
-        onThinking: (t) => onEvent({ type: "thinking", text: t }),
-      });
+      try {
+        await AgentCore.consumeProviderStream({
+          response: res,
+          provider,
+          onText: (text) => {
+            const vis = stripper.push(text);
+            if (vis) {
+              collected += vis;
+              onEvent({ type: "chunk", text: vis });
+            }
+          },
+          onToolCall: (tc) => toolCalls.push(tc),
+          onThinking: (t) => onEvent({ type: "thinking", text: t }),
+        });
+      } catch (e) {
+        // Обрыв чтения потока по «Стоп»: это остановка человека, а не ошибка прогона.
+        if (e && e.name === "AbortError") return stopGraceful(collected);
+        throw e;
+      }
 
       const tail = stripper.finish();
       if (tail) {
@@ -356,9 +376,9 @@
           // Память проекта, дневник агента и точки отката работают только в desktop-приложении.
           result =
             "⚠️ Инструменты памяти проекта (noteSave/noteRead/noteList/noteDelete), дневника агента (diaryWrite/diaryRead) и точек отката (checkpointSave/checkpointList/checkpointRollback) доступны только в desktop-приложении. Запустите приложение на Windows (bun run dist:win).";
-        } else if (c.name === "ycStatus" || c.name === "ycList" || c.name === "ycCreate" || c.name === "ycDelete" || c.name === "ycDeploy" || c.name === "ycLogs" || c.name === "ycContainer") {
+        } else if (c.name === "ycStatus" || c.name === "ycList" || c.name === "ycCreate" || c.name === "ycDelete" || c.name === "ycDeploy" || c.name === "ycLogs" || c.name === "ycContainer" || c.name === "ycSecret" || c.name === "ycDns" || c.name === "ycRegistry" || c.name === "ycCosts" || c.name === "ycInstall") {
           result =
-            "⚠️ Инструменты Yandex Cloud (ycStatus/ycList/ycCreate/ycDelete) доступны только в desktop-приложении. Запустите приложение на Windows (bun run dist:win).";
+            "⚠️ Инструменты Yandex Cloud (ycStatus/ycList/ycCreate/ycDelete/ycDeploy/ycLogs/ycContainer/ycSecret/ycDns/ycRegistry/ycCosts/ycInstall) доступны только в desktop-приложении. Запустите приложение на Windows (bun run dist:win).";
         } else {
           result =
             "⚠️ Файловые операции и git недоступны в веб-версии. Запустите приложение на Windows (bun run dist:win).";
@@ -367,7 +387,13 @@
         apiMessages.push({ role: "tool", tool_call_id: c.id, content: result });
       }
     }
-    onEvent({ type: "error", message: "Превышено максимальное число раундов вызова инструментов (" + maxRounds + ")." });
+    onEvent({ type: "resume", reason: "лимит раундов" });
+    onEvent({
+      type: "error",
+      message:
+        "Превышено максимальное число раундов вызова инструментов (" + maxRounds + "). " +
+        "Нажми «▶ Продолжить» — прогон вернёт себе прошлый ход и продолжит с текущего места.",
+    });
   }
 
   return {

@@ -1,0 +1,419 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   ОФОРМЛЕНИЕ «REPLIT» — ТЁМНАЯ ТЕМА
+   ---------------------------------------------------------------------------
+   Подключается ПОСЛЕ styles.css, monochrome.css, yc-console.css и
+   deploy-panel.css — то есть последней. Всё здесь перекрывает предыдущие слои.
+
+   Почему отдельным файлом, а не правкой styles.css: styles.css — 3686 строк и
+   147 КБ, в нём три наложенных друг на друга поколения темы (монохром сверху,
+   «неон 2100» снизу). Переписать его целиком — потерять историю; правки инстру-
+   ментом в файле >64 КБ не видны за границей. Поэтому новая тема — отдельный
+   слой: палитра + точечная зачистка того, что monochrome.css не покрыл.
+
+   ДВА АКЦЕНТА, КАК В REPLIT (проверено по их интерфейсу):
+     • СИНИЙ — цвет ДЕЙСТВИЯ. Им красятся кнопки главного действия (Publish,
+       «Новый чат», отправка), фокусные кольца, активные вкладки, ссылки.
+       Его в интерфейсе много, и он означает «нажми меня».
+     • ОРАНЖЕВЫЙ #f26207 — цвет БРЕНДА. Живёт ровно в логотипе и больше нигде.
+       Это ровно то место, где прошлая версия файла ошибалась: оранжевый стоял
+       на всех кнопках.
+
+   Что ещё взято у Replit (тёмное оформление редактора):
+     • фон почти чёрный и НЕЙТРАЛЬНЫЙ (#0d0d0f), без синевы. Прошлая версия
+       файла держала здесь сине-серый #0e1525, и интерфейс читался как
+       «тёмно-синий», а не как почти чёрный, каким он выглядит у Replit;
+     • панели на ступень светлее фона (боковая колонка, карточки, поля);
+     • границы тёмно-серые (#2a2a2f), тонкие, без свечений;
+     • выделение строки/вкладки — приподнятый фон и полоска, без неона.
+
+   Токены названы ТАК ЖЕ, как в styles.css (--bg, --bg-side, --accent …), поэтому
+   весь интерфейс перекрашивается через них; дальше идут только те правила,
+   которые в предыдущих слоях были записаны ЛИТЕРАЛЬНЫМ цветом.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* Фон и поверхности: нейтральный тёмно-графитовый, почти чёрный — как на
+     скриншоте Replit. Синевы здесь нет намеренно. */
+  --bg: #0d0d0f;          /* рабочая область */
+  --bg-soft: #131315;     /* панели второго плана */
+  --bg-side: #18181b;     /* рельса и список чатов (как сайдбар Replit) */
+  --bg-hover: rgba(255, 255, 255, 0.07);
+  --bg-input: #18181b;
+  --bg-card: #18181b;
+  --bg-bubble-user: #242428;
+  --bg-bubble-ai: #141416;
+  --bg-tool: #131315;
+  /* Границы */
+  --border: #2a2a2f;
+  --border-soft: #202023;
+  /* Текст */
+  --text: #f4f4f5;
+  --text-dim: #9c9ca4;
+  --text-faint: #6c6c74;
+  /* Бренд: оранжевый Replit — ТОЛЬКО для логотипа */
+  --brand: #f26207;
+  --brand-2: #ff8a3d;
+  --brand-gradient: linear-gradient(135deg, #f26207, #ff8a3d);
+  /* Действие: синий — кнопки, фокус, активные вкладки, ссылки. Ровно тот же
+     синий, что на странице входа с телефона (mobile-api.js): одна палитра. */
+  --accent: #2563eb;
+  --accent-2: #3b82f6;
+  --accent-soft: rgba(37, 99, 235, 0.14);
+  --accent-line: rgba(37, 99, 235, 0.42);
+  --accent-ring: rgba(37, 99, 235, 0.4);
+  --gradient: linear-gradient(135deg, #2563eb, #3b82f6);
+  /* Состояния */
+  --danger: #ee5a5a;
+  --ok: #2ecc8f;
+  --warn: #f2b007;
+}
+
+/* ─── 1. Каркас: рельса, боковая колонка, шапка, панели ─────────────────── */
+#rail { background: var(--bg-side) !important; border-right-color: var(--border) !important; }
+#sidebar { background: var(--bg-side) !important; border-right-color: var(--border) !important; }
+#chat-header { background: var(--bg) !important; border-bottom-color: var(--border-soft) !important; }
+#project-panel { background: var(--bg-side) !important; border-left-color: var(--border) !important; }
+.side-panel { background: var(--bg-soft) !important; border-left-color: var(--border) !important; }
+.term-out { background: #08080a !important; }
+.status-bar, #status-bar { background: var(--bg-side) !important; border-color: var(--border-soft) !important; }
+.sp-resize:hover { background: var(--accent-ring) !important; }
+
+/* ─── 2. Логотип — бренд (оранжевый), действия — акцент (синий) ─────────── */
+.rail-logo,
+.brand-logo,
+.welcome-logo {
+  background: var(--brand-gradient) !important;
+  color: #ffffff !important;
+}
+.rail-logo { border-radius: 10px !important; }
+.rail-btn.rail-accent {
+  background: var(--accent) !important;
+  border-color: transparent !important;
+  color: #ffffff !important;
+}
+.rail-btn.rail-accent:hover {
+  background: var(--accent-2) !important;
+  border-color: transparent !important;
+  color: #ffffff !important;
+}
+.rail-btn.active {
+  background: var(--accent-soft) !important;
+  border-color: var(--accent-line) !important;
+  color: var(--accent-2) !important;
+}
+.rail-btn:hover { color: var(--text) !important; }
+
+.btn-primary {
+  background: var(--gradient) !important;
+  border: 1px solid transparent !important;
+  color: #ffffff !important;
+}
+.btn-primary:hover { background: var(--accent-2) !important; border-color: transparent !important; }
+.btn:hover { border-color: #3a3a42 !important; }
+.btn-danger { border-color: rgba(238, 90, 90, 0.5) !important; color: var(--danger) !important; }
+.btn-danger:hover { background: rgba(238, 90, 90, 0.12) !important; border-color: rgba(238, 90, 90, 0.72) !important; }
+
+.composer-btns #btn-send {
+  background: var(--gradient) !important;
+  color: #ffffff !important;
+}
+.composer-btns #btn-send:hover { background: var(--accent-2) !important; }
+.composer-btns #btn-stop { border-color: rgba(238, 90, 90, 0.5) !important; color: var(--danger) !important; }
+.composer:focus-within { border-color: var(--accent) !important; }
+
+/* ─── 3. Кольцо фокуса — синее (доступность) ───────────────────────────── */
+.composer:focus-within,
+#chat-search:focus,
+#preview-url:focus,
+.field input:focus,
+.field textarea:focus,
+.select:focus,
+.chat-title-input:focus,
+.settings-search:focus-within,
+.input-name:focus {
+  box-shadow: 0 0 0 2px var(--accent-ring) !important;
+}
+.code-edit:focus,
+.input-name:focus,
+.gh-repo-search input:focus { outline-color: var(--accent) !important; }
+.project-select:focus { border-color: var(--accent) !important; }
+.check-row input,
+input[type="checkbox"],
+input[type="radio"] { accent-color: var(--accent) !important; }
+.chat-title-input { border-color: var(--border) !important; background: var(--bg-input) !important; }
+
+/* ─── 4. Сообщения ─────────────────────────────────────────────────────── */
+.msg.user .bubble {
+  background: var(--bg-bubble-user) !important;
+  color: var(--text) !important;
+  border: 1px solid #33333a !important;
+}
+.msg.user .bubble a { color: #6cb6ff !important; }
+.msg.assistant .bubble { background: var(--bg-bubble-ai) !important; border-color: var(--border-soft) !important; }
+.msg.assistant .think {
+  background: rgba(255, 255, 255, 0.03) !important;
+  border: 1px solid var(--border-soft) !important;
+  border-left: 3px solid var(--accent) !important;
+}
+.bubble.pending::after { background: var(--accent) !important; }
+
+/* ─── 5. Терминал и лог превью ─────────────────────────────────────────── */
+.term-cmd-line { color: #cfe3ff !important; }
+.term-err { color: #ff9a9a !important; }
+.term-agent { color: var(--accent-2) !important; }
+.term-server { color: #e8b96b !important; }
+.term-server .ts-info { color: #9da2b3 !important; }
+.term-server .ts-err { color: #ff9a9a !important; }
+.term-server .ts-ok { color: var(--ok) !important; }
+.term-server .ts-warn { color: var(--warn) !important; }
+.term-prompt,
+.term-cmd-line .term-prefix { color: var(--ok) !important; }
+#term-input { caret-color: var(--accent) !important; }
+.preview-log .pl-cmd { color: #cfe3ff !important; }
+.preview-log .pl-err { color: #ff9a9a !important; }
+.preview-stage { background: var(--bg) !important; }
+
+/* ─── 6. Состояния, счётчики, дерево, диффы ────────────────────────────── */
+.work-group.finished .work-count,
+.tool-status.ok,
+.change-status.staged,
+.tree-row.file.tree-new .tree-name,
+.diff-line.add,
+.commit-file-status.add { color: var(--ok) !important; }
+.tool-status.err,
+.tool-body.err .tool-label,
+.tool-body.err .tool-result,
+.file-error,
+.device-status.err,
+.settings-msg.err,
+#mail-msg.error,
+.gh-repos-status.err,
+.diff-line.del,
+.commit-file-status.del { color: var(--danger) !important; }
+.change-status.modified,
+.tree-row.file.tree-mod .tree-name,
+.commit-file-status.mod { color: var(--warn) !important; }
+.change-status.untracked { color: var(--text-dim) !important; }
+.commit-hash { color: var(--accent-2) !important; }
+.diff-file-head { color: var(--accent-2) !important; }
+.tool-body.busy .tool-state { color: var(--accent) !important; }
+.tool-body.done .tool-state { color: var(--ok) !important; }
+.tool-body.err .tool-state { color: var(--danger) !important; }
+.work-head { background: transparent !important; }
+.work-head:hover,
+.work-group.expanded .work-head { background: rgba(255, 255, 255, 0.05) !important; }
+.tool-body:hover .tool-row { background: rgba(255, 255, 255, 0.04) !important; }
+.plan-group.finished .plan-fill { background: var(--ok) !important; }
+.plan-count { color: var(--text-dim) !important; }
+.plan-group.finished .plan-count { color: var(--ok) !important; }
+.ctx-text.warn { color: var(--warn) !important; }
+.ctx-text.danger { color: var(--danger) !important; }
+.drop-hint { border-color: var(--accent) !important; color: var(--accent-2) !important; }
+.tree-row.drop-target { outline-color: var(--accent) !important; outline-style: dashed !important; }
+.fs-tools.publish-tools .btn { background: rgba(46, 204, 143, 0.12) !important; color: var(--ok) !important; }
+.env-scope.limited { border-color: var(--accent-line) !important; }
+.env-key { color: var(--accent-2) !important; }
+
+/* ─── 7. Разметка ответа: ссылки, код, таблицы, диаграммы ──────────────── */
+.bubble.md a { color: #6cb6ff !important; }
+.bubble.md a:hover { color: #9ccbff !important; }
+.bubble.md .md-task { color: #6cb6ff !important; }
+.bubble.md code.md-code {
+  color: #d7e3ff !important;
+  background: rgba(76, 154, 255, 0.1) !important;
+}
+.md-codeblock { background: #08080a !important; border-color: var(--border-soft) !important; }
+.md-codehead { background: transparent !important; border-color: var(--border-soft) !important; }
+.md-copy:hover { border-color: var(--border) !important; color: var(--text) !important; }
+.md-table th { background: rgba(255, 255, 255, 0.04) !important; }
+.bubble.md blockquote.md-quote { border-left: 3px solid #3a3a42 !important; }
+.dg-node,
+.seq-actor {
+  background: var(--bg-card) !important;
+  border-color: var(--border) !important;
+  color: var(--text) !important;
+}
+.dg-arrow-label,
+.seq-label { background: var(--bg-card) !important; color: var(--text-dim) !important; }
+.seq-note { border-color: rgba(242, 176, 7, 0.35) !important; color: #f7dc9a !important; }
+.code-ln { color: #4a4a52 !important; }
+.code-line:hover { background: rgba(255, 255, 255, 0.03) !important; }
+.code-input { color: var(--text) !important; }
+#file-path { color: var(--text-dim) !important; }
+.image-view { background: var(--bg-soft) !important; }
+
+/* ─── 8. Списки, вкладки, служебные подписи ───────────────────────────── */
+.panel-tab.active { color: var(--accent-2) !important; }
+.gh-repos-body.open .repo-chev { color: var(--accent-2) !important; }
+.device-code { color: var(--accent-2) !important; }
+.mobile-url-chip { color: var(--accent-2) !important; }
+.mobile-url-none { color: var(--warn) !important; }
+.mobile-pin-input { color: var(--text) !important; border-color: var(--border) !important; }
+.vision-note { color: var(--text-dim) !important; }
+.ota-status { color: var(--text-dim) !important; }
+.scroll-bottom { background: var(--bg-card) !important; border-color: var(--border) !important; color: var(--text-dim) !important; }
+/* Файл тащат в поле: рамка и подпись в тон палитры. Класс ставит оболочка при drop
+   (app.js) — правило для .input-hint существовало, а сам композер никак не реагировал. */
+.composer.drag-over { border-color: var(--accent-2) !important; box-shadow: 0 0 0 2px var(--accent-ring) !important; background: var(--bg-hover) !important; }
+.composer.drag-over .input-hint { color: var(--accent-2) !important; font-weight: 600; }
+
+/* Yandex Cloud: статусы в цветах палитры, а не в своих зелёных/красных */
+.yc-conn-status.ok,
+.yc-deploy-result,
+.yc-status.active { color: var(--ok) !important; }
+.yc-conn-status.err,
+.yc-card-count.err,
+.yc-card-err,
+.yc-step.err,
+.yc-status.error { color: var(--danger) !important; }
+.yc-status.active { background: rgba(46, 204, 143, 0.12) !important; }
+.yc-status.creating { color: var(--warn) !important; background: rgba(242, 176, 7, 0.12) !important; }
+.yc-status.error { background: rgba(238, 90, 90, 0.12) !important; }
+
+/* ─── 9. Рабочая область: лента вкладок (как в Replit) ──────────────────
+   Вкладка — не «таблетка» с заливкой, а полоска на полосе вкладок: неактивные
+   плоские на цвете панели, активная приподнята фоном рабочей области и
+   скруглена сверху, низ отделён волосяной линией. Метафора вкладок браузера/
+   VS Code: видно, какие разделы открыты и какой из них сейчас на экране.
+   Работает и в шапке правой панели (.sp-switch), и в панели проекта
+   (.panel-tabs) — это одна и та же лента, поэтому стиль общий. */
+.sp-head {
+  gap: 6px;
+  align-items: stretch;
+  padding: 0 6px 0 8px;
+  background: var(--bg-side) !important;
+  border-bottom: 1px solid var(--border) !important;
+}
+.sp-switch {
+  flex: 1 1 auto;
+  align-items: flex-end;
+  padding: 6px 0 0 !important;
+  background: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+  scrollbar-width: none;
+}
+.sp-switch::-webkit-scrollbar { display: none; }
+.sp-btn {
+  gap: 6px;
+  padding: 7px 11px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  font-size: 12.5px;
+  font-weight: 550;
+  white-space: nowrap;
+  box-shadow: none;
+  text-shadow: none !important;
+}
+.sp-btn:hover { color: var(--text); background: rgba(255, 255, 255, 0.05); }
+.sp-btn.active {
+  background: var(--bg) !important;
+  color: var(--text) !important;
+  border-color: var(--border) !important;
+  box-shadow: none !important;
+}
+.sp-btn.active svg { color: var(--accent-2); }
+#btn-sp-close { align-self: center; }
+
+/* Та же лента — в панели проекта (Файлы / Изменения / Коммиты).
+   Здесь полоса тёмнее содержимого, а активная вкладка его повторяет: так
+   вкладка выглядит продолжением панели, а не наклейкой сверху. */
+.panel-tabs {
+  gap: 2px;
+  padding: 6px 8px 0 !important;
+  background: var(--bg-soft) !important;
+  border-bottom-color: var(--border) !important;
+}
+.panel-tab {
+  padding: 8px 0;
+  margin-bottom: 0;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  font-size: 12.5px;
+  font-weight: 550;
+  color: var(--text-dim);
+  text-shadow: none !important;
+}
+.panel-tab:hover { color: var(--text); background: rgba(255, 255, 255, 0.05); }
+.panel-tab.active {
+  background: var(--bg-side) !important;
+  color: var(--text) !important;
+  border-color: var(--border) !important;
+  border-bottom: none !important;
+  font-weight: 650;
+}
+
+/* ─── 10. Полосы прокрутки ────────────────────────────────────────────── */
+::-webkit-scrollbar-thumb { background: #2c2c32 !important; }
+::-webkit-scrollbar-thumb:hover { background: #3d3d45 !important; }
+
+/* ─── 11. Reasoning effort: плашка у поля ввода ───────────────────────────
+   Уровень выбран — кнопка подсвечена, как другие включённые режимы (план).
+   В списке две строки на пункт: название и объяснение, поэтому моноширинный
+   шрифт и запрет переноса от .mp-item здесь снимаются. */
+.reasoning-btn.active {
+  background: var(--accent-soft) !important;
+  border-color: var(--accent-line) !important;
+  color: var(--accent-2) !important;
+}
+.rp-list { max-height: none; }
+.rp-item {
+  font-family: inherit;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+.rp-name { display: block; font-size: 12.5px; font-weight: 650; }
+.rp-hint { display: block; font-size: 11.5px; color: var(--text-faint); margin-top: 2px; }
+.rp-item.active .rp-hint { color: var(--accent-2); }
+.rp-note { font-size: 11.5px; color: var(--text-faint); }
+
+/* ─── 12. Рельса: компактные значки ─────────────────────────────────────
+   Значки были крупными (19px в плитке 38px) и спорили с содержимым.
+   Уменьшены и значки, и плитки, шаг плотнее — рельса читается как
+   навигация, а не как второй список. Подсветка — приподнятая плитка без
+   рамки: у Replit активный значок не обведён, а «притоплен» фоном. */
+#rail {
+  width: 46px;
+  min-width: 46px;
+  flex: 0 0 46px;
+  gap: 3px;
+  padding: 10px 0;
+}
+#rail .rail-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+}
+#rail .rail-btn svg { width: 16px; height: 16px; }
+#rail .rail-logo {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  margin-bottom: 2px;
+}
+#rail .rail-logo svg { width: 17px; height: 17px; }
+#rail .rail-sep { width: 18px; margin: 2px 0 4px; }
+#rail .rail-btn .hd-dot { top: 4px; right: 4px; }
+#rail .rail-badge { top: 2px; right: 2px; min-width: 13px; height: 13px; font-size: 9.5px; padding: 0 3px; }
+#rail .rail-btn.active {
+  background: rgba(255, 255, 255, 0.09) !important;
+  border-color: transparent !important;
+  color: var(--text) !important;
+}
+#rail .rail-btn:hover {
+  background: rgba(255, 255, 255, 0.055) !important;
+  border-color: transparent !important;
+  color: var(--text) !important;
+}
+#rail .rail-btn.rail-accent.active,
+#rail .rail-btn.rail-accent {
+  background: var(--accent) !important;
+  border-color: transparent !important;
+  color: #ffffff !important;
+}
+#rail .rail-btn.rail-accent:hover { background: var(--accent-2) !important; }

@@ -311,10 +311,70 @@
     return [Object.assign({}, first, { content: head + rule })].concat(messages.slice(1));
   }
 
+  // ── Рассуждения (Reasoning effort) — из src/renderer/reasoning.js ──────────
+  // Три положения человека ложатся на три ступени шкалы провайдера, поэтому каждое
+  // что-то меняет: low < medium < high. Ступени «max» у совместимых API нет — выше
+  // high шкала не идёт. У Ollama ступени есть только у gpt-oss, поэтому там любому
+  // нашему уровню соответствует think: true. Кому это поле вообще можно слать —
+  // решает reasoningSupport() ниже.
+  const REASONING_LEVELS = { low: "low", high: "medium", max: "high" };
+  function reasoningLevel(v) {
+    const s = String(v || "off").toLowerCase();
+    return REASONING_LEVELS[s] ? s : "off";
+  }
+
+  // ── Умеет ли модель рассуждать вообще ─────────────────────────────────────
+  // Плашка 🧠 нужна не всем моделям: у модели без рассуждений она обещает то, чего
+  // нет, и человек либо жмёт впустую, либо получает отказ сервера. Ответ на этот
+  // вопрос живёт здесь же, рядом со шкалой, чтобы «что шлём» и «кому шлём» не
+  // разъезжались: транспорт — единственное место, которое решает судьбу этого поля.
+  //
+  // Три ответа, а не два:
+  //   "no"      — знаем, что рассуждений нет: плашку прячем;
+  //   "yes"     — знаем, что есть;
+  //   "unknown" — по имени не понять (свой прокси, редкая сборка): плашку ОСТАВЛЯЕМ.
+  // Прятать по догадке нельзя: у человека с незнакомым названием модели пропала бы
+  // работающая настройка. Лишняя плашка дешевле — если сервер поля не знает, прогон
+  // снимает его (run-retry.js) и запоминает отказ по этой модели.
+  //
+  // Источник — имя модели, и это осознанно: единого поля «умею рассуждать» нет ни в
+  // /models, ни в ответе (Ollama сообщает capabilities только у новых сборок), а имя
+  // есть всегда и не требует запроса — значит ответ мгновенный и одинаковый в окне,
+  // на телефоне и в браузере.
+  const REASONING_YES = [
+    /(^|[^a-z])oss([^a-z]|$)/, // gpt-oss — рассуждающая линейка OpenAI
+    /deepseek[-_]?r1|\br1\b/, // DeepSeek R1 и его дистилляты (в том числе на llama)
+    /\bqwq/, /qwen3/, // QwQ и Qwen3 (у обоих режим размышлений)
+    /\bthink/, /\breason/, // ...-thinking, deepseek-reasoner, glm-4.6-thinking
+    /(^|[^a-z])o[134]([^a-z0-9]|$)/, // o1 / o3 / o4 (OpenAI): уровень у них и есть шкала
+    /gpt[-_]?5/, /magistral/, // GPT-5; Mistral: рассуждающая ветка (не путать с mistral)
+    /grok[-_]?[34]/, /glm[-_]?4\.[56]/, /kimi[-_]?k2/,
+    /deepseek[-_]?v3\.[12]/, /minimax[-_]?m[12]/, /gemini[-_]?2\.5/,
+  ];
+  const REASONING_NO = [
+    /llama/, /gemma/, /\bphi[-_]?\d/, // обычные локальные сборки без размышлений
+    /mistral|ministral|mixtral|devstral/,
+    /smollm|tinyllama|dolphin|vicuna|hermes/, /qwen2\.5/,
+    // GPT-3.5/4-линейка: уровень у них не поддерживается (рассуждения — только у o*)
+    /gpt[-_]?[34]([^a-z0-9]|$)|gpt[-_]?[34]o/,
+    /command[-_]?[ra]/, /dbrx|olmo/,
+  ];
+  function reasoningSupport(provider, model) {
+    // Anthropic: рассуждения включаются бюджетом токенов (thinking.budget_tokens), а не
+    // уровнем, — транспорт туда поля рассуждений не шлёт вовсе. Значит плашка там
+    // ничего не делает, и её место не в окне.
+    if (provider === "anthropic") return "no";
+    const name = String(model || "").toLowerCase();
+    if (!name) return "unknown"; // модель не выбрана — судить не о чем
+    if (REASONING_YES.some((re) => re.test(name))) return "yes";
+    if (REASONING_NO.some((re) => re.test(name))) return "no";
+    return "unknown";
+  }
+
   /**
    * Собирает HTTP-запрос к нужному провайдеру.
    * s — объект настроек: { provider, ollamaUrl, openaiUrl, anthropicUrl, openaiApiKey, anthropicApiKey }
-   * opts — { model, messages, tools, fromBrowser, noTools, numCtxBudget, modelWindow }
+   * opts — { model, messages, tools, fromBrowser, noTools, numCtxBudget, modelWindow, reasoning }
    */
   function buildChatRequest(s, opts) {
     const provider = s && s.provider ? s.provider : "openai";
@@ -341,6 +401,9 @@
       // падал целиком. Отдаём каталог текстом и просим вызывать инструменты JSON-блоком.
       if (opts && opts.noTools) body.messages = withTextTools(merged, tools);
       else body.tools = tools;
+      // Рассуждения: у Ollama это булев think. Ставим только по явному выбору
+      // человека — нерассуждающая модель на это поле отвечает ошибкой.
+      if (reasoningLevel(opts && opts.reasoning) !== "off") body.think = true;
       const numCtx = ollamaNumCtx(opts && opts.numCtxBudget, opts && opts.modelWindow);
       if (numCtx > 0) body.options = { num_ctx: numCtx };
       return { url: baseFor(provider, s) + "/api/chat", headers, body: JSON.stringify(body) };
@@ -391,6 +454,11 @@
     // явному запросу stream_options.include_usage (последний чанк с usage).
     // Строгий сервер может поля не знать — тогда main.js выключает его и повторяет.
     if (opts && opts.includeUsage) body.stream_options = { include_usage: true };
+    // Рассуждения: reasoning_effort знают не все совместимые серверы, поэтому поле
+    // добавляется только по явному выбору человека, а отказ сервера снимает его
+    // на весь прогон (run-retry.js).
+    const reasoningHere = reasoningLevel(opts && opts.reasoning);
+    if (reasoningHere !== "off") body.reasoning_effort = REASONING_LEVELS[reasoningHere];
     const g4f = splitG4fRoute(model);
     if (g4f) {
       body.model = g4f.model;
@@ -1097,6 +1165,8 @@
     ollamaModelInfo,
     ollamaNumCtx,
     modelWindow,
+    reasoningLevel,
+    reasoningSupport,
     probeLocalModel,
     OLLAMA_KEEP_ALIVE,
   };

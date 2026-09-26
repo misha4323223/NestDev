@@ -471,6 +471,36 @@ async function testWebChat() {
       await web.webSend([{ role: "user", content: "привет" }], (ev) => events.push(ev), undefined, {});
       assert.strictEqual(calls.length, before, "запрос ушёл без выбранной модели");
       assert.ok(events.some((e) => e.type === "error" && /модель/i.test(e.message)), "нет понятного отказа: " + JSON.stringify(events));
+
+      // 4. «Стоп» посреди потока: чтение обрывается AbortError — это остановка
+      // человека. Прогон завершается мягко, а в окне зажигается «▶ Продолжить»;
+      // раньше AbortError улетал наружу: ответ обрывался молча, продолжать было нечем.
+      events.length = 0;
+      settings.model = "m1";
+      const abortErr = new Error("Прерывание запроса: остановлено человеком");
+      abortErr.name = "AbortError";
+      // Кусок текста отдаётся ПЕРВЫМ чтением (он должен дойти до окна), а обрыв
+      // приходит следом — так же ведёт себя прерванный поток у провайдера.
+      const cutOff = (parts) =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              for (const p of parts) controller.enqueue(new TextEncoder().encode("data: " + JSON.stringify(p) + "\n\n"));
+              setTimeout(() => controller.error(abortErr), 5);
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } }
+        );
+      script = () => cutOff([{ choices: [{ delta: { content: "начал" } }] }]);
+      await web.webSend([{ role: "user", content: "работай" }], (ev) => events.push(ev), new AbortController().signal, {});
+      assert.ok(!events.some((e) => e.type === "error"), "остановка человека ушла в чат ошибкой: " + JSON.stringify(events.filter((e) => e.type === "error")));
+      assert.deepStrictEqual(
+        events.filter((e) => e.type === "resume" || e.type === "done").map((e) => e.type),
+        ["resume", "done"],
+        "веб-режим не зажёг кнопку продолжения: " + JSON.stringify(events.map((e) => e.type))
+      );
+      assert.ok(/остановлено пользователем/.test(events.find((e) => e.type === "resume").reason), "у кнопки нет причины остановки");
+      assert.ok(/начал/.test(events.filter((e) => e.type === "chunk").map((e) => e.text).join("")), "частичный текст потерялся");
     } finally {
       global.fetch = realFetch;
     }
@@ -689,7 +719,7 @@ async function testChatEvents() {
       ensureSeg: 0, thinkBox: 0, planFromModel: [], planAdvance: 0, planFinish: 0,
       planOutcome: 0, planText: 0, planPanel: 0, planSet: [], addRow: [], planAdd: [],
       built: [], refreshed: [], openAsk: [], closedAsk: 0, context: [], mission: [],
-      tasksRendered: 0, flushed: 0, sidePanel: [], projectRefresh: [], deploy: [], timers: [],
+      tasksRendered: 0, flushed: 0, sidePanel: [], projectRefresh: [], deploy: [], timers: [], resume: [], resumeHidden: 0,
       settingsSaved: 0, getSettingsCalls: 0, answer: [],
     };
     const msgEls = new Map();
@@ -764,6 +794,9 @@ async function testChatEvents() {
       getSidePanel: () => ({ openSidePanel: (t) => spy.sidePanel.push(t), previewOpen: (u) => spy.sidePanel.push(u) }),
       getTasksMission: () => ({ renderTasks: () => { spy.tasksRendered++; }, missionFromEvent: (ev) => spy.mission.push(ev.type) }),
       getProjectPanel: () => ({ setFileViewPath: () => {}, refreshProject: () => spy.projectRefresh.push(1) }),
+      // Кнопка «Продолжить» после остановки: модуль прогона объявлен в окне ниже,
+      // поэтому событие зовёт его отложенной стрелкой.
+      getChatRun: () => ({ showResume: (r) => spy.resume.push(r), hideResume: () => { spy.resumeHidden++; } }),
     };
     const ev = sandbox.module.exports(deps);
     return {
@@ -799,7 +832,7 @@ async function testChatEvents() {
     for (const name of ["settings", "chatsData", "session", "lastUndoCount", "planCollapsed", "remoteRunNotified"]) {
       assert.ok(!new RegExp("(^|[^\\w$.])" + name + "\\b").test(src), "модуль читает " + name + " напрямую вместо живого доступа");
     }
-    for (const pair of [["SidePanel.", "getSidePanel()"], ["TasksMission.", "getTasksMission()"], ["ProjectPanel.", "getProjectPanel()"]]) {
+    for (const pair of [["SidePanel.", "getSidePanel()"], ["TasksMission.", "getTasksMission()"], ["ProjectPanel.", "getProjectPanel()"], ["ChatRun.", "getChatRun()"]]) {
       assert.ok(src.indexOf(pair[0]) === -1, "модуль зовёт " + pair[0] + " напрямую вместо " + pair[1]);
     }
     assert.ok(!/window\.api\b|localStorage/.test(src), "модуль лезет в чужие глобалы");
@@ -808,7 +841,8 @@ async function testChatEvents() {
     for (const dep of ["getSettings: () => settings", "setSettings: (s) => { settings = s; }", "getChatsData: () => chatsData",
       "getSession: () => session", "setLastUndoCount: (v) => { lastUndoCount = v; }", "setPlanCollapsed: (v) => PlanPanel.setPlanCollapsed(v)",
       "getRemoteRunNotified: () => remoteRunNotified", "setRemoteRunNotified: (v) => { remoteRunNotified = v; }",
-      "getSidePanel: () => SidePanel", "getTasksMission: () => TasksMission", "getProjectPanel: () => ProjectPanel"]) {
+      "getSidePanel: () => SidePanel", "getTasksMission: () => TasksMission", "getProjectPanel: () => ProjectPanel",
+      "getChatRun: () => ChatRun"]) {
       assert.ok(wiring.includes(dep), "в проводку не передан " + dep);
     }
   });
@@ -904,6 +938,11 @@ async function testChatEvents() {
     assert.strictEqual(typeof env.spy.openAsk[0].cb, "function", "ответу некуда уйти: обработчик потерялся");
     env.spy.openAsk[0].cb("a.txt");
     assert.deepStrictEqual(env.spy.answer, ["a.txt"], "ответ на вопрос агента не ушёл в главный процесс");
+    // Остановка с сохранённой работой (лимит раундов, «Стоп», пауза миссии): кнопку
+    // «Продолжить» в окне зажигает СВОЁ событие прогона, а не разбор текста ответа.
+    env.onAiEvent({ type: "resume", reason: "лимит раундов" });
+    assert.deepStrictEqual(env.spy.resume, ["лимит раундов"], "событие продолжения не зажгло кнопку: " + JSON.stringify(env.spy.resume));
+    assert.strictEqual(env.spy.resumeHidden, 0, "кнопку спрятали сразу после показа");
     env.onAiEvent({ type: "done" });
     assert.ok(env.spy.planFinish > 0 && env.spy.planPanel > 1, "финиш запуска не закрыл шаг текстового плана");
     env.onAiEvent({ type: "error", message: "сеть отвалилась" });
@@ -1427,7 +1466,7 @@ async function testTasksMission() {
       );
     };
     const M = build();
-    assert.deepStrictEqual(Object.keys(M).sort(), ["initRolesAndTasks", "missionFromEvent", "refreshMission", "renderTasks"], "наружу торчит лишнее или чего-то не хватает");
+    assert.deepStrictEqual(Object.keys(M).sort(), ["initRolesAndTasks", "missionFromEvent", "refreshMission", "renderTasks", "setChatRole"], "наружу торчит лишнее или чего-то не хватает");
 
     // 1. Навешивание: кнопки панелей и лентяи подписки.
     M.initRolesAndTasks();
@@ -1443,7 +1482,7 @@ async function testTasksMission() {
     assert.strictEqual($("tasks-quick-due").children.length, 5, "быстрые сроки не построены");
     assert.strictEqual($("task-new-auto").textContent, "▷ агент", "строка добавления не в режиме «не агенту»");
     // Роль берётся из самого чата: у нас в чате «менеджер».
-    assert.ok(/Менеджер/.test($("btn-role").textContent), "роль чата не показана на кнопке: " + $("btn-role").textContent);
+    assert.ok(/Менеджер/.test($("role-label").textContent), "роль чата не показана на кнопке: " + $("role-label").textContent);
     assert.ok($("btn-role").classList.contains("active"), "нестандартная роль не подсвечена");
     // Миссия пришла из главного процесса и нарисовалась сразу.
     assert.strictEqual($("ms-title").textContent, "Разбор заявок", "карточка миссии не заполнена");
@@ -4335,36 +4374,36 @@ async function testSessionExtras() {
   const cls = new Set();
   const dom = {
     "ctx-indicator": { classList: { add: (c) => cls.add(c) }, title: "" },
-    "ctx-fill": { style: {}, classList: { toggle: (c, on) => (on ? cls.add(c) : cls.delete(c)) } },
-    "ctx-text": { textContent: "" },
+    "ctx-text": { textContent: "", classList: { toggle: (c, on) => (on ? cls.add(c) : cls.delete(c)) } },
   };
   const ctx = ctxMod((id) => dom[id] || null);
 
-  await test("контекст: индикатор рисует проценты, токены и цвет по уровню", () => {
+  await test("контекст: только слово и процент, как у Freebuff", () => {
     ctx.renderContext({ used: 12400, budget: 24000, percent: 52 });
-    assert.strictEqual(dom["ctx-fill"].style.width, "52%");
-    assert.strictEqual(dom["ctx-text"].textContent, "🧠 12.4k / 24k · 52%");
+    assert.strictEqual(dom["ctx-text"].textContent, "Контекст 52%");
     assert.ok(cls.has("visible"), "индикатор остался скрытым");
     assert.ok(!cls.has("warn") && !cls.has("danger"), "лишний цвет на 52%");
     ctx.renderContext({ used: 19000, budget: 24000, percent: 80 });
     assert.ok(cls.has("warn"), "нет жёлтого на 80%");
     ctx.renderContext({ used: 23000, budget: 24000, percent: 96 });
     assert.ok(cls.has("danger"), "нет красного на 96%");
+    // Точные числа токенов остались только в подсказке: в подписи им места нет.
+    assert.ok(/23k/.test(dom["ctx-indicator"].title), "в подсказке нет числа токенов");
+    assert.ok(/24k/.test(dom["ctx-indicator"].title), "в подсказке нет бюджета");
     assert.strictEqual(ctx.fmtTokens(950), "950");
     assert.strictEqual(ctx.fmtTokens(20000), "20k");
   });
 
   await test("контекст: переполнение показывается честно (>100%), а не «100%»", () => {
     ctx.renderContext({ used: 62000, budget: 50000, percent: 100 });
-    assert.strictEqual(dom["ctx-text"].textContent, "🧠 62k / 50k · 124%");
-    assert.strictEqual(dom["ctx-fill"].style.width, "100%", "полоска должна упираться в 100%");
+    assert.strictEqual(dom["ctx-text"].textContent, "Контекст 124%");
     assert.ok(cls.has("danger"), "нет красного при переполнении");
     assert.ok(/БОЛЬШЕ бюджета/.test(dom["ctx-indicator"].title), "нет объяснения переполнения");
     assert.ok(/приблизительная/.test(dom["ctx-indicator"].title), "нет оговорки про оценку");
     assert.ok(/текущий шаг/.test(dom["ctx-indicator"].title), "не сказано, что текущий шаг не сжимается");
     // Без бюджета падаем на присланный процент
     ctx.renderContext({ used: 100, budget: 0, percent: 40 });
-    assert.strictEqual(dom["ctx-text"].textContent, "🧠 100 / 0 · 40%");
+    assert.strictEqual(dom["ctx-text"].textContent, "Контекст 40%");
   });
 
   await test("контекст: индикатор скрыт по умолчанию (до первого ответа)", () => {
@@ -5466,7 +5505,7 @@ async function testYandexCloud() {
 
   await test("Yandex Cloud: инструменты, алиасы промпта, мост и интерфейс согласованы", () => {
     const names = core.TOOL_DEFINITIONS.map((d) => d.function && d.function.name);
-    for (const n of ["ycStatus", "ycList", "ycContainer", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"]) {
+    for (const n of ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycDb", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"]) {
       assert.ok(names.includes(n), "нет инструмента " + n);
     }
     const prompt = core.SYSTEM_PROMPT || "";
@@ -6114,7 +6153,7 @@ async function testYandexCloud() {
     }
     assert.deepStrictEqual(def.function.parameters.required, ["action", "container"], "action и container обязательны");
     const preload = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
-    assert.ok(/ycSetPermissions: \(allowCreate, allowDelete, allowUpdate\)/.test(preload), "preload не передаёт третье разрешение");
+    assert.ok(/ycSetPermissions: \(allowCreate, allowDelete, allowUpdate, allowPublic\)/.test(preload), "preload не передаёт четвёртое разрешение");
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     assert.ok(html.includes('id="s-yc-allow-update"'), "нет чекбокса «Разрешить агенту менять контейнеры»");
     // обработчики разрешений Yandex Cloud переехали в src/renderer/yc-panel.js (этап 2)
@@ -6122,7 +6161,7 @@ async function testYandexCloud() {
       .map((f) => fs.readFileSync(path.join(ROOT, "src", "renderer", f), "utf8"))
       .join("\n");
     assert.ok(/s-yc-allow-update"\)\.onchange/.test(app), "интерфейс не слушает третий чекбокс");
-    assert.ok(/api\.ycSetPermissions\(create, del, upd\)/.test(app), "интерфейс не сохраняет третье разрешение");
+    assert.ok(/api\.ycSetPermissions\(create, del, upd, pub\)/.test(app), "интерфейс не сохраняет четвёртое разрешение");
     const main = backendSrc();
     assert.ok(hasTool(main, "ycContainer"), "нет обработчика ycContainer");
     assert.ok(/allowUpdate \? "разрешено"/.test(main), "ycStatus не сообщает про право менять контейнеры");
@@ -6832,7 +6871,7 @@ async function testContextMemory() {
       assert.ok(preloadSrc.includes(fn + ":"), "нет preload." + fn);
     }
     assert.ok(/name: "memoryList"/.test(coreSrc) && /name: "memorySearch"/.test(coreSrc), "нет описаний инструментов");
-    assert.ok(/noteDelete, memoryList, memorySearch, (todoWrite, )?checkpointSave/.test(coreSrc), "инструменты не в списке промпта");
+    assert.ok(/noteDelete, (diaryWrite, diaryRead, )?memoryList, memorySearch, (todoWrite, )?checkpointSave/.test(coreSrc), "инструменты не в списке промпта");
     assert.ok(/"memoryList", "memorySearch",/.test(coreSrc), "память не в ядре инструментов (тесный контекст)");
     assert.ok(/memory_list: "memoryList"/.test(coreSrc), "нет алиасов инструментов");
     assert.ok(htmlSrc.includes('id="s-context-memory"'), "нет галочки в настройках");
@@ -10839,10 +10878,16 @@ async function testOllamaWindow() {
       // Дефект воспроизводится на том же честном расчёте, но с прежним бюджетом 14 000:
       // от окна после промпта и истории остаётся ~30 токенов, и групп не помещается ни одна.
       assert.strictEqual(pick(14000).groups.length, 0, "прежний бюджет 14 000 больше не воспроизводит дефект — тест перестал быть о том");
-      // И граница резерва: модели, у которой после промпта и истории остаётся место под
-      // группу (окно ~22k), группа обязана достаться. Жёсткий резерв 12 000 ломает ровно
-      // этот случай — тест держит и его.
-      assert.ok(pick(22000).groups.indexOf("browser") >= 0, "при достаточном окне группа не влезает: " + JSON.stringify(pick(22000).groups));
+      // И граница: как только окна хватает на промпт, историю и вес группы, группа
+      // обязана достаться. Окно НЕ вбиваем числом: длина промпта (и, значит, порог)
+      // меняется от добавления инструмента, и «22 000» краснело бы на верной правке
+      // (урок части 49: сторож держит смысл, а не вид). Жёсткий резерв истории
+      // 12 000 всё равно ловится: тогда браузерная группа не влезает и в потолок ниже.
+      let win = 8000;
+      while (win < 60000 && pick(win).groups.indexOf("browser") < 0) win += 250;
+      assert.ok(win <= 30000, "браузерная группа не влезает и в большое окно (нашли на " + win + ")");
+      assert.ok(pick(win).groups.indexOf("browser") >= 0, "при достаточном окне группа не влезает: " + win);
+      assert.ok(pick(16000).groups.indexOf("browser") < 0, "без места под группу она всё же включилась: " + JSON.stringify(pick(16000).groups));
     });
 
     await test("модель без инструментов: вместо схем уходит текстовый каталог", () => {
@@ -10931,16 +10976,18 @@ async function testOllamaWindow() {
       assert.strictEqual(core.isLocalEndpoint({ provider: "openai", openaiUrl: "http://192.168.1.50:8000/v1" }), true, "сервер в домашней сети считается облаком");
       assert.strictEqual(core.isLocalEndpoint({ provider: "openai", openaiUrl: "https://api.deepseek.com/v1" }), false, "облако принято за локальный сервер");
       assert.strictEqual(core.isLocalEndpoint({ provider: "anthropic" }), false, "Anthropic принят за локальный сервер");
-      // Потолок: у местного сервера платим памятью (KV-кэш), а не деньгами.
+      // Потолок: у местного сервера платим памятью (KV-кэш), а не деньгами, поэтому
+      // облачный потолок высокий (400k, как у Freebuff), а настоящий предел задаёт
+      // окно САМОЙ модели — оно и обрезает бюджет, когда известно.
       const cloud = core.contextBudget("openai", "qwen3-4b");
-      assert.strictEqual(cloud, 26000, "запасной бюджет совместимого API изменился");
+      assert.strictEqual(cloud, 400000, "у совместимого API не облачный потолок 400k");
       assert.strictEqual(core.windowBudget("openai", cloud, 40960, { local: true }), 32768, "локальное окно 40k не использовано");
-      assert.strictEqual(core.windowBudget("openai", cloud, 40960), 26000, "облачный бюджет совместимого API поехал");
+      assert.strictEqual(core.windowBudget("openai", cloud, 40960), 36864, "окно модели не стало потолком бюджета");
       assert.strictEqual(core.windowBudget("openai", 50000, 131072, { local: true }), 32768, "потолок памяти не держит локальный сервер");
       assert.strictEqual(core.windowBudget("openai", cloud, 8192, { local: true }), 4096, "окно 8k у локального сервера не учтено");
       // окно неизвестно — бюджет не режем «на всякий случай»: у g4f и подобных
       // местных прокси окна большие, а переполнение ловит повтор с меньшим бюджетом.
-      assert.strictEqual(core.windowBudget("openai", cloud, 0, { local: true }), 26000, "локальный сервер без окна потерял бюджет");
+      assert.strictEqual(core.windowBudget("openai", cloud, 0, { local: true }), cloud, "локальный сервер без окна потерял бюджет");
       // main.js: признак считается один раз и уходит во все три места.
       assert.ok(/const localEndpoint = isLocalEndpoint\(settings\);/.test(mainSrc), "признак локального сервера не считается в прогоне");
       assert.ok(
@@ -13306,7 +13353,11 @@ async function testYcConsole() {
       assert.ok(serviceKeys.indexOf(key) >= 0, "связи для неизвестного сервиса: " + key);
       for (const r of c.RELATIONS[key]) {
         assert.ok(r.key && r.title, "у связи нет ключа или подписи");
-        assert.ok(Array.isArray(r.attempts) && r.attempts.length > 0, "связь без вариантов запроса: " + key + ":" + r.key);
+        // Способ запроса объявлен ВСЕГДА: либо формы пути консольного API, либо
+        // свой протокол у связи (s3 — объекты бакета, docApi — таблицы базы YDB).
+        const special = r.s3 === true || r.docApi === true;
+        assert.ok(Array.isArray(r.attempts), "варианты запроса не массив: " + key + ":" + r.key);
+        assert.ok(special || r.attempts.length > 0, "связь без способа запроса: " + key + ":" + r.key);
         for (const a of r.attempts) {
           assert.strictEqual(typeof a.path, "function", "вариант без пути: " + key + ":" + r.key);
           assert.ok(String(a.path({ id: "r1", folderId: "f1" })).startsWith("/"), "путь не от корня: " + key + ":" + r.key);
@@ -13318,6 +13369,7 @@ async function testYcConsole() {
     }
     assert.deepStrictEqual(c.capabilities().find((x) => x.serviceKey === "vpc").relations.map((r) => r.title), ["Подсети", "Группы безопасности", "Таблицы маршрутизации"]);
     assert.ok(c.capabilities().find((x) => x.serviceKey === "serverlessContainers").relations.some((r) => r.key === "revisions"));
+    assert.ok(c.RELATIONS.ydb.some((r) => r.key === "tables" && r.docApi === true), "у таблиц базы YDB не объявлен свой способ запроса (docApi)");
   });
 }
 // ── Политика инструментов и журнал действий ─────────────────────────────────
@@ -14391,7 +14443,7 @@ async function testYcSplit() {
   await test("Yandex Cloud: служебный слой и каналы вынесены из main.js", () => {
     const channels = [
       "yc:status", "yc:setToken", "yc:folders", "yc:setFolder", "yc:setPermissions",
-      "yc:logout", "yc:console:overview", "yc:console:list", "yc:console:rollback",
+      "yc:logout", "yc:console:overview", "yc:console:list", "yc:console:rollback", "yc:console:secretVersion", "yc:console:dnsRecord", "yc:console:registryImage", "yc:console:storageObject", "yc:console:bucketAccess",
       "yc:resources", "yc:costs", "yc:create", "yc:delete", "yc:logs",
       "yc:cliStatus", "yc:installCli",
     ];
@@ -14409,7 +14461,7 @@ async function testYcSplit() {
     assert.ok(main.includes('require("./yc-service.js")') && main.includes('require("./yc-ipc.js")'), "main.js не подключает вынесенные модули");
     assert.ok(/registerYcIpc\(\{ ipcMain/.test(main), "IPC-мост не регистрируется");
     const found = [...ipcSrc.matchAll(/ipcMain\.handle\("(yc:[^"]+)"/g)].map((m) => m[1]);
-    assert.strictEqual(found.length, 16, "каналов в мосте должно быть 16 (yc:deploy остаётся мостом деплоя): " + found.length);
+    assert.strictEqual(found.length, 21, "каналов в мосте должно быть 21 (yc:deploy остаётся мостом деплоя): " + found.length);
   });
 
   await test("Yandex Cloud: служебный слой работает сам, без main.js", () => {
@@ -16019,9 +16071,12 @@ async function testContextWindow() {
     assert.ok(withImage >= 800, "изображение не учтено в токенах: " + withImage);
     assert.ok(ctx.estimateMessageTokens({ role: "user", content: "привет мир" }) >= 3, "токены сообщения не считаются");
 
-    // Бюджет: у локальных моделей свой потолок, иначе — по типу модели.
+    // Бюджет: у локальных моделей свой потолок, у облака — 400k (как у Freebuff),
+    // а настоящий предел задаёт окно модели (windowBudget выше по коду).
     assert.strictEqual(ctx.contextBudget("ollama", "qwen3:4b"), 14000, "потолок Ollama изменился");
-    assert.strictEqual(ctx.contextBudget("openai", "deepseek-chat"), 26000, "потолок для больших моделей изменился");
+    assert.strictEqual(ctx.CLOUD_CTX_BUDGET, 400000, "потолок облака вернулся к прежнему");
+    assert.strictEqual(ctx.contextBudget("openai", "deepseek-chat"), ctx.CLOUD_CTX_BUDGET, "потолок для больших моделей изменился");
+    assert.strictEqual(ctx.contextBudget("anthropic", "claude-sonnet-4"), 180000, "потолок Anthropic вышел за его окно 200k");
     assert.ok(ctx.contextBudget("openai", "gpt-4o") > 0, "бюджет обычной модели не посчитан");
 
     // Обрезка текста: короткий не трогаем, у длинного видно, сколько было.
@@ -17549,10 +17604,11 @@ async function testOneNavigation() {
     }
     assert.ok(/\.header-btns \.hdr-dupe \{ display: none; \}/.test(css), "дубли шапки видны на широком экране");
     assert.ok(m900 && /\.header-btns \.hdr-dupe \{ display: inline-flex; \}/.test(m900[1]), "на телефоне иконки разделов не вернулись в шапку");
-    // Вкладки внутри панели — тот же дубль: на широком экране их нет.
-    assert.ok(/\.sp-switch \{\n  display: none;/.test(css), "вкладки панели видны на широком экране");
+    // Лента вкладок рабочей области (как в Replit) видна и на широком экране:
+    // разделы переключает активная вкладка, а рельса слева остаётся пусковой.
+    assert.ok(/\.sp-switch \{\n  display: flex;/.test(css), "лента вкладок панели скрыта на широком экране");
     assert.ok(m900 && /\.sp-switch \{ display: flex; \}/.test(m900[1]), "на телефоне вкладки панели не вернулись");
-    // Вместо вкладок панель показывает название раздела.
+    // Подпись раздела осталась в разметке, но её роль взяла активная вкладка.
     assert.ok(html.indexOf('id="sp-title"') !== -1, "в шапке панели нет названия раздела");
     const navSrc = uiFile("side-panel.js");
     assert.ok(/SP_TITLES = \{[\s\S]{0,200}?tasks: "Дела"/.test(navSrc), "нет названий разделов");
@@ -17563,10 +17619,10 @@ async function testOneNavigation() {
     const mobDupe = css.indexOf(".header-btns .hdr-dupe { display: inline-flex; }");
     assert.ok(baseDupe > 0 && mobDupe > baseDupe, "мобильное правило дублей не после базового");
     assert.ok(css.indexOf(".header-btns .hdr-dupe { display: none; }", baseDupe + 1) === -1, "базовое правило дублей продублировано");
-    const baseSwitch = css.indexOf(".sp-switch {\n  display: none;");
+    const baseSwitch = css.indexOf(".sp-switch {\n  display: flex;");
     const mobSwitch = css.indexOf(".sp-switch { display: flex; }");
     assert.ok(baseSwitch > 0 && mobSwitch > baseSwitch, "мобильное правило вкладок не после базового");
-    assert.ok(css.indexOf(".sp-switch {\n  display: none;", baseSwitch + 1) === -1, "базовое правило вкладок продублировано");
+    assert.ok(css.indexOf(".sp-switch {\n  display: flex;", baseSwitch + 1) === -1, "базовое правило вкладок продублировано");
     assert.ok(m900 && m900[1].indexOf(".sp-switch { display: flex; }") !== -1 && m900[1].indexOf(".header-btns .hdr-dupe { display: inline-flex; }") !== -1, "мобильные правила лежат вне блока 900px");
     // Стили, которые грузятся последними, не должны возвращать этим элементам видимость.
     for (const cssFile of ["monochrome.css", "yc-console.css", "deploy-panel.css"]) {
@@ -17644,13 +17700,24 @@ async function testOneNavigation() {
   });
 
   await test("композер: кнопки одной высоты, подписи компактные", () => {
-    assert.ok(/\.composer-btns \{ display: flex; align-items: center; gap: 6px; margin-left: auto; \}/.test(css), "кнопки композера не прижаты вправо");
-    assert.ok(/\.composer-btns > \.btn \{ height: 30px; padding: 0 10px; border-radius: 9px; font-size: 12px; gap: 5px; \}/.test(css), "кнопки композера не одной высоты");
-    assert.ok(/\.composer-btns > #btn-send,\n\.composer-btns > #btn-stop \{ width: 34px; height: 34px;/.test(css), "главное действие не выделено размером");
+    // Ряд кнопок прижат вправо И обязан сжиматься: колонка чата сужается, когда
+    // открыта правая рабочая область, а flex-потомки по умолчанию не сжимаются —
+    // без min-width:0 «Отправить» выезжала за колонку под панель (живой прогон
+    // окна: кнопка видна, клик не проходит). Проверяем смысл, а не точный вид.
+    const btnsRule = (css.match(/\.composer-btns \{[^}]*\}/) || [""])[0];
+    assert.ok(/margin-left: auto/.test(btnsRule), "кнопки композера не прижаты вправо: " + btnsRule);
+    assert.ok(/min-width: 0/.test(btnsRule), "ряд кнопок не сжимается — «Отправить» уедет под панель: " + btnsRule);
+    assert.ok(/flex-wrap: wrap/.test(btnsRule), "ряд кнопок не переносится в узкой колонке: " + btnsRule);
+    const rowRule = (css.match(/\.composer-row \{[^}]*\}/) || [""])[0];
+    assert.ok(/min-width: 0/.test(rowRule), "строка композера не сжимается: " + rowRule);
+    assert.ok(/\.composer-btns > \.btn \{ height: 28px; padding: 0 9px; border-radius: 8px; font-size: 11.5px; gap: 5px; \}/.test(css), "кнопки композера не одной высоты");
+    assert.ok(/\.composer-btns > #btn-send,\n\.composer-btns > #btn-stop \{ width: 30px; height: 30px;/.test(css), "главное действие не выделено размером");
     assert.ok(html.indexOf("Enter — отправить · Shift+Enter — новая строка</span>") !== -1, "подсказка в композере не укорочена");
-    assert.ok(html.indexOf("📋 План</button>") !== -1, "подпись режима плана не укорочена");
+    assert.ok(html.indexOf("План</button>") !== -1, "подпись режима плана не укорочена");
+    assert.ok(html.indexOf(">Рассуждения</span>") !== -1, "кнопка рассуждений не переведена на русский");
+    assert.ok(html.indexOf("🧠 Reasoning") === -1 && html.indexOf("📋 План") === -1, "в композере остались эмодзи вместо иконок");
     assert.ok(m900 && /\.input-hint \{ display: none; \}/.test(m900[1]), "на телефоне осталась подсказка про Enter");
-    assert.ok(m900 && /\.composer-btns \{ gap: 5px; \}/.test(m900[1]), "на телефоне кнопки композера не сжаты");
+    assert.ok(m900 && /\.composer-btns \{ gap: 3px; \}/.test(m900[1]), "на телефоне кнопки композера не сжаты");
   });
 }
 // ── E2E настоящего облака (scripts/live-yc-real.js, 1.5.97) ──────────────────

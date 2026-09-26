@@ -179,11 +179,46 @@
     else if (getWebAbort()) getWebAbort().abort();
   }
 
+  // Текст кнопки «▶ Продолжить»: это ТА ЖЕ просьба, которую человек писал руками
+  // («продолжай»). Её узнаёт хранилище миссии (missionStore.isResumeText) — иначе
+  // каждый клик кнопки становился бы «уточнением к цели» миссии.
+  const RESUME_TEXT =
+    "Продолжи работу с того места, где остановился, опираясь на уже сделанное: не начинай заново и не повторяй выполненные шаги. " +
+    "Сначала коротко оцени текущее состояние, затем продолжай.";
+
+  // Показ и скрытие: кнопку зажигает событие прогона «resume» (остановка с
+  // сохранённой работой), гасят — новый прогон и нажатие.
+  function showResume(reason) {
+    $("resume-bar").classList.remove("hidden");
+    $("btn-resume").title = reason
+      ? "Продолжить с того места, где остановился (" + reason + ")"
+      : "Продолжить с того места, где остановился";
+  }
+
+  function hideResume() {
+    $("resume-bar").classList.add("hidden");
+  }
+
+  // Нажатие: отправка тем же путём, что у обычного сообщения, — в прогон уходит
+  // просьба продолжить, а чекпоинт возвращает работе её же прошлые шаги.
+  function resume() {
+    if (getStreaming()) return;
+    hideResume();
+    const inp = $("input");
+    inp.value = RESUME_TEXT;
+    autoResize();
+    sendMessage();
+  }
+
   return {
     finishStream,
     addUndoButton,
     maybeRestoreUndoButton,
     setStreaming,
     stop,
+    showResume,
+    hideResume,
+    resume,
+    RESUME_TEXT,
   };
 });

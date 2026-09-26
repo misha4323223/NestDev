@@ -40,6 +40,10 @@
     longWorkRounds: 600, // раундов на миссию
     longWorkAutoContinue: 6, // авто-продолжений после сбоя
     noToolsModel: false, // модель без нативных вызовов: схемы не шлём, инструменты — JSON-блоком
+    // Модели, про которые провайдер САМ сказал, что поля рассуждений не знает:
+    // «провайдер|модель» → true. По ним плашка 🧠 не показывается вовсе — иначе
+    // каждый запуск тратил бы раунд на ту же ошибку (пишет reasoning.js).
+    reasoningUnsupported: {},
   };
 
   // Пресеты для OpenAI-совместимых API (ключ/модель хранятся отдельно по каждому пресету? нет — единый URL+ключ).
@@ -92,32 +96,96 @@
   let planToggleOn = false; // «Режим плана» — сначала план, потом выполнение
   let lastUndoCount = 0; // сколько файлов можно откатить после последнего ответа агента
   let pendingImage = null; // dataURL скриншота, прикреплённого к следующему сообщению
+  // Текстовые файлы к следующему сообщению: [{ name, text }]. Картинка уходит
+  // отдельной частью (image_url), а файл вкладывается текстом — у моделей без
+  // зрения другого способа увидеть содержимое файла нет.
+  let pendingFiles = [];
+  const FILE_TEXT_LIMIT = 60000; // один файл целиком в запрос не годится — 60 КБ
+  const FILES_MAX = 8; // больше восьми вложений раздувают запрос без пользы
   let cachedModels = {}; // кэш списков моделей по провайдеру (для быстрого переключения в шапке)
 
-  // Вставка изображений (Ctrl+V): если в буфере картинка — прикрепляем к сообщению
+  // Панель вложений показывает то, что реально приложено: картинку — миниатюрой,
+  // файлы — списком имён. Без этого было видно только «прикреплено» без деталей,
+  // а при одном файле (без картинки) миниатюра рисовала пустую рамку.
+  function refreshAttachBar() {
+    const bar = $("attach-bar");
+    const thumb = $("attach-thumb");
+    if (!bar || !thumb) return;
+    const nameEl = $("attach-name");
+    if (pendingImage) {
+      thumb.src = pendingImage;
+      thumb.classList.remove("hidden");
+    } else {
+      thumb.removeAttribute("src");
+      thumb.classList.add("hidden");
+    }
+    if (nameEl) {
+      const parts = [];
+      if (pendingImage) parts.push("скриншот");
+      for (const f of pendingFiles) parts.push(f.name);
+      nameEl.textContent = parts.length ? parts.join(", ") + " — уйдёт с сообщением" : "";
+    }
+    bar.classList.toggle("hidden", !pendingImage && !pendingFiles.length);
+  }
+
+  // Один файл из поля выбора или из буфера обмена: картинка — миниатюрой,
+  // остальное — текстом (двоичное содержимое в чат не имеет смысла).
+  function attachFile(file) {
+    if (!file) return;
+    const name = file.name || "файл";
+    if (/^image\//.test(file.type || "")) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        pendingImage = String(reader.result || "");
+        refreshAttachBar();
+      };
+      reader.readAsDataURL(file);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      let text = String(reader.result || "");
+      // Двоичный файл, переодетый в текстовое имя (например .log с нулями):
+      // в запрос такое отправлять нельзя — получается мусор в контексте.
+      if (text.indexOf("\u0000") !== -1) {
+        toast("Файл «" + name + "» — двоичный, вложить текстом не могу");
+        return;
+      }
+      if (text.length > FILE_TEXT_LIMIT) {
+        text = text.slice(0, FILE_TEXT_LIMIT) + "\n… (файл обрезан: показано " + Math.round(FILE_TEXT_LIMIT / 1024) + " КБ из " + Math.round((file.size || 0) / 1024) + " КБ)";
+      }
+      pendingFiles.push({ name: name, text: text });
+      if (pendingFiles.length > FILES_MAX) pendingFiles = pendingFiles.slice(-FILES_MAX);
+      refreshAttachBar();
+    };
+    reader.readAsText(file);
+  }
+
+  // Вставка из буфера (Ctrl+V). Картинка приходит элементом clipboard, а файл — в
+  // clipboardData.files (после «Копировать файл» в проводнике). Раньше читался только
+  // первый путь, и вставленный файл молча пропадал: подсветки не было, вложения нет.
   function onInputPaste(e) {
-    const items = e.clipboardData && e.clipboardData.items;
-    if (!items) return;
+    const dt = e.clipboardData;
+    if (!dt) return;
+    let taken = false;
+    for (const f of Array.from(dt.files || [])) {
+      attachFile(f);
+      taken = true;
+    }
+    const items = dt.items || [];
     for (const it of items) {
       if (it.type && it.type.startsWith("image/")) {
         e.preventDefault();
-        const file = it.getAsFile && it.getAsFile();
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = () => {
-          pendingImage = String(reader.result || "");
-          $("attach-bar").classList.remove("hidden");
-          $("attach-thumb").src = pendingImage;
-        };
-        reader.readAsDataURL(file);
+        attachFile(it.getAsFile && it.getAsFile());
         return;
       }
     }
+    if (taken) e.preventDefault(); // файл из буфера не вставляем текстом в поле
   }
   function hideAttachBar() {
     pendingImage = null;
-    $("attach-bar").classList.add("hidden");
-    $("attach-thumb").removeAttribute("src");
+    pendingFiles = [];
+    refreshAttachBar();
   }
   let currentPreset = "deepseek";
   const msgEls = new Map();
@@ -186,7 +254,10 @@
     getProjectPanel: () => ProjectPanel,
     // После загрузки настроек спрашиваем про папки работы агента — но только при
     // первом запуске и один раз (см. settings-panel.js, maybeAskFolders).
-    afterLoad: () => { if (SettingsPanel && SettingsPanel.maybeAskFolders) SettingsPanel.maybeAskFolders(); },
+    // Раскладку правой рабочей области восстанавливаем здесь же (см. restoreSidePanel
+    // в side-panel.js): открытие «превью» пишет настройки ЦЕЛИКОМ, и до их чтения оно
+    // затирало бы умолчаниями настоящие — модель «сбрасывалась» сразу после запуска.
+    afterLoad: () => { if (SettingsPanel && SettingsPanel.maybeAskFolders) SettingsPanel.maybeAskFolders(); if (SidePanel && SidePanel.restoreSidePanel) SidePanel.restoreSidePanel(); },
   });
   // Сброс на диск при закрытии/сворачивании окна — на прежнем месте куска.
   ChatStore.wire();
@@ -274,6 +345,24 @@
   // по ходу хода, настройки и история чатов переписываются целиком. Что собирается
   // НИЖЕ (лента, панель настроек, разбор событий агента, прогон ответа, автозадачи
   // и веб-режим) — стрелками.
+  // ─── Рассуждения модели (Reasoning effort) — код в src/renderer/reasoning.js ───
+  // Плашка рядом с полем ввода: Выкл / Low / High / Max. Выбор лежит в настройках
+  // и уезжает вместе с сообщением (opts.reasoning); в шкалу провайдера его переводит
+  // транспорт. Собирается ДО отправки: chat-send спрашивает уровень на каждом ходу.
+  const Reasoning = window.Reasoning({
+    $: $,
+    toast: toast,
+    getSettings: () => settings,
+    persistSettings: () => ChatStore.persistSettings(),
+    // Умеет ли модель рассуждать, решает транспорт (рядом со шкалой провайдеров) —
+    // по имени модели, без запроса, поэтому ответ одинаков в окне, на телефоне и в
+    // браузере. Спрашиваем у ЯДРА, а не у window.ProviderTransport: в окне тот —
+    // ФАБРИКА (объект собирает agent-core.js), и свойство у неё дало бы молчаливое
+    // «не понять» у всех моделей сразу.
+    support: (provider, model) => AgentCore.reasoningSupport(provider, model),
+  });
+  Reasoning.wire();
+
   const ChatSend = window.ChatSend({
     $: $,
     isElectron: isElectron,
@@ -293,6 +382,8 @@
     getPlanToggleOn: () => planToggleOn,
     setPlanToggleOn: (v) => { planToggleOn = v; },
     getPendingImage: () => pendingImage,
+    getPendingFiles: () => pendingFiles,
+    getReasoning: () => Reasoning.get(),
     setLastUndoCount: (v) => { lastUndoCount = v; },
     setSession: (v) => { session = v; },
     getWebAbort: () => webAbort,
@@ -364,6 +455,9 @@
 
   function renderMessages() {
     ChatRun.maybeRestoreUndoButton();
+    // Смена чата и загрузка истории: кнопка «Продолжить» относится к прогону
+    // прошлого чата — в новом она была бы чужой.
+    ChatRun.hideResume();
     updateModelNeeded();
     PlanPanel.renderPlanPanel();
     const wrap = $("messages");
@@ -505,6 +599,9 @@
     setSettings: (s) => { settings = s; },
     getChatsData: () => chatsData,
     getSession: () => session,
+    // Отказ провайдера «поля рассуждений не знаю» приходит событием — по нему плашка
+    // 🧠 пропадает у этой модели навсегда (помним в настройках, а не в памяти окна).
+    getReasoning: () => Reasoning,
     setLastUndoCount: (v) => { lastUndoCount = v; },
     setPlanCollapsed: (v) => PlanPanel.setPlanCollapsed(v),
     getRemoteRunNotified: () => remoteRunNotified,
@@ -531,6 +628,9 @@
     getSidePanel: () => SidePanel,
     getTasksMission: () => TasksMission,
     getProjectPanel: () => ProjectPanel,
+    // Модуль прогона объявлен НИЖЕ (он берёт отправку из chat-send.js) — только
+    // отложенной стрелкой: прямое чтение биндинга обрывает загрузку окна.
+    getChatRun: () => ChatRun,
   });
 
   // ─── Правая панель, рельса, консоль и превью — код в src/renderer/side-panel.js ───
@@ -543,6 +643,9 @@
     api: api,
     isElectron: isElectron,
     toast: toast,
+    // Модальное подтверждение нужно панели для необратимых действий (удаление
+    // образа реестра, записи DNS) — живёт в панели проекта, отдаём его целиком.
+    confirmModal: (...a) => ProjectPanel.confirmModal(...a),
     AgentCore: AgentCore,
     esc: (t) => ProjectPanel.esc(t),
     persistSettings: ChatStore.persistSettings,
@@ -727,6 +830,9 @@
     cachedModels: cachedModels,
     persistSettings: ChatStore.persistSettings,
     updateStatusBar: () => ProjectPanel.updateStatusBar(),
+    // Смена модели меняет и плашку 🧠 (у модели без рассуждений её нет вовсе):
+    // обновление значка модели — единственное место, через которое проходят все смены.
+    updateReasoning: () => Reasoning.updateButton(),
     updateModelNeeded: updateModelNeeded,
     refreshProject: () => ProjectPanel.refreshProject(),
     toast: toast,
@@ -768,25 +874,27 @@
     return (Math.round(v / 100) / 10).toFixed(1).replace(/\.0$/, "") + "k";
   }
 
-  // Полоска заполняемости контекста модели под полем ввода (приходит событием "context").
+  // Заполняемость контекста модели под полем ввода (приходит событием "context").
+  // Показываем ТОЛЬКО слово и процент (как у Freebuff). Полоска убрана: она
+  // отнимала ширину, читалась как второй индикатор загрузки, а точные числа
+  // всё равно лежат в подсказке.
   function renderContext(ev) {
     const el = $("ctx-indicator");
-    if (!el || !$("ctx-fill") || !$("ctx-text")) return;
+    const textEl = $("ctx-text");
+    if (!el || !textEl) return;
     const used = Number((ev && ev.used) || 0);
     const budget = Number((ev && ev.budget) || 0);
     // Процент считаем от бюджета: при переполнении он честно больше 100, а не
     // «упирается» в 100 (раньше при 62 000 из 50 000 показывалось «100%»).
     const pct = budget > 0 ? Math.round((used / budget) * 100) : Math.max(0, parseInt(ev && ev.percent, 10) || 0);
-    const barPct = Math.max(0, Math.min(100, pct));
-    const fill = $("ctx-fill");
-    fill.style.width = barPct + "%";
-    fill.classList.toggle("warn", barPct >= 75 && barPct < 92);
-    fill.classList.toggle("danger", barPct >= 92);
-    $("ctx-text").textContent = "🧠 " + fmtTokens(used) + " / " + fmtTokens(budget) + " · " + pct + "%";
+    textEl.textContent = "Контекст " + pct + "%";
+    textEl.classList.toggle("warn", pct >= 75 && pct < 92);
+    textEl.classList.toggle("danger", pct >= 92);
     el.classList.add("visible");
     el.title =
-      "Контекст модели: занято " + used.toLocaleString("ru-RU") + " из " + budget.toLocaleString("ru-RU") +
-      " токенов (" + pct + "%). Это история переписки и схема инструментов; оценка приблизительная (по символам), а не точный счёт токенов модели." +
+      "Контекст модели: занято " + fmtTokens(used) + " из " + fmtTokens(budget) +
+      " токенов (" + pct + "%); точнее — " + used.toLocaleString("ru-RU") + " из " + budget.toLocaleString("ru-RU") +
+      ". Это история переписки и схема инструментов; оценка приблизительная (по символам), а не точный счёт токенов модели." +
       (pct > 100
         ? " Сейчас занято БОЛЬШЕ бюджета: текущий шаг (твоё сообщение и результаты инструментов) не сжимается и уходит целиком. Перед следующим запросом история снова обрезается до бюджета, а при переполнении старая часть сворачивается в памятку."
         : " При заполнении старая часть автоматически сжимается в памятку.");
@@ -839,6 +947,7 @@
 
   $("btn-send").onclick = ChatSend.sendMessage;
   $("btn-stop").onclick = ChatRun.stop;
+  $("btn-resume").onclick = ChatRun.resume;
   $("btn-plan").onclick = () => {
     if (streaming) return;
     planToggleOn = !planToggleOn;
@@ -854,6 +963,43 @@
   $("input").addEventListener("input", autoResize);
   $("input").addEventListener("paste", onInputPaste);
   $("btn-attach-remove").onclick = hideAttachBar;
+  // Кнопка-скрепка. Раньше обработчика у неё не было ВООБЩЕ: поле #file-input лежало
+  // в разметке, но никто его не открывал и не читал — отсюда «кнопка не работает».
+  $("btn-attach-file").onclick = () => $("file-input").click();
+  $("file-input").addEventListener("change", (e) => {
+    for (const f of Array.from(e.target.files || [])) attachFile(f);
+    e.target.value = ""; // тот же файл можно приложить повторно
+  });
+  // Перетаскивание файлов в композер. Это третий путь к вложению — единственный,
+  // который вообще не спрашивает системный диалог: в веб-превью и во встроенных
+  // веб-вью он бывает недоступен, из-за чего скрепка выглядит «мёртвой», хотя
+  // обработчик на ней есть. Здесь файл приходит прямо в страницу.
+  const composerEl = document.querySelector(".composer");
+  if (composerEl) {
+    const dropHasFiles = (e) =>
+      !!(e.dataTransfer && Array.prototype.slice.call(e.dataTransfer.types || []).some((t) => t === "Files"));
+    composerEl.addEventListener("dragenter", (e) => {
+      if (!dropHasFiles(e)) return;
+      e.preventDefault();
+      composerEl.classList.add("drag-over");
+    });
+    composerEl.addEventListener("dragover", (e) => {
+      if (!dropHasFiles(e)) return;
+      e.preventDefault(); // без этого браузер отменяет drop и файл не придёт
+      e.dataTransfer.dropEffect = "copy";
+    });
+    composerEl.addEventListener("dragleave", (e) => {
+      if (e.target === composerEl) composerEl.classList.remove("drag-over");
+    });
+    composerEl.addEventListener("drop", (e) => {
+      e.preventDefault();
+      composerEl.classList.remove("drag-over");
+      const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+      if (!files.length) return;
+      for (const f of files) attachFile(f);
+      toast(files.length > 1 ? "Файлов прикреплено: " + files.length : "Файл прикреплён: " + files[0].name);
+    });
+  }
   $("chat-title").addEventListener("dblclick", ChatRename.startRenameChat);
   $("btn-new-chat").onclick = () => {
     if (!streaming) createChat();
