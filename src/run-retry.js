@@ -50,11 +50,15 @@ function createRunRetry(deps) {
     rateRetries: 0, // сколько раз ждали лимит 429 в этом запуске
     rateWaitedMs: 0, // и сколько всего секунд простояли
     unavailableRetries: 0, // повторы «холодного» отказа пула / 5xx
-    contextRetried: false, // переполнение контекста лечим один раз
+    contextRetried: false, // переполнение контекста лечили хотя бы раз
+    contextRetriedSteps: 0, // сколько ступеней ужатия уже сделано (см. CONTEXT_RETRY_LIMIT)
   };
   // Пауза внедряемая: ожидание лимита — часть решения, и её надо уметь проверить,
   // не высиживая десятки секунд в тестах.
   const pause = deps.pause || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  // Сколько ступеней ужатия истории разрешено при отказе по размеру контекста. Три:
+  // при неизвестном окне первая ступень может не дать ничего, и одной мало.
+  const CONTEXT_RETRY_LIMIT = 3;
   // Сколько всего разрешено простоять в ожидании лимита (429) за один запуск. Три паузы
   // по 5 с лимит «8 запросов в минуту» не лечат: раньше прогон падал, и пользователь
   // писал «продолжай» руками. Ждём сами, но с потолком — чтобы не висеть вечно.
@@ -199,12 +203,43 @@ function createRunRetry(deps) {
       };
     }
 
-    // Переполнение контекста (частая беда локальных моделей Ollama с малым окном):
-    // один раз повторяем запрос с резко урезанной историей, чтобы не падать.
-    if (!state.contextRetried && /context|too long|maximum|num_ctx|token/i.test(detail) && getBudget() > 3000) {
-      state.contextRetried = true;
-      await shrinkContext();
-      return repeat("context");
+    // Переполнение контекста (частая беда локальных моделей с малым окном, а также
+    // провайдеров, которые своё окно не сообщают): ужимаем историю и повторяем ТОТ ЖЕ
+    // раунд. Ступеней несколько, а не одна: при неизвестном окне первый шаг может не
+    // ужать ничего (история влезает в новый бюджет), и раньше это кончалось падением
+    // прогона с сырым JSON провайдера. Предел ступеней — CONTEXT_RETRY_LIMIT.
+    const contextish = /context|too long|maximum|num_ctx|token/i.test(detail);
+    // Слова, которые встречаются ТОЛЬКО у переполнения окна: «maximum context length»,
+    // «context_length_exceeded», «num_ctx». Слабое «token» сюда не входит: «invalid token» —
+    // это про ключ, и рассказывать там про окно модели нельзя.
+    const contextSure = /context|too long|maximum|num_ctx/i.test(detail);
+    if (contextish) {
+      if (contextSure && state.contextRetriedSteps < CONTEXT_RETRY_LIMIT && getBudget() > 3000) {
+        state.contextRetriedSteps++;
+        state.contextRetried = true;
+        const before = getBudget();
+        await shrinkContext();
+        emit({
+          type: "notice",
+          text:
+            "⚠ Модель ответила, что запрос больше её окна: ужимаю историю (бюджет " +
+            Math.round(before / 1000) + "k → " + Math.round(getBudget() / 1000) + "k токенов) и повторяю тот же раунд.",
+        });
+        return repeat("context");
+      }
+      // Ступени кончились (или ужимать уже некуда): говорим по-русски и подсказываем, что
+      // делать — сырой ответ провайдера человеку читать незачем. Если сработало слабое
+      // «token», а ступеней не было, это не про окно: пусть решает общий путь ниже.
+      if (contextSure || state.contextRetriedSteps > 0) {
+        return {
+          kind: "throw",
+          error: new Error(
+            "⚠ Модель отказалась принять запрос: он больше её окна контекста, даже ужав историю " +
+              "(≈" + Math.round(getBudget() / 1000) + "k токенов). Работа сохранена: нажми «▶ Продолжить» — прогон " +
+              "вернёт себе прошлые шаги и пойдёт дальше; или выбери модель с окном побольше — эта сборка окно не сообщает."
+          ),
+        };
+      }
     }
 
     // 402 = Insufficient Balance: у провайдера кончились деньги. Подсказываем по-русски.

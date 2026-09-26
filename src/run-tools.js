@@ -58,6 +58,7 @@ function createRunTools(deps) {
     active: [], // схемы, которые реально уйдут в запрос
     weight: 0, // их вес в токенах
     histBudget: 1500, // сколько оставлено истории (её держит контекст-менеджер)
+    guidesWeight: 0, // вес справочников группы: они едут в КАЖДЫЙ запрос
     route: null, // последний результат routeTools (метрики + предохранители)
     guideNotes: [], // system-сообщения со справочниками (стабильный префикс)
     systemWeight: systemWeight,
@@ -106,8 +107,6 @@ function createRunTools(deps) {
       // То же сообщение — в чат: в «Консоли» его не видит тот, кто просто пишет задачу.
       emit({ type: "notice", text: narrowNote });
     }
-    // История + резерв 15%: сжатие успевает до переполнения.
-    state.histBudget = Math.max(1500, Math.floor((budget - state.weight - systemWeight) * 0.85));
     // Справочник группы: подключаем один раз за задачу, дальше он просто едет в запросе.
     if (!planMode && state.route) {
       for (const gid of state.route.groups) {
@@ -124,6 +123,18 @@ function createRunTools(deps) {
         termEmit({ type: "metrics", text: "📘 Подключён справочник «" + gname + "» (группа «" + gid + "»)." });
       }
     }
+    // Вес справочников: они уезжают в КАЖДЫЙ запрос system-сообщениями (см.
+    // requestMessages в src/run-round.js), поэтому их место обязано входить в бюджет
+    // истории. Раньше не входило: на окне 32k справочник облака (+2,7k токенов)
+    // выводил запрос за окно, и модель получала обрезанный промпт — «агент
+    // перегружается» без единого слова о причине (замер: 30 729 против 28 672).
+    state.guidesWeight = state.guideNotes.length ? estimateTokens(JSON.stringify(state.guideNotes)) : 0;
+    // История + резерв 15%: сжатие успевает до переполнения. Схемы, системный промпт
+    // и справочники вычитаются: всё это едет в запрос вместе с историей.
+    state.histBudget = Math.max(
+      1500,
+      Math.floor((budget - state.weight - systemWeight - state.guidesWeight) * 0.85)
+    );
   };
 
   // Предохранитель A: модель вызвала реальный инструмент, которого нет в текущем
@@ -154,7 +165,7 @@ function createRunTools(deps) {
   // Переполнение контекста: историю урезают, и её бюджет считается иначе — без
   // резерва 15% (окно уже ужато вручную). Формула остаётся здесь: она про бюджет
   // истории, и держать её в двух местах — верный способ их развести.
-  const histBudgetAfterOverflow = () => Math.max(1500, getBudget() - state.weight - systemWeight);
+  const histBudgetAfterOverflow = () => Math.max(1500, getBudget() - state.weight - systemWeight - state.guidesWeight);
 
   // Объект для executeTool (findTools): включить группу на лету и посмотреть состав.
   const router = {

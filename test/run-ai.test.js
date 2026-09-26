@@ -463,17 +463,25 @@ const systemOf = (m) => String((m.calls.rounds[0] || {}).messages && (m.calls.ro
     assert.ok(/Провайдер отверг stream_options/.test(m.calls.metrics.map((x) => x.text).join(" ")), "в консоль не сказано про отказ");
   });
 
-  await test("ужатие контекста берёт 40% текущего бюджета и пересобирает историю", async () => {
+  await test("ужатие контекста считает от ФАКТИЧЕСКОГО размера запроса и пересобирает историю", async () => {
     const m = mk();
     await run(m);
     const before = m.calls.manages.length;
     assert.ok(m.calls.retryDeps && typeof m.calls.retryDeps.shrinkContext === "function", "ужатие не отдано модулю повторов");
     assert.ok(typeof m.calls.retryDeps.getBudget === "function", "бюджет не отдан функцией");
     const budget = m.calls.retryDeps.getBudget();
-    await m.calls.retryDeps.shrinkContext();
+    const res = await m.calls.retryDeps.shrinkContext();
     assert.ok(m.calls.manages.length > before, "история не пересобрана при ужатии");
-    assert.strictEqual(m.calls.retryDeps.getBudget(), Math.max(3000, Math.floor(budget * 0.4)),
-      "бюджет не срезан до 40%: " + m.calls.retryDeps.getBudget() + " при " + budget);
+    assert.ok(res && typeof res.budget === "number" && typeof res.cost === "number",
+      "ужатие не сообщило бюджет и размер запроса");
+    assert.strictEqual(m.calls.retryDeps.getBudget(), res.budget, "бюджет прогона и отчёт ужатия расходятся");
+    // Главное: шаг считается от того, сколько токенов уедет НА САМОМ ДЕЛЕ. Прежнее «×0,4
+    // от бюджета» при неизвестном окне (400 000) давало 160 000 — история в них влезала,
+    // запрос не менялся ни на токен, и второй отказ провайдера убивал прогон.
+    assert.strictEqual(res.budget, Math.max(3000, Math.floor(Math.min(budget * 0.4, res.cost * 0.6))),
+      "шаг ужатия не от фактического размера запроса: " + res.budget + " при бюджете " + budget + " и запросе ≈" + res.cost);
+    assert.ok(res.budget < budget, "бюджет не срезан: " + res.budget + " при " + budget);
+    assert.ok(res.cost > 0, "размер запроса не посчитан");
   });
 
   await test("авто-коммит: только когда были правки и не в режиме плана", async () => {

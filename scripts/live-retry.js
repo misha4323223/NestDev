@@ -509,7 +509,16 @@ const COLD_WAIT_MS = core.coldCacheInfo(503, "cache_only_cold", 1).waitMs;
   let memoHistory = [{ role: "user", content: longAsk }];
   const memo1 = await callIpc("ai:send", memoHistory.slice(), { chatId: "chat-live-memo", role: "developer" });
   ok(memo1 && memo1.ok === true, "первый прогон (длинное задание) прошёл: " + JSON.stringify(memo1 && memo1.error));
-  ok(!fs.existsSync(mirrorDir), "зеркало появилось ДО сжатия контекста — проверка ниже была бы пустой");
+  // История ОДНОЙ задачи (одна просьба и всё после неё) — тот самый случай, где сжатие
+  // раньше не срабатывало вовсе: summarizer видел «последняя просьба на нулевом месте»,
+  // отвечал «нечего сжимать» и возвращался ни с чем, а история ехала в запрос целиком.
+  // Теперь середина витка сворачивается, и памятка приходит уже на ПЕРВОМ прогоне —
+  // проверяем это здесь, а не после второго, иначе проверка сторожит пустоту.
+  ok(memoReqs.some((r) => r.stream === false && !r.tools.length), "на первом прогоне контекст одной задачи не сжат: summarizer снова отказался сворачивать середину витка");
+  ok(fs.existsSync(mirrorDir), "памятка собралась, но в зеркало проекта .agent/context не легла");
+  const firstMirrorFiles = fs.existsSync(mirrorDir) ? fs.readdirSync(mirrorDir) : [];
+  const firstMirrorText = firstMirrorFiles.length ? fs.readFileSync(path.join(mirrorDir, firstMirrorFiles[0]), "utf8") : "";
+  ok(firstMirrorText.indexOf(MEMO_TEXT) >= 0, "в зеркало проекта легла НЕ сама памятка: " + firstMirrorText.slice(0, 140));
 
   const memosBefore = kind("memory").length;
   const diaryBefore = countDiary(diaryDir);

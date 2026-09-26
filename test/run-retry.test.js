@@ -248,15 +248,29 @@ const RESP_429 = (detail) => ({ status: 429, headers: { get: () => null }, detai
   });
 
   // ── Переполнение контекста ───────────────────────────────────────────────
-  await test("переполнение контекста: ужимаем историю один раз и повторяем", async () => {
+  await test("переполнение контекста: ужимаем историю ступенями и повторяем тот же раунд", async () => {
     const r = makeRetry({ budget: 60000 });
     const v = await r.retry.plan({ status: 400, headers: { get: () => null }, detail: "This model's maximum context length is 8192 tokens" });
     assert.strictEqual(v.kind, "repeat", "переполнение контекста роняет прогон");
+    assert.strictEqual(v.what, "context", "переполнение ушло не в свою ветку");
     assert.strictEqual(r.seen.shrink, 1, "история не ужата");
     assert.ok(r.getBudget() < 60000, "бюджет контекста не уменьшен");
-    const again = await r.retry.plan({ status: 400, headers: { get: () => null }, detail: "maximum context length" });
-    assert.strictEqual(again.kind, "throw", "контекст ужимается по кругу");
-    assert.strictEqual(r.seen.shrink, 1, "ужатие повторилось");
+    assert.ok(/ужимаю историю/.test(r.chatText()), "человеку не сказано, что история ужимается: " + r.chatText());
+    // Ступеней несколько, а не одна: при неизвестном окне первый шаг может не ужать
+    // ничего (история влезает в новый бюджет), и прежний второй отказ убивал прогон
+    // с сырым JSON провайдера (замер: 145 440 т. до ужатия и 145 440 после).
+    const second = await r.retry.plan({ status: 400, headers: { get: () => null }, detail: "maximum context length" });
+    assert.strictEqual(second.kind, "repeat", "вторая ступень ужатия не сделана");
+    assert.strictEqual(r.seen.shrink, 2, "ступени ужатия не считаются: " + r.seen.shrink);
+    const third = await r.retry.plan({ status: 400, headers: { get: () => null }, detail: "maximum context length" });
+    assert.strictEqual(third.kind, "repeat", "третья ступень ужатия не сделана");
+    assert.strictEqual(r.seen.shrink, 3, "ступени ужатия не считаются: " + r.seen.shrink);
+    // Ступени кончились: дальше — понятная ошибка по-русски, а не сырой ответ провайдера.
+    const fourth = await r.retry.plan({ status: 400, headers: { get: () => null }, detail: "maximum context length" });
+    assert.strictEqual(fourth.kind, "throw", "контекст ужимается по кругу");
+    assert.strictEqual(r.seen.shrink, 3, "ужатий больше предела: " + r.seen.shrink);
+    assert.ok(/Продолжить/.test(fourth.error.message), "ошибка не подсказывает, что делать: " + fourth.error.message);
+    assert.ok(/окн/.test(fourth.error.message), "ошибка не объясняет причину (окно модели): " + fourth.error.message);
   });
 
   await test("на крошечном бюджете контекст не ужимаем — там уже нечего ужимать", async () => {
@@ -264,6 +278,30 @@ const RESP_429 = (detail) => ({ status: 429, headers: { get: () => null }, detai
     const v = await r.retry.plan({ status: 400, headers: { get: () => null }, detail: "context too long" });
     assert.strictEqual(v.kind, "throw", "ужимаем то, что уже меньше минимума");
     assert.strictEqual(r.seen.shrink, 0, "shrinkContext вызван на крошечном бюджете");
+    assert.ok(/Продолжить/.test(v.error.message), "нет понятного выхода: " + v.error.message);
+  });
+
+  await test("на самом дне бюджета отказ по контексту всё равно объясняется по-русски", async () => {
+    // Ужатие упирается в минимум 3000. Прежняя ветка открывалась только при `budget > 3000`,
+    // и следующий отказ проваливался в общий путь: человек читал сырой ответ провайдера
+    // («This model's maximum context length is 8192 tokens») вместо подсказки с кнопкой.
+    const r = makeRetry({ budget: 3000 });
+    const v = await r.retry.plan({ status: 400, headers: { get: () => null }, detail: "This model's maximum context length is 8192 tokens" });
+    assert.strictEqual(v.kind, "throw", "отказ по контексту остановил прогон непонятно");
+    assert.strictEqual(r.seen.shrink, 0, "ужимаем на минимальном бюджете");
+    assert.ok(/Продолжить/.test(v.error.message), "нет подсказки про «▶ Продолжить»: " + v.error.message);
+    assert.ok(!/maximum context length/.test(v.error.message), "человеку показан сырой ответ провайдера: " + v.error.message);
+  });
+
+  await test("отказ по ключу не выдаётся за переполнение окна", async () => {
+    // Слово «token» встречается и в отказе по ключу («invalid token»): путать это с
+    // переполнением нельзя — совет «выбери модель с окном побольше» был бы враньём.
+    const r = makeRetry({ budget: 60000 });
+    const v = await r.retry.plan({ status: 401, headers: { get: () => null }, detail: "invalid api token" });
+    assert.strictEqual(v.kind, "throw", "отказ по ключу не остановил прогон");
+    assert.strictEqual(r.seen.shrink, 0, "история ужата из-за отказа по ключу");
+    assert.ok(!/окн/.test(v.error.message), "отказ по ключу объяснён окном модели: " + v.error.message);
+    assert.ok(/invalid api token/.test(v.error.message), "текст провайдера потерялся: " + v.error.message);
   });
 
   // ── Оборванная связь (ответа с кодом нет вообще) ──────────────────────────

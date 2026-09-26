@@ -865,8 +865,16 @@ const onlyMission = (dir) => {
     // Индикатор контекста обязан считать УЖЕ подставленную сводку, иначе он врёт
     // про занятое место. Смотрим именно тот вызов, что стоит после подстановки.
     const spliceAt = runAiSrc.indexOf("canonical.splice(1, 0, digestMsg)");
-    const emitAfter = runAiSrc.indexOf("emitContext(canonical)", spliceAt);
-    assert.ok(spliceAt > 0 && emitAfter > spliceAt && emitAfter - spliceAt < 400, "индикатор контекста считается до подстановки сводки");
+    // Между подстановкой и индикатором стоит предохранитель размера: он мерит ВЕСЬ
+    // запрос (история + справочники + схемы + сводка) и урезает историю, пока она не
+    // влезет в бюджет окна.
+    assert.ok(/await fitBeforeRound\(digestMsg\);/.test(runAiSrc), "запрос уходит без предохранителя размера");
+    const emitAfter = runAiSrc.indexOf("emitContext(canonical.slice(1))", spliceAt);
+    assert.ok(spliceAt > 0 && emitAfter > spliceAt && emitAfter - spliceAt < 900, "индикатор контекста считается до подстановки сводки");
+    // Системный промпт лежит ВНУТРИ истории, а emitContext прибавляет его вес сам:
+    // передать ему canonical целиком — значит посчитать промпт дважды (замер: «100%»
+    // на окне 32k, когда в запросе было ≈30 729 из 28 672 токенов).
+    assert.ok(runAiSrc.indexOf("emitContext(canonical)") < 0, "индикатору отдаётся история вместе с системным промптом — промпт считается дважды");
     // Сводка уходит модели: раунд получает ту самую историю, куда её подставили.
     assert.ok(/roundRunner\.run\(\{[^}]*messages: canonical/.test(runAiSrc), "раунд получает не ту историю, куда подставлена сводка");
     // Живые мосты для сводки держит оболочка: значения меняются по ходу работы.

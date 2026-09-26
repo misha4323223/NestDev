@@ -77,19 +77,89 @@
     }
     // Контекст-окно (в браузере те же бюджеты, что и в Electron)
     let budget = AgentCore.contextBudget(provider, getSettings().model);
-    let contextRetried = false; // при переполнении контекста пробуем ещё раз с меньшим бюджетом
+    // Окно модели у ЛОКАЛЬНОГО сервера узнаём у него самого — как в приложении
+    // (Ollama /api/show, LM Studio /api/v0/models, llama.cpp /props). От окна зависят
+    // и бюджет истории, и num_ctx: без него Ollama берёт дефолт (часто 2048) и молча
+    // режет запрос, а человек видит «модель ничего не делает». Облачным провайдерам
+    // этот запрос не нужен: num_ctx — понятие Ollama, а бюджет у них свой.
+    let modelWin = 0; // реальное окно модели (0 — сервер не ответил)
+    if (provider === "ollama" || AgentCore.isLocalEndpoint(getSettings())) {
+      try {
+        modelWin = await AgentCore.modelWindow(getSettings(), getSettings().model);
+        if (modelWin > 0) budget = AgentCore.windowBudget(provider, budget, modelWin, { local: true });
+      } catch {}
+    }
+    let contextRetriedSteps = 0; // ступени ужатия при отказе «запрос больше окна»
+    let webFitWarned = false; // про «запрос не влезал» говорим один раз за прогон
+    let webNarrowWarned = false; // и про тесное окно — тоже один раз: иначе шум в каждом раунде
+    // Системный промпт уезжает в КАЖДЫЙ запрос — считаем его один раз.
+    const systemText =
+      AgentCore.SYSTEM_PROMPT +
+      (getSettings().workingDir ? "\n\nРабочая директория: " + getSettings().workingDir : "") +
+      (planMode
+        ? "\n\nРЕЖИМ ПЛАНА: сейчас НЕ выполняй инструменты и НЕ изменяй файлы. Составь пошаговый план работ и перечисли файлы, которые затронешь. Жди команды пользователя."
+        : "");
+    const systemWeight = AgentCore.estimateTokens(systemText);
+    // ── Схемы инструментов: в веб-режиме их не считали ВООБЩЕ ────────────────
+    // Уходили все 167 схем (≈33 000 токенов). На окне 32k они одни занимали окно
+    // целиком: человек писал задачу, а модель получала обрезанный промпт или отказ
+    // «контекст больше окна». Теперь как в приложении: набор схем отбирает роутер, а
+    // группы накапливаются за прогон (однажды понадобившаяся — остаётся).
+    const webSticky = new Set();
+    let webTools = planMode ? AgentCore.PLAN_MODE_TOOL_DEFINITIONS : AgentCore.TOOL_DEFINITIONS;
+    let toolsWeight = AgentCore.estimateTokens(JSON.stringify(webTools));
+    const routeWebTools = (taskText) => {
+      if (planMode) {
+        webTools = AgentCore.PLAN_MODE_TOOL_DEFINITIONS;
+      } else {
+        const baseWeight = AgentCore.routeTools({ text: "" }).tokens;
+        const route = AgentCore.routeTools({
+          text: taskText || "",
+          sticky: [...webSticky],
+          roleGroups: AgentCore.rolePlan(opts.role || "dev").groups,
+          maxTokens: AgentCore.routerMaxTokens(budget, systemWeight, baseWeight),
+        });
+        for (const gid of route.groups) webSticky.add(gid);
+        webTools = route.tools;
+      }
+      toolsWeight = AgentCore.estimateTokens(JSON.stringify(webTools));
+    };
+    routeWebTools(AgentCore.routerTaskText(messages));
+    // Бюджет истории: окно минус системный промпт и схемы, минус резерв 15% на ответ
+    // модели и результаты инструментов (та же формула, что в приложении).
+    const histBudget = () => Math.max(1500, Math.floor((budget - toolsWeight - systemWeight) * 0.85));
+    // Сколько токенов уедет на самом деле: история целиком плюс схемы (промпт внутри неё).
+    const payloadWeight = () => AgentCore.estimateTokens(JSON.stringify(apiMessages)) + toolsWeight;
+    // Индикатор контекста: история считается БЕЗ системного промпта (он лежит внутри
+    // неё, а вес промпта прибавляем сами) — иначе промпт считался бы дважды.
+    const emitWebContext = () => {
+      const histTokens = apiMessages.length > 1 ? AgentCore.estimateTokens(JSON.stringify(apiMessages.slice(1))) : 0;
+      const used = histTokens + toolsWeight + systemWeight;
+      onEvent({
+        type: "context",
+        used: used,
+        budget: budget,
+        percent: budget > 0 ? Math.max(0, Math.min(100, Math.round((used / budget) * 100))) : 0,
+        history: histTokens,
+        tools: toolsWeight,
+        system: systemWeight,
+      });
+    };
+    // Сжатие (памятка) в веб-режиме не работало вовсе: история молча обрезалась по
+    // голове, вместе с целью задачи. Менеджер контекста тот же, что в приложении.
+    const ctxManager = AgentCore.createContextManager({
+      settings: getSettings(),
+      emit: (ev) => onEvent(ev),
+      planMode,
+      local: AgentCore.isLocalEndpoint(getSettings()),
+    });
     try {
-      messages = AgentCore.trimConversation(messages, budget);
+      messages = AgentCore.trimConversation(messages, histBudget());
     } catch {}
     let apiMessages = [
       {
         role: "system",
-        content:
-          AgentCore.SYSTEM_PROMPT +
-          (getSettings().workingDir ? "\n\nРабочая директория: " + getSettings().workingDir : "") +
-          (planMode
-            ? "\n\nРЕЖИМ ПЛАНА: сейчас НЕ выполняй инструменты и НЕ изменяй файлы. Составь пошаговый план работ и перечисли файлы, которые затронешь. Жди команды пользователя."
-            : ""),
+        content: systemText,
       },
       ...messages,
     ];
@@ -116,10 +186,46 @@
       const toolCalls = [];
       const stripper = AgentCore.createThinkingStripper({ onHidden: (t) => onEvent({ type: "thinking", text: t }) });
 
-      // Контекст-менеджмент: держим историю в рамках бюджета между раундами
+      // Контекст-менеджмент: держим историю в рамках бюджета между раундами. Сначала
+      // сжатие старых витков в памятку (если место кончилось), затем обрезка хвоста.
       if (apiMessages.length > 1) {
-        apiMessages = [apiMessages[0], ...AgentCore.trimConversation(apiMessages.slice(1), budget)];
+        apiMessages = [apiMessages[0], ...(await ctxManager.manage(apiMessages.slice(1), histBudget()))];
       }
+      // Предохранитель перед отправкой: мерим ВЕСЬ запрос (история + промпт + схемы) и
+      // урезаем историю ступенями, пока он не влезет в бюджет окна. Раньше бюджет
+      // считался только по длине истории, а схемы и промпт в него не входили совсем.
+      if (payloadWeight() > budget) {
+        const before = payloadWeight();
+        for (const frac of [0.8, 0.6, 0.4, 0.25, 0.1]) {
+          const target = Math.max(1500, Math.floor((budget - toolsWeight - systemWeight) * frac));
+          apiMessages = [apiMessages[0], ...(await ctxManager.manage(apiMessages.slice(1), target))];
+          if (payloadWeight() <= budget) break;
+        }
+        // Один раз за прогон: на малом окне условие верно в каждом раунде, и та же строка
+        // каждые несколько секунд — шум, который мешает читать ответ агента.
+        if (!webFitWarned) {
+          webFitWarned = true;
+          onEvent({
+            type: "notice",
+            text:
+              "⚠ Запрос не влезал в окно модели (≈" + Math.round(before / 1000) + "k из " + Math.round(budget / 1000) +
+              "k токенов): ужал историю до ≈" + Math.round(payloadWeight() / 1000) + "k и продолжаю.",
+          });
+        }
+        // История ужата до минимума, а запрос всё равно больше окна: причина в схемах и
+        // промпте, и молчать об этом нельзя — модель будет видеть обрезанный контекст.
+        if (payloadWeight() > budget && !webNarrowWarned) {
+          webNarrowWarned = true;
+          onEvent({
+            type: "notice",
+            text:
+              "⚠ Окно модели мало: инструменты (~" + Math.round(toolsWeight / 1000) + "k) и промпт (~" +
+              Math.round(systemWeight / 1000) + "k) занимают почти всё окно (" + Math.round(budget / 1000) +
+              "k т.). Возьми модель с окном побольше, иначе агент работает вслепую.",
+          });
+        }
+      }
+      emitWebContext();
       // Финальный предохранитель перед отправкой: осиротевшие tool-сообщения
       // (role:"tool" без предшествующего assistant с tool_calls) — 400 wrong_api_format.
       if (apiMessages.length > 1) {
@@ -129,8 +235,13 @@
       const req = AgentCore.buildChatRequest(getSettings(), {
         model: getSettings().model,
         messages: apiMessages,
-        tools: planMode ? AgentCore.PLAN_MODE_TOOL_DEFINITIONS : AgentCore.TOOL_DEFINITIONS,
+        tools: webTools,
         fromBrowser: true,
+        // Локальному серверу — тот же num_ctx, что и у бюджета, и не больше окна
+        // модели: иначе Ollama молча режет промпт (в веб-режиме эта ручка не
+        // передавалась вовсе).
+        numCtxBudget: budget,
+        modelWindow: modelWin,
         // Рассуждения (Low/High/Max) — из плашки рядом с полем ввода. «off» —
         // поле в запрос не попадает.
         reasoning: opts.reasoning || "off",
@@ -173,15 +284,44 @@
             continue;
           }
         }
-        // Переполнение контекста: один раз повторяем с резко урезанной историей
-        if (!contextRetried && /context|too long|maximum|num_ctx|token/i.test(detail) && budget > 3000) {
-          contextRetried = true;
-          budget = Math.max(3000, Math.floor(budget * 0.4));
-          if (apiMessages.length > 1) {
-            apiMessages = [apiMessages[0], ...AgentCore.trimConversation(apiMessages.slice(1), budget)];
+        // Переполнение контекста: ужимаем историю ступенями и повторяем ТОТ ЖЕ раунд.
+        // Одной ступени мало при неизвестном окне: история влезает в новый бюджет, запрос
+        // не меняется ни на токен — и второй отказ заканчивал прогон сырым JSON провайдера
+        // (замер в приложении: 145 440 токенов до ужатия и 145 440 после).
+        const contextish = /context|too long|maximum|num_ctx|token/i.test(detail);
+        // «token» само по себе бывает про ключ — про окно рассказываем только по словам,
+        // которые встречаются у переполнения («maximum context length», «context_length_exceeded»).
+        const contextSure = /context|too long|maximum|num_ctx/i.test(detail);
+        if (contextish) {
+          if (contextSure && contextRetriedSteps < 3 && budget > 3000) {
+            contextRetriedSteps++;
+            const beforeBudget = budget;
+            const real = Math.max(payloadWeight(), 1);
+            budget = Math.max(3000, Math.floor(Math.min(budget * 0.4, real * 0.6)));
+            if (apiMessages.length > 1) {
+              apiMessages = [apiMessages[0], ...(await ctxManager.manage(apiMessages.slice(1), histBudget()))];
+            }
+            onEvent({
+              type: "notice",
+              text:
+                "⚠ Модель ответила, что запрос больше её окна: ужимаю историю (бюджет " + Math.round(beforeBudget / 1000) +
+                "k → " + Math.round(budget / 1000) + "k токенов) и повторяю тот же раунд.",
+            });
+            round--;
+            continue;
           }
-          round--;
-          continue;
+          // Ступени кончились (или ужимать некуда): объясняем по-русски и подсказываем
+          // кнопку «▶ Продолжить». Слабое «token» без единой ступени — это не про окно.
+          if (contextSure || contextRetriedSteps > 0) {
+            onEvent({
+              type: "error",
+              message:
+                "⚠ Модель отказалась принять запрос: он больше её окна контекста, даже ужав историю (≈" +
+                Math.round(budget / 1000) + "k токенов). Переписка сохранена: нажми «▶ Продолжить» — прогон " +
+                "вернёт её себе и пойдёт дальше; или выбери модель с окном побольше.",
+            });
+            return;
+          }
         }
         if (res.status === 402) {
           if (tryWebAutoSwitch("API error 402: недостаточно средств")) { round--; continue; }
@@ -260,6 +400,18 @@
         if (seenCalls.has(sig)) continue;
         seenCalls.add(sig);
         calls.push(norm);
+      }
+      // Вызов инструмента вне текущего набора схем: дотягиваем его группу — в этом и
+      // следующих раундах схема будет на месте (в приложении то же, предохранитель A).
+      if (!planMode) {
+        let grew = false;
+        for (const c of calls) {
+          const gid = AgentCore.groupOfTool(c.name);
+          if (!gid || webSticky.has(gid)) continue;
+          webSticky.add(gid);
+          grew = true;
+        }
+        if (grew) routeWebTools(AgentCore.routerTaskText(messages));
       }
       // Все вызовы раунда оказались дублями — завершаем без «пустых» tool_calls.
       if (!calls.length) {

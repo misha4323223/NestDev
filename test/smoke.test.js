@@ -426,6 +426,9 @@ async function testWebChat() {
     assert.ok(profLine > 0 && webLine > profLine, "подключения собираются после веб-режима — он получит пустую ссылку");
 
     const sse = (parts) => new Response(parts.map((p) => "data: " + JSON.stringify(p) + "\n\n").join(""), { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    // У Ollama свой формат: не SSE, а NDJSON — каждая строка отдельный объект, и
+    // разбирается он другим путём (см. provider-transport.js). Подменять его SSE нельзя.
+    const ndjson = (parts) => new Response(parts.map((p) => JSON.stringify(p) + "\n").join(""), { status: 200, headers: { "Content-Type": "application/x-ndjson" } });
     const realFetch = global.fetch;
     const calls = [];
     let script = null; // что отвечает подменённая сеть на каждый вызов
@@ -501,6 +504,77 @@ async function testWebChat() {
       );
       assert.ok(/остановлено пользователем/.test(events.find((e) => e.type === "resume").reason), "у кнопки нет причины остановки");
       assert.ok(/начал/.test(events.filter((e) => e.type === "chunk").map((e) => e.text).join("")), "частичный текст потерялся");
+
+      // 5. Контекст в веб-режиме: раньше не считались НИ системный промпт, НИ схемы
+      //    инструментов, и в запрос уходили ВСЕ 167 схем (≈33 000 токенов) — на локальном
+      //    окне они одни занимали окно целиком. Теперь набор отбирает роутер, индикатор
+      //    получает честные числа, а окно модели спрашивается у САМОГО сервера: от него
+      //    зависят и бюджет истории, и num_ctx, без которого Ollama молча резала запрос.
+      events.length = 0;
+      calls.length = 0;
+      settings.provider = "ollama";
+      settings.model = "qwen3:4b";
+      settings.ollamaUrl = "http://127.0.0.1:11577";
+      script = (n) => {
+        if (/\/api\/show$/.test(calls[n - 1].url)) {
+          return new Response(
+            JSON.stringify({ model_info: { "general.architecture": "qwen3", "qwen3.context_length": 32768 }, capabilities: ["completion", "tools"] }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        return ndjson([{ message: { content: "готово" } }, { done: true }]);
+      };
+      await web.webSend([{ role: "user", content: "сходи на сайт и прочитай страницу" }], (ev) => events.push(ev), undefined, {});
+      assert.ok(calls.length >= 2, "запрос не ушёл на локальный сервер: " + JSON.stringify(calls.map((c) => c.url)));
+      assert.ok(/\/api\/show$/.test(calls[0].url), "веб-режим не спросил окно модели у сервера: " + calls[0].url);
+      const chatCall = calls.find((c) => /\/api\/chat$/.test(c.url));
+      assert.ok(chatCall, "запрос чата не ушёл: " + JSON.stringify(calls.map((c) => c.url)));
+      const allTools = AgentCore2.TOOL_DEFINITIONS.length;
+      const sentTools = (JSON.parse(chatCall.body).tools || []).length;
+      assert.ok(sentTools > 0, "в веб-версии ушёл запрос без схем инструментов");
+      assert.ok(sentTools < allTools, "в запрос ушли ВСЕ схемы (" + sentTools + " из " + allTools + "): на малом окне они занимают его целиком");
+      // num_ctx = бюджет + запас, но не больше окна: без него Ollama брала дефолт.
+      assert.strictEqual(JSON.parse(chatCall.body).options.num_ctx, 32768, "num_ctx не ушёл в запрос веб-режима: " + chatCall.body.slice(0, 300));
+      const ctxEv = events.filter((e) => e.type === "context").pop();
+      assert.ok(ctxEv, "индикатор контекста не получил чисел: " + JSON.stringify(events.map((e) => e.type)));
+      assert.strictEqual(ctxEv.budget, 28672, "бюджет веб-версии посчитан не от окна модели: " + ctxEv.budget);
+      assert.ok(ctxEv.tools > 0 && ctxEv.system > 0, "индикатор не учитывает схемы и промпт: " + JSON.stringify(ctxEv));
+      assert.ok(ctxEv.history <= ctxEv.budget, "индикатор считает истории больше бюджета: " + JSON.stringify(ctxEv));
+      assert.ok(/готово/.test(events.filter((e) => e.type === "chunk").map((e) => e.text).join("")), "ответ не дошёл");
+
+      // 6. Отказ «запрос больше окна»: историю ужимаем и повторяем ТОТ ЖЕ раунд, а когда
+      //    ступени кончились — объясняем по-русски. Сырой английский ответ провайдера
+      //    («maximum context length is 8192 tokens») человеку читать незачем.
+      events.length = 0;
+      calls.length = 0;
+      settings.provider = "openai";
+      settings.model = "m1";
+      script = () => new Response(JSON.stringify({ error: { message: "This model's maximum context length is 8192 tokens" } }), { status: 400, headers: { "Content-Type": "application/json" } });
+      const longHistory = [];
+      for (let i = 0; i < 6; i++) {
+        longHistory.push({ role: "user", content: "шаг " + i + " " + "слово ".repeat(200) });
+        longHistory.push({ role: "assistant", content: "ясно " + "ответ ".repeat(200) });
+      }
+      await web.webSend(longHistory, (ev) => events.push(ev), undefined, {});
+      const steps = events.filter((e) => e.type === "notice" && /больше её окна/.test(e.text));
+      assert.ok(steps.length >= 1 && steps.length <= 3, "ступени ужатия вне предела 1–3: " + steps.length);
+      // Повторы не должны превращаться в поток одинаковых строк: про размер запроса и про
+      // тесное окно говорим один раз за прогон (в приложении для этого есть state.warned).
+      assert.strictEqual(
+        events.filter((e) => e.type === "notice" && /не влезал в окно/.test(e.text)).length,
+        1,
+        "про размер запроса сказано не один раз"
+      );
+      assert.strictEqual(
+        events.filter((e) => e.type === "notice" && /Окно модели мало/.test(e.text)).length,
+        1,
+        "про тесное окно сказано не один раз"
+      );
+      assert.ok(calls.length >= 2, "раунд не повторён после ужатия: вызовов " + calls.length);
+      const err = events.filter((e) => e.type === "error").pop();
+      assert.ok(err, "прогон упал без объяснения: " + JSON.stringify(events.map((e) => e.type)));
+      assert.ok(/Продолжить/.test(err.message), "в тексте ошибки нет выхода из положения: " + err.message);
+      assert.ok(!/maximum context length/.test(err.message), "человеку показан сырой ответ провайдера: " + err.message);
     } finally {
       global.fetch = realFetch;
     }
@@ -4361,7 +4435,11 @@ async function testSessionExtras() {
   await test("контекст: main.js считает заполняемость и шлёт её в интерфейс", () => {
     assert.ok(/type: "context"/.test(mainSrc), "нет события context");
     assert.ok(/emitContext\(trimmedHistory\)/.test(mainSrc), "нет отправки после обрезки истории");
-    assert.ok(/emitContext\(canonical\)/.test(mainSrc), "нет обновления между раундами");
+    assert.ok(/emitContext\(canonical\.slice\(1\)\)/.test(mainSrc), "нет обновления между раундами");
+    // История отдаётся индикатору БЕЗ системного промпта: он лежит внутри неё, а вес
+    // промпта emitContext прибавляет сам — иначе промпт считался бы дважды и индикатор
+    // показывал «100%» задолго до настоящего заполнения (замер: 34 758 из 28 672).
+    assert.ok(!/emitContext\(canonical\)/.test(mainSrc), "индикатору отдаётся история вместе с системным промптом");
   });
 
   // Отрисовку индикатора берём как реальный код из app.js и подставляем простой DOM.
@@ -7616,8 +7694,18 @@ async function testPlanPanel() {
         // (этап 3.7): спрашиваем интерфейс целиком, а не адрес кода.
         assert.ok(/planRoundStarted\(chat, seg\.id\);/.test(uiAll()), "новый раунд ответа не двигает галочки текстового плана");
     assert.ok(/if \(planTextFinish\(chat\)\)/.test(uiFile("chat-events.js")), "финиш запуска не закрывает шаг текстового плана");
-    // Веб-версия: в План-режиме список инструментов больше не пуст — todoWrite доходит до модели.
-    assert.ok(/tools: planMode \? AgentCore\.PLAN_MODE_TOOL_DEFINITIONS : AgentCore\.TOOL_DEFINITIONS,/.test(uiAll()), "в веб-версии План-режим без todoWrite");
+    // Веб-версия: в План-режиме список инструментов больше не пуст — todoWrite доходит до
+    // модели. Набор схем теперь отбирает роутер (как в приложении), а в плане он не
+    // работает: туда идёт готовый набор PLAN_MODE_TOOL_DEFINITIONS.
+    assert.ok(
+      /let webTools = planMode \? AgentCore\.PLAN_MODE_TOOL_DEFINITIONS : AgentCore\.TOOL_DEFINITIONS;/.test(uiAll()),
+      "в веб-версии План-режим без todoWrite"
+    );
+    assert.ok(/tools: webTools,/.test(uiAll()), "в запросе веб-версии уходит не тот набор схем");
+    // Роутер схем: без него уходили все 167 схем (≈33 000 токенов) — на окне 32k они
+    // одни занимали окно целиком.
+    assert.ok(/roleGroups: AgentCore\.rolePlan\(opts\.role \|\| "dev"\)\.groups,/.test(uiAll()), "роутер схем в веб-версии не спрашивает роль чата");
+    assert.ok(/maxTokens: AgentCore\.routerMaxTokens\(budget, systemWeight, baseWeight\),/.test(uiAll()), "набор схем в веб-версии не ограничен окном");
   });
 
   await test("план: план из размышлений — «План уже составлен. Сейчас нужно:»", () => {
@@ -8568,9 +8656,24 @@ async function testAgentSpeedups() {
   });
 
   await test("компакция: сжатие с резервом 15% до переполнения", () => {
-    // Резерв 15% + честное вычитание схем и системного промпта (иначе индикатор врёт).
-    assert.ok(/Math\.floor\(\(budget - state\.weight - systemWeight\) \* 0\.85\)/.test(mainSrc), "нет резерва 15% в бюджете истории");
+    // Резерв 15% + честное вычитание схем, системного промпта и справочников группы (иначе
+    // индикатор врёт, а запрос не влезает в окно модели).
+    assert.ok(
+      /Math\.floor\(\(budget - state\.weight - systemWeight - state\.guidesWeight\) \* 0\.85\)/.test(mainSrc),
+      "нет резерва 15% в бюджете истории (или справочники не вычтены)"
+    );
     assert.ok(/const systemWeight = estimateTokens\(systemPrompt\);/.test(mainSrc), "системный промпт не вычитается из бюджета");
+    // Справочник группы уезжает в КАЖДЫЙ запрос system-сообщением: его вес обязан
+    // считаться, иначе на окне 32k запрос выходил за окно (замер: 30 729 из 28 672, а
+    // справочник облака — 2 684 токена).
+    assert.ok(
+      /state\.guidesWeight = state\.guideNotes\.length \? estimateTokens\(JSON\.stringify\(state\.guideNotes\)\) : 0;/.test(mainSrc),
+      "вес справочников группы не считается"
+    );
+    assert.ok(
+      /const histBudgetAfterOverflow = \(\) => Math\.max\(1500, getBudget\(\) - state\.weight - systemWeight - state\.guidesWeight\);/.test(mainSrc),
+      "после переполнения бюджет истории не учитывает справочники"
+    );
     assert.ok(/const used = histTokens \+ tools\.state\.weight \+ tools\.state\.systemWeight;/.test(mainSrc), "индикатор контекста не учитывает промпт");
   });
   await test("кэш промпта: Claude получает точки кэша, OpenAI-совместимым поле не шлём", () => {
@@ -10851,9 +10954,14 @@ async function testOllamaWindow() {
       // Локальные токены бесплатны: платим памятью (KV-кэш) и временем, поэтому потолок — окно.
       const cloud = core.contextBudget("ollama", "qwen3:4b");
       assert.strictEqual(cloud, 14000, "изменился запасной бюджет на случай молчащего сервера");
-      assert.strictEqual(core.windowBudget("ollama", cloud, 40960), 32768, "окно 40k не использовано");
+      // Окно 40k отдаётся целиком, минус резерв на ответ: прежние «32 768» были не
+      // потолком модели, а нашей осторожностью и срезали окно у больших моделей.
+      assert.strictEqual(core.windowBudget("ollama", cloud, 40960), 36864, "окно 40k не использовано");
       assert.strictEqual(core.windowBudget("ollama", cloud, 8192), 4096, "окно 8k не учтено");
-      assert.strictEqual(core.windowBudget("ollama", cloud, 131072), 32768, "потолок памяти не держит");
+      // Модель с окном 128k больше не ужимается вчетверо раньше времени: пределами
+      // остаются окно модели и общий потолок бюджета (400k, как и просили).
+      assert.strictEqual(core.windowBudget("ollama", cloud, 131072), 126976, "окно 128k не использовано");
+      assert.strictEqual(core.windowBudget("ollama", cloud, 2000000), 400000, "потолок бюджета не общий с облаком");
       // Окно меньше резерва на ответ: отдаём всё окно, но не больше него.
       assert.strictEqual(core.windowBudget("ollama", cloud, 2048), 2048, "бюджет превысил окно модели");
       // Окно неизвестно (сервер молчит) — поведение прежнее.
@@ -10981,9 +11089,12 @@ async function testOllamaWindow() {
       // окно САМОЙ модели — оно и обрезает бюджет, когда известно.
       const cloud = core.contextBudget("openai", "qwen3-4b");
       assert.strictEqual(cloud, 400000, "у совместимого API не облачный потолок 400k");
-      assert.strictEqual(core.windowBudget("openai", cloud, 40960, { local: true }), 32768, "локальное окно 40k не использовано");
+      // Локальный сервер и Ollama идут одним путём: настоящий предел — окно САМОЙ модели,
+      // а потолок бюджета общий с облаком (400k).
+      assert.strictEqual(core.windowBudget("openai", cloud, 40960, { local: true }), 36864, "локальное окно 40k не использовано");
       assert.strictEqual(core.windowBudget("openai", cloud, 40960), 36864, "окно модели не стало потолком бюджета");
-      assert.strictEqual(core.windowBudget("openai", 50000, 131072, { local: true }), 32768, "потолок памяти не держит локальный сервер");
+      assert.strictEqual(core.windowBudget("openai", 50000, 131072, { local: true }), 126976, "окно 128k у местного сервера не использовано");
+      assert.strictEqual(core.windowBudget("openai", 50000, 2000000, { local: true }), 400000, "потолок местного сервера разошёлся с облачным");
       assert.strictEqual(core.windowBudget("openai", cloud, 8192, { local: true }), 4096, "окно 8k у локального сервера не учтено");
       // окно неизвестно — бюджет не режем «на всякий случай»: у g4f и подобных
       // местных прокси окна большие, а переполнение ловит повтор с меньшим бюджетом.
@@ -11222,6 +11333,50 @@ async function testLongChatRecovery() {
       assert.ok(bodies.length > 1, "сжатие по-прежнему одноразовое: вызовов " + bodies.length);
       assert.ok(bodies.length <= 3, "сжатий больше лимита: " + bodies.length);
       assert.ok(bodies[1].includes("МЕМО1"), "повторное сжатие не видит предыдущую памятку — старые шаги потеряются");
+    });
+
+    await test("выросший чат одной задачи: памятка ЗАМЕНЯЕТ свёрнутый кусок, а не дописывается", async () => {
+      // Одна просьба человека и сорок шагов агента после неё — тот самый ход, где сжатие
+      // было фиктивным: границы «до последней просьбы» в истории нет, а правило «текущий
+      // виток сохраняем целиком» не давало свернуть ничего. Замер на живом чате:
+      // 112 911 токенов до сжатия и 112 911 после — история оставалась целой, а памятка
+      // ехала доплаткой и обещала экономию, которой не было.
+      const chunk = "строка старого контекста ".repeat(120);
+      const goal = { role: "user", content: "одна задача: дойти до конца" };
+      const history = [goal];
+      for (let i = 0; i < 40; i++) history.push({ role: "assistant", content: chunk + " шаг " + i });
+      const settings = { provider: "openai", model: "gpt-4o", openaiUrl: "https://example.invalid/v1", openaiApiKey: "k" };
+      const cm = core.createContextManager({ settings, planMode: false });
+      const out = await cm.manage(history, 2000);
+      assert.ok(out.length && out[0].role === "system" && /ПАМЯТКА ПРЕДЫДУЩЕГО КОНТЕКСТА/.test(out[0].content), "памятка не встала первой");
+      assert.strictEqual(out[1], goal, "просьба человека потерялась — агент забудет, чего от него хотят");
+      assert.ok(out.length < history.length, "история не свёрнута: было " + history.length + " сообщений, стало " + out.length);
+      const before = history.reduce((n, m) => n + String(m.content).length, 0);
+      const after = out.reduce((n, m) => n + String(m.content).length, 0);
+      assert.ok(after < before / 2, "переписка не уменьшилась: было " + Math.round(before / 1000) + "k символов, стало " + Math.round(after / 1000) + "k");
+    });
+
+    await test("выросший чат одной задачи: при двух просьбах хвост начинается с последней", async () => {
+      // Обычный длинный чат: просьб несколько, и граница свёрнутого — последняя из них.
+      // Всё, что было до неё, уходит в памятку; её письмо и шаги по нему остаются целиком.
+      const chunk = "строка старого контекста ".repeat(120);
+      const history = [];
+      for (let i = 0; i < 10; i++) {
+        history.push({ role: "user", content: chunk + " просьба " + i });
+        history.push({ role: "assistant", content: chunk + " ответ " + i });
+      }
+      const last = { role: "user", content: "последняя просьба: допиши отчёт" };
+      history.push(last);
+      // Текущий виток уже пошёл: после последней просьбы есть шаги агента, и они
+      // обязаны остаться в запросе — по ним прогон и продолжает работу.
+      history.push({ role: "assistant", content: "Открыл отчёт." });
+      history.push({ role: "tool", content: "Отчёт: 12 строк." });
+      const settings = { provider: "openai", model: "gpt-4o", openaiUrl: "https://example.invalid/v1", openaiApiKey: "k" };
+      const cm = core.createContextManager({ settings, planMode: false });
+      const out = await cm.manage(history, 2000);
+      assert.ok(out.length && out[0].role === "system", "памятка не встала первой");
+      assert.ok(out.indexOf(last) > 0, "последняя просьба потерялась из хвоста");
+      assert.ok(out.some((m) => m !== last && m.role === "assistant"), "шаги текущего витка потерялись");
     });
   } finally {
     global.fetch = realFetch;

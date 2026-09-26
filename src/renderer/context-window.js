@@ -82,7 +82,13 @@
   // Прежние жёсткие 14 000 были наследием облачной экономии: у модели с окном 40k
   // история сжималась втрое раньше, чем кончалось место.
   const LOCAL_CTX_FALLBACK = 14000; // окно неизвестно (сервер молчит) — безопасный дефолт
-  const LOCAL_CTX_CAP = 32768; // KV-кэш 8B-модели ~4 ГБ: выше — уже не ноутбук
+  // Потолок бюджета у локальной модели. Раньше здесь стояло 32 768 («KV-кэш 8B-модели
+  // ~4 ГБ: выше — уже не ноутбук») — и это срезало окно у моделей с большим контекстом:
+  // у модели с окном 128k история сжималась вчетверо раньше, чем кончалось место.
+  // Теперь потолок тот же, что у облака (400 000), а настоящий предел даёт ОКНО
+  // самой модели — оно вычитается ниже, и `num_ctx` уходит в Ollama равным бюджету.
+  // Память (KV-кэш) — решение человека: модель с окном 128k так и просит больше.
+  const LOCAL_CTX_CAP = CLOUD_CTX_BUDGET;
   const OUTPUT_RESERVE = 4096; // запас на ответ модели и результаты инструментов
   function windowBudget(provider, cloudBudget, window, opts) {
     const win = Math.round(Number(window) || 0);
@@ -185,6 +191,10 @@
       const provider = s && s.provider ? s.provider : "openai";
       const model = (s && s.model) || "";
       if (!model) return null;
+      // Границу свёрнутого считает manage и называет её явно (headEnd). Причина:
+      // «последней просьбы человека» в истории может и не быть — в прогоне одной задачи
+      // она стоит первой, а дальше идут только шаги агента, и прежняя проверка
+      // `lastUser <= 0` отказывалась сжимать ровно там, где шагов набираются сотни.
       let lastUser = -1;
       for (let i = messages.length - 1; i >= 0; i--) {
         if (messages[i] && messages[i].role === "user") {
@@ -192,8 +202,9 @@
           break;
         }
       }
-      if (lastUser <= 0) return null; // нечего сжимать — только текущий виток
-      const head = messages.slice(0, lastUser);
+      const headEnd = Math.round(Number(o.headEnd) || 0) || lastUser;
+      if (headEnd <= 0) return null; // и правда нечего: вся история — один виток без шагов
+      const head = messages.slice(0, headEnd);
       let headTokens = 0;
       for (const m of head) headTokens += estimateMessageTokens(m);
       if (headTokens < 4000) return null; // голова маленькая — обычная обрезка дешевле вызова
@@ -284,6 +295,10 @@
     let compactCount = 0;
     const COMPACT_LIMIT = 3;
     let compactMemo = null;
+    // Свёрнут ли кусок в ЭТОМ вызове и с какого места история остаётся как есть.
+    let compactedNow = false;
+    let keepFrom = 0;
+    let keepGoal = false; // историю одной задачи начинаем с её же просьбы дословно
     // num_ctx для запроса за памяткой: тот же, что у основного запроса, иначе Ollama
     // собирает памятку с дефолтным окном 2048 и ещё и перезагружает модель.
     const localCtx = Math.round(Number(opts && opts.localCtx) || 0);
@@ -302,6 +317,17 @@
           return compactMemo ? [compactMemo, ...sanitizeToolPairs(messages)] : sanitizeToolPairs(messages);
         }
         if (compactCount < COMPACT_LIMIT && !planMode) {
+          // Граница свёрнутого: последняя просьба человека и всё после неё остаются как
+          // есть — по ним прогон и продолжает работу. Если просьба одна (история началась
+          // с неё, а дальше одни шаги), границы нет: сворачиваем середину витка, оставляя
+          // свежий хвост шагов. Иначе сжимать было бы нечего, и вся история ехала в запрос.
+          const KEEP_TAIL = 8;
+          let boundary = 0;
+          for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i] && messages[i].role === "user") { boundary = i; break; }
+          }
+          const boundaryIsUser = boundary > 0;
+          if (!boundaryIsUser) boundary = Math.max(1, messages.length - KEEP_TAIL);
           try {
             // Предыдущую памятку скармливаем вместе с новыми сообщениями: иначе
             // повторное сжатие потеряло бы всё, что уже было свёрнуто в неё.
@@ -311,6 +337,7 @@
               {
                 numCtx: localCtx,
                 local: localServer,
+                headEnd: boundary,
                 onFail: (why) => {
                   if (compactFailed) return; // говорим один раз за прогон, а не каждый виток
                   compactFailed = true;
@@ -331,6 +358,9 @@
                   String(memoText).trim(),
               };
               compactCount++;
+              compactedNow = true;
+              keepFrom = boundary; // ровно та граница, по которой собрана памятка
+              keepGoal = !boundaryIsUser; // сворачивали середину витка — просьбу оставляем
               if (onMemo) {
                 try {
                   onMemo({
@@ -342,12 +372,42 @@
                   });
                 } catch {}
               }
-              if (emit) emit({ type: "compact", text: "🧠 Контекст сжат: старые шаги свернуты в памятку — токены экономятся." });
             }
           } catch {}
         }
-        const rest = trimConversation(messages, Math.max(1500, budget - memoWeight - 400));
-        return compactMemo ? [compactMemo, ...rest] : rest;
+        // Памятка ЗАМЕНЯЕТ свёрнутый кусок, а не дописывается к нему. Раньше история
+        // оставалась целиком (она влезала в бюджет — зачем же её резать), и событие
+        // «контекст сжат» обещало экономию, которой не было: замер на длинном чате дал
+        // 112 911 токенов до сжатия и 112 911 после — памятка просто ехала доплаткой.
+        // Отдельная беда — история одной задачи: она начинается с просьбы человека, дальше
+        // одни шаги агента, и правило trimConversation «последнее user-сообщение оставляем
+        // целиком» сохраняло её ВСЮ — памятка ехала доплаткой, и «сжатие» не сжимало ничего.
+        // Поэтому границу называет тот, кто собирает памятку (последняя просьба человека, а
+        // если её нет — середина витка с запасом KEEP_TAIL шагов), и хвост режется ровно по ней.
+        let tail = messages;
+        if (compactedNow) {
+          tail = messages.slice(Math.min(keepFrom, messages.length));
+          // Отвечать нечем, если не оставить ни одного шага.
+          if (!tail.length) tail = messages.slice(-1);
+          // В истории одной задачи просьба человека одна и стоит в начале: под памяткой
+          // она свёрнута вместе со всем остальным, но терять дословную цель незачем —
+          // оставляем её перед хвостом. Так задача не «растворяется» в пересказе.
+          if (keepGoal && messages[0] && messages[0].role === "user") tail = [messages[0], ...tail];
+        }
+        const nowMemoWeight = compactMemo ? estimateTokens(compactMemo.content) : 0;
+        const rest = trimConversation(tail, Math.max(1500, budget - nowMemoWeight - 400));
+        const out = compactMemo ? [compactMemo, ...rest] : rest;
+        if (compactedNow && emit) {
+          let afterTokens = 0;
+          for (const m of out) afterTokens += estimateMessageTokens(m);
+          emit({
+            type: "compact",
+            text:
+              "🧠 Контекст сжат: " + (messages.length - tail.length) + " сообщений свернуты в памятку (≈" +
+              Math.round(total / 1000) + "k → ≈" + Math.round(afterTokens / 1000) + "k токенов).",
+          });
+        }
+        return out;
       },
       memo() {
         return compactMemo;

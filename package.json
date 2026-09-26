@@ -1,6 +1,6 @@
 {
   "name": "ai-agent",
-  "version": "1.5.219",
+  "version": "1.5.220",
   "private": true,
   "description": "NestDev — чат с AI-агентом (Ollama / Groq / внешние API), файловые операции и git",
   "author": "NestDev",
@@ -59,6 +59,7 @@
     "test:live:tool-registry": "node scripts/live-tool-registry.js",
     "test:live:screens": "node scripts/live-screens.js",
     "test:live:retry": "node scripts/live-retry.js",
+    "test:live:ctxsize": "node scripts/live-context-size.js",
     "test:live:round": "node scripts/live-round.js",
     "test:live:lifecycle": "node scripts/live-lifecycle.js",
     "test:live:run-context": "node scripts/live-run-context.js",

@@ -444,20 +444,72 @@ async function runAi(settings, messages, win, opts) {
   // работа уже на диске.
   runCtx.save(canonical);
 
+  // ── Сколько токенов РЕАЛЬНО уедет в запрос ────────────────────────────────
+  // Бюджет истории считается заранее и по частям (схемы, промпт, справочники), но в
+  // запрос едет ещё сводка миссии и всё, что добавилось в текущем витке. Одна честная
+  // мера на всё — здесь: ею пользуется предохранитель перед отправкой и ужатие после
+  // отказа провайдера. Системный промпт лежит ВНУТРИ истории (canonical[0]), поэтому
+  // отдельно не прибавляется — иначе он считался бы дважды.
+  const payloadTokens = (history, digest) =>
+    estimateTokens(JSON.stringify(history)) +
+    tools.state.weight +
+    (tools.state.guidesWeight || 0) +
+    (digest && history.indexOf(digest) < 0 ? estimateTokens(JSON.stringify(digest)) : 0);
+
+  // Предохранитель перед отправкой: запрос ОБЯЗАН влезать в бюджет. Бюджет истории
+  // считается заранее и по частям, но справочники группы, сводка миссии и текущий виток
+  // в него не входят — на длинном чате это те самые 5–10k, из-за которых локальная
+  // модель получала обрезанный промпт, а облачная — отказ «контекст больше окна».
+  // Мерим ВЕСЬ запрос и урезаем историю ступенями, пока он не влезет; сводку миссии не
+  // выбрасываем — по ней модель и работает (она ставится сразу после системной).
+  const fitBeforeRound = async (digest) => {
+    let cost = payloadTokens(canonical, digest);
+    if (cost <= budget) return cost;
+    const before = cost;
+    const digestWeight = digest ? estimateTokens(JSON.stringify(digest)) : 0;
+    for (const frac of [0.8, 0.6, 0.4, 0.25, 0.1]) {
+      const target = Math.max(
+        1500,
+        Math.floor((budget - tools.state.weight - tools.state.systemWeight - (tools.state.guidesWeight || 0) - digestWeight) * frac)
+      );
+      const sys = canonical[0];
+      const kept = canonical.slice(1).filter((m) => m !== digest);
+      canonical = [sys, ...(await ctxManager.manage(kept, target))];
+      if (digest) canonical.splice(1, 0, digest);
+      cost = payloadTokens(canonical, digest);
+      if (cost <= budget) break;
+    }
+    if (emit) {
+      emit({
+        type: "notice",
+        text:
+          "⚠ Запрос не влезал в окно модели (≈" + Math.round(before / 1000) + "k из " + Math.round(budget / 1000) +
+          "k токенов): ужал историю до ≈" + Math.round(cost / 1000) + "k и продолжаю.",
+      });
+    }
+    return cost;
+  };
+
   // Ужать историю при переполнении контекста: бюджет уменьшается, список пересобирается.
   // Ровно та же работа нужна и при сжатии между раундами, поэтому — одной точкой входа.
   const shrinkContext = async () => {
-    budget = Math.max(3000, Math.floor(budget * 0.4));
+    // Ужимаем по ФАКТИЧЕСКОМУ размеру запроса, а не умножением прежнего бюджета: при
+    // неизвестном окне бюджет мог быть 400 000, и «×0,4» давало 160 000 — вся история в
+    // них влезала, запрос не менялся ни на токен, и второй отказ провайдера убивал
+    // прогон (замер: 145 440 т. до ужатия и 145 440 после). Берём меньший из двух шагов.
+    const real = Math.max(payloadTokens(canonical, null), 1);
+    budget = Math.max(3000, Math.floor(Math.min(budget * 0.4, real * 0.6)));
     tools.state.histBudget = tools.histBudgetAfterOverflow();
     if (canonical.length > 1) {
       const sys = canonical[0];
       canonical = [sys, ...(await ctxManager.manage(canonical.slice(1), tools.state.histBudget))];
-      emitContext(canonical);
+      emitContext(canonical.slice(1));
     }
     if (canonical.length > 1) {
       const sys = canonical[0];
       canonical = [sys, ...sanitizeToolPairs(canonical.slice(1))];
     }
+    return { budget: budget, cost: payloadTokens(canonical, null) };
   };
 
   // Восстановление после отказа запроса (лимиты 429, «холодный» пул 503, переполнение
@@ -635,8 +687,13 @@ async function runAi(settings, messages, win, opts) {
     // всегда — и в первом раунде, и после границы батча, и после сжатия.
     const digestMsg = mission.digestMessage();
     if (digestMsg) canonical.splice(1, 0, digestMsg);
-    // Индикатор контекста — ПОСЛЕ подстановки: иначе он врал бы про занятое место.
-    emitContext(canonical);
+    // Предохранитель: мерим ВЕСЬ запрос (история + справочники + схемы + сводка) и
+    // урезаем историю, пока он не влезет в бюджет.
+    await fitBeforeRound(digestMsg);
+    // Индикатор контекста — ПОСЛЕ подстановки и подгонки: он показывает занятое место.
+    // Историю отдаём БЕЗ системного промпта: он внутри неё, и отдельно прибавлять его
+    // (tools.state.systemWeight) значило бы считать промпт дважды — индикатор врал.
+    emitContext(canonical.slice(1));
     // Чекпоинт перед запросом: обрыв на ответе модели оставляет работу на диске.
     runCtx.save(canonical);
 
