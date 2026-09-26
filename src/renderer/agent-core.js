@@ -852,7 +852,7 @@
       icon: "🧑💼",
       title: "Ассистент",
       hint: "Помощник по делам на этом ПК: файлы, документы, письма, сайты, порядок.",
-      groups: ["notes", "mail", "system", "browser", "files", "terminal", "vault"],
+      groups: ["notes", "mail", "system", "browser", "files", "terminal", "vault", "sheets"],
       chips: [
         { t: "Спланируй мой день", send: true },
         { t: "Разбери входящие", send: true },
@@ -881,7 +881,7 @@
       hint: "Дела и сроки: план дня, дедлайны, напоминания, отчёты.",
       // browser и vault — чтобы вести переписку с клиентами в ВК и на сайтах: без группы
       // браузера роль дел физически не могла отправить сообщение, хотя справочник ВК есть.
-      groups: ["tasks", "notes", "mail", "system", "browser", "vault"],
+      groups: ["tasks", "notes", "mail", "system", "browser", "vault", "sheets"],
       chips: [
         { t: "Что у меня на сегодня?", send: true },
         { t: "Что просрочено?", send: true },
@@ -1130,6 +1130,13 @@
       title: "Yandex Cloud",
       keywords: ["yandex", "яндекс", "облак", "cloud", "серверлес", "serverless", "бакет", "s3"],
       names: ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycDb", "ycCosts", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"],
+    },
+    {
+      id: "sheets",
+      title: "таблицы (Excel и Google Sheets)",
+      keywords: ["таблиц", "table", "excel", "эксель", "xlsx", "csv", "google sheet", "гугл таблиц",
+        "google-таблиц", "sheets", "выгрузк", "отчёт", "отчет", "смет", "прайс"],
+      names: ["sheetWrite", "sheetRead", "gSheetRead", "gSheetWrite", "gSheetAppend", "gSheetInfo", "gSheetCreate"],
     },
   ];
 

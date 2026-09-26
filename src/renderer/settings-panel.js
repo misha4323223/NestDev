@@ -143,6 +143,7 @@
     $("s-vision-url").value = getSettings().visionUrl || "";
     $("s-vision-key").value = getSettings().visionKey || "";
     $("s-serper-key").value = getSettings().serperApiKey || "";
+    if ($("s-gsheet-key")) $("s-gsheet-key").value = getSettings().googleServiceAccount || "";
     $("s-vision-model").value = getSettings().visionModel || "";
     $("s-image-model").value = getSettings().imageModel || "";
     renderVisionDetect();
@@ -206,6 +207,7 @@
     getSettings().visionUrl = $("s-vision-url").value.trim();
     getSettings().visionKey = $("s-vision-key").value.trim();
     getSettings().serperApiKey = $("s-serper-key").value.trim();
+    if ($("s-gsheet-key")) getSettings().googleServiceAccount = $("s-gsheet-key").value.trim();
     getSettings().mailAddress = $("s-mail-address").value.trim();
     getSettings().mailFromName = $("s-mail-from-name").value.trim();
     getSettings().mailPassword = $("s-mail-pass").value.trim();
@@ -314,20 +316,37 @@
     setSettingsMsg("", false);
   }
 
-  // Кликабельные подсказки с моделями под активным провайдером
+  // Кликабельные подсказки с моделями под активным провайдером.
+  // Показываем ВЕСЬ список, а не первые 12: у OpenRouter моделей сотни, и раньше
+  // нужную модель в настройках было просто не найти. Поиск над списком сужает его.
+  // Последний рендер запоминаем, чтобы поиск перерисовывал тот же список.
+  let modelHintState = { provider: "", models: [] };
   function renderModelHints(provider, models) {
     cachedModels[provider] = models || [];
+    modelHintState = { provider: provider || "", models: models || [] };
     const box = $("model-hints");
     box.innerHTML = "";
     if (!provider || !models || !models.length) {
       box.classList.add("hidden");
       return;
     }
+    const searchBox = $("model-search");
+    const q = String((searchBox && searchBox.value) || "").trim().toLowerCase();
+    const shown = q ? models.filter((m) => String(m).toLowerCase().indexOf(q) !== -1) : models;
     const label = document.createElement("span");
     label.className = "hint-label";
-    label.textContent = "Модели (клик — вставить):";
+    label.textContent = q
+      ? "Найдено " + shown.length + " из " + models.length + ":"
+      : "Модели (" + models.length + ", клик — вставить):";
     box.appendChild(label);
-    const shown = models.slice(0, 12);
+    if (!shown.length) {
+      const none = document.createElement("span");
+      none.className = "hint";
+      none.textContent = "ничего не найдено";
+      box.appendChild(none);
+      box.classList.remove("hidden");
+      return;
+    }
     for (const name of shown) {
       const b = document.createElement("button");
       b.type = "button";
@@ -826,6 +845,8 @@
     renderOtaStatus: renderOtaStatus,
     openSettings: openSettings,
     renderModelHints: renderModelHints,
+    // Поиск в настройках перерисовывает тот же список с учётом введённого текста.
+    refilterModelHints: () => renderModelHints(modelHintState.provider, modelHintState.models),
     requestModelsList: requestModelsList,
     loadModels: loadModels,
     testConnection: testConnection,

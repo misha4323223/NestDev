@@ -47,6 +47,13 @@ function isEnabled() {
   return !!enabled;
 }
 
+// Текущие значения секретов агента: ими пользуется и полный журнал действий
+// (src/agent-log.js) — так у маскировки одна точка правды (setSecrets зовёт
+// src/agent-env.js при пересборке окружения), а не две копии списка.
+function secrets() {
+  return secretValues;
+}
+
 // Передать значения, которые нельзя показывать в журнале ни при каких условиях.
 function setSecrets(list) {
   secretValues = (Array.isArray(list) ? list : [])
@@ -197,6 +204,7 @@ module.exports = {
   setEnabled,
   isEnabled,
   setSecrets,
+  secrets,
   outcomeOf,
   file,
   record,

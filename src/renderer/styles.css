@@ -922,6 +922,11 @@ body.resizing { cursor: col-resize; user-select: none; }
   font-size: 12.5px; font-weight: 700; color: var(--text);
 }
 .mp-list { max-height: 320px; overflow-y: auto; padding: 6px; }
+.mp-search {
+  width: calc(100% - 16px); margin: 8px 8px 0; box-sizing: border-box;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text); font: inherit; font-size: 12px; padding: 6px 9px;
+}
 .mp-item {
   display: block; width: 100%; text-align: left;
   background: none; border: none; color: var(--text-dim);
@@ -1080,7 +1085,7 @@ body.resizing-x { cursor: col-resize; user-select: none; }
 .chip.action { padding: 8px 14px; font-size: 12.5px; background: var(--bg-card); }
 
 /* Быстрый выбор модели из загруженного списка */
-.model-hints { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.model-hints { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; max-height: 240px; overflow-y: auto; }
 .model-hints .hint-label { font-size: 12px; color: var(--text-dim); margin-right: 2px; }
 .model-hints .chip { font-size: 12px; padding: 4px 11px; }
 .model-hints .chip.active { background: rgba(34, 211, 238, 0.15); border-color: var(--accent); color: var(--accent-2); }

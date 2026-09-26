@@ -50,14 +50,28 @@
     $("mp-title").textContent = "Модель · " + (PRESET_LABEL[provider] || provider);
     const list = $("mp-list");
     list.innerHTML = "";
-    const models = cachedModels[provider] || [];
-    if (!models.length) {
+    const all = cachedModels[provider] || [];
+    const search = $("mp-search");
+    const q = String((search && search.value) || "").trim().toLowerCase();
+    const models = q ? all.filter((m) => String(m).toLowerCase().indexOf(q) !== -1) : all;
+    if (!all.length) {
       const empty = document.createElement("div");
       empty.className = "mp-empty";
       empty.textContent = "Список моделей ещё не загружен. Нажми «↻ Обновить» или открой Настройки.";
       list.appendChild(empty);
+      return;
     }
-    for (const name of models.slice(0, 30)) {
+    if (!models.length) {
+      const none = document.createElement("div");
+      none.className = "mp-empty";
+      none.textContent = "Ничего не найдено по «" + String(search.value).trim() + "».";
+      list.appendChild(none);
+      return;
+    }
+    // Весь список провайдера, без обрезки: у OpenRouter моделей сотни, и раньше
+    // показывались только первые 30 — нужную модель было просто не найти. Поиск
+    // над списком сужает его по названию.
+    for (const name of models) {
       const b = document.createElement("button");
       b.type = "button";
       b.className = "mp-item" + (name === cur ? " active" : "");
@@ -110,6 +124,9 @@
     $("model-badge").onclick = toggleModelPopup;
     $("mp-close").onclick = closeModelPopup;
     $("mp-refresh").onclick = refreshModelsQuick;
+    // Поиск по списку: фильтрует на лету, пока попап открыт.
+    const searchBox = $("mp-search");
+    if (searchBox) searchBox.addEventListener("input", () => renderModelPopup());
     $("mp-settings").onclick = () => {
       closeModelPopup();
       getSettingsPanel().openSettings();

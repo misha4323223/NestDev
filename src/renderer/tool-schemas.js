@@ -2484,6 +2484,137 @@ const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "sheetWrite",
+      description:
+        "Собрать таблицу в НАСТОЯЩИЙ файл Excel (.xlsx) или .csv в рабочей папке. Так собираются отчёты, сметы, выгрузки, которые человек потом открывает в Excel. Данные можно передать как rows (двумерный массив строк), objects (массив объектов — шапка соберётся из ключей), csv (готовый текст с разделителями) или sheets (несколько листов: [{ name, rows }]). Числа и булевы остаются числами (в Excel считаются формулами), строки с запятыми и кавычками экранируются. Формат: xlsx (по умолчанию) или csv. Пример: sheetWrite { path: \"отчёт.xlsx\", rows: [[\"Клиент\",\"Сумма\"],[\"ООО Ромашка\",120000]] }.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Куда сохранить — от рабочей папки (report.xlsx, отчёты/март.csv)" },
+          format: { type: "string", description: "xlsx (по умолчанию) или csv; определяет расширение файла" },
+          name: { type: "string", description: "Имя листа при одном листе (по умолчанию «Лист1»)" },
+          rows: { type: "array", description: "Данные: массив строк (каждая строка — массив ячеек)" },
+          objects: { type: "array", description: "Данные: массив объектов — первая строка станет шапкой из ключей" },
+          csv: { type: "string", description: "Готовый CSV/TSV-текст с данными" },
+          sheets: {
+            type: "array",
+            description: "Несколько листов книги: [{ name, rows }]. Если задано — rows/objects/csv игнорируются",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string", description: "Имя листа" },
+                rows: { type: "array", description: "Строки этого листа" },
+              },
+            },
+          },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "sheetRead",
+      description:
+        "Прочитать таблицу из файла (.xlsx или .csv) в рабочей папке и показать её модели таблицей. Для .xlsx можно указать лист (sheet) по имени; as: \"json\" вернёт массив объектов (шапка — первая строка). Используй, чтобы проверить собранный отчёт или разобрать чужой файл Excel.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Файл таблицы от рабочей папки (.xlsx/.csv)" },
+          sheet: { type: "string", description: "Имя листа в книге (по умолчанию — первый)" },
+          limit: { type: "integer", description: "Сколько строк показать (по умолчанию 200)" },
+          as: { type: "string", description: "Формат ответа: table (по умолчанию) или json" },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "gSheetRead",
+      description:
+        "Прочитать диапазон Google-таблицы («живой», общей) через API по ключу service account. spreadsheet — ссылка на таблицу или её id, range — диапазон в A1-нотации (например \"Лист1!A1:D20\"). Ключ берётся из настроек (Настройки → Таблицы → «Ключ service account»); без ключа инструмент не падает, а вернёт рецепт браузерного пути (browserOpen + vaultFill). Таблицу надо расшарить на e-mail сервис-аккаунта.",
+      parameters: {
+        type: "object",
+        properties: {
+          spreadsheet: { type: "string", description: "Ссылка на Google-таблицу или её id (можно url/id)" },
+          range: { type: "string", description: "Диапазон A1, например \"Лист1!A1:D20\" (по умолчанию A1)" },
+          limit: { type: "integer", description: "Сколько строк показать (по умолчанию 200)" },
+          as: { type: "string", description: "Формат ответа: table (по умолчанию) или json" },
+        },
+        required: ["spreadsheet"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "gSheetWrite",
+      description:
+        "Записать (перезаписать) диапазон Google-таблицы через API по ключу service account. spreadsheet — ссылка/id, range — куда писать (\"Лист1!A1\"), values — массив строк или массив объектов. Требуется редактирование (роль Редактор у сервис-аккаунта). Без ключа вернёт браузерный рецепт.",
+      parameters: {
+        type: "object",
+        properties: {
+          spreadsheet: { type: "string", description: "Ссылка на Google-таблицу или её id" },
+          range: { type: "string", description: "Куда писать, A1-нотация (по умолчанию A1)" },
+          values: { type: "array", description: "Данные: массив строк или массив объектов" },
+        },
+        required: ["spreadsheet", "values"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "gSheetAppend",
+      description:
+        "Добавить строки В КОНЕЦ Google-таблицы через API по ключу service account (не затирая существующие). spreadsheet — ссылка/id, range — лист/начало (\"Лист1!A1\"), values — массив строк или объектов. Так ведут общую таблицу заявок, журнал, отчёт, куда копится по строке.",
+      parameters: {
+        type: "object",
+        properties: {
+          spreadsheet: { type: "string", description: "Ссылка на Google-таблицу или её id" },
+          range: { type: "string", description: "Лист/начало, A1-нотация (по умолчанию A1)" },
+          values: { type: "array", description: "Данные: массив строк или массив объектов" },
+        },
+        required: ["spreadsheet", "values"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "gSheetInfo",
+      description:
+        "Показать, что за Google-таблица: название, id и листы с их размерами. Полезно перед чтением/записью, чтобы узнать имена листов. spreadsheet — ссылка или id; ключ берётся из настроек.",
+      parameters: {
+        type: "object",
+        properties: {
+          spreadsheet: { type: "string", description: "Ссылка на Google-таблицу или её id" },
+        },
+        required: ["spreadsheet"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "gSheetCreate",
+      description:
+        "Создать новую Google-таблицу по ключу service account. title — название. Вернёт id и ссылку. Важно: таблица принадлежит сервис-аккаунту — чтобы её видел человек, открой ссылку и расшарь на свой аккаунт, либо веди её через gSheetWrite/gSheetAppend.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Название новой таблицы" },
+        },
+        required: ["title"],
+      },
+    },
+  },
 ];
   return { TOOL_DEFINITIONS };
 });

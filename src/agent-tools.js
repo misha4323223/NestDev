@@ -37,6 +37,7 @@ const { createMediaTools } = require("./agent-tools-media.js"); // медиа, �
 const { createVaultTools } = require("./agent-tools-vault.js"); // пароли сайтов и почта (хранилище, отправка и чтение писем)
 const { createEnvTools } = require("./agent-tools-env.js"); // окружение агента и OTA (живой мост: выданные переменные)
 const { createBrowserTools } = require("./agent-tools-browser.js"); // браузер агента (живой мост: снимок уходит событием)
+const { createSheetsTools } = require("./agent-tools-sheets.js"); // таблицы: файл Excel и Google Sheets (ключ или браузерный путь)
 
 
 function createAgentTools(deps) {
@@ -487,6 +488,7 @@ function createAgentTools(deps) {
     "gitBlame": git.gitBlame,
     "semanticSearch": memory.semanticSearch,
     ...createCloudTools(deps),
+    ...createSheetsTools(deps),
   };
 }
 

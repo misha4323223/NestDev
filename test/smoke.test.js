@@ -13673,6 +13673,52 @@ async function testToolPolicy() {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  await test("полный журнал агента: пишет КАЖДЫЙ вызов, держит конец вывода, секретов не содержит", () => {
+    const agentLog = require(path.join(ROOT, "src", "agent-log.js"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-log-test-"));
+    const file = path.join(dir, "agent.log");
+    agentLog.init(file, true);
+
+    // Пишется ЛЮБОЙ вызов — в этом и смысл журнала: «что агент вообще делал».
+    const head = "npm warn ".repeat(300);
+    const errTail = "npm ERR! code ERESOLVE — Could not resolve dependency\n";
+    const row = agentLog.record({ tool: "runCommand", args: { command: "npm install react", githubToken: "ghp_0123456789abcdefghij" }, result: head + errTail, source: "desktop", ms: 1234 });
+    assert.ok(row && row.tool === "runCommand" && row.capability === "terminal.execute" && row.risk === "medium", "вызов команды не записан");
+    assert.strictEqual(row.source, "desktop", "источник (ПК/телефон) не записан");
+    assert.strictEqual(row.ms, 1234, "время выполнения не записано");
+    assert.strictEqual(row.chars, (head + errTail).length, "размер вывода не записан");
+    // Главное: КОНЕЦ вывода (ошибка) сохраняется — именно его прятал head-only срез.
+    assert.ok(/ERESOLVE/.test(row.result), "конец вывода потерян в полном журнале: " + row.result.slice(-60));
+
+    // Обычное чтение пишется тоже (в отличие от журнала опасного).
+    const read = agentLog.record({ tool: "readFile", args: { path: "/a.txt" }, result: "ok", source: "mobile" });
+    assert.ok(read && read.tool === "readFile", "обычное чтение не попало в полный журнал");
+
+    const text = fs.readFileSync(file, "utf8");
+    assert.ok(text.indexOf("ghp_0123456789abcdefghij") === -1, "секрет попал в файл полного журнала");
+    assert.ok(text.indexOf("***") >= 0, "вместо секрета нет пометки");
+    const lines = agentLog.tail(20);
+    assert.ok(lines.length >= 2 && lines.every((l) => l.time && l.ts && l.tool && "ok" in l), "записи полного журнала неполные");
+
+    agentLog.setEnabled(false);
+    assert.strictEqual(agentLog.record({ tool: "readFile", args: {}, result: "x" }), null, "выключенный полный журнал пишет");
+    agentLog.setEnabled(true);
+
+    // Битый путь не должен ломать прогон агента.
+    agentLog.init(path.join(dir, "нет", "такой", "папки", "agent.log"), true);
+    assert.strictEqual(agentLog.record({ tool: "readFile", args: {}, result: "x" }), null, "битый путь бросил исключение");
+
+    // Ротация: полный журнал не растёт бесконечно.
+    fs.writeFileSync(file, "x".repeat(agentLog.MAX_BYTES + 10), "utf8");
+    agentLog.init(file, true);
+    agentLog.record({ tool: "readFile", args: {}, result: "x" });
+    assert.ok(fs.existsSync(file + ".1"), "старый полный журнал не сдвинут в .1");
+    assert.ok(fs.statSync(file).size < 2000, "новый полный журнал не начат заново");
+
+    agentLog.clear();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   await test("main.js спрашивает по политике, пишет в журнал и не отдаёт секреты дампам", () => {
     const src = backendSrc();
     assert.ok(src.indexOf("toolPolicy.needsConfirm(c.name)") >= 0, "подтверждение не привязано к политике");
@@ -14909,7 +14955,7 @@ async function testFsGitIpc() {
     // Разбор живёт отдельным модулем: он длинный, и та же проверка нужна, чтобы
     // находить пропуски при следующем разрезании файла.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "agent-tools-browser.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js", "run-context.js", "ask-wait.js", "agent-data.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "agent-tools-browser.js", "agent-tools-sheets.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js", "run-context.js", "ask-wait.js", "agent-data.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
@@ -14919,7 +14965,7 @@ async function testFsGitIpc() {
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
     // правок, сводка плана) молча перестанет обновляться.
     const { scanWiring } = require(path.join(__dirname, "backend-wiring.js"));
-    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "agent-tools-browser.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js", "run-context.js", "ask-wait.js", "agent-data.js"];
+    const modules = ["yc-service.js", "yc-ipc.js", "deploy-ipc.js", "mail-ipc.js", "fs-ipc.js", "git-ipc.js", "agent-tools.js", "agent-tools-cloud.js", "agent-tools-git.js", "agent-tools-files.js", "agent-tools-write.js", "agent-tools-run.js", "agent-tools-system.js", "agent-tools-net.js", "agent-tools-memory.js", "agent-tools-mission.js", "agent-tools-app.js", "agent-tools-devtools.js", "agent-tools-media.js", "agent-tools-vault.js", "agent-tools-env.js", "agent-tools-browser.js", "agent-tools-sheets.js", "system-stack.js", "mission-ipc.js", "model-ipc.js", "github-ipc.js", "settings-store.js", "paths-git.js", "project-search.js", "undo-store.js", "bg-processes.js", "screens.js", "rate-limiters.js", "tool-helpers.js", "project-analysis.js", "site-guides.js", "terminal-panel.js", "app-window.js", "lifecycle.js", "run-mission.js", "run-tools.js", "run-retry.js", "run-round.js", "run-calls.js", "run-strict.js", "run-batch.js", "run-nudge.js", "agent-env.js", "shell-tools.js", "tasks-reminders.js", "run-ai.js", "browser-ipc.js", "git-stage.js", "chats-ipc.js", "memory-ipc.js", "settings-ipc.js", "mobile-ipc.js", "projects-ipc.js", "preview-ipc.js", "ota-ipc.js", "project-brief.js", "run-ipc.js", "tool-registry.js", "run-context.js", "ask-wait.js", "agent-data.js"];
     const r = scanWiring(ROOT, modules, fs, path);
     assert.deepStrictEqual(r.assigns, [], "модуль присваивает чужому имени без сеттера: " + r.assigns.join(", "));
     assert.deepStrictEqual(r.bareLive, [], "живое значение берётся напрямую, мимо моста live: " + r.bareLive.join(", "));
@@ -16237,7 +16283,9 @@ async function testContextWindow() {
     // Обрезка текста: короткий не трогаем, у длинного видно, сколько было.
     assert.strictEqual(ctx.truncateText("коротко", 100), "коротко", "короткий текст обрезан");
     const long = ctx.truncateText("x".repeat(500), 100);
-    assert.ok(long.startsWith("x".repeat(100)) && long.includes("обрезано: 500"), "обрезанный текст не объясняет размер: " + long.slice(90, 140));
+    // Обрезка держит ОБА конца (начало и конец): у команд и запросов важное — в конце
+    // (ошибка сборки, код возврата), поэтому хвост больше не теряется молча.
+    assert.ok(long.startsWith("x".repeat(50)) && long.includes("обрезано: 500") && long.endsWith("x".repeat(50)), "обрезанный текст не объясняет размер: " + long.slice(40, 160));
 
     // Пары tool: осиротевший результат инструмента роняет запрос (400 wrong_api_format).
     const orphan = ctx.sanitizeToolPairs([{ role: "user", content: "привет" }, { role: "tool", tool_call_id: "a", content: "результат" }]);

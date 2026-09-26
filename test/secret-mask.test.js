@@ -60,6 +60,7 @@ const SETTINGS = () => ({
   githubToken: "ghp-токен",
   yandexOauthToken: "y0-токен",
   mailPassword: "пароль-почты",
+  googleServiceAccount: '{"client_email":"a@b.iam.gserviceaccount.com","private_key":"ключ"}',
   mobilePin: "482913",
   agentEnv: { TOKEN: "значение-переменной", CITY: "Москва" },
   agentEnvScopes: { TOKEN: ["terminal"] },

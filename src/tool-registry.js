@@ -20,7 +20,10 @@
        оставил бы себе чужие переменные окружения (или потерял свои) до конца
        прогона, а видно это только по «не найдено» внутри команд;
      • исключение из обработчика, ушедшее наружу, рвёт весь прогон вместо того,
-       чтобы вернуть модели текст ошибки — и модель не может исправиться.
+       чтобы вернуть модели текст ошибки — и модель не может исправиться;
+     • потерянная строка в полном журнале действий (src/agent-log.js) — в собранном
+       приложении другого следа «что делал агент» нет; поэтому запись стоит на
+       единственной точке вызова, ПОСЛЕ возврата назначения и в try внутри модуля.
 
    Живое здесь — назначение окружения: getCapability/setCapability принадлежат
    экземпляру src/agent-env.js, собранному в оболочке (своя копия модуля дала бы
@@ -46,7 +49,7 @@ function describeToolArgs(name, a) {
 }
 
 function createToolRegistry(deps) {
-  const { createAgentTools, fmtError, getCapability, setCapability } = deps;
+  const { createAgentTools, fmtError, getCapability, setCapability, agentLog, getRunOrigin } = deps;
 
   // Обработчики собираются ОДИН раз: deps — тот самый плоский список имён, что
   // пришёл из оболочки (плюс четыре имени для нас, их инструменты просто не берут).
@@ -59,21 +62,37 @@ function createToolRegistry(deps) {
     // одного «текущего назначения» достаточно; вложенный вызов вернёт своё.
     const prevCapability = getCapability();
     setCapability(toolPolicy.capabilityOf(name));
+    const started = Date.now();
+    let result;
     try {
       // Пользователь нажал Esc/«Стоп» — агент должен немедленно остановиться.
       if (global.__agentStopRequested) {
-        return "⏹ Остановлено пользователем (Esc / Стоп). Немедленно прекрати вызовы инструментов и заверши ответ КРАТКИМ итогом: что успел сделать и что осталось.";
+        result = "⏹ Остановлено пользователем (Esc / Стоп). Немедленно прекрати вызовы инструментов и заверши ответ КРАТКИМ итогом: что успел сделать и что осталось.";
+      } else {
+        // Обработчики вынесены в src/agent-tools.js (1.5.77): здесь только выбор
+        // инструмента и единая обработка ошибок — как и раньше.
+        const handler = handlers[name];
+        result = !handler ? "Ошибка: неизвестный инструмент " + name : await handler(args, settings);
       }
-      // Обработчики вынесены в src/agent-tools.js (1.5.77): здесь только выбор
-      // инструмента и единая обработка ошибок — как и раньше.
-      const handler = handlers[name];
-      if (!handler) return "Ошибка: неизвестный инструмент " + name;
-      return await handler(args, settings);
     } catch (e) {
-      return "Ошибка: " + fmtError(e);
+      result = "Ошибка: " + fmtError(e);
     } finally {
       setCapability(prevCapability);
     }
+    // Полный журнал действий (src/agent-log.js): КАЖДАЯ пара «вызов → результат».
+    // Пишется ПОСЛЕ возврата назначения (в строку не должны попасть чужие секреты)
+    // и никогда не мешает прогону: record() сам глушит любые свои сбои. Модуль
+    // необязателен — без него реестр работает как раньше.
+    if (agentLog) {
+      agentLog.record({
+        tool: name,
+        args: args,
+        result: result,
+        source: typeof getRunOrigin === "function" ? getRunOrigin() : "",
+        ms: Date.now() - started,
+      });
+    }
+    return result;
   }
 
   return { executeTool };

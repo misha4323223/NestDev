@@ -145,6 +145,13 @@ const CAPABILITIES = [
   { cap: "cloud.delete", risk: RISK.HIGH, tools: ["ycDelete"] },
   { cap: "cloud.deploy", risk: RISK.HIGH, tools: ["ycDeploy"] },
   { cap: "cloud.cli.install", risk: RISK.MEDIUM, tools: ["ycInstall"] },
+  // ── таблицы (Excel и Google Sheets) ──
+  // Чтение своей/общей таблицы — низкий риск. Запись в файл и в Google-таблицу
+  // меняет данные, но у пользователя есть наглядный результат; подтверждение
+  // дублировало бы обычный диалог, поэтому только журнал.
+  { cap: "sheets.read", risk: RISK.LOW, tools: ["sheetRead", "gSheetRead", "gSheetInfo"] },
+  { cap: "sheets.write", risk: RISK.MEDIUM, tools: ["sheetWrite", "gSheetWrite", "gSheetAppend"] },
+  { cap: "sheets.google.create", risk: RISK.MEDIUM, tools: ["gSheetCreate"] },
   // ── самообновление приложения ──
   { cap: "self.update", risk: RISK.MEDIUM, tools: ["otaCheck"] },
   { cap: "self.status", risk: RISK.LOW, tools: ["otaStatus"] },

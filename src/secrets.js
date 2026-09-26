@@ -28,6 +28,7 @@ const SECRET_KEYS = [
   "openaiProfiles", // массив сохранённых OpenAI-подключений (внутри — apiKey)
   "yandexOauthToken", // OAuth-токен Yandex (для Yandex Cloud REST API)
   "serperApiKey", // API-ключ Serper (усиленный Google-поиск для агента)
+  "googleServiceAccount", // JSON ключа service account Google — доступ агента к Google Sheets по API
   "sitePasswords", // пароли сайтов для агента (менеджер паролей) — шифруются как ключи
   "mailPassword", // пароль приложения для почты (SMTP/IMAP) — шифруется
 ];

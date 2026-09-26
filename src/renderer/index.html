@@ -245,6 +245,7 @@
              далеко от своей кнопки. Позицию задаёт replit-theme.css. -->
         <div id="model-popup" class="model-popup hidden">
           <div class="mp-head"><span id="mp-title">Модель</span><button id="mp-close" class="btn btn-ghost btn-icon" title="Закрыть"><svg class="btn-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg></button></div>
+          <input id="mp-search" class="mp-search" type="search" placeholder="Поиск модели…" spellcheck="false" autocomplete="off" />
           <div id="mp-list" class="mp-list"></div>
           <div class="mp-foot">
             <button id="mp-refresh" class="btn btn-ghost btn-small"><svg class="btn-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16" /><path d="M3 21v-5h5" /></svg><span id="mp-refresh-label">Обновить</span></button>
@@ -920,6 +921,10 @@
             </div>
           </div>
 
+          <div class="field">
+            <label>Модели провайдера <span class="hint">(весь список с сервера; начни вводить — отфильтруется)</span></label>
+            <input id="model-search" placeholder="Поиск модели…" spellcheck="false" autocomplete="off" />
+          </div>
           <div id="model-hints" class="model-hints hidden"></div>
         </div>
 
@@ -1220,6 +1225,16 @@
                 <button id="btn-toggle-serper-key" class="btn btn-ghost" title="Показать/скрыть">👁</button>
               </div>
             </div>
+          </div>
+          <div class="settings-section">
+            <div class="settings-section-title">📊 Таблицы (Excel и Google Sheets)</div>
+            <div class="field">
+              <label>Ключ service account Google <span class="hint">(чтобы агент читал и правил Google-таблицы по API, без окна браузера. Создай сервисный аккаунт в Google Cloud, включи Google Sheets API и скачай JSON-ключ — вставь его сюда. Затем расшарь нужную таблицу на e-mail сервис-аккаунта (роль «Редактор»). Хранится зашифрованно. Пусто — агент работает с Google-таблицами через браузер, живой сессией.)</span></label>
+              <div class="input-row">
+                <textarea id="s-gsheet-key" class="input" rows="3" placeholder='{ "type": "service_account", "project_id": "...", ... }' spellcheck="false" autocomplete="off"></textarea>
+              </div>
+            </div>
+            <div class="hint-block">Файлы Excel (.xlsx) агент собирает САМ, без ключа — <b>sheetWrite</b> / <b>sheetRead</b> в рабочей папке. Ключ нужен только для «живых» Google-таблиц: <b>gSheetRead</b> / <b>gSheetWrite</b> / <b>gSheetAppend</b> / <b>gSheetInfo</b> / <b>gSheetCreate</b>.</div>
           </div>
         </div>
 

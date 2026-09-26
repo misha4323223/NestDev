@@ -74,7 +74,7 @@ function buildModelPopup(world) {
 
   // Что лежит ВНУТРИ попапа (из настоящей разметки). Заглушка проверяет вложенность
   // по этому списку: без него клик по строке списка считался бы кликом мимо попапа.
-  const INNER = ["mp-title", "mp-list", "mp-close", "mp-refresh", "mp-settings"];
+  const INNER = ["mp-title", "mp-search", "mp-list", "mp-close", "mp-refresh", "mp-settings"];
   for (const id of INNER) assert.ok(HTML_SRC.includes('id="' + id + '"'), "в разметке нет #" + id);
 
   function mkEl(id) {
@@ -247,7 +247,7 @@ const lastMsg = (env) => env.calls.msgs[env.calls.msgs.length - 1] || "";
     assert.strictEqual(env.$("mp-title").textContent, "Модель · Ollama", "на открытии заголовок не обновился");
   });
 
-  await test("попап модели: пустой кэш объясняется, неизвестный провайдер назван как есть, список обрезан", () => {
+  await test("попап модели: пустой кэш объясняется, неизвестный провайдер назван как есть, список показан целиком", () => {
     const empty = buildModelPopup({ cachedModels: { openai: [] } });
     empty.popup.toggleModelPopup();
     assert.strictEqual(items(empty).length, 1, "на пустом кэше список не объяснён");
@@ -257,11 +257,29 @@ const lastMsg = (env) => env.calls.msgs[env.calls.msgs.length - 1] || "";
 
     const many = buildModelPopup({ cachedModels: { openai: Array.from({ length: 45 }, (_, i) => "m" + i) } });
     many.popup.toggleModelPopup();
-    assert.strictEqual(items(many).length, 30, "список не обрезан до 30: " + items(many).length);
+    assert.strictEqual(items(many).length, 45, "показаны не все модели: " + items(many).length);
 
     const other = buildModelPopup({ settings: { provider: "свой-провайдер", model: "" }, cachedModels: {} });
     other.popup.toggleModelPopup();
     assert.strictEqual(other.$("mp-title").textContent, "Модель · свой-провайдер", "неизвестный провайдер потерял имя: " + other.$("mp-title").textContent);
+  });
+
+  await test("попап модели: поиск сужает список, пустой результат объясняется", () => {
+    const env = buildModelPopup({ cachedModels: { openai: ["gpt-4o", "llama-3.3-70b", "qwen-3-32b"] } });
+    env.popup.wireHeader();
+    env.popup.toggleModelPopup();
+    const box = env.$("mp-search");
+    box.value = "llama";
+    box.listeners.input();
+    assert.strictEqual(items(env).length, 1, "поиск не сузил список: " + items(env).length);
+    assert.strictEqual(items(env)[0].textContent, "llama-3.3-70b", "найдена не та модель");
+    box.value = "нет-такой";
+    box.listeners.input();
+    assert.strictEqual(items(env).length, 1, "пустой результат не показан");
+    assert.ok(/Ничего не найдено/.test(items(env)[0].textContent), "пустой результат не объяснён: " + items(env)[0].textContent);
+    box.value = "";
+    box.listeners.input();
+    assert.strictEqual(items(env).length, 3, "сброс поиска не вернул список");
   });
 
   await test("попап модели: выбор пишет модель и в настройки, и в поле провайдера", () => {

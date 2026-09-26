@@ -231,8 +231,10 @@ function createRunTools(deps) {
         const res = await spawnCollect(cmd, agentWorkDir(settings), ms, "");
         const body = (res.out || "").trim();
         if (res.ok) return "$ " + cmd + " (лимит " + ms + " мс)\n\n" + (body || "Готово (без вывода).");
-        if (res.timedOut) return "⏱ Команда не уложилась в " + ms + " мс и остановлена принудительно:\n$ " + cmd + "\n\n" + (body.slice(0, 3000) || "(вывода не было)") + "\n\nУвеличь timeoutMs или разбей команду на шаги.";
-        return "$ " + cmd + "\nКоманда упала (код " + res.code + "):\n" + (body.slice(0, 4000) || "(без вывода)") + "\n\nОбъяснение: " + explainExit(res.code, cmd);
+        // truncateText держит ОБА конца: у падения важное — в конце (хвост ошибки), а
+        // head-only срез молча прятал его от модели.
+        if (res.timedOut) return "⏱ Команда не уложилась в " + ms + " мс и остановлена принудительно:\n$ " + cmd + "\n\n" + (truncateText(body, 3000) || "(вывода не было)") + "\n\nУвеличь timeoutMs или разбей команду на шаги.";
+        return "$ " + cmd + "\nКоманда упала (код " + res.code + "):\n" + (truncateText(body, 4000) || "(без вывода)") + "\n\nОбъяснение: " + explainExit(res.code, cmd);
     },
     "retryCommand": async (args, settings) => {
         const cmd = String(args.command || "").trim();
@@ -246,12 +248,12 @@ function createRunTools(deps) {
           const res = await spawnCollect(cmd, agentWorkDir(settings), timeoutMs, "");
           last = res;
           if (res.ok) {
-            return "$ " + cmd + "\n(попыток: " + (attempt + 1) + ")\n\n✅ успех с попытки #" + (attempt + 1) + "\n\n--- вывод ---\n" + ((res.out || "").trim().slice(0, 6000) || "(пусто)");
+            return "$ " + cmd + "\n(попыток: " + (attempt + 1) + ")\n\n✅ успех с попытки #" + (attempt + 1) + "\n\n--- вывод ---\n" + (truncateText((res.out || "").trim(), 6000) || "(пусто)");
           }
           log.push("❌ попытка #" + (attempt + 1) + (res.timedOut ? " — таймаут " + timeoutMs + " мс" : " — код " + res.code) + (attempt < retries ? " → повтор через " + pauseMs + " мс" : ""));
           if (attempt < retries) await new Promise((r2) => setTimeout(r2, pauseMs));
         }
-        return "$ " + cmd + "\nНе удалось после " + (retries + 1) + " попыток:\n" + log.join("\n") + "\n\n--- вывод последней попытки ---\n" + ((last && (last.out || "").trim().slice(0, 5000)) || "(пусто)") + "\n\nОбъяснение: " + explainExit(last ? last.code : 1, cmd);
+        return "$ " + cmd + "\nНе удалось после " + (retries + 1) + " попыток:\n" + log.join("\n") + "\n\n--- вывод последней попытки ---\n" + ((last && truncateText((last.out || "").trim(), 5000)) || "(пусто)") + "\n\nОбъяснение: " + explainExit(last ? last.code : 1, cmd);
     },
     "runScript": async (args, settings) => {
         const cwd = agentWorkDir(settings);

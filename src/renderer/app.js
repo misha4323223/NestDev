@@ -1176,6 +1176,8 @@
     ChatStore.persistSettings();
     SettingsPanel.loadModels();
   };
+  // Поиск по списку моделей в настройках: сужает уже загруженный список.
+  if ($("model-search")) $("model-search").addEventListener("input", () => SettingsPanel.refilterModelHints());
   $("btn-probe-ollama").onclick = () => {
     SettingsPanel.probeLocalModelUI();
   };

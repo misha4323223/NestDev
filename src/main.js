@@ -104,6 +104,7 @@ const toolPolicy = require("./tool-policy.js"); // политика инстру
 const { createAgentTools } = require("./agent-tools.js"); // агентские инструменты: 159 обработчиков своим модулем (облачные — в agent-tools-cloud.js)
 
 const audit = require("./audit-log.js");
+const agentLog = require("./agent-log.js"); // полный журнал действий агента (каждый вызов и его вывод)
 // Куда главному процессу можно ходить по адресу, который назвал интерфейс
 // (ai:test, ai:models, g4f:*): одна точка правды против SSRF в метаданные облака.
 const netGuard = require("./net-guard.js");
@@ -117,6 +118,7 @@ const cloudState = require("./cloud-state.js"); // состояние облак
 const { createDeployEngine } = require("./deploy-engine.js"); // конвейер деплоя: стадии, проверка после выката, откат // журнал действий агента (JSONL, без секретов)
 secrets.init(path.join(app.getPath("userData"), "secrets.json"));
 audit.init(path.join(app.getPath("userData"), "audit.log")); // журнал действий: подключается к userData
+agentLog.init(path.join(app.getPath("userData"), "agent.log")); // полный журнал действий агента: там же
 const _ipcHandleOrig = ipcMain.handle.bind(ipcMain);
 const ipcHandlerMap = new Map();
 ipcMain.handle = (channel, fn) => {
@@ -1091,6 +1093,8 @@ startLifecycle();
 // окружения (get/setCapability принадлежат экземпляру src/agent-env.js выше).
 const { executeTool } = createToolRegistry({
   createAgentTools,
+  agentLog, // полный журнал "вызов → результат" живёт на единственной точке вызова
+  getRunOrigin: () => activeRunOrigin, // чей прогон — ПК или телефон (метка в строке журнала)
   fmtError,
   getCapability,
   setCapability,
