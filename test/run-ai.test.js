@@ -122,7 +122,11 @@ function mk(over) {
     UNAVAILABLE_MAX: 2,
     agentStore: { tasksBrief: (ud, n) => { calls.brief.push([ud, n]); return "- Позвонить в банк"; } },
     agentWorkDir: () => "/work/проект",
-    audit: { record: () => {} },
+    // Журнал: прогону от него нужен только вердикт «вызов удался?» (audit.toolOk) —
+    // тот же самый, что в журнале действий и в строке действий в чате. Здесь —
+    // настоящий модуль (record() без init() ничего не пишет), а не заглушка: иначе
+    // проверка «провал последнего шага» молча ничего бы не проверяла.
+    audit: require(path.join(ROOT, "src", "audit-log.js")),
     autoCheckpointCommit: async () => { calls.commits++; return { committed: true, message: "💾 Авто-коммит агента: тест" }; },
     auxConfig: () => ({ enabled: !!o.vision, auto: true, visionModel: "v", url: "http://v" }),
     buildChatRequest: () => ({}),
@@ -187,7 +191,15 @@ function mk(over) {
         if (step.onRun) step.onRun();
         if (step.error) throw step.error;
         if (step.repeat) return { kind: "repeat" };
-        return { kind: "ok", toolCalls: step.toolCalls || [], text: step.text === undefined ? "Готово." : step.text };
+        return {
+          kind: "ok",
+          toolCalls: step.toolCalls || [],
+          text: step.text === undefined ? "Готово." : step.text,
+          // Чем кончился раунд по мнению транспорта: обрыв лимитом вывода или поток
+          // без финального маркера. Настоящий модуль отдаёт эти же поля.
+          truncated: !!step.truncated,
+          incomplete: !!step.incomplete,
+        };
       },
     }),
     createRunStrict: () => ({
@@ -196,6 +208,11 @@ function mk(over) {
         // История, которую получают инструменты, — та же, что сохранится: ею же
         // проверяется, что сводка в неё не осела (см. проверку про сводку ниже).
         calls.histories.push(d && d.history);
+        // Итог шага, как его пишет настоящий модуль (вызов → результат): без него
+        // финал прогона не увидел бы, что последний шаг не удался.
+        if (o.toolResult !== undefined && d && d.history) {
+          d.history.push({ role: "tool", tool_call_id: "id1", content: o.toolResult });
+        }
       },
     }),
     createRunTools: (d) => { calls.toolsDeps = d; return tools; },
@@ -774,6 +791,50 @@ const systemOf = (m) => String((m.calls.rounds[0] || {}).messages && (m.calls.ro
     assert.ok(!/^let |^var /m.test(MODULE_SRC), "в модуле завелось состояние уровня файла");
   });
 
+  await test("финал после провала шага и обрыва ответа: заметка, кнопка «Продолжить», открытый чекпоинт", async () => {
+    // Жалоба человека: агент просто останавливается через 10–15 секунд, кнопки
+    // «▶ Продолжить» нет — и непонятно, доведено дело или нет. Три случая: последний
+    // инструмент вернул ошибку, ответ оборван лимитом вывода, поток закрылся без
+    // финального маркера. Во всех трёх работа остаётся на диске, а человек видит кнопку.
+    const failed = mk({
+      rounds: [{ text: "сделал", toolCalls: [{ name: "readFile", args: { path: "a.js" } }] }],
+      toolResult: "Ошибка: папка не найдена: /нет/такой/папки",
+    });
+    await run(failed);
+    const notices = failed.calls.events.filter((e) => e.ev && e.ev.type === "notice").map((e) => String(e.ev.text));
+    assert.ok(notices.some((t) => /Последний шаг .*закончился ошибкой/.test(t)), "про провал шага человеку не сказали: " + JSON.stringify(notices));
+    assert.ok(notices.some((t) => /Продолжить/.test(t)), "в объяснении нет подсказки про кнопку продолжения");
+    assert.ok(
+      failed.calls.events.some((e) => e.ev && e.ev.type === "resume" && /ошибку/.test(e.ev.reason)),
+      "провал последнего шага не зажёг кнопку «Продолжить»"
+    );
+    assert.strictEqual(failed.calls.ctxClosed, 0, "чекпоинт закрыт после провала шага — продолжению нечего вернуть");
+
+    // Оборванный ответ: у кнопки своя причина, и она называет ИМЕННО обрыв.
+    const cut = mk({ rounds: [{ text: "Начало ответа, который ", truncated: true }] });
+    await run(cut);
+    assert.ok(
+      cut.calls.events.some((e) => e.ev && e.ev.type === "resume" && /оборван лимитом вывода/.test(e.ev.reason)),
+      "обрыв ответа лимитом вывода не зажёг кнопку"
+    );
+    assert.strictEqual(cut.calls.ctxClosed, 0, "чекпоинт закрыт после обрыва ответа");
+    const broke = mk({ rounds: [{ text: "Начало ", incomplete: true }] });
+    await run(broke);
+    assert.ok(
+      broke.calls.events.some((e) => e.ev && e.ev.type === "resume" && /оборвался/.test(e.ev.reason)),
+      "поток без финального маркера не зажёг кнопку"
+    );
+
+    // Обратная сторона: обычный финал с УДАЧНЫМ последним шагом — тишина и закрытый
+    // чекпоинт. Иначе кнопка горела бы после каждой сделанной работы.
+    const ok = mk({
+      rounds: [{ text: "сделал", toolCalls: [{ name: "readFile", args: { path: "a.js" } }] }],
+      toolResult: "прочитал a.js: 12 строк",
+    });
+    await run(ok);
+    assert.ok(!ok.calls.events.some((e) => e.ev && e.ev.type === "resume"), "удачный финал зажёг кнопку «Продолжить»");
+    assert.strictEqual(ok.calls.ctxClosed, 1, "обычный финал перестал закрывать чекпоинт: " + ok.calls.ctxClosed);
+  });
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");
   process.exit(failed ? 1 : 0);
 })();

@@ -255,6 +255,12 @@ async function runAi(settings, messages, win, opts) {
   // Счётчики повторов, ожидание лимита и лимитер провайдера живут в src/run-retry.js,
   // который собирается ниже (после истории: ему нужно уметь ужимать контекст).
   let reportRetried = false; // пустой финальный текст — один раз просим итоговый отчёт
+  // Чем закончился ПОСЛЕДНИЙ раунд: ответ оборван лимитом вывода (truncated) или
+  // поток закрылся без финального маркера (incomplete). По этим признакам финал
+  // прогона решает, доведена ли работа (см. endRun) — раньше оборванный ответ был
+  // неотличим от полного, и человек видел обрыв без объяснения и без кнопки.
+  let roundTruncated = false;
+  let roundIncomplete = false;
   live.activePlanSummary = null; // план прошлого прогона не должен влиять на этот
   // ── Роутер инструментов и справочники ──────────────────────────────────────
   // Состав схем, липкость групп, предохранители A и C, вес схем и автоподключение
@@ -306,6 +312,37 @@ async function runAi(settings, messages, win, opts) {
   };
 
 
+  // Последний результат инструмента в рабочей истории: имя вызова и «шапка» ошибки.
+  // Нужно на финале: модель может закончить ответ текстом сразу после провала шага —
+  // со стороны это выглядит как «довёл дело до конца», а на самом деле шаг не удался.
+  // Решение «удался или нет» берём у audit.toolOk — то же правило, что у журнала.
+  const lastFailedTool = (history) => {
+    try {
+      const list = Array.isArray(history) ? history : [];
+      for (let i = list.length - 1; i >= 0; i--) {
+        const m = list[i];
+        if (!m || m.role !== "tool") continue;
+        if (audit.toolOk(m.content)) return null; // последний шаг удался — не наш случай
+        let name = "";
+        // Имя вызова лежит в assistant-сообщении с tool_calls — ищем его по tool_call_id.
+        for (let j = i - 1; j >= 0; j--) {
+          const a = list[j];
+          if (!a || a.role !== "assistant") continue;
+          const calls = Array.isArray(a.tool_calls) ? a.tool_calls : [];
+          for (const c of calls) {
+            if (c && c.id && c.id === m.tool_call_id) name = (c.function && c.function.name) || "";
+          }
+          break;
+        }
+        const head = String(m.content || "").replace(/\r/g, "").trim().split("\n").filter((l) => l.trim())[0] || "";
+        return { name: name || "инструмент", head: head.slice(0, 160) };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
   // ── Завершение прогона — одна точка входа ──────────────────────────────────
   // И обычный финал, и мягкая остановка миссии (лимит раундов/времени, зацикливание)
   // проходят здесь: пользователь получает объяснение, а не «ошибку API».
@@ -325,8 +362,31 @@ async function runAi(settings, messages, win, opts) {
     // Мягкая остановка миссии (stopNote) — наоборот: человек продолжит её кнопкой,
     // и чекпоинт даст модели её же прошлые шаги, а не пересказ. «▶ Продолжить» горит
     // только там, где продолжать ЕСТЬ что: закрытая миссия её не показывает (resume: false).
-    if (!stopNote) runCtx.close();
-    else if (!info || info.resume !== false) resumeReady("работа остановлена");
+    //
+    // Четвёртый случай — «модель сама замолчала, а последний шаг не удался» либо ответ
+    // оборван (лимит вывода / поток без финального маркера). Раньше это выглядело как
+    // обычный финал: чекпоинт удалялся, кнопки не было, и человек искал «продолжай»
+    // руками теряя всю работу прогона. Теперь такой конец называем вслух, а рабочую
+    // историю НЕ закрываем — кнопка вернёт модели её же прошлые шаги (см. run-context).
+    const showResume = !info || info.resume !== false;
+    const failedStep = !stopNote && !abort.signal.aborted ? lastFailedTool(canonical) : null;
+    const cutOff = !stopNote && (roundTruncated || roundIncomplete);
+    if (!stopNote && !failedStep && !cutOff) {
+      runCtx.close();
+    } else if (failedStep) {
+      emit({
+        type: "notice",
+        text:
+          "⚠ Последний шаг («" + failedStep.name + "») закончился ошибкой, а модель завершила ответ: " +
+          failedStep.head +
+          "\nЕсли работа не доведена — нажми «▶ Продолжить»: агент получит тот же ход работы и продолжит с этого места.",
+      });
+      if (showResume) resumeReady("последний инструмент вернул ошибку");
+    } else if (cutOff) {
+      if (showResume) resumeReady(roundIncomplete ? "поток ответа оборвался" : "ответ оборван лимитом вывода");
+    } else if (showResume) {
+      resumeReady("работа остановлена");
+    }
     if (!String(finalText || "").trim() && !abort.signal.aborted) {
       finalText =
         "⚠ Модель не прислала итоговый текст (вероятно, переполнен контекст). Изменения сохранены; нажми «▶ Продолжить» или «↻ Перегенерировать».";
@@ -604,6 +664,10 @@ async function runAi(settings, messages, win, opts) {
     truncateText,
     fmtError,
     PARALLEL_SAFE_TOOLS,
+    // Вердикт «вызов удался?» для строки действий в окне: одно правило с журналом
+    // (src/audit-log.js, toolOk) — иначе пачка read-only и строгая очередь судили бы
+    // один и тот же вызов по-разному.
+    toolOk: audit.toolOk,
   });
 
   // Строгая очередь вызовов: подтверждения человеком, чекпоинты отката, журнал
@@ -753,6 +817,10 @@ async function runAi(settings, messages, win, opts) {
     if (roundOut.kind === "error") throw roundOut.error;
     const toolCalls = roundOut.toolCalls;
     finalText = roundOut.text;
+    // Как закончился ИМЕННО этот раунд — по этому финал прогона поймёт, доведена ли
+    // работа. Флаги переживают повтор раунда: повторный удачный раунд их перезапишет.
+    roundTruncated = !!roundOut.truncated;
+    roundIncomplete = !!roundOut.incomplete;
 
     // Запасной способ живёт в src/run-calls.js. Он стоит здесь, ДО призывов и
     // «пустого отчёта»: найденный в тексте вызов обязан выполниться, а не уйти
@@ -850,7 +918,19 @@ async function runAi(settings, messages, win, opts) {
     // Ждём и продолжаем, пока миссия жива и не исчерпан запас авто-продолжений.
     const mAlive = !fatal && mission.alive();
     const mContinues = mAlive && mission.canAutoContinue();
-    if (fatal || (attemptNum > AUTO_RETRY_LIMIT && !mContinues)) throw e;
+    if (fatal || (attemptNum > AUTO_RETRY_LIMIT && !mContinues)) {
+      // Сбой на запросе (провайдер молчит, отверг запрос, сеть оборвалась) — не повод
+      // терять кнопку: работа на диске цела, чекпоинт открыт, повтор с тем же ходом
+      // дёшев и обычно лечит. Единственное исключение — «Не выбрана модель»: это
+      // настройка, а не сбой, продолжать нечего.
+      const aborted = !!(e && e.name === "AbortError");
+      const configError = /Не выбрана модель/.test(String((e && e.message) || e));
+      // Прерывание БЕЗ остановки человека (закрытие приложения, обрыв чтения потока)
+      // кнопки не зажигает: это сбой прогона, а не «работа ждёт продолжения» — так
+      // решено намеренно (см. test/run-ai.test.js).
+      if (!aborted && !configError) resumeReady("сбой на запросе к провайдеру");
+      throw e;
+    }
     if (mContinues) mission.recordError(e);
     const errText = String((e && e.message) || e).slice(0, 800);
     // Провайдер отверг stream_options уже внутри ответа (не ошибкой на заголовках) —

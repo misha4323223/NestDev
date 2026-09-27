@@ -65,6 +65,9 @@ function makeCalls(opts) {
     truncateText: (t, max) => "CAP(" + String(t).slice(0, max) + ")",
     fmtError: (e) => (e && e.message) || String(e),
     PARALLEL_SAFE_TOOLS: o.safe || new Set(["readFile", "searchProject"]),
+    // Вердикт «вызов удался?» — тот же, что у журнала действий: окно получает готовый
+    // признак (ok) вместо догадки по тексту результата.
+    toolOk: o.toolOk || require(path.join(ROOT, "src", "audit-log.js")).toolOk,
   });
   const history = o.history || [];
   return {

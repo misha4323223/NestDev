@@ -74,7 +74,20 @@ const BREAKS = {
   missionId: ["src/main.js", "        runMissionId = v;\n", '        runMissionId = "мусор";\n'],
   // Кнопка «▶ Продолжить»: без признака остановки кнопка не горит, без мягкого
   // завершения «Стопа» посреди запроса прогон падает ошибкой.
+  // План, показанный в чате до миссии, обязан стать её шагами: с выключенным
+  // переносом карточка «Миссия» снова говорит «план не составлен».
+  planseed: ["src/run-mission.js", "      if (planOwn && Array.isArray(planOwn.tasks) && planOwn.tasks.length) {\n", "      if (false) {\n"],
   noresume: ["src/run-ai.js", '    resumeReady("остановлено пользователем");\n', ""],
+  // [12.5] Прогон не ищет упавший последний шаг — конец снова выглядит обычным финалом.
+  nofailedstep: [
+    "src/run-ai.js",
+    "    const failedStep = !stopNote && !abort.signal.aborted ? lastFailedTool(canonical) : null;\n",
+    "    const failedStep = null;\n",
+  ],
+  // [12.6] Оборванный поток снова считается полным ответом.
+  noincomplete: ["src/run-round.js", "        incomplete = true;\n", "        incomplete = false;\n"],
+  // [12.3.5] Кнопка в чате больше не возвращает паузу своего чата в работу.
+  noadopt: ["src/run-mission.js", "      if (missionStore.isResumeText(goalSeed)) {\n", "      if (false) {\n"],
   stopabort: ["src/run-ai.js", "    if (global.__agentStopRequested) return stopGraceful();\n    const fatal =", "    const fatal ="],
 };
 let brokenFile = null;
@@ -137,6 +150,9 @@ const chatBodies = [];
 let served = 0; // сколько раз провайдер отдал ответ чата
 let answerDelayMs = 0; // темп ответа: чтобы человек успел нажать «Стоп» посреди запроса
 let plainAnswer = false; // ответ без вызовов инструментов: обычный финал прогона
+let failToolQuit = false; // [12.5] последний шаг упал, а модель всё равно закончила ответ
+let failToolQuitRound = 0; // счётчик раундов ЭТОГО режима (served сквозной на весь прогон)
+let cutStream = false; // [12.6] поток кончился без финального маркера
 const sse = (chunks) => chunks.map((c) => "data: " + JSON.stringify(c) + "\n\n").join("") + "data: [DONE]\n\n";
 
 function chatAnswer() {
@@ -156,6 +172,28 @@ function chatAnswer() {
     type: "function",
     function: { name: name, arguments: JSON.stringify(args) },
   });
+  // [12.5] Живая беда: инструмент вернул «Не нашёл «Сообщение»», а прогон закрылся как
+  // обычный финал. Первый раунд читает файла, которого нет; второй заканчивает работу
+  // текстом без вызовов — ровно так это и выглядело у человека.
+  if (failToolQuit) {
+    failToolQuitRound++;
+    if (failToolQuitRound === 1) {
+      return sse([
+        { choices: [{ index: 0, delta: { role: "assistant", content: "Сначала прочитаю файл.\n" } }] },
+        { choices: [{ index: 0, delta: { tool_calls: [call(0, "call_fail_1", "readFile", { path: "нет-такого-файла.txt" })] } }] },
+        { choices: [], usage: { prompt_tokens: 120, completion_tokens: 30 } },
+      ]);
+    }
+    return sse([
+      { choices: [{ index: 0, delta: { role: "assistant", content: "Готово: отчёт составлен." } }] },
+      { choices: [], usage: { prompt_tokens: 130, completion_tokens: 10 } },
+    ]);
+  }
+  // [12.6] Поток обрывается без финального маркера: [DONE] и finish_reason не отправляем
+  // вовсе — раньше такой ответ ничем не отличался от полного.
+  if (cutStream) {
+    return "data: " + JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "Начал писать отчёт и оборвался на полуслове" } }] }) + "\n\n";
+  }
   const chunks = [
     { choices: [{ index: 0, delta: { role: "assistant", content: "Раунд " + n + ": двигаю работу дальше.\n" } }] },
     {
@@ -175,6 +213,26 @@ function chatAnswer() {
   // этого прогона и не теряет её после продолжения.
   if (n === 8 || n === 20 || n === 30) {
     chunks.push({ choices: [{ index: 0, delta: { tool_calls: [call(1, "call_step_" + n, "missionStep", { done: "работа раунда " + n })] } }] });
+  }
+  // План человеку модель показывает РАНЬШЕ миссии (второй раунд — миссии ещё нет,
+  // её заводит приложение на шестом) и повторяет его внутри миссии (восьмой).
+  // Живая беда 1.5.22x: карточка «Миссия» говорила «план не составлен», хотя план
+  // в панели чата человек видит, — потому что шаги миссии оставались пустыми.
+  if (n === 2) {
+    chunks.push({ choices: [{ index: 0, delta: { tool_calls: [call(1, "call_plan_" + n, "todoWrite", {
+      title: "Заметки",
+      tasks: [{ text: "план до миссии: разложить" }, { text: "план до миссии: свести" }],
+    })] } }] });
+  }
+  if (n === 8) {
+    chunks.push({ choices: [{ index: 0, delta: { tool_calls: [call(2, "call_plan2_" + n, "todoWrite", {
+      title: "Заметки",
+      tasks: [
+        { text: "план до миссии: разложить", status: "done" },
+        { text: "план до миссии: свести", status: "in_progress" },
+        { text: "план после миссии: отчитаться" },
+      ],
+    })] } }] });
   }
   chunks.push({ choices: [], usage: { prompt_tokens: 120, completion_tokens: 30 } });
   return sse(chunks);
@@ -351,6 +409,30 @@ const ROUND_LIMIT = 50;
   const decoyRec = missionStore.missionLoad(workDir, decoyId);
   ok(decoyRec && decoyRec.status === "active" && decoyRec.steps.length === 0, "чужая работа осталась нетронутой");
 
+  console.log("\n[5Б] План из чата стал шагами миссии — и до её появления, и внутри неё");
+  // У агента план ОДИН, а мест показа два: панель чата (её ведёт интерфейс по
+  // todoWrite) и панель «Миссия» (её ведут файлы миссии). Модель показывает план
+  // раньше, чем прогон заводит миссию (шестой раунд) — значит при заведении план
+  // обязан перенестись в миссию, иначе карточка говорит «план не составлен»، хотя
+  // человек план видит. Проверяем оба шага: перенос при создании (2 пункта) и
+  // обновление внутри миссии (3 пункта, статусы двигаются).
+  const planRec = missionStore.missionLoad(workDir, missionId);
+  const planSteps = (planRec && planRec.steps) || [];
+  const planLines = (journal.match(/План \(\d+\).*/g) || []);
+  ok(planLines.some((l) => /^План \(2\): план до миссии: разложить · план до миссии: свести$/.test(l)),
+    "журнал миссии помнит план, показанный ДО неё: " + JSON.stringify(planLines));
+  ok(planLines.some((l) => /^План \(3\): план до миссии: разложить · план до миссии: свести · план после миссии: отчитаться$/.test(l)),
+    "журнал миссии помнит и план, обновлённый внутри неё: " + JSON.stringify(planLines));
+  // Статусы пунктов («в работе») проверяются в разделе [9] — по сводке у модели: к концу
+  // прогона миссия встаёт на паузу, и незакрытый пункт законно становится «ожидает»
+  // (шага в работе у паузы нет — так его и записывает закрытие миссии).
+  ok(
+    planSteps.slice(0, 3).map((s) => s.title).join("|") ===
+      "план до миссии: разложить|план до миссии: свести|план после миссии: отчитаться",
+    "план из чата стоит во главе шагов миссии: " + JSON.stringify(planSteps.slice(0, 3).map((s) => s.title))
+  );
+  ok(planSteps[0] && planSteps[0].state === "done", "выполненный пункт плана отмечен готовым: " + (planSteps[0] && planSteps[0].state));
+
   console.log("\n[6] Граница батча: прогон пережил 25 раундов и продолжил работу");
   const batchEvent = kind("mission").find((e) => e.ev.phase === "batch");
   ok(!!batchEvent, "в окно ушло событие нового батча");
@@ -417,6 +499,8 @@ const ROUND_LIMIT = 50;
   const firstAfterBatch = afterBatch[0] || { digest: "" };
   ok(firstAfterBatch.digest.indexOf("Цель: Сделай 50 заметок в папке notes") >= 0, "после границы батча сводка называет цель работы");
   ok(/План: /.test(firstAfterBatch.digest), "после границы батча сводка несёт план работы");
+  ok(/План: 1\) ✓ план до миссии: разложить; 2\) → сейчас план до миссии: свести; 3\) • план после миссии: отчитаться/.test(firstAfterBatch.digest),
+    "сводка называет пункты плана с состоянием каждого: " + JSON.stringify((firstAfterBatch.digest.match(/План: .*/) || [""])[0].slice(0, 200)));
   ok(/· батч 2 ·/.test(firstAfterBatch.digest), "после границы батча сводка говорит, какой батч идёт: " + (firstAfterBatch.digest.split("\n")[2] || ""));
   const earlier = (firstAfterBatch.digest.match(/notes\/round-(\d+)\.txt/g) || []).map((s) => Number(/(\d+)/.exec(s)[1])).filter((n) => n < 26);
   ok(earlier.length > 0, "после границы батча сводка напоминает файлы, сделанные ДО неё: " + JSON.stringify(earlier.slice(0, 5)));
@@ -612,6 +696,31 @@ const ROUND_LIMIT = 50;
     "человеку сказано, что работа на паузе"
   );
 
+  // 12.3.5. Человек нажимает «▶ Продолжить» В ЧАТЕ (а не в панели миссии). Пауза
+  // ЭТОГО чата обязана вернуться в работу: раньше её подхватывала только кнопка
+  // панели (mission:resume), а кнопка в чате шла «без миссии» — призывы молчали, и
+  // панель показывала ту же паузу как чужую работу.
+  const pausedBefore = missionStore.missionLoad(workDir, missionId) || {};
+  ok(pausedBefore.status === "paused", "перед кнопкой в чате миссия стоит на паузе: " + pausedBefore.status);
+  const stagesBeforeChatButton = (pausedBefore.stages || []).length;
+  await call("settings:set", { longWorkRounds: 2 });
+  const chatButtonRes = await call(
+    "ai:send",
+    [{ role: "user", content: RESUME_TEXT }],
+    { chatId: "chat-live", role: "developer" }
+  );
+  ok(chatButtonRes && chatButtonRes.ok === true, "прогон после кнопки в чате прошёл: " + JSON.stringify(chatButtonRes));
+  const afterChatButton = missionStore.missionLoad(workDir, missionId) || {};
+  // Признак подхвата: миссия снова шла ВМЕСТЕ с прогоном — появился свой отрезок,
+  // а пауза «пауза миссии» сменилась лимитом раундов, на котором прогон и встал.
+  ok(
+    (afterChatButton.stages || []).length === stagesBeforeChatButton + 1 &&
+      /лимит раундов/.test(afterChatButton.reason || ""),
+    "кнопка в чате вернула паузу в работу: " +
+      JSON.stringify({ stages: (afterChatButton.stages || []).length, reason: afterChatButton.reason })
+  );
+  await call("settings:set", { longWorkRounds: 25 });
+
   // 12.4. Обычный финал: возвращаться некуда — кнопка НЕ зажигается.
   await call("settings:set", { longWorkRounds: 25 });
   const plainResumesBefore = kind("resume").length;
@@ -620,6 +729,63 @@ const ROUND_LIMIT = 50;
   plainAnswer = false;
   ok(plainRes && plainRes.ok === true, "обычный финал прошёл: " + JSON.stringify(plainRes));
   ok(kind("resume").length === plainResumesBefore, "обычный финал зажёг кнопку продолжения");
+
+  // 12.5. Модель закончила ответ, а последний шаг УПАЛ — живая беда: инструмент
+  // вернул ошибку, а прогон закрылся как обычный финал. Теперь это сказано вслух и
+  // кнопка «▶ Продолжить» горит: работу есть с чего возвращать.
+  await call("settings:set", { longWork: false });
+  const failNoticesBefore = kind("notice").length;
+  const failResumesBefore = kind("resume").length;
+  const failErrorsBefore = kind("error").length;
+  failToolQuit = true;
+  const failRes = await call("ai:send", [{ role: "user", content: "Прочитай файл и отчитайся" }], { chatId: "chat-fail", role: "developer" });
+  failToolQuit = false;
+  ok(failRes && failRes.ok === true, "упавший шаг не превратил прогон в ошибку API: " + JSON.stringify(failRes && failRes.error));
+  const failNotice = kind("notice")
+    .slice(failNoticesBefore)
+    .find((e) => e.ev.text && e.ev.text.indexOf("закончился ошибкой") >= 0);
+  ok(
+    !!failNotice,
+    "человеку сказано, что последний шаг упал: " + JSON.stringify(kind("notice").slice(failNoticesBefore).map((e) => String(e.ev.text).slice(0, 60)))
+  );
+  ok(!!failNotice && failNotice.ev.text.indexOf("readFile") >= 0, "в объяснении назван упавший инструмент");
+  ok(!!failNotice && failNotice.ev.text.indexOf("▶ Продолжить") >= 0, "в объяснении сказано, чем продолжить");
+  const failResumes = kind("resume");
+  ok(
+    failResumes.length === failResumesBefore + 1,
+    "упавший шаг зажёг кнопку продолжения: событий resume " + (failResumes.length - failResumesBefore)
+  );
+  ok(
+    /последний инструмент вернул ошибку/.test((((failResumes[failResumes.length - 1] || {}).ev) || {}).reason || ""),
+    "у кнопки причина — ошибка шага: " + JSON.stringify((((failResumes[failResumes.length - 1] || {}).ev) || {}).reason)
+  );
+  ok(kind("error").length === failErrorsBefore, "упавший шаг не ушёл в чат ошибкой");
+  await call("settings:set", { longWork: true });
+
+  // 12.6. Поток ответа оборвался без финального маркера (шлюз или сеть закрыли
+  // соединение). Раньше это выглядело как полный ответ: фраза на полуслове и молчание.
+  await call("settings:set", { longWork: false });
+  const cutNoticesBefore = kind("notice").length;
+  const cutResumesBefore = kind("resume").length;
+  const cutErrorsBefore = kind("error").length;
+  cutStream = true;
+  const cutRes = await call("ai:send", [{ role: "user", content: "Напиши отчёт" }], { chatId: "chat-cut", role: "developer" });
+  cutStream = false;
+  ok(cutRes && cutRes.ok === true, "оборванный поток не уронил прогон ошибкой: " + JSON.stringify(cutRes && cutRes.error));
+  ok(
+    kind("notice").slice(cutNoticesBefore).some((e) => e.ev.text && e.ev.text.indexOf("Поток ответа оборвался") >= 0),
+    "человеку сказано, что поток оборвался: " + JSON.stringify(kind("notice").slice(cutNoticesBefore).map((e) => String(e.ev.text).slice(0, 60)))
+  );
+  const cutResumes = kind("resume");
+  ok(
+    cutResumes.length === cutResumesBefore + 1 && /поток ответа оборвался/.test((((cutResumes[cutResumes.length - 1] || {}).ev) || {}).reason || ""),
+    "обрыв потока зажёг кнопку продолжения с причиной: " + JSON.stringify(cutResumes.map((e) => e.ev.reason).slice(-2))
+  );
+  ok(kind("error").length === cutErrorsBefore, "обрыв потока не ушёл в чат ошибкой");
+  const cutText = kind("chunk").map((e) => e.ev.text).join("");
+  ok(cutText.indexOf("оборвался на полуслове") >= 0, "текст, пришедший до обрыва, показан человеку, а не выброшен");
+  await call("settings:set", { longWork: true });
+
 
   console.log("\n[13] Ничего не осталось висеть");
   ok(global.__agentRunning === false, "признак прогона снят");

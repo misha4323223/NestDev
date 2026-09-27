@@ -96,6 +96,11 @@ function makeRun(over) {
       get agentEnv() {
         return o.agentEnv || null;
       },
+      // План из чата (todoWrite) — тот же мост, что в оболочке: миссия берёт его
+      // себе в шаги, когда прогон заводит её ПОЗЖЕ плана.
+      get activePlanTasks() {
+        return o.planTasks || null;
+      },
       get backgrounds() {
         return o.backgrounds || null;
       },
@@ -883,6 +888,75 @@ const onlyMission = (dir) => {
   });
 
 
+  await test("36. план из чата становится шагами миссии, когда работа заводится позже плана", () => {
+    // Живая беда: модель показывает план первым делом (второй раунд), а миссию
+    // прогон заводит только на шестом — и карточка «Миссия» говорила «план не
+    // составлен», хотя план человек уже видел в панели чата. План у агента ОДИН,
+    // а мест показа два.
+    const r = makeRun({
+      planTasks: {
+        chatId: "chat-1",
+        tasks: [{ text: "разложить заметки", status: "done" }, { text: "свести в отчёт", status: "in_progress" }],
+        title: "Заметки",
+      },
+    });
+    r.mission.state.rounds = MISSION_AUTO_ROUND + 1;
+    r.mission.autoStart();
+    const rec = onlyMission(r.dir);
+    assert.deepStrictEqual(
+      rec.steps.map((s) => s.title + ":" + s.state),
+      ["разложить заметки:done", "свести в отчёт:doing"],
+      "шаги миссии — не план из чата: " + JSON.stringify(rec.steps.map((s) => s.title + ":" + s.state))
+    );
+    assert.ok(notes(r.dir, rec.id).some((t) => /План \(2\): разложить заметки · свести в отчёт/.test(t)), "план не записан в журнал миссии");
+    assert.ok(notes(r.dir, rec.id).some((t) => /План из чата перенесён в шаги миссии \(2\)/.test(t)), "в журнале не сказано, откуда взят план");
+    // Панель «Миссия» показывает шаги сразу: событие с ними уходит в окно, а не ждёт опроса.
+    assert.ok(
+      r.events.some((e) => e.type === "mission" && (e.steps || []).length === 2),
+      "в окно не ушло событие миссии с шагами: " + JSON.stringify(r.events.filter((e) => e.type === "mission").map((e) => (e.steps || []).length))
+    );
+    // И обратная сторона: план ЧУЖОГО чата работой этого чата не становится — иначе
+    // план одной переписки показывался бы в миссии другой.
+    const other = makeRun({ planTasks: { chatId: "chat-2", tasks: [{ text: "чужое дело", status: "done" }] } });
+    other.mission.state.rounds = MISSION_AUTO_ROUND + 1;
+    other.mission.autoStart();
+    const otherRec = onlyMission(other.dir);
+    assert.strictEqual(otherRec.steps.length, 0, "план чужого чата стал шагами этой миссии: " + JSON.stringify(otherRec.steps.map((s) => s.title)));
+  });
+  await test("5б. кнопка «▶ Продолжить» в чате подхватывает паузу ИМЕННО своего чата", () => {
+    const dir = workspace();
+    // Обычная просьба паузу не поднимает: она ждёт человека (проверка 5).
+    const own = missionStore.missionCreate(dir, { goal: "работа на паузе", chatId: "chat-1" }).mission;
+    missionStore.missionFinish(dir, own.id, { status: "paused", reason: "жду человека" });
+    const plain = makeRun({ dir: dir, chatId: "chat-1" });
+    assert.strictEqual(plain.mission.refresh(), null, "пауза подхватилась обычной просьбой");
+
+    // Просьба кнопки «▶ Продолжить» в чате возвращает миссию в работу — так же, как
+    // кнопка в панели миссии (там это делает mission:resume). Текст кнопки живёт в
+    // src/renderer/chat-run.js, поэтому сверяем его с проверкой в хранилище миссии.
+    const seed = "Продолжи работу с того места, где остановился, опираясь на уже сделанное: не начинай заново.";
+    assert.ok(missionStore.isResumeText(seed), "текст кнопки «▶ Продолжить» не признан просьбой продолжить");
+    const chatRun = fs.readFileSync(path.join(ROOT, "src", "renderer", "chat-run.js"), "utf8");
+    assert.ok(
+      chatRun.indexOf("Продолжи работу с того места, где остановился, опираясь на уже сделанное") > 0,
+      "текст кнопки в чате разошёлся с проверкой в хранилище миссии"
+    );
+    const resumed = makeRun({ dir: dir, chatId: "chat-1", messages: [{ role: "user", content: seed }] });
+    const got = resumed.mission.refresh();
+    assert.ok(got && got.id === own.id, "кнопка «▶ Продолжить» не подхватила паузу своей миссии: " + (got && got.id));
+    assert.strictEqual(got.status, "active", "миссия вернулась не в работу: " + got.status);
+    assert.strictEqual(missionStore.missionLoad(dir, own.id).status, "active", "на диске миссия осталась на паузе");
+    assert.ok(
+      notes(dir, own.id).some((t) => t.indexOf("вернул миссию в работу") >= 0),
+      "в журнал миссии не записано возвращение в работу"
+    );
+    // Чужая пауза силой кнопки не подхватывается: работа другого чата — не наша.
+    const foreign = missionStore.missionCreate(dir, { goal: "чужая пауза", chatId: "chat-2" }).mission;
+    missionStore.missionFinish(dir, foreign.id, { status: "paused", reason: "жду человека" });
+    const other = makeRun({ dir: dir, chatId: "chat-1", messages: [{ role: "user", content: seed }] });
+    const got2 = other.mission.refresh();
+    assert.ok(!got2 || got2.id !== foreign.id, "кнопка подхватила паузу чужого чата: " + (got2 && got2.id));
+  });
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");
   process.exit(failed ? 1 : 0);
 })();

@@ -13690,6 +13690,24 @@ async function testToolPolicy() {
     // Главное: КОНЕЦ вывода (ошибка) сохраняется — именно его прятал head-only срез.
     assert.ok(/ERESOLVE/.test(row.result), "конец вывода потерян в полном журнале: " + row.result.slice(-60));
 
+    // Исход вызова в журнале — по ОДНОМУ правилу с окном (audit.toolOk). Раньше
+    // «Ошибка удаления: Не найдено (404)», «⏱ Команда не уложилась…» и вывод команды
+    // с ненулевым кодом считались удачей: в журнале провал выглядел зелёным.
+    const outcome = require(path.join(ROOT, "src", "audit-log.js"));
+    for (const bad of [
+      "Ошибка удаления: Не найдено (404): The specified bucket does not exist.",
+      "Ошибка browserFill: Не нашёл «Сообщение». Похожие элементы: e174",
+      "⛔ Отказано: действие запрещено настройкой",
+      "⏱ Команда не уложилась в 60 000 мс и остановлена принудительно",
+      "Не удалось открыть: нет доступа",
+      "$ dir /s /b C:\\нет\\такой\n(каталог: C:\\проект) Команда завершилась с кодом 1 (0.6 с): FINDSTR: Cannot open",
+    ]) {
+      assert.strictEqual(outcome.toolOk(bad), false, "провал принят за удачу: " + bad);
+    }
+    for (const good of ["OK — файл записан", "Готово: 3 файла", "$ npm test\nКоманда завершилась с кодом 0 (1.2 с)"]) {
+      assert.strictEqual(outcome.toolOk(good), true, "удачный вызов назван провалом: " + good);
+    }
+
     // Обычное чтение пишется тоже (в отличие от журнала опасного).
     const read = agentLog.record({ tool: "readFile", args: { path: "/a.txt" }, result: "ok", source: "mobile" });
     assert.ok(read && read.tool === "readFile", "обычное чтение не попало в полный журнал");
@@ -15231,7 +15249,17 @@ async function testAgentTools() {
     );
     assert.ok(runSrc.indexOf("if (resumePlan.resumed)") >= 0, "решение о продолжении не проверяется");
     assert.ok(runSrc.indexOf("runCtx.save(canonical);") >= 0, "рабочая история не фиксируется по ходу прогона");
-    assert.ok(runSrc.indexOf("if (!stopNote) runCtx.close();") >= 0, "финал не закрывает чекпоинт: сданная работа вернулась бы в контекст");
+    // Чекпоинт закрывается только на ЯСНОМ финале: если последний шаг упал или ответ
+    // оборван, работа остаётся на диске — ради этого кнопка «▶ Продолжить» и живёт.
+    assert.ok(
+      runSrc.indexOf("if (!stopNote && !failedStep && !cutOff) {") >= 0,
+      "ясный финал не закрывает чекпоинт: сданная работа вернулась бы в контекст"
+    );
+    assert.ok(
+      runSrc.indexOf("const failedStep = !stopNote && !abort.signal.aborted ? lastFailedTool(canonical) : null;") >= 0 &&
+        runSrc.indexOf("if (showResume) resumeReady(\"последний инструмент вернул ошибку\");") >= 0,
+      "прогон не замечает, что последний шаг не удался — человек опять ищет «продолжай» руками"
+    );
     // Вызовы и их результаты обязаны дожить до запроса: без tool_call_id разбор пар
     // выбрасывает результат как осиротевший, и продолжение снова пустое.
     assert.ok(runSrc.indexOf("if (m.tool_calls) one.tool_calls = m.tool_calls;") >= 0, "вызовы инструментов теряются при сборке истории");

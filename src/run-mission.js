@@ -142,6 +142,29 @@ function createRunMission(deps) {
         live.missionClaim = "";
         if (claimed && claimed.status === "active") return claimed;
       }
+      // Кнопка «▶ Продолжить» в ОКНЕ приходит не id миссии, а просьбой человека
+      // (её текст — src/renderer/chat-run.js). Панель миссии в этом случае зовёт
+      // mission:resume, и та возвращает миссию в работу, а кнопка в чате не
+      // возвращала: прогон шёл без миссии, призывы молчали, и панель показывала
+      // ту же паузу как чужую работу. Теперь просьба «продолжи» подхватывает
+      // паузу ИМЕННО своего чата и снова ставит её в работу — так же, как кнопка
+      // в панели (см. src/mission-ipc.js: mission:resume).
+      if (missionStore.isResumeText(goalSeed)) {
+        const list = missionStore.missionList(dir, { limit: 20 }) || [];
+        const paused = list.find(
+          (r) => r && String(r.status || "") === "paused" && (!chatId || String(r.chatId || "") === String(chatId))
+        );
+        if (paused) {
+          try {
+            paused.status = "active";
+            paused.finishedAt = 0;
+            paused.reason = "";
+            missionStore.missionSave(dir, paused);
+            missionStore.missionNote(dir, paused.id, "note", "▶ Человек вернул миссию в работу (кнопка «Продолжить» в чате).");
+          } catch {}
+          return paused;
+        }
+      }
       return missionGuard.pickAdopted(missionStore.missionList(dir, { limit: 20 }), { chatId: chatId });
     } catch {
       return null;
@@ -202,13 +225,37 @@ function createRunMission(deps) {
       if (!r.ok) return null;
       setRec(r.mission);
       state.autoCreated = true;
-      missionStore.missionNote(dir, state.rec.id, "note", "📄 Миссию завело приложение (" + why + "): цель взята из последней просьбы.");
+      // План человек уже видел в панели чата: модель показывает его первым делом, а
+      // миссию прогон заводит только сейчас (шестой раунд). Без переноса карточка
+      // «Миссия» говорила «план не составлен», хотя план есть, — и модель в сводке
+      // читала то же самое. План чужого чата работой этого чата не становится.
+      const planOwn =
+        live.activePlanTasks && String(live.activePlanTasks.chatId || "") === String(chatId || "") ? live.activePlanTasks : null;
+      let planSeeded = 0;
+      if (planOwn && Array.isArray(planOwn.tasks) && planOwn.tasks.length) {
+        const seeded = missionStore.missionSetPlan(dir, state.rec.id, planOwn.tasks);
+        if (seeded && seeded.ok) {
+          setRec(seeded.mission);
+          planSeeded = seeded.progress.total;
+        }
+      }
+      missionStore.missionNote(
+        dir,
+        state.rec.id,
+        "note",
+        "📄 Миссию завело приложение (" + why + "): цель взята из последней просьбы." +
+          (planSeeded ? " План из чата перенесён в шаги миссии (" + planSeeded + ")." : "")
+      );
       emit({
         type: "notice",
         text:
           "📄 Длинная работа: завёл миссию «" + state.rec.title + "». Цель, план и журнал — в папке " +
-          folderText(state.rec) + besideNote() + ". Работа продолжится сама, если прогон оборвётся.",
+          folderText(state.rec) + besideNote() +
+          (planSeeded ? ". План из чата перенёс в шаги миссии: " + planSeeded + " пункт(а)" : "") +
+          ". Работа продолжится сама, если прогон оборвётся.",
       });
+      // Панель «Миссия» показывает шаги сразу, а не со следующим опросом.
+      if (planSeeded) emitState("tick");
     } catch {}
     return state.rec;
   };

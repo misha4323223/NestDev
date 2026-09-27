@@ -74,11 +74,38 @@ function outcomeOf(result) {
   const lines = s.slice(0, 500).split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 4);
   for (const line of lines) {
     if (line.startsWith("⛔")) return "error";
+    // Таймаут инструмента — это НЕсделанная работа, а не удача: «⏱ Команда не
+    // уложилась в 60 000 мс и остановлена принудительно» раньше считалось успехом.
+    if (line.startsWith("⏱")) return "error";
     const low = line.toLowerCase();
-    if (/^(ошибка|error)\s*[:!]/.test(low)) return "error";
-    if (/^не вып[оa]лнен/.test(low)) return "error";
+    // «Ошибка:» и «Ошибка git:» — прежний случай. Но инструменты говорят и
+    // «Ошибка удаления: Не найдено (404)», «Ошибка browserFill: Не нашёл «Сообщение»»:
+    // двоеточие стоит не сразу после слова, и правило [:!] объявляло такой вывод
+    // УСПЕХОМ. Из-за этого журнал врал (✓ у неудачного удаления бакета и у
+    // незаполненного поля), а модели потом не на что было опереться.
+    if (/^(ошибка|error)([\s:!]|$)/.test(low)) return "error";
+    if (/^не (вып[оa]лнен|удалось)/.test(low)) return "error";
   }
   return "ok";
+}
+
+// Провал, который видно не по слову «Ошибка», а по выводу: команда завершилась
+// ненулевым кодом или не уложилась в таймаут. Отдельной проверкой, потому что
+// строка начинается с «$ имя-команды» и первым правилом не ловится. Живёт здесь
+// (рядом с outcomeOf), чтобы у окна, журнала действий и полного журнала агента
+// был ОДИН ответ на вопрос «вызов удался?».
+function looksFailed(result) {
+  const s = String(result == null ? "" : result);
+  if (/Команда завершилась с кодом (?!0\b)\d+/.test(s)) return true;
+  if (/Команда не уложилась|ист[её]к таймаут/i.test(s)) return true;
+  return false;
+}
+
+// Одна точка правды «инструмент справился»: и журнал действий агента
+// (src/agent-log.js), и событие окна tool_result пользуются ею — иначе журнал и
+// полоска действий в чате говорили разное об одном и том же вызове.
+function toolOk(result) {
+  return outcomeOf(result) === "ok" && !looksFailed(result);
 }
 
 function errorHead(result) {
@@ -206,6 +233,8 @@ module.exports = {
   setSecrets,
   secrets,
   outcomeOf,
+  looksFailed,
+  toolOk,
   file,
   record,
   tail,

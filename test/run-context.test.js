@@ -381,7 +381,21 @@ const checkpointFile = (dir, id) => path.join(dir, ".agent", "runs", String(id |
     assert.ok(/runCtx\.plan\(runHistory\)/.test(RUN_AI_SRC), "прогон не возвращает работу в контекст");
     assert.ok(/if \(resumePlan\.resumed\)/.test(RUN_AI_SRC), "сообщение о продолжении не зависит от решения плана");
     assert.ok(/runCtx\.save\(canonical\);/.test(RUN_AI_SRC), "чекпоинт не пишется по ходу работы");
-    assert.ok(/if \(!stopNote\) runCtx\.close\(\);/.test(RUN_AI_SRC), "финал прогона не закрывает чекпоинт");
+    // Чекпоинт закрывается ТОЛЬКО на честном финале. Если последний шаг упал или ответ
+    // оборван (лимит вывода / поток без финального маркера) — работу не выбрасываем:
+    // кнопка «▶ Продолжить» вернёт модели её же прошлые шаги.
+    assert.ok(
+      /if \(!stopNote && !failedStep && !cutOff\) \{\s*\n\s*runCtx\.close\(\);/.test(RUN_AI_SRC),
+      "финал прогона не закрывает чекпоинт"
+    );
+    assert.ok(
+      /const failedStep = !stopNote && !abort\.signal\.aborted \? lastFailedTool\(canonical\)/.test(RUN_AI_SRC),
+      "прогон не видит последний неудачный шаг"
+    );
+    assert.ok(
+      /resumeReady\("последний инструмент вернул ошибку"\)/.test(RUN_AI_SRC),
+      "после упавшего шага нет предложения продолжить"
+    );
     // Работа возвращается ЖИВЫМ значением рабочей папки: клонирование и смена
     // проекта меняют её на ходу, копия застыла бы на прежней.
     assert.ok(/dir: \(\) => workDir/.test(RUN_AI_SRC), "рабочая папка передана копией");

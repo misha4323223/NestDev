@@ -67,7 +67,7 @@ const sseChunk = (delta, extra) =>
   "data: " + JSON.stringify(Object.assign({ choices: [{ index: 0, delta: delta }] }, extra || {})) + "\n";
 
 async function consume(lines, provider, handlers) {
-  const seen = { text: [], think: [], usage: [], cut: 0 };
+  const seen = { text: [], think: [], usage: [], cut: 0, incomplete: 0 };
   await core.consumeProviderStream(
     Object.assign(
       {
@@ -78,6 +78,11 @@ async function consume(lines, provider, handlers) {
         onUsage: (u) => seen.usage.push(u),
         onTruncated: () => {
           seen.cut++;
+        },
+        // Финального маркера в потоке не было (провайдер закрыл соединение сам) —
+        // прогон объяснит это словами и зажжёт «▶ Продолжить».
+        onIncomplete: () => {
+          seen.incomplete++;
         },
       },
       handlers || {}
@@ -195,6 +200,59 @@ async function consume(lines, provider, handlers) {
     const s = core.createThinkingStripper();
     assert.strictEqual(s.push("ответ <thi"), "ответ ", "видимый текст отдан неполностью");
     assert.strictEqual(s.finish(), "<thi", "подозрительный хвост потерян на завершении потока");
+  });
+
+  await test("финальный маркер потока: без него ответ считается оборванным", async () => {
+    // Провайдер может закрыть соединение, не прислав финальный маркер: раньше такой
+    // поток был неотличим от полного ответа — человек видел обрыв на полуслове и не
+    // знал, что работа не доведена. Теперь это отдельный признак (incomplete), и
+    // прогон по нему зажигает «▶ Продолжить» (см. test/run-ai.test.js).
+    const full = await consume([sseChunk({ role: "assistant", content: "готово" }), "data: [DONE]"], "openai");
+    assert.strictEqual(full.incomplete, 0, "полный ответ ([DONE]) помечен оборванным");
+    const byReason = await consume(
+      [sseChunk({ role: "assistant", content: "готово" }), sseChunk({}, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })],
+      "openai"
+    );
+    assert.strictEqual(byReason.incomplete, 0, "прокси без [DONE], но с finish_reason, помечен оборванным");
+    const cut = await consume([sseChunk({ role: "assistant", content: "Начало ответа, который " }), sseChunk({ content: "оборвался" })], "openai");
+    assert.strictEqual(cut.incomplete, 1, "поток без финального маркера не помечен оборванным: " + cut.incomplete);
+    assert.strictEqual(cut.text.join(""), "Начало ответа, который оборвался", "текст до обрыва потерян");
+
+    // Ollama: финал — чанк с done:true.
+    const ollamaDone = await consume([JSON.stringify({ message: { content: "готово" }, done: true, done_reason: "stop" })], "ollama");
+    assert.strictEqual(ollamaDone.incomplete, 0, "финальный чанк Ollama принят за обрыв");
+    const ollamaCut = await consume([JSON.stringify({ message: { content: "обрыв" }, done: false })], "ollama");
+    assert.strictEqual(ollamaCut.incomplete, 1, "поток Ollama без done принят за полный");
+
+    // Claude: финал — message_stop (stop_reason у message_delta — тоже финал).
+    const claude = await consume(["data: " + JSON.stringify({ type: "message_stop" })], "anthropic");
+    assert.strictEqual(claude.incomplete, 0, "message_stop не признан финалом Claude");
+    const claudeCut = await consume(
+      ["data: " + JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "обрыв" } })],
+      "anthropic"
+    );
+    assert.strictEqual(claudeCut.incomplete, 1, "поток Claude без message_stop принят за полный");
+
+    // Ошибка чтения — не «ответ без маркера»: про обрыв скажет свой путь ошибки,
+    // и второй раз пугать человека словами про неполный ответ незачем.
+    let onError = 0;
+    await assert.rejects(
+      () =>
+        consume([sseChunk({ role: "assistant", content: "x" })], "openai", {
+          response: {
+            body: new ReadableStream({
+              start(c) {
+                c.error(new Error("обрыв соединения"));
+              },
+            }),
+          },
+          onIncomplete: () => {
+            onError++;
+          },
+        }),
+      /обрыв соединения/
+    );
+    assert.strictEqual(onError, 0, "ошибка чтения выдана за «ответ без финального маркера»");
   });
 
   await test("stripThinking целиком: теги вырезаны, рассуждения не в ответе", () => {

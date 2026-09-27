@@ -240,6 +240,15 @@ function createAgentTools(deps) {
     set activePlanSummary(v) {
       deps.live.setActivePlanSummary(v);
     },
+    // План ЦЕЛИКОМ (todoWrite) — с чатом, где он показан. Миссию прогон заводит
+    // позже плана, и при заведении план переносится в её шаги: у агента план один,
+    // а мест показа два (панель чата и шаги миссии в файлах).
+    get activePlanTasks() {
+      return deps.live.activePlanTasks ? deps.live.activePlanTasks() : null;
+    },
+    set activePlanTasks(v) {
+      if (deps.live.setActivePlanTasks) deps.live.setActivePlanTasks(v);
+    },
   };
 
   // git и GitHub: своим модулем (часть 40, заход 2). Порядок инструментов в реестре

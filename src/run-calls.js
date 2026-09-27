@@ -36,6 +36,11 @@ function createRunCalls(deps) {
     fmtError,
     // Множество read-only инструментов: собрано один раз в main.js.
     PARALLEL_SAFE_TOOLS,
+    // Вердикт «вызов удался?» — то же правило, что у журнала действий
+    // (src/audit-log.js, toolOk). Приходит функцией от прогона: модуль не достаёт
+    // ничего сам, а окно должно получать готовый ответ, а не угадывать его по тексту
+    // (вывод упавшей команды начинается с «$ имя-команды», а не со слова «Ошибка»).
+    toolOk,
   } = deps;
 
   // 1. Текстовые вызовы. Модель могла напечатать JSON-вызов инструмента в тексте,
@@ -115,7 +120,10 @@ function createRunCalls(deps) {
     );
     calls.forEach((c, i) => {
       const capped = truncateText(results[i], 8000);
-      emit({ type: "tool_result", name: c.name, result: capped });
+      // ok считает главный процесс: окно раньше угадывало исход по началу строки и
+      // показывало зелёное «✓ Готово» упавшей команде (её вывод начинается с «$ …»),
+      // а ⛔ и «Не удалось» не замечало вовсе.
+      emit({ type: "tool_result", name: c.name, result: capped, ok: toolOk ? toolOk(capped) : undefined });
       history.push({ role: "tool", tool_call_id: c.id, content: capped });
     });
   };

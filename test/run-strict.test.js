@@ -71,7 +71,12 @@ function makeStrict(opts) {
       return "результат " + name;
     },
     truncateText: (t, n) => (String(t).length > n ? String(t).slice(0, n) : String(t)),
-    audit: { record: (r) => seen.audit.push(r) },
+    // Журнал: record() собирает события, вердикт «вызов удался?» — настоящий, из
+    // src/audit-log.js: им же окно рисует строку действия (ok в событии tool_result),
+    // и подменять его заглушкой значило бы проверять не то, что видит человек.
+    audit: Object.assign({}, require(path.join(ROOT, "src", "audit-log.js")), {
+      record: (r) => seen.audit.push(r),
+    }),
     mission: { noteCall: (name, args) => seen.mission.push({ name: name, args: args }) },
     snapshotFileForUndo: (p) => {
       if (o.undoThrows) throw new Error("диск переполнен");

@@ -75,15 +75,11 @@ function rotateIfNeeded() {
   }
 }
 
-// Понятный отказ по тексту результата: не нулевой код команды, таймаут. Само
-// «Ошибка:/⛔» ловит audit.outcomeOf — здесь только то, чего он не видит (вывод
-// команды начинается с «Команда завершилась с кодом N», а не со слова «Ошибка»).
-function looksFailed(text) {
-  const s = String(text == null ? "" : text);
-  if (/Команда завершилась с кодом (?!0\b)\d+/.test(s)) return true;
-  if (/Команда не уложилась|ист[её]к таймаут/i.test(s)) return true;
-  return false;
-}
+// Понятный отказ по тексту результата («Ошибка:/⛔/⏱» и ненулевой код команды)
+// живёт теперь в src/audit-log.js (outcomeOf + looksFailed) — у окна, журнала
+// действий и этого журнала один ответ на вопрос «вызов удался?». Раньше копия
+// правила была здесь и отставала: строка начинается с «$ имя-команды», а не со
+// слова «Ошибка», и провал выглядел зелёным в обоих журналах.
 
 // Обрезка с обоих концов: начало (что вообще пришло) и конец (ошибка/код/итог).
 function headTail(text, cap) {
@@ -112,7 +108,7 @@ function record(entry) {
       capability: pol.capability,
       risk: pol.risk,
       source: e.source || "",
-      ok: audit.outcomeOf(text) === "ok" && !looksFailed(text),
+      ok: audit.toolOk(text),
       ms: e.ms == null ? null : Number(e.ms),
       chars: text.length,
       args: toolPolicy.redact(e.args, 0, secrets),
@@ -179,7 +175,9 @@ module.exports = {
   clear,
   rotateIfNeeded,
   headTail,
-  looksFailed,
+  // Наружу остаётся тем же именем, но правило теперь ОДНО для всех — из
+  // src/audit-log.js: иначе панель журнала и строка действий судили вызов по-разному.
+  looksFailed: audit.looksFailed,
   MAX_BYTES,
   MAX_RESULT,
   MAX_TAIL,

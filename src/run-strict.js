@@ -146,7 +146,10 @@ function createRunStrict(deps) {
       mission.noteCall(c.name, c.args);
       // Держим контекст в рамках бюджета: длинный вывод инструмента ужимаем
       const capped = truncateText(result, 8000);
-      emit({ type: "tool_result", name: c.name, result: capped });
+      // ok считает главный процесс тем же правилом, что журнал действий: окно иначе
+      // угадывало исход по началу текста и показывало зелёное «✓ Готово» упавшей
+      // команде, а ⛔ / «Не удалось» / «⏱» не замечало вовсе.
+      emit({ type: "tool_result", name: c.name, result: capped, ok: audit.toolOk(capped) });
       history.push({ role: "tool", tool_call_id: c.id, content: capped });
     }
   };

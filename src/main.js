@@ -593,6 +593,11 @@ let activeEmit = null; // отправка ai:event из executeTool (showImage 
 // Последний план работ (todoWrite) текущего прогона. Нужен предохранителю,
 // который ловит обрыв: модель ответила текстом, а пункты плана не закрыты.
 let activePlanSummary = null;
+// …и сам план ЦЕЛИКОМ (пункты, а не счётчики). Миссию прогон заводит ПОЗЖЕ плана
+// (шестой раунд работы инструментами), поэтому без этих пунктов её карточка говорила
+// «план не составлен», хотя план человек уже видел в панели чата. План у агента один,
+// а мест показа два: панель чата (её ведёт окно) и шаги миссии (их ведут файлы).
+let activePlanTasks = null;
 // Роутер инструментов текущего запуска: findTools по нему включает группы на лету.
 let activeToolRouter = null;
 
@@ -696,6 +701,8 @@ const { runAi } = createRunAi({
     set activeEmit(v) { activeEmit = v; },
     get activePlanSummary() { return activePlanSummary; },
     set activePlanSummary(v) { activePlanSummary = v; },
+    get activePlanTasks() { return activePlanTasks; },
+    set activePlanTasks(v) { activePlanTasks = v; },
     get activeToolRouter() { return activeToolRouter; },
     set activeToolRouter(v) { activeToolRouter = v; },
     get activeRunUndo() { return activeRunUndo; },
@@ -1310,6 +1317,10 @@ const { executeTool } = createToolRegistry({
     activePlanSummary: () => activePlanSummary,
     setActivePlanSummary: (v) => {
       activePlanSummary = v;
+    },
+    activePlanTasks: () => activePlanTasks,
+    setActivePlanTasks: (v) => {
+      activePlanTasks = v;
     },
   },
 });

@@ -79,12 +79,18 @@ function createRunRound(deps) {
   // Один раунд: запрос → поток ответа → цифры. Возвращает:
   //   { kind: "repeat" }                       — раунд повторяется тем же контекстом;
   //   { kind: "error", error }                 — фатальная ошибка с понятным текстом;
-  //   { kind: "ok", text, toolCalls, truncated }.
+  //   { kind: "ok", text, toolCalls, truncated, incomplete }.
+  //
+  // truncated — модель упёрлась в лимит вывода; incomplete — поток кончился без
+  // финального маркера ([DONE] / done / message_stop), то есть ответ мог оборваться
+  // на середине. Разница нужна прогону: оба случая — «работа не доведена», но
+  // объяснять их человеку надо разными словами.
   const run = async (round) => {
     const startedAt = Date.now();
     let ttfbMs = 0;
     let collected = "";
     let truncated = false;
+    let incomplete = false; // поток закончился, не прислав финального маркера
     let usage = null;
     const toolCalls = [];
     const stripper = createThinkingStripper({ onHidden: emitThink });
@@ -160,6 +166,11 @@ function createRunRound(deps) {
       onTruncated: () => {
         truncated = true;
       },
+      // Провайдер закрыл поток без финального маркера (обрыв на шлюзе/сети, а не
+      // «Стоп» и не ошибка). Раньше такой ответ ничем не отличался от полного.
+      onIncomplete: () => {
+        incomplete = true;
+      },
       onUsage: (u) => {
         if (!u) return;
         usage = usage || { prompt: 0, completion: 0, cached: 0 };
@@ -176,7 +187,17 @@ function createRunRound(deps) {
         type: "notice",
         text:
           "⚠ Ответ модели оборван лимитом вывода (модель упёрлась в максимум токенов ответа). " +
-          "Напиши «продолжай», если нужен остаток.",
+          "Нажми «▶ Продолжить» (или напиши «продолжай»), если нужен остаток.",
+      });
+    }
+    // Поток оборвался без финального маркера: ответ может быть неполным — говорим
+    // об этом сразу, а не оставляем человека гадать, почему фраза кончилась на полуслове.
+    if (incomplete && !truncated) {
+      emit({
+        type: "notice",
+        text:
+          "⚠ Поток ответа оборвался, не дойдя до конца (провайдер закрыл соединение без финального маркера). " +
+          "Проверь работу агента и нажми «▶ Продолжить», если он остановился на середине.",
       });
     }
 
@@ -216,7 +237,7 @@ function createRunRound(deps) {
       emit({ type: "chunk", text: tail });
     }
 
-    return { kind: "ok", text: collected, toolCalls: toolCalls, truncated: truncated };
+    return { kind: "ok", text: collected, toolCalls: toolCalls, truncated: truncated, incomplete: incomplete };
   };
 
   return { run: run };

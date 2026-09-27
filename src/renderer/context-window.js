@@ -139,25 +139,46 @@
     // сворачивается в памятку (compactRemote вызывается раньше и видит голову целиком).
     // Прежний проход «с начала» тратил бюджет именно на СТАРЫЕ сообщения, а на длинном
     // чате срез схлопывался до одного последнего сообщения — агент терял задачу.
-    let total = 0;
-    let start = messages.length - 1;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const w = estimateMessageTokens(messages[i]);
-      // Последнее сообщение оставляем всегда, даже если оно одно больше бюджета.
-      if (i < messages.length - 1 && total + w > limit) break;
-      total += w;
-      start = i;
-    }
-    // Текущий виток не рвём: последнее user-сообщение и всё после него остаются целиком.
+    const windowStart = (cap) => {
+      let total = 0;
+      let start = messages.length - 1;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const w = estimateMessageTokens(messages[i]);
+        // Последнее сообщение оставляем всегда, даже если оно одно больше бюджета.
+        if (i < messages.length - 1 && total + w > cap) break;
+        total += w;
+        start = i;
+      }
+      return start;
+    };
+    // Просьба человека (последнее user-сообщение) обязана уехать модели: без неё агент не
+    // знает, чего от него хотят. Но «оставить просьбу И ВСЁ, что после неё» — не то же
+    // самое. В длительной работе просьба ОДНА и стоит в начале, а дальше идут сотни шагов
+    // агента (вызовы инструментов и их результаты) — те самые сотни тысяч токенов, из-за
+    // которых провайдер отвечает «запрос больше окна». Прежнее правило (start = lastUser)
+    // отдавало эту работу ЦЕЛИКОМ, и обрезка не обрезала ничего: замер на живом прогоне —
+    // 334 796 токенов истории при бюджете 12 000, а после отказа провайдера ступени ужатия
+    // (shrinkContext) возвращали тот же самый запрос, и прогон умирал на третьей ступени.
+    // Поэтому просьба едет ОТДЕЛЬНО (одним сообщением перед хвостом), а хвост отсчитывается
+    // от бюджета — ровно как в обычном длинном чате.
     let lastUser = -1;
     for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "user") {
+      if (messages[i] && messages[i].role === "user") {
         lastUser = i;
         break;
       }
     }
-    if (lastUser >= 0 && start > lastUser) start = lastUser;
-    let kept = messages.slice(start);
+    let start = windowStart(limit);
+    let kept;
+    if (lastUser >= 0 && lastUser < start) {
+      // Просьба осталась за окном: ужимаем хвост на её вес и ставим её перед ним.
+      const uWeight = estimateMessageTokens(messages[lastUser]);
+      start = windowStart(Math.max(0, limit - uWeight));
+      if (start <= lastUser) start = lastUser + 1; // сама просьба дважды не едет
+      kept = [messages[lastUser], ...messages.slice(start)];
+    } else {
+      kept = messages.slice(start);
+    }
     // Не оставляем «висящий» assistant/tool в начале среза без его вопроса
     // Ведущие system-заметки (перенос задачи, восстановление после сбоя) сохраняем:
     // провайдеры принимают их в начале и склеивают в одну шапку.
@@ -305,10 +326,6 @@
     let compactCount = 0;
     const COMPACT_LIMIT = 3;
     let compactMemo = null;
-    // Свёрнут ли кусок в ЭТОМ вызове и с какого места история остаётся как есть.
-    let compactedNow = false;
-    let keepFrom = 0;
-    let keepGoal = false; // историю одной задачи начинаем с её же просьбы дословно
     // num_ctx для запроса за памяткой: тот же, что у основного запроса, иначе Ollama
     // собирает памятку с дефолтным окном 2048 и ещё и перезагружает модель.
     const localCtx = Math.round(Number(opts && opts.localCtx) || 0);
@@ -318,36 +335,49 @@
     return {
       async manage(messages, budget) {
         if (!Array.isArray(messages) || !messages.length) return messages || [];
+        // Памятка — ОДНО сообщение и всегда первое. Если она уже лежит в истории (её
+        // положил прошлый вызов), вынимаем её из тела: иначе она поехала бы и в голову,
+        // которую пересказываем, и в хвост — то есть дважды, и «сжатие» снова ничего бы
+        // не сжимало (ровно этот замер и был в 1.5.9x: 112 911 токенов до и после).
+        const body = compactMemo ? messages.filter((m) => m !== compactMemo) : messages;
         const memoWeight = compactMemo ? estimateTokens(compactMemo.content) : 0;
         let total = 0;
-        for (const m of messages) total += estimateMessageTokens(m);
+        for (const m of body) total += estimateMessageTokens(m);
         // Страховка: даже если обрезка не нужна, убираем осиротевшие tool-сообщения
         // (role:"tool" без предшествующего assistant с tool_calls ломает API — 400 wrong_api_format).
         if (total + memoWeight <= budget) {
-          return compactMemo ? [compactMemo, ...sanitizeToolPairs(messages)] : sanitizeToolPairs(messages);
+          return compactMemo ? [compactMemo, ...sanitizeToolPairs(body)] : sanitizeToolPairs(body);
         }
+        // Граница свёрнутого: последняя просьба человека и всё после неё остаются как
+        // есть — по ним прогон и продолжает работу. Если просьба одна (история началась
+        // с неё, а дальше одни шаги), границы нет: сворачиваем середину витка, оставляя
+        // свежий хвост шагов. Иначе сжимать было бы нечего, и вся история ехала в запрос.
+        const KEEP_TAIL = 8;
+        let boundary = 0;
+        for (let i = body.length - 1; i >= 0; i--) {
+          if (body[i] && body[i].role === "user") { boundary = i; break; }
+        }
+        const boundaryIsUser = boundary > 0;
+        if (!boundaryIsUser) boundary = Math.max(1, body.length - KEEP_TAIL);
+        // Свёрнут ли кусок в ЭТОМ вызове: границу нельзя запоминать между вызовами —
+        // история между ними пересобирается (canonical = [system, ...результат]), и старый
+        // номер указывал бы в середину ДРУГОГО массива. Раньше keepFrom жил в замыкании:
+        // после третьего сжатия хвост схлопывался до одного сообщения, и агент терял и
+        // просьбу человека, и свежие шаги («пишет что-то и отключается»).
+        let folded = false;
         if (compactCount < COMPACT_LIMIT && !planMode) {
-          // Граница свёрнутого: последняя просьба человека и всё после неё остаются как
-          // есть — по ним прогон и продолжает работу. Если просьба одна (история началась
-          // с неё, а дальше одни шаги), границы нет: сворачиваем середину витка, оставляя
-          // свежий хвост шагов. Иначе сжимать было бы нечего, и вся история ехала в запрос.
-          const KEEP_TAIL = 8;
-          let boundary = 0;
-          for (let i = messages.length - 1; i >= 0; i--) {
-            if (messages[i] && messages[i].role === "user") { boundary = i; break; }
-          }
-          const boundaryIsUser = boundary > 0;
-          if (!boundaryIsUser) boundary = Math.max(1, messages.length - KEEP_TAIL);
           try {
             // Предыдущую памятку скармливаем вместе с новыми сообщениями: иначе
             // повторное сжатие потеряло бы всё, что уже было свёрнуто в неё.
             const memoText = await compactRemote(
               settings,
-              compactMemo ? [compactMemo, ...messages] : messages,
+              compactMemo ? [compactMemo, ...body] : body,
               {
                 numCtx: localCtx,
                 local: localServer,
-                headEnd: boundary,
+                // Граница посчитана по body, а памятка едет в голову отдельным первым
+                // сообщением — в общем массиве она сдвигает границу ровно на один.
+                headEnd: boundary + (compactMemo ? 1 : 0),
                 onFail: (why) => {
                   if (compactFailed) return; // говорим один раз за прогон, а не каждый виток
                   compactFailed = true;
@@ -368,14 +398,12 @@
                   String(memoText).trim(),
               };
               compactCount++;
-              compactedNow = true;
-              keepFrom = boundary; // ровно та граница, по которой собрана памятка
-              keepGoal = !boundaryIsUser; // сворачивали середину витка — просьбу оставляем
+              folded = true;
               if (onMemo) {
                 try {
                   onMemo({
                     text: String(memoText).trim(),
-                    messages,
+                    messages: body,
                     provider: settings.provider || "",
                     model: settings.model || "",
                     ts: Date.now(),
@@ -394,26 +422,25 @@
         // целиком» сохраняло её ВСЮ — памятка ехала доплаткой, и «сжатие» не сжимало ничего.
         // Поэтому границу называет тот, кто собирает памятку (последняя просьба человека, а
         // если её нет — середина витка с запасом KEEP_TAIL шагов), и хвост режется ровно по ней.
-        let tail = messages;
-        if (compactedNow) {
-          tail = messages.slice(Math.min(keepFrom, messages.length));
-          // Отвечать нечем, если не оставить ни одного шага.
-          if (!tail.length) tail = messages.slice(-1);
-          // В истории одной задачи просьба человека одна и стоит в начале: под памяткой
-          // она свёрнута вместе со всем остальным, но терять дословную цель незачем —
-          // оставляем её перед хвостом. Так задача не «растворяется» в пересказе.
-          if (keepGoal && messages[0] && messages[0].role === "user") tail = [messages[0], ...tail];
-        }
+        // Хвост режется ВСЕГДА и по НЫНЕШНЕЙ границе — и когда сжатие удалось, и когда
+        // сжимать больше нельзя (лимит исчерпан или зовём не модель, а обрезку).
+        let tail = body.slice(Math.min(boundary, body.length));
+        // Отвечать нечем, если не оставить ни одного шага.
+        if (!tail.length) tail = body.slice(-1);
+        // В истории одной задачи просьба человека одна и стоит в начале: под памяткой
+        // она свёрнута вместе со всем остальным, но терять дословную цель незачем —
+        // оставляем её перед хвостом. Так задача не «растворяется» в пересказе.
+        if (!boundaryIsUser && body[0] && body[0].role === "user") tail = [body[0], ...tail];
         const nowMemoWeight = compactMemo ? estimateTokens(compactMemo.content) : 0;
         const rest = trimConversation(tail, Math.max(1500, budget - nowMemoWeight - 400));
         const out = compactMemo ? [compactMemo, ...rest] : rest;
-        if (compactedNow && emit) {
+        if (folded && emit) {
           let afterTokens = 0;
           for (const m of out) afterTokens += estimateMessageTokens(m);
           emit({
             type: "compact",
             text:
-              "🧠 Контекст сжат: " + (messages.length - tail.length) + " сообщений свернуты в памятку (≈" +
+              "🧠 Контекст сжат: " + (body.length - tail.length) + " сообщений свернуты в памятку (≈" +
               Math.round(total / 1000) + "k → ≈" + Math.round(afterTokens / 1000) + "k токенов).",
           });
         }

@@ -155,6 +155,12 @@ function createMissionTools(deps, live) {
         if (live.activeEmit) live.activeEmit({ type: "plan", tasks: planTasks, title: planTitle });
         const ps = planSummary(planTasks);
         live.activePlanSummary = { total: ps.total, done: ps.done, failed: ps.failed };
+        // План ЦЕЛИКОМ — вместе с чатом, в котором он показан. Миссию прогон заводит
+        // ПОЗЖЕ плана (шестой раунд работы инструментами), и при заведении план
+        // переносится в её шаги: иначе карточка «Миссия» говорила «план не составлен»,
+        // хотя план человек уже видел в панели чата. Чат храним рядом, чтобы план
+        // одного чата не стал планом работы другого.
+        live.activePlanTasks = { chatId: String(live.activeRunChatId || ""), tasks: planTasks, title: planTitle };
         // План у агента ОДИН: если прогон ведёт миссию, тот же план становится её
         // шагами, а переходы (сделано / не вышло) — строками её журнала. Так карточка
         // миссии перестаёт говорить «план не составлен», когда план есть.

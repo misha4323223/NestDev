@@ -250,6 +250,24 @@ function providedToRegistry() {
     }
   });
 
+  await test("пустой ответ инструмента назван ошибкой, а не тихим успехом", async () => {
+    // Модель принимает молчание инструмента за «получилось» и идёт дальше по ложному
+    // следу, а человек видит в строке действий удачный вызов. Пустой ответ (null,
+    // undefined, одни пробелы) обязан называться ошибкой: тогда у модели есть шанс
+    // исправиться, а в журнале не остаётся зелёной строки о несделанной работе.
+    const env = mkRegistry({ handlers: { silent: async () => "", empty: async () => undefined, blank: async () => "   \n " } });
+    for (const name of ["silent", "empty", "blank"]) {
+      const res = await env.registry.executeTool(name, {}, { model: "m" });
+      assert.match(String(res), /^Ошибка: инструмент /, "пустой ответ «" + name + "» прошёл молча: " + JSON.stringify(res));
+      assert.ok(String(res).indexOf(name) > 0, "в ошибке нет имени инструмента: " + res);
+    }
+    // Обычный ответ не тронут, а исключение обработчика по-прежнему объясняется словами.
+    const ok = await env.registry.executeTool("readFile", { path: "a.js" }, { model: "m" });
+    assert.strictEqual(ok, "прочитал a.js в m", "обычный ответ инструмента испорчен: " + ok);
+    const boom = await env.registry.executeTool("boom", {}, { model: "m" });
+    assert.strictEqual(boom, "Ошибка: понятный текст: обработчик упал", "ошибка обработчика перестала объясняться: " + boom);
+  });
+
   await test("в оболочке этого больше нет, а модуль собран на своём месте и вовремя", () => {
     for (const gone of ["async function executeTool(", "const agentToolHandlers =", "function describeToolArgs(", "toolPolicy.describe("]) {
       assert.ok(MAIN_SRC.indexOf(gone) < 0, "в main.js осталось: " + gone);

@@ -505,7 +505,7 @@
     return { prompt: prompt || 0, completion: completion || 0, cached: cached || 0 };
   }
 
-  async function consumeProviderStream({ response, provider, onText, onToolCall, onThinking, onUsage, onTruncated, local, firstByteTimeoutMs, idleTimeoutMs }) {
+  async function consumeProviderStream({ response, provider, onText, onToolCall, onThinking, onUsage, onTruncated, onIncomplete, local, firstByteTimeoutMs, idleTimeoutMs }) {
     if (!response || !response.body) throw new Error("Пустой ответ от сервера (нет тела).");
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -536,6 +536,11 @@
     const firstMs = firstByteTimeoutMs || (localish ? 300000 : 90000);
     const idleMs = idleTimeoutMs || (localish ? 120000 : 60000);
     let gotFirst = false;
+    // Пришёл ли ФИНАЛЬНЫЙ маркер потока: [DONE] (OpenAI-совместимые), done:true
+    // (Ollama), message_stop / stop_reason (Anthropic) или finish_reason в чанке.
+    // Без этого признака оборванный на полуслове поток выглядел законченным
+    // ответом: человек видел обрыв и не знал, что работа не доведена.
+    let sawEnd = false;
     // reader.read() с таймером: зависший стрим не держит чат в «думании» вечно.
     const readChunk = () =>
       new Promise((resolve, reject) => {
@@ -566,6 +571,7 @@
       if (typeof e === "string") return e;
       return e.message || e.detail || e.code || JSON.stringify(e).slice(0, 300);
     };
+    let broke = false; // чтение потока упало ошибкой, а не закончилось само
     try {
       while (true) {
         const { done, value } = await readChunk();
@@ -597,6 +603,7 @@
             }
             // done_reason «length» = модель упёрлась в лимит вывода и оборвала ответ
             // на полуслове. Раньше это выглядело как обычный законченный ответ.
+            if (obj.done) sawEnd = true; // финальный чанк Ollama
             if (obj.done && obj.done_reason === "length" && onTruncated) onTruncated();
             if (Array.isArray(msg.tool_calls)) {
               for (const tc of msg.tool_calls) {
@@ -617,7 +624,10 @@
 
           if (!line.startsWith("data:")) continue; // SSE (OpenAI/Anthropic): игнорируем event:-строки
           const data = line.slice(5).trim();
-          if (!data || data === "[DONE]") continue;
+          if (!data) continue;
+          // [DONE] — финальный маркер OpenAI-совместимых. Раньше строка просто
+          // пропускалась, и отличить полный ответ от оборванного было нечем.
+          if (data === "[DONE]") { sawEnd = true; continue; }
           let obj;
           try { obj = JSON.parse(data); } catch { continue; }
 
@@ -637,6 +647,9 @@
             // на полуслове. Раньше эту пометку получал только Ollama (done_reason), и у
             // облачных провайдеров (DeepSeek, Groq, OpenAI) обрезанный ответ выглядел
             // законченным: человек не знал, что нужно написать «продолжай».
+            // finish_reason есть у заключительного чанка выбора — это тоже финал
+            // (прокси, которые не шлют [DONE], иначе считались бы оборванными).
+            if (choice.finish_reason) sawEnd = true;
             if (choice.finish_reason === "length" && onTruncated) onTruncated();
             const delta = choice.delta || {};
             if (delta.content && onText) onText(delta.content);
@@ -679,6 +692,8 @@
             }
             if (onUsage && type === "message_delta" && obj.usage) onUsage(normalizeUsage(obj.usage));
             // stop_reason «max_tokens» = ответ оборван лимитом вывода (у Claude своё имя).
+            if (type === "message_stop") sawEnd = true;
+            if (type === "message_delta" && obj.delta && obj.delta.stop_reason) sawEnd = true;
             if (type === "message_delta" && obj.delta && obj.delta.stop_reason === "max_tokens" && onTruncated) onTruncated();
             if (type === "content_block_start") {
               const block = obj.content_block || {};
@@ -700,10 +715,19 @@
           }
         }
       }
+    } catch (e) {
+      // Поток прервался ошибкой (обрыв сети, таймаут, «Стоп») — это НЕ «ответ без
+      // финального маркера»: про обрыв прогон скажет своим путём, и второй раз
+      // пугать человека незачем.
+      broke = true;
+      throw e;
     } finally {
       try { reader.releaseLock(); } catch {}
     }
     finalizeAccum();
+    // Финального маркера не было, чтение кончилось само: ответ может быть неполным.
+    // Говорим об этом отдельным признаком — прогон объяснит словами и даст «▶ Продолжить».
+    if (!sawEnd && !broke && onIncomplete) onIncomplete();
   }
 
   /** Возвращает список доступных моделей у выбранного провайдера (throws при ошибке). */
