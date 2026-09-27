@@ -24,6 +24,7 @@
 const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
+const { execFileSync } = require("child_process");
 
 const ROOT = path.join(__dirname, "..");
 let passed = 0;
@@ -98,6 +99,40 @@ function walk(rel, out) {
     assert.ok(/^node_modules\/$/m.test(gi) && /^dist\/$/m.test(gi), "потеряны правила сборки");
     // OTA-бандл по-прежнему коммитим — иначе обновления не доедут.
     assert.ok(/^!ota\/bundle\.json$/m.test(gi) && /^!ota\/manifest\.json$/m.test(gi), "OTA-бандл больше не коммитится");
+  });
+
+  await test("фолбэк playwright: каталог в репозитории, а не под .gitignore", () => {
+    const gi = fs.readFileSync(path.join(ROOT, ".gitignore"), "utf8");
+    const ignored = gi.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+    assert.ok(!ignored.some((l) => /^backup-playwright\/?$/.test(l)), "backup-playwright/ снова в .gitignore — фолбэк потеряется");
+    for (const f of [
+      "backup-playwright/restore.js",
+      "backup-playwright/README.md",
+      "backup-playwright/package.json.bak",
+      "backup-playwright/electron-builder.yml.bak",
+    ]) {
+      assert.ok(exists(f), "пропал " + f);
+    }
+    // Playwright в проекте (возвращён частью 66): браузерные инструменты агента — на нём.
+    const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
+    assert.ok((pkg.dependencies || {}).playwright, "playwright пропал из dependencies — браузерные инструменты агента сломаны");
+    const lock = JSON.parse(fs.readFileSync(path.join(ROOT, "package-lock.json"), "utf8"));
+    assert.ok(lock.packages && lock.packages["node_modules/playwright"], "в package-lock.json нет playwright");
+    assert.ok(lock.packages["node_modules/playwright-core"], "в package-lock.json нет playwright-core");
+    const builder = fs.readFileSync(path.join(ROOT, "electron-builder.yml"), "utf8");
+    assert.ok(builder.includes("node_modules/playwright/**"), "из electron-builder.yml пропал asarUnpack для playwright");
+  });
+
+  await test("фолбэк playwright: restore.js безопасен и отвечает на --dry-run", () => {
+    const src = fs.readFileSync(path.join(ROOT, "backup-playwright", "restore.js"), "utf8");
+    assert.ok(/npm install --ignore-scripts/.test(src), "restore.js не ставит пакет");
+    assert.ok(/--dry-run/.test(src), "в restore.js нет безопасного --dry-run");
+    assert.ok(!/copyFileSync/.test(src), "restore.js перезаписывает файлы снимками — потеряются свежие правки");
+    const out = execFileSync(process.execPath, [path.join(ROOT, "backup-playwright", "restore.js"), "--dry-run"], {
+      cwd: ROOT,
+      encoding: "utf8",
+    });
+    assert.ok(/restore\.js|фолбэк/i.test(out), "restore.js не рассказал о себе: " + out.slice(0, 120));
   });
 
   await test("живое приложение: точка входа и разметка на месте", () => {
@@ -443,6 +478,12 @@ function walk(rel, out) {
     // Считаем обе формы: и длинную (readFileSync(path.join(...))) и короткий помощник
     // read("src", "renderer", "app.js") из отдельных наборов — иначе чтение через
     // помощник осталось бы для сторожа невидимым.
+    // Потолок поднят с 39 до 40 (окно контекста вручную, test/context-ui.test.js) —
+    // тем же правилом и с тем же смыслом: чип «Контекст» стал кнопкой с попапом, и
+    // код переехал в свой модуль окна. Набор проверяет ту же границу «в оболочке
+    // только сборка, сам код в модуле» + проводку window.ContextUI({...}) — иначе
+    // модуль можно было бы потерять вместе с кликом по чипу, и никто бы не заметил.
+    // Ровно одно чтение app.js на набор — только эта граница.
     const files = walk("test", []).filter((f) => f.endsWith(".js"));
     let n = 0;
     for (const rel of files) {
@@ -451,7 +492,7 @@ function walk(rel, out) {
         (text.match(/readFileSync\(path\.join\(ROOT, "src", "renderer", "app\.js"\)/g) || []).length +
         (text.match(/\bread\("src", "renderer", "app\.js"\)/g) || []).length;
     }
-    assert.ok(n <= 39, "прямых чтений app.js стало " + n + " (потолок 39). Возьмите кусок через uiFile/uiAll/uiFind; если чтение действительно нужно — поднимите потолок здесь осознанно, с пояснением.");
+    assert.ok(n <= 40, "прямых чтений app.js стало " + n + " (потолок 40). Возьмите кусок через uiFile/uiAll/uiFind; если чтение действительно нужно — поднимите потолок здесь осознанно, с пояснением.");
   });
 
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");

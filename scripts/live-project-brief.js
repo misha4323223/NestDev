@@ -77,10 +77,10 @@ const { buildProjectBrief } = createProjectBrief({
 const brief = buildProjectBrief(ROOT);
 
 console.log("\n[1] мусор в структуру не попадает");
-// Проверяем ИМЕНА ЗАПИСЕЙ структуры, а не подстроку во всём тексте. Рядом с проектом
-// может лежать своя папка (у владельца — `backup-playwright/` с файлом
-// `node_modules-playwright.tar.gz`; в репозиторий она не едет, в .gitignore),
-// и подстрочный поиск краснел бы на ЧУЖОМ имени файла, ничего не говоря о проекте.
+// Проверяем ИМЕНА ЗАПИСЕЙ структуры, а не подстроку во всём тексте. В проекте есть
+// своя папка `backup-playwright/` (фолбэк удалённого playwright — теперь в
+// репозитории, см. её README), и подстрочный поиск краснел бы на упоминании
+// `node_modules` в её снимках (.bak), ничего не говоря о самом проекте.
 const briefEntryHas = (name) =>
   (brief.match(/\n(?:📁|📄) [^\n]+/g) || [])
     .some((l) => l.replace(/^\s*(?:📁|📄)\s*/, "").split("/").includes(name));

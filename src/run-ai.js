@@ -71,6 +71,10 @@ function createRunAi(deps) {
     resolvePath,
     roleIdFromAny,
     rolePlan,
+    roleFolders,
+    // Прокси для внешних API (src/net-proxy.js): прогон передаёт его раунду,
+    // который через него ходит к провайдеру. Выключенная настройка — обычный fetch.
+    netProxy,
     roleMismatchNote,
     routeTools,
     routerMaxTokens,
@@ -108,6 +112,15 @@ async function runAi(settings, messages, win, opts) {
   // живой строкой до самого запроса: в шкалу провайдера его переводит транспорт.
   const reasoning = String((opts && opts.reasoning) || "off");
   const roleNote = role.prompt ? "\n\n" + role.prompt : "";
+  // Папка роли (часть 61): если в настройках у этой роли (и у активного проекта) задана
+  // папка с файлом PROMPT.md, его текст дописывается в системный промпт. Папка не задана
+  // (или файл не читается) — пустая строка, промпт не меняется ни на байт.
+  let roleFolderNote = "";
+  try {
+    roleFolderNote = roleFolders ? roleFolders.blockFor(settings, role.id, role.title) : "";
+  } catch {
+    roleFolderNote = "";
+  }
 
   // Менеджеру сразу даём свежую сводку дел — чтобы он не гадал и не звал taskList впустую.
   let tasksNote = "";
@@ -193,6 +206,22 @@ async function runAi(settings, messages, win, opts) {
     // окном 2048 «пол» в 3000 гарантировал переполнение на каждом запросе.
     budget = Math.max(budget, modelWin > 0 ? Math.min(3000, modelWin) : 3000);
   } catch {}
+  // Ручное окно контекста — выбор человека в чипе «Контекст» под полем ввода
+  // (src/renderer/context-ui.js), 0 — авто. Он главнее всего, что мы узнали сами:
+  // человек знает свою модель и роутер лучше нас, а именно на OpenAI-совместимых
+  // роутерах окно не сообщается вовсе, и авто уходит за настоящее окно модели —
+  // отказ провайдера или молчаливая обрезка запроса, после которой агент перестаёт
+  // звать инструменты. Бюджетом становится выбранное число: история сжимается
+  // заранее, до переполнения.
+  const manualWindow = Math.round(Number(settings.contextWindow) || 0);
+  if (manualWindow > 0) {
+    modelWin = manualWindow;
+    // Ручное окно — это окно МОДЕЛИ: бюджет истории считаем тем же расчётом, что и
+    // для найденного окна (минус резерв на ответ), но потолком ставим само число,
+    // а не облачный бюджет: человек знает свою модель лучше нашей экономии.
+    budget = windowBudget(provider, manualWindow, manualWindow, { local: localEndpoint });
+    budget = Math.max(budget, Math.min(3000, manualWindow));
+  }
   // Возможности локальной модели (tools) — не «информация к сведению»: без capability
   // «tools» схемы в запросе бесполезны, а часть сборок Ollama отвечает на них ошибкой и
   // роняет весь раунд. Ниже это переключает протокол вызова инструментов.
@@ -430,7 +459,7 @@ async function runAi(settings, messages, win, opts) {
   let canonical = [
     {
       role: "system",
-      content: SYSTEM_PROMPT + roleNote + mismatchNote + tasksNote + wdNote + dataNote + briefNote + cloneNote + (planMode ? "\n\nРЕЖИМ ПЛАНА: доступен только todoWrite — вызови его с планом работ (3–7 пунктов) и в тексте перечисли файлы, которые затронешь. НЕ изменяй файлы и НЕ выполняй другие инструменты. Жди команды пользователя." : ""),
+      content: SYSTEM_PROMPT + roleNote + roleFolderNote + mismatchNote + tasksNote + wdNote + dataNote + briefNote + cloneNote + (planMode ? "\n\nРЕЖИМ ПЛАНА: доступен только todoWrite — вызови его с планом работ (3–7 пунктов) и в тексте перечисли файлы, которые затронешь. НЕ изменяй файлы и НЕ выполняй другие инструменты. Жди команды пользователя." : ""),
     },
     ...sanitizeToolPairs(
       runHistory.map((m) => {
@@ -555,6 +584,7 @@ async function runAi(settings, messages, win, opts) {
     abort: abort,
     SYSTEM_PROMPT,
     buildChatRequest,
+    netProxy,
     consumeProviderStream,
     createThinkingStripper,
     readApiError,

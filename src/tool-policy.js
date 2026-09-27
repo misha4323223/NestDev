@@ -64,7 +64,7 @@ const CAPABILITIES = [
     "runCommand", "runCommandOutput", "retryCommand", "timeoutCommand", "startBackground",
     "stopBackground", "sendInput", "shellStart", "shellSend", "runScript",
   ]},
-  { cap: "terminal.admin", risk: RISK.HIGH, confirm: true, tools: ["runCommandAsAdmin"] },
+  { cap: "terminal.admin", risk: RISK.HIGH, confirm: true, tools: ["runCommandAsAdmin", "openAdminTerminal"] },
   // ── git ──
   { cap: "git.read", risk: RISK.LOW, tools: ["gitStatus", "gitDiff", "gitLog", "gitBranch", "gitBlame"] },
   { cap: "git.clone", risk: RISK.MEDIUM, tools: ["gitClone", "gitPull"] },
@@ -226,6 +226,7 @@ function describe(name, args) {
   if (name === "installExe") return "скачать и запустить установщик: " + String(x.url || "").slice(0, 120);
   if (name === "installSystemPackage") return "установить программу: " + String(x.name || x.package || x.id || "?");
   if (name === "runCommandAsAdmin") return "выполнить с правами администратора: " + String(x.command || "").slice(0, 160);
+  if (name === "openAdminTerminal") return "открыть окно PowerShell от администратора" + (x.command ? ": " + String(x.command).slice(0, 160) : "");
   if (name === "otaRollback") return "откатить приложение на предыдущую версию (OTA)";
   if (name === "browserClearProfile") return "очистить профиль браузера агента (входы на сайты и куки будут удалены)";
   if (name === "checkpointRollback") return "восстановить файлы из чекпоинта: " + String(x.name || x.id || "?");

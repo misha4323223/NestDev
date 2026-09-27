@@ -526,12 +526,20 @@
   };
   // Одна точка сохранения разрешений: чекбоксов четыре, а вызов один — иначе
   // легко забыть передать последнее поле и молча сбросить его в false.
+  // ВАЖНО: сразу правим и локальное зеркало настроек (getSettings()). Иначе кнопка
+  // «Сохранить» в панели настроек пишет ЦЕЛИКОМ старое зеркало (persistSettings →
+  // api.setSettings) и только что включённый чекбокс возвращается в false.
   function saveYcPerms() {
     const create = $("s-yc-allow-create").checked;
     const del = $("s-yc-allow-delete").checked;
     const upd = $("s-yc-allow-update").checked;
     const pub = $("s-yc-allow-public").checked;
     api.ycSetPermissions(create, del, upd, pub);
+    const s = getSettings();
+    s.ycAllowAgentCreate = create;
+    s.ycAllowAgentDelete = del;
+    s.ycAllowAgentUpdate = upd;
+    s.ycAllowAgentPublic = pub;
     return { create, del, upd, pub };
   }
   $("s-yc-allow-create").onchange = () => {

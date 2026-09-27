@@ -1458,6 +1458,19 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+        name: "openAdminTerminal",
+        description: "Открыть ЖИВОЕ окно PowerShell с правами администратора (Windows): появится системный запрос прав (UAC) — пользователь подтверждает вручную. command — необязательная команда, которую сразу выполнить в этом окне (окно остаётся открытым: -NoExit). Это для работы руками; за разовым результатом с выводом иди в runCommandAsAdmin. На macOS/Linux окно пока не открывается — там используй runCommandAsAdmin.",
+        parameters: {
+          type: "object",
+          properties: {
+            command: { type: "string", description: "Необязательная команда, которую сразу выполнить в админском окне (например: winget upgrade --all)" },
+          },
+        },
+      },
+    },
+  {
+    type: "function",
+    function: {
         name: "downloadAndExtract",
         description: "Скачать архив (.zip / .tar.gz / .tgz) по URL и распаковать в папку (path — по умолчанию downloads в рабочей директории). Позволяет получить репозиторий с GitHub (https://github.com/owner/repo/archive/refs/heads/main.zip) даже если git не установлен. Поддерживает большие архивы (до 300 МБ).",
         parameters: {

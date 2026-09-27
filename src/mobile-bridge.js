@@ -196,6 +196,7 @@ const STATIC_FILES = new Set([
   "auto-tasks.js",
   "model-popup.js",
   "reasoning.js",
+  "context-ui.js",
   "ask-modal.js",
   "chat-rename.js",
   "chat-store.js",

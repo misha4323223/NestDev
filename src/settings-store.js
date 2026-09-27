@@ -32,6 +32,12 @@ const DEFAULT_SETTINGS = {
   anthropicUrl: "https://api.anthropic.com",
   anthropicApiKey: "",
   model: "",
+  // Окно контекста модели, заданное человеком вручную (чип «Контекст» под полем
+  // ввода). 0 — авто: окно спрашивается у провайдера (/models → context_length) и
+  // запоминается, когда провайдер отказывает по длине. На OpenAI-совместимых
+  // роутерах окно не сообщается вовсе, и авто упирается в общий потолок облака —
+  // тогда человек ставит своё значение, и агент сжимает историю вовремя.
+  contextWindow: 0,
   workingDir: os.homedir(),
   githubToken: "",
   githubClientId: "",
@@ -95,6 +101,13 @@ const DEFAULT_SETTINGS = {
   openaiActiveProfile: "", // id активного подключения ("" — не выбрано)
   autoSwitchProfiles: false, // при ошибке ключа/баланса/лимита — авто-переключение на следующее подключение
 
+  // Прокси для внешних API: OpenAI, Anthropic, Google, Groq из России без VPN
+  // недоступны. Через прокси идут ТОЛЬКО запросы к провайдеру — файлы, git,
+  // терминал, браузер и свой Ollama/LM Studio работают напрямую (src/net-proxy.js).
+  proxyEnabled: false,
+  proxyUrl: "", // http://host:port, https://… или socks5://user:pass@host:port
+  proxyBypassLocal: true, // localhost, 127.0.0.1 и домашние сети — мимо прокси
+
   // Yandex Cloud (REST API): авторизация (OAuth-токен — в secrets.json), каталог, разрешения агента
   ycCloudId: "", // id облака
   ycFolderId: "", // id каталога (folder), с которым работает дашборд и агент
@@ -102,6 +115,7 @@ const DEFAULT_SETTINGS = {
   ycAllowAgentCreate: false, // агенту ЗАПРЕЩЕНО создавать ресурсы, пока пользователь явно не включит
   ycAllowAgentDelete: false, // удаление ресурсов агентом — только с явного разрешения
   ycAllowAgentUpdate: false, // менять настройки контейнеров, деплоить ревизии и откатывать их — тоже только с явного разрешения
+  ycAllowAgentPublic: false, // открывать бакет для чтения из интернета — только с явного разрешения
 
   // Память диалогов: когда контекст переполняется, агент сворачивает старые шаги
   // в памятку — здесь такая памятка сохраняется локально по датам в
@@ -138,6 +152,12 @@ const DEFAULT_SETTINGS = {
   // Журнал действий агента: опасные и требующие подтверждения действия пишутся
   // в userData/audit.log (JSONL). Секреты в журнал не попадают. Включён по умолчанию.
   auditLog: true,
+
+  // Папки ролей ПО КАЖДОМУ ПРОЕКТУ: { <id проекта>: { dev, assistant, manager, researcher } }.
+  // Когда чат работает в роли, приложение читает из её папки файл PROMPT.md и
+  // дописывает его в системный промпт (src/role-folders.js). Ключ — id проекта,
+  // а не путь: проект можно переименовать или перенести, привязка останется.
+  roleDirs: {},
 };
 
 const settingsFile = () => path.join(app.getPath("userData"), "settings.json");
@@ -201,6 +221,21 @@ function normalizeSettings(raw) {
   s.agentEnvScopes = toolPolicy.normalizeScopes(s.agentEnvScopes);
   // Пароли сайтов: чистка мусора и дублей (пустые/битые записи отбрасываются).
   s.sitePasswords = vault.sanitizeList(s.sitePasswords);
+  // Папки ролей: здесь держим только ФОРМУ (объект), чтобы в settings.json не попал
+  // массив или строка на месте карты проектов. Глубокую чистку (чужие роли, не-строки,
+  // хвостовые разделители пути) делает src/role-folders.js при чтении промпта —
+  // одна точка правды, без второго списка ролей.
+  if (!s.roleDirs || typeof s.roleDirs !== "object" || Array.isArray(s.roleDirs)) s.roleDirs = {};
+  // Прокси: здесь держим только ФОРМУ полей, чтобы в файле настроек не оказалось
+  // числа или объекта на месте адреса (тогда адрес уехал бы в URL как «[object
+  // Object]» и человек видел бы непонятную ошибку). Годен ли адрес и как по нему
+  // ходить — решает src/net-proxy.js в момент запроса: одна точка правды.
+  s.proxyEnabled = s.proxyEnabled === true;
+  s.proxyUrl = typeof s.proxyUrl === "string" ? s.proxyUrl.trim() : "";
+  s.proxyBypassLocal = s.proxyBypassLocal !== false;
+  // Окно контекста, выбранное человеком: целое число токенов, 0 — авто.
+  // Потолок 8 000 000 просто отсекает опечатки (моделей такого размера нет).
+  s.contextWindow = Math.max(0, Math.min(8000000, Math.round(Number(s.contextWindow) || 0)));
   return s;
 }
 function loadSettings() {

@@ -12,6 +12,7 @@ const {
   TOOL_DEFINITIONS,
   rolePlan,
   roleIdFromAny,
+  roleMismatchNote,
   createThinkingStripper,
   extractToolCallsFromText,
   normalizeToolName,
@@ -456,6 +457,40 @@ const { buildProjectBrief } = createProjectBrief({
   ycBriefLine: (...args) => ycService.ycBriefLine(...args),
 });
 
+// Папки ролей (часть 61): у каждой роли — и у каждого проекта своя — своя папка,
+// из неё читается файл PROMPT.md и дописывается в системный промпт рядом с САММАРИ
+// ПРОЕКТА. Модуль чистый (fs/path), сборка стоит рядом с визиткой: обе собираются
+// на каждый прогон, а пустая настройка НЕ меняет промпт ни на байт.
+const { createRoleFolders } = require("./role-folders.js");
+const roleFolders = createRoleFolders({ fs, path });
+
+// ───────────────────────────── Прокси для внешних API ─────────────────────────
+// Часть AI-API (OpenAI, Anthropic, Google, Groq) из России без VPN недоступна.
+// Модуль (src/net-proxy.js) умеет http(s)-прокси и SOCKS5 без внешних
+// зависимостей, а решение «идти ли через прокси» принимает на КАЖДЫЙ запрос:
+// локальные адреса и выключенная галочка означают прежний fetch.
+const { createNetProxy } = require("./net-proxy.js");
+const netProxy = createNetProxy({});
+// Подключение к провайдеру (src/renderer/provider-config.js) — ОДНА точка, через
+// которую идут все запросы к API: список моделей, прозвон окна модели, сжатие
+// контекста вспомогательной моделью. Подставляем ей наш запрос с прокси, чтобы
+// не прошивать прокси в каждый модуль по отдельности. В браузере (веб-превью)
+// подстановки нет — там работает обычный fetch.
+const ProviderConfig = require("./renderer/provider-config.js");
+ProviderConfig.setFetchImpl((url, opts) => netProxy.fetchFor(loadSettings(), url, opts));
+// Проверка прокси из окна (канал settings:testProxy) — src/net-proxy-ipc.js.
+// Канал поднимается здесь же, рядом с самим модулем прокси, а не в толпе ipc
+// ниже: Electron разрешает обработчик в момент вызова, поэтому порядок сборки
+// на работу не влияет, а читать проводку прокси так проще.
+const { registerNetProxyIpc } = require("./net-proxy-ipc.js");
+registerNetProxyIpc({
+  ipcMain,
+  netProxy,
+  loadSettings,
+  ipcGuard,
+  getWindow: () => mainWindow,
+});
+
 // ═══════════════════ Системные программы и окружение ═══════════════════
 // Раздел вынесен в src/system-stack.js (1.5.78): PATH и поиск программ, живая
 // сессия PowerShell с кэшем справок, системные менеджеры пакетов, загрузка
@@ -505,6 +540,7 @@ const {
   findInstallersIn,
   downloadAndExtractTo,
   runAsAdmin,
+  openAdminTerminal,
 } = systemStack;
 
 // git add -A, но БЕЗ файлов секретов — код в src/git-stage.js (часть 28).
@@ -589,6 +625,8 @@ const { runAi } = createRunAi({
   auxConfig,
   buildChatRequest,
   buildProjectBrief,
+  roleFolders,
+  netProxy,
   classifyKeyError,
   coldCacheInfo,
   consumeProviderStream,
@@ -1189,6 +1227,7 @@ const { executeTool } = createToolRegistry({
   findInstallersIn,
   downloadAndExtractTo,
   runAsAdmin,
+  openAdminTerminal,
   envPathInfo,
   findProgram,
   runProgVersion,

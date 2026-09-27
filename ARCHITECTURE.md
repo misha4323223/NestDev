@@ -69,6 +69,7 @@
 | src/renderer/settings-panel.js | настройки: вкладки, поля, провайдеры, замер модели, сохранение | app.js: window.SettingsPanel({ |
 | src/renderer/g4f-panel.js | выбор провайдера G4F: поиск, список, тест провайдера, подбор порта | app.js: window.G4fPanel({ |
 | src/renderer/auto-tasks.js | автозадачи: чат «Автозадачи», очередь дел, запуск по сроку и «▶ сейчас» | app.js: window.AutoTasks({ |
+| src/renderer/context-ui.js | окно контекста модели вручную: чип «Контекст» под полем ввода — кнопка, по клику выбор окна (0 = авто); выбранное окно перебивает авто-определение в прогоне, поэтому история сжимается, не доходя до предела роутеров, которые окно не сообщают | app.js: window.ContextUI({ |
 | src/renderer/model-popup.js | быстрый выбор модели в шапке: попап, кэш списка, «↻ Обновить», клик мимо | app.js: window.ModelPopup({ |
 | src/renderer/reasoning.js | сколько модель думает перед ответом: плашка Low/High/Max у поля ввода — только у моделей с рассуждениями (кого показывать, решает provider-transport.js.reasoningSupport; отказ провайдера помнится по модели), выбор в настройках | app.js: window.Reasoning({ |
 | src/renderer/ask-modal.js | модалка «вопрос агента» (askUser): показ вопроса, ответ и отмена | app.js: window.AskModal({ |

@@ -21,12 +21,17 @@
     baseFor,
     isLocalBase,
     proxiedBase,
+    // Запрос к API: в Electron main уходит через прокси, если человек его включил
+    // (подстановка — src/net-proxy.js), в браузере и без настройки — обычный fetch.
+    netFetch,
     apiKeyFor,
     apiHeaders,
     projectHeader,
     jsonArgs,
     genCallId,
   } = config || {};
+  // Подстраховка: сборка без хука (старый набор) работает как раньше.
+  const callApi = typeof netFetch === "function" ? netFetch : (url, init) => fetch(url, init);
   // Таблица инструментов нужна здесь для схем запроса: у каждого семейства
   // провайдеров формат схем свой, и «пустой» список означал бы агента без инструментов.
   const TOOL_DEFINITIONS = toolDefinitions || [];
@@ -710,18 +715,18 @@
     const headers = apiHeaders(provider, apiKey, fromBrowser, projectHeader(s));
 
     if (provider === "ollama") {
-      const res = await fetch(baseFor(provider, s) + "/api/tags", { headers, signal: timeout });
+      const res = await callApi(baseFor(provider, s) + "/api/tags", { headers, signal: timeout });
       if (!res.ok) throw new Error("Ollama error " + res.status + ": " + (await res.text()).slice(0, 300));
       const data = await res.json();
       return (data.models || []).map((m) => m.name);
     }
     if (provider === "anthropic") {
-      const res = await fetch(baseFor(provider, s) + "/v1/models", { headers, signal: timeout });
+      const res = await callApi(baseFor(provider, s) + "/v1/models", { headers, signal: timeout });
       if (!res.ok) throw new Error("Claude API error " + res.status + ": " + (await res.text()).slice(0, 300));
       const data = await res.json();
       return (data.data || []).map((m) => m.id);
     }
-    const res = await fetch(proxiedBase(baseFor(provider, s)) + "/models", { headers, signal: timeout });
+    const res = await callApi(proxiedBase(baseFor(provider, s)) + "/models", { headers, signal: timeout });
     if (!res.ok) throw new Error("API error " + res.status + ": " + (await res.text()).slice(0, 300));
     const data = await res.json();
     return (data.data || []).map((m) => m.id);
@@ -746,7 +751,7 @@
     if (name) {
       try {
         const timeout = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined;
-        const res = await fetch(base + "/api/show", {
+        const res = await callApi(base + "/api/show", {
           method: "POST",
           headers: apiHeaders("ollama", apiKeyFor("ollama", s), false, projectHeader(s)),
           signal: timeout,
@@ -831,7 +836,7 @@
       typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(4000) : undefined;
     let propsWindow = 0;
     try {
-      const r = await fetch(root + "/api/v0/models", { signal: to() });
+      const r = await callApi(root + "/api/v0/models", { signal: to() });
       if (r.ok) {
         const d = await r.json();
         for (const m of d.data || []) {
@@ -842,7 +847,7 @@
       }
     } catch {}
     try {
-      const r = await fetch(root + "/props", { signal: to() });
+      const r = await callApi(root + "/props", { signal: to() });
       if (r.ok) {
         const d = await r.json();
         const dg = (d && d.default_generation_settings) || {};
@@ -864,7 +869,7 @@
       let propsWindow = 0;
       try {
         const timeout = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined;
-        const res = await fetch(proxiedBase(base) + "/models", {
+        const res = await callApi(proxiedBase(base) + "/models", {
           headers: apiHeaders(provider, apiKeyFor(provider, s), false, projectHeader(s)),
           signal: timeout,
         });
@@ -926,7 +931,7 @@
   // Есть не во всех сборках Ollama, поэтому молчание сервера — не ошибка проверки.
   async function ollamaPs(base, headers) {
     try {
-      const res = await fetch(base + "/api/ps", { headers, signal: _probeTimeout(5000) });
+      const res = await callApi(base + "/api/ps", { headers, signal: _probeTimeout(5000) });
       if (!res.ok) return [];
       const d = await res.json();
       return Array.isArray(d.models) ? d.models : [];
@@ -1020,7 +1025,7 @@
     const base = baseFor("ollama", s);
     r.base = base;
     const t0 = Date.now();
-    const tags = await fetch(base + "/api/tags", { headers, signal: _probeTimeout(Math.min(15000, timeoutMs)) });
+    const tags = await callApi(base + "/api/tags", { headers, signal: _probeTimeout(Math.min(15000, timeoutMs)) });
     if (!tags.ok) throw new Error("Ollama ответила " + tags.status + " на /api/tags: " + (await tags.text()).slice(0, 200));
     r.connectMs = Date.now() - t0;
     const before = await ollamaPs(base, headers);
@@ -1042,7 +1047,7 @@
     };
     if (r.numCtx > 0) body.options.num_ctx = r.numCtx;
     const t1 = Date.now();
-    const res = await fetch(base + "/api/chat", {
+    const res = await callApi(base + "/api/chat", {
       method: "POST",
       headers,
       body: JSON.stringify(body),
@@ -1080,11 +1085,11 @@
     const base = baseFor(provider, s);
     r.base = base;
     const t0 = Date.now();
-    const res = await fetch(proxiedBase(base) + "/models", { headers, signal: _probeTimeout(10000) });
+    const res = await callApi(proxiedBase(base) + "/models", { headers, signal: _probeTimeout(10000) });
     r.connectMs = Date.now() - t0;
     if (!res.ok) throw new Error("сервер ответил " + res.status + " на /models: " + (await res.text()).slice(0, 200));
     const t1 = Date.now();
-    const res2 = await fetch(proxiedBase(base) + "/chat/completions", {
+    const res2 = await callApi(proxiedBase(base) + "/chat/completions", {
       method: "POST",
       headers,
       body: JSON.stringify({

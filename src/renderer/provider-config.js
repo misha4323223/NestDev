@@ -19,6 +19,24 @@
     anthropic: "https://api.anthropic.com",
   };
 
+  // ── Прокси для внешних API ─────────────────────────────────────────────────
+  // Часть провайдеров (OpenAI, Anthropic, Google, Groq) из России без VPN
+  // недоступна. Все обращения к API идут через netFetch, а не через системный
+  // fetch: так у них ОДНА точка, куда главный процесс подставляет запрос через
+  // прокси (src/net-proxy.js). В браузере подстановки нет — и netFetch просто
+  // зовёт обычный fetch, ничего не меняя.
+  //
+  // Значение берём в момент вызова, а не при сборке модуля: подстановка живёт
+  // в главном процессе и может случиться после require.
+  let proxyFetch = null;
+  function setFetchImpl(fn) {
+    proxyFetch = typeof fn === "function" ? fn : null;
+  }
+  function netFetch(url, init) {
+    if (proxyFetch) return proxyFetch(url, init);
+    return fetch(url, init);
+  }
+
   // ── Реестр провайдеров G4F (маршрут «Провайдер:модель» в поле модели) ──
   // rec: ★ рекомендованные — стабильные и работающие без ключа/логина.
   // Список один на всех: его же использует транспорт buildChatRequest, чтобы
@@ -343,6 +361,8 @@
 
   return {
     DEFAULT_BASES,
+    setFetchImpl,
+    netFetch,
     G4F_PROVIDERS,
     G4F_PROVIDER_NAMES,
     splitG4fRoute,

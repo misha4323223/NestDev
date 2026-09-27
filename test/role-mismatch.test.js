@@ -117,7 +117,9 @@ const codeAsk = [user("Напиши мне функцию на Python: разб�
     const nudgeSrc = fs.readFileSync(path.join(ROOT, "src", "run-nudge.js"), "utf8");
     const webSrc = fs.readFileSync(path.join(ROOT, "src", "renderer", "web-chat.js"), "utf8");
     assert.ok(/roleMismatchNote\(messages, role\.id\)/.test(runSrc), "подсказка не считается в прогоне");
-    assert.ok(/SYSTEM_PROMPT \+ roleNote \+ mismatchNote/.test(runSrc), "подсказка не уходит в системный промпт");
+    // Между текстом роли и подсказкой стоит блок папки роли (часть 61) — он пуст,
+    // когда папка не задана, поэтому порядок здесь проверяется с ним.
+    assert.ok(/SYSTEM_PROMPT \+ roleNote \+ (roleFolderNote \+ )?mismatchNote/.test(runSrc), "подсказка не уходит в системный промпт");
     assert.ok(/getRoleMismatch: \(\) => mismatchNote/.test(runSrc), "прогон не отдаёт подсказку призыву");
     assert.ok(/getRoleMismatch/.test(nudgeSrc), "призыв не читает подсказку");
     assert.ok(/suggestRole/.test(nudgeSrc), "призыв не просит предложить роль");

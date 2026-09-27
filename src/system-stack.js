@@ -761,6 +761,69 @@ async function runAsAdmin(cmd) {
   return "На Linux нужен pkexec (policykit) или sudo с паролем. Установи pkexec либо выполни команду вручную в терминале с sudo.";
 }
 
+// ── Живое окно терминала от администратора ──────────────────────────────────
+// runAsAdmin выполняет РАЗОВУЮ команду и ждёт её конца (вывод админского окна мы не
+// перехватываем). Но иногда нужен именно ЖИВОЙ администраторский терминал: человек
+// сам поработает в нём руками. Разница только в ожидании — окно открывается и
+// остаётся (нет -Wait), а внешний запускатель возвращается сразу после старта окна.
+//
+// План запуска — ЧИСТАЯ функция: запрос UAC в тесте не нажать, поэтому набор
+// проверяет сам план (что за процесс и с какими аргументами открывается), а живой
+// прогон — следствие (окно действительно появилось).
+function adminTerminalPlan(platform, opts) {
+  const o = opts || {};
+  const command = String(o.command || "").trim();
+  if (platform !== "win32") {
+    // Живое админское окно сделано для Windows (там это Start-Process -Verb RunAs).
+    // На macOS/Linux честнее указать на рабочий механизм, чем делать вид, что окно
+    // открылось: там права запрашивает runCommandAsAdmin и возвращает вывод.
+    return {
+      ok: false,
+      reason:
+        "Живое окно администратора реализовано для Windows. На " +
+        (platform === "darwin" ? "macOS" : "Linux") +
+        " используй runCommandAsAdmin(команда) — он запросит права и вернёт вывод.",
+    };
+  }
+  // Внутренняя команда уходит ЗАКОДИРОВАННОЙ (base64 UTF-16LE), поэтому кавычки,
+  // пробелы и переводы строк в ней не ломают ArgumentList: в список Start-Process
+  // попадает только голый base64. -NoExit держит окно открытым после команды.
+  const inner = ["-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass"];
+  if (command) inner.push("-EncodedCommand", Buffer.from(command, "utf16le").toString("base64"));
+  const list = inner.map((s) => "'" + String(s).replace(/'/g, "''") + "'").join(",");
+  const ps = "Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList " + list;
+  return {
+    ok: true,
+    argv: [
+      "powershell.exe",
+      "-NoProfile",
+      "-NonInteractive",
+      "-EncodedCommand",
+      Buffer.from(ps, "utf16le").toString("base64"),
+    ],
+    note:
+      "окно PowerShell с правами администратора открыто (подтверди запрос UAC)." +
+      (command ? " Команда запущена в нём; окно осталось открытым (-NoExit)." : " Работай в нём как обычно; окно останется до закрытия."),
+  };
+}
+
+async function openAdminTerminal(opts) {
+  const plan = adminTerminalPlan(process.platform, opts);
+  if (!plan.ok) return plan.reason;
+  // Без -Wait: запускатель возвращается, как только окно стартовало. Если человек
+  // отклонил UAC, Start-Process падает — об этом и скажем. Ждать бесконечно нельзя:
+  // иначе забытый запрос прав подвесил бы вызов на весь таймаут.
+  const r = await spawnRaw(plan.argv, { timeoutMs: 120000 });
+  if (!r.ok) {
+    return (
+      "Не удалось открыть окно администратора: " +
+      ((r.err || "").trim() || "код " + r.code) +
+      " — возможно, запрос UAC отклонён или ещё висит (подтверди его)."
+    );
+  }
+  return "OK — " + plan.note;
+}
+
   return {
     envPathInfo,
     setMergedPath,
@@ -787,6 +850,10 @@ async function runAsAdmin(cmd) {
     // прогон проверяет следствие — что настоящий .tar.gz РАСПАКОВАЛСЯ).
     archiveKind,
     runAsAdmin,
+    // openAdminTerminal — живое админское окно; adminTerminalPlan — его чистый
+    // план (наружу для набора: UAC в тесте не нажать).
+    openAdminTerminal,
+    adminTerminalPlan,
   };
 }
 

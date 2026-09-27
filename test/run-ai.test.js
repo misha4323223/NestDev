@@ -127,6 +127,9 @@ function mk(over) {
     auxConfig: () => ({ enabled: !!o.vision, auto: true, visionModel: "v", url: "http://v" }),
     buildChatRequest: () => ({}),
     buildProjectBrief: () => "ВИЗИТКА ПРОЕКТА",
+    // Папка роли (часть 61): в заглушке — управляемая строка, а живое чтение файла
+    // PROMPT.md проверяет отдельный набор test/role-folders.test.js.
+    roleFolders: { blockFor: () => (o.roleFolder ? "БЛОК РОЛИ" : "") },
     classifyKeyError: () => ({ key: true, cooldownMs: 1000 }),
     coldCacheInfo: () => "холодный пул",
     consumeProviderStream: async () => {},
@@ -269,6 +272,30 @@ const systemOf = (m) => String((m.calls.rounds[0] || {}).messages && (m.calls.ro
     assert.ok(/САММАРИ ПРОЕКТА.*ВИЗИТКА ПРОЕКТА/s.test(sys), "визитка проекта потерялась");
     assert.deepStrictEqual(m.calls.brief[0], ["/tasks", 8], "сводка дел не взята у хранилища");
     assert.ok(/МОИ ДЕЛА.*Позвонить в банк/s.test(sys), "менеджер не получил свежую сводку дел");
+  });
+
+  await test("папка роли уходит в промпт сразу после текста роли", async () => {
+    // Папка роли — это её PROMPT.md из файла (часть 61). Он обязан стоять рядом с
+    // текстом роли и до визитки проекта: так тон и правила роли читаются раньше
+    // описания папки, а не тонут после него.
+    const m = mk({ roleFolder: true });
+    await run(m, { role: "manager" });
+    const sys = systemOf(m);
+    assert.ok(/БЛОК РОЛИ/.test(sys), "блок папки роли не доехал до модели");
+    assert.ok(sys.indexOf("РОЛЬ: manager") < sys.indexOf("БЛОК РОЛИ"), "блок роли уехал выше текста роли");
+    assert.ok(sys.indexOf("БЛОК РОЛИ") < sys.indexOf("САММАРИ ПРОЕКТА"), "блок роли уехал после визитки проекта");
+  });
+
+  await test("без папки роли промпт не меняется ни на байт", async () => {
+    // Пустая настройка — это не «пустой блок», а ОТСУТСТВИЕ блока: иначе на пустой
+    // папке поехали бы все замеры промпта и бюджеты контекста.
+    const m = mk();
+    await run(m, { role: "manager" });
+    assert.ok(!/БЛОК РОЛИ/.test(systemOf(m)), "без папки в промпт попал блок роли");
+    const n = mk({ roleFolder: true });
+    await run(n, { role: "manager" });
+    assert.ok(systemOf(n).indexOf("БЛОК РОЛИ") >= 0 && systemOf(m).indexOf("БЛОК РОЛИ") < 0,
+      "блок роли появился не из-за настройки");
   });
 
   await test("рабочий репозиторий назван, если он не совпал с рабочей папкой", async () => {

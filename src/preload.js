@@ -16,6 +16,11 @@ contextBridge.exposeInMainWorld("api", {
   undoRollback: () => ipcRenderer.invoke("undo:rollback"),
   stopMessage: () => ipcRenderer.invoke("ai:stop"),
   testConnection: (ui) => ipcRenderer.invoke("ai:test", ui),
+  // Проверка прокси для внешних API: запрос делает ГЛАВНЫЙ процесс своим кодом
+  // (src/net-proxy.js) — в окне свой сетевой стек, и проверка оттуда говорила бы
+  // о другом соединении. Адрес приходит из поля настроек (человек мог его ещё
+  // не сохранить).
+  testProxy: (ui) => ipcRenderer.invoke("settings:testProxy", ui || {}),
   listModels: (ui) => ipcRenderer.invoke("ai:models", ui),
   probeLocalModel: (ui) => ipcRenderer.invoke("ai:probeLocal", ui),
   g4fTest: (opts) => ipcRenderer.invoke("g4f:test", opts),

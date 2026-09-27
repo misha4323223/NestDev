@@ -107,7 +107,26 @@ const readRaw = (file) => (fs.existsSync(file) ? fs.readFileSync(file, "utf8") :
     assert.strictEqual(s.allowAgentPush, false, "агенту разрешён push в GitHub по умолчанию");
     assert.strictEqual(s.mailAllowAgentSend, false, "агенту разрешена отправка писем по умолчанию");
     assert.strictEqual(s.ycAllowAgentCreate, false, "агенту разрешено создавать ресурсы в облаке по умолчанию");
+    assert.strictEqual(s.contextWindow, 0, "окно контекста задано вручную без ведома пользователя");
     assert.ok(fs.existsSync(env.settingsFile) === false, "чтение настроек создало файл");
+  });
+
+  await test("окно контекста вручную: переживает чтение, мусор и опечатки срезаются к границам", () => {
+    const env = build();
+    writeJson(env.settingsFile, { contextWindow: 131072 });
+    assert.strictEqual(env.store.loadSettings().contextWindow, 131072, "выбранное окно потерялось при чтении");
+
+    writeJson(env.settingsFile, { contextWindow: -5 });
+    assert.strictEqual(env.store.loadSettings().contextWindow, 0, "отрицательное окно не сведено к «Авто»");
+
+    writeJson(env.settingsFile, { contextWindow: 99999999 });
+    assert.strictEqual(env.store.loadSettings().contextWindow, 8000000, "опечатка в окне не ограничена");
+
+    writeJson(env.settingsFile, { contextWindow: "128000" });
+    assert.strictEqual(env.store.loadSettings().contextWindow, 128000, "окно строкой не прочитано");
+
+    writeJson(env.settingsFile, { contextWindow: "чушь" });
+    assert.strictEqual(env.store.loadSettings().contextWindow, 0, "мусор в окне не сведён к «Авто»");
   });
 
   await test("миграция: provider «external» и старые поля становятся openai-подключением", () => {
@@ -401,6 +420,43 @@ const readRaw = (file) => (fs.existsSync(file) ? fs.readFileSync(file, "utf8") :
     assert.strictEqual(MAIN_SRC.indexOf("function applyBrowserSettings(s) {"), -1, "применение профиля браузера осталось в оболочке");
     assert.ok(STORE_SRC.indexOf("applyAgentEnv(") >= 0 && STORE_SRC.indexOf("applyBrowserSettings(") >= 0,
       "модуль не применяет настройки к живым подсистемам");
+  });
+
+  console.log("\n[6] Разрешения Яндекс.Облака: чекбоксы не сбрасываются");
+
+  await test("разрешения облака переживают сохранение всего объекта настроек", () => {
+    // Кнопка «Сохранить» в панели настроек пишет getSettings() ЦЕЛИКОМ. Если
+    // разрешения не лежат в схеме настроек, такая запись их молча теряет.
+    const env = build();
+    const s = env.store.loadSettings();
+    s.ycAllowAgentCreate = true;
+    s.ycAllowAgentDelete = true;
+    s.ycAllowAgentUpdate = true;
+    s.ycAllowAgentPublic = true;
+    env.store.saveSettings(s);
+    const back = env.store.loadSettings();
+    assert.strictEqual(back.ycAllowAgentCreate, true, "разрешение «создавать ресурсы» потерялось при записи");
+    assert.strictEqual(back.ycAllowAgentDelete, true, "разрешение «удалять ресурсы» потерялось при записи");
+    assert.strictEqual(back.ycAllowAgentUpdate, true, "разрешение «менять контейнеры» потерялось при записи");
+    assert.strictEqual(back.ycAllowAgentPublic, true, "разрешение «делать бакет публичным» потерялось при записи");
+  });
+
+  await test("окно облака держит зеркало настроек: чекбоксы не сбрасываются кнопкой «Сохранить»", () => {
+    // Ошибка была тихой: панель облака сохраняла права на диск (yc:setPermissions),
+    // но локальное зеркало окна не трогала. Кнопка «Сохранить» затем писала старое
+    // зеркало целиком (persistSettings → api.setSettings) и чекбокс возвращался в false.
+    const YC_PANEL_SRC = read("src", "renderer", "yc-panel.js");
+    const HTML_SRC = read("src", "renderer", "index.html");
+    const at = YC_PANEL_SRC.indexOf("function saveYcPerms()");
+    assert.ok(at >= 0, "точки сохранения прав облака больше нет");
+    const body = YC_PANEL_SRC.slice(at, YC_PANEL_SRC.indexOf("return { create, del, upd, pub };", at));
+    for (const f of ["ycAllowAgentCreate", "ycAllowAgentDelete", "ycAllowAgentUpdate", "ycAllowAgentPublic"]) {
+      assert.ok(body.indexOf(f) >= 0, "saveYcPerms не обновляет зеркало настроек: " + f);
+      assert.ok(STORE_SRC.indexOf(f + ":") >= 0, "в схеме настроек нет " + f);
+    }
+    for (const id of ["s-yc-allow-create", "s-yc-allow-delete", "s-yc-allow-update", "s-yc-allow-public"]) {
+      assert.ok(HTML_SRC.indexOf('id="' + id + '"') >= 0, "нет чекбокса " + id);
+    }
   });
 
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");

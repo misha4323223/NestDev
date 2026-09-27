@@ -220,7 +220,28 @@
           <!-- Заполняемость контекста — только слово и процент (как у Freebuff).
                Полоска убрана: она отнимала ширину и читалась как второй индикатор
                загрузки, а точные числа всё равно лежат в подсказке. -->
-          <div id="ctx-indicator" class="ctx-indicator" title="Заполняемость контекста модели"><span id="ctx-text"></span></div>
+          <div id="ctx-indicator" class="ctx-indicator" role="button" tabindex="0" title="Заполняемость контекста модели. Нажми, чтобы задать окно вручную"><span id="ctx-text"></span></div>
+          <!-- Окно контекста вручную: у OpenAI-совместимых роутеров окно модели не
+               сообщается, и авто уходит за настоящее окно — агент перестаёт звать
+               инструменты и «пишет код в чат». Здесь человек задаёт окно сам. -->
+          <div id="ctx-popover" class="ctx-popover hidden">
+            <div class="ctx-pop-title">Окно контекста модели</div>
+            <div class="ctx-pop-current" id="ctx-pop-current"></div>
+            <div class="ctx-pop-opts" id="ctx-pop-opts">
+              <button type="button" class="ctx-opt" data-win="0">Авто</button>
+              <button type="button" class="ctx-opt" data-win="32000">32k</button>
+              <button type="button" class="ctx-opt" data-win="65536">64k</button>
+              <button type="button" class="ctx-opt" data-win="131072">128k</button>
+              <button type="button" class="ctx-opt" data-win="204800">200k</button>
+              <button type="button" class="ctx-opt" data-win="1000000">1M</button>
+              <button type="button" class="ctx-opt" data-win="-1">Своё…</button>
+            </div>
+            <div class="ctx-pop-custom hidden" id="ctx-pop-custom">
+              <input id="ctx-pop-input" type="number" min="4000" max="8000000" step="1000" placeholder="например 128000" />
+              <button type="button" id="ctx-pop-apply" class="ctx-opt">Применить</button>
+            </div>
+            <div class="ctx-pop-hint">«Авто» — приложение определит окно само. Если модель жалуется, что запрос слишком длинный, или агент подолгу «забывает» начало работы — поставь меньше. У моделей с большим окном ставь больше: история будет жить дольше и чат реже будет сжиматься.</div>
+          </div>
           <div class="composer-row">
             <span class="input-hint">Enter — отправить · Shift+Enter — новая строка</span>
             <div class="composer-btns">
@@ -717,6 +738,14 @@
           <button class="stab" data-tab="secrets" title="Переменные окружения, пароли сайтов и поиск для агента">
             <span class="stab-ico">🔒</span>
             <span class="stab-text"><b>Секреты</b><small>переменные, пароли сайтов, поиск</small></span>
+          </button>
+          <button class="stab" data-tab="roles" title="Роли: у каждой роли и у каждого проекта своя папка с файлом PROMPT.md — тон, правила и знание о бренде">
+            <span class="stab-ico">🎭</span>
+            <span class="stab-text"><b>Роли</b><small>папки ролей и их промты</small></span>
+          </button>
+          <button class="stab" data-tab="proxy" title="Прокси для внешних API: в России OpenAI, Anthropic, Google и Groq без VPN недоступны. Через прокси идут только запросы к провайдеру — файлы, git, терминал и свой Ollama остаются напрямую.">
+            <span class="stab-ico">🌍</span>
+            <span class="stab-text"><b>Прокси</b><small>доступ к внешним API</small></span>
           </button>
           <div class="settings-nav-group">Интеграции</div>
           <button class="stab" data-tab="yandex" title="Yandex Cloud: авторизация, каталог, разрешения агента">
@@ -1397,6 +1426,55 @@
           </div>
         </div>
 
+        <!-- ── Вкладка: Роли ── -->
+        <div class="settings-tab-body hidden" data-tab-body="roles">
+          <div class="settings-section">
+            <div class="settings-section-title">🎭 Папки ролей</div>
+            <div class="hint-block">
+              У каждой роли — своя папка, и у <b>каждого проекта она своя</b>. Положи в папку файл
+              <code>PROMPT.md</code> — когда чат работает в этой роли, его текст подхватывается
+              автоматически (без напоминаний) и уходит агенту в системный промпт рядом с блоком
+              «САММАРИ ПРОЕКТА». Так задаются тон, правила и знание о бренде. Папку не выбрал —
+              промпт не меняется вовсе. Остальные файлы из той же папки агент читает сам, когда нужны.
+            </div>
+            <div id="roles-project" class="hint-block">Проект: —</div>
+            <div id="roles-list"></div>
+          </div>
+        </div>
+        <!-- ── Вкладка: Прокси для внешних API ── -->
+        <div class="settings-tab-body hidden" data-tab-body="proxy">
+          <div class="settings-section">
+            <div class="settings-section-title">🌍 Прокси для внешних API</div>
+            <div class="field">
+              <label class="check-row" title="Через прокси идут ТОЛЬКО запросы к AI-провайдеру. Локальная работа приложения (файлы, git, терминал, Ollama на этом ПК) прокси не касается.">
+                <input id="s-proxy-enabled" type="checkbox" />
+                <span class="check-row-text">
+                  <b>Ходить к провайдеру через прокси</b>
+                  <small>Часть API (OpenAI, Anthropic, Google, Groq) из России без VPN недоступна. Включаешь — и запросы агента к провайдеру идут через прокси: чат, список моделей, сжатие контекста и вспомогательная модель. Выключаешь — работает как раньше, напрямую.</small>
+                </span>
+              </label>
+            </div>
+            <div class="field">
+              <label>Адрес прокси</label>
+              <div class="input-row">
+                <input id="s-proxy-url" placeholder="http://127.0.0.1:8080  или  socks5://user:pass@host:1080" spellcheck="false" autocomplete="off" />
+                <button id="btn-proxy-test" class="btn btn-ghost" title="Сделать настоящий запрос через прокси и показать выходной IP">🔌 Проверить</button>
+              </div>
+              <div class="hint-block">Подойдёт свой клиент на этом ПК (sing-box, Xray, v2ray — обычно <code>socks5://127.0.0.1:1080</code> или <code>http://127.0.0.1:8080</code>) либо внешний <code>http://</code> / <code>socks5://</code> прокси. Логин и пароль пишутся прямо в адресе: <code>socks5://user:pass@host:1080</code>. Кнопка «Проверить» делает настоящий запрос наружу и показывает, каким IP нас видит провайдер, — это честная проверка, а не «настройка сохранена».</div>
+              <div id="proxy-test-status" class="ota-status">—</div>
+            </div>
+            <div class="field">
+              <label class="check-row" title="Локальные адреса проксировать вредно: свой Ollama и внутренние сервисы живут на этом же ПК.">
+                <input id="s-proxy-bypass-local" type="checkbox" />
+                <span>Не отправлять через прокси локальные адреса</span>
+              </label>
+              <div class="hint-block">Включено по умолчанию: <code>localhost</code>, <code>127.0.0.1</code> и домашние сети (<code>192.168.x.x</code>, <code>10.x.x.x</code>) идут напрямую. Именно так работает свой Ollama, LM Studio и llama.cpp — проксировать их незачем и вредно.</div>
+            </div>
+            <div class="field">
+              <div class="hint-block">Проверка прокси идёт из главного процесса тем же кодом, что и настоящий запрос агента. Прокси может быть доступен не из России — тогда возьми VPS за рубежом или платный <code>socks5://</code>.</div>
+            </div>
+          </div>
+        </div>
         <!-- ── Вкладка: Self-update (OTA) ── -->
         <div class="settings-tab-body hidden" data-tab-body="ota">
           <div class="settings-section">
@@ -1483,6 +1561,7 @@
   <script src="auto-tasks.js"></script>
   <script src="model-popup.js"></script>
   <script src="reasoning.js"></script>
+  <script src="context-ui.js"></script>
   <script src="ask-modal.js"></script>
   <script src="chat-rename.js"></script>
   <script src="chat-store.js"></script>

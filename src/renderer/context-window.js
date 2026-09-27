@@ -15,7 +15,10 @@
   }
 })(typeof self !== "undefined" ? self : this, function (deps) {
   const { config, transport } = deps || {};
-  const { baseFor, proxiedBase, apiKeyFor, apiHeaders, projectHeader } = config || {};
+  const { baseFor, proxiedBase, netFetch, apiKeyFor, apiHeaders, projectHeader } = config || {};
+  // Запрос к API: в Electron main уходит через прокси, если человек его включил
+  // (подстановка — src/net-proxy.js); в браузере и без настройки — обычный fetch.
+  const callApi = typeof netFetch === "function" ? netFetch : (url, init) => fetch(url, init);
   const { partsText } = transport || {};
 
   // ── Контекст-окно: грубая оценка токенов и обрезка истории ──
@@ -237,7 +240,7 @@
       const timeout = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(timeoutMs) : undefined;
       const headers = apiHeaders(provider, apiKeyFor(provider, s), false, projectHeader(s));
       if (provider === "anthropic") {
-        const res = await fetch(baseFor(provider, s) + "/v1/messages", {
+        const res = await callApi(baseFor(provider, s) + "/v1/messages", {
           method: "POST",
           headers,
           signal: timeout,
@@ -258,7 +261,7 @@
         };
         const numCtx = Math.round(Number(o.numCtx) || 0);
         if (numCtx > 0) localChat.options = { num_ctx: numCtx };
-        const res = await fetch(baseFor(provider, s) + "/api/chat", {
+        const res = await callApi(baseFor(provider, s) + "/api/chat", {
           method: "POST",
           headers: headers,
           signal: timeout,
@@ -268,7 +271,7 @@
         const d = await res.json();
         return (d.message && d.message.content) || null;
       }
-      const res = await fetch(proxiedBase(baseFor(provider, s)) + "/chat/completions", {
+      const res = await callApi(proxiedBase(baseFor(provider, s)) + "/chat/completions", {
         method: "POST",
         headers,
         signal: timeout,

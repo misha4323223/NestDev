@@ -190,11 +190,11 @@ const stopAll = async () => {
     ok(seenWiring.run === 1, "createRunTools вызван " + seenWiring.run + " раз(а)");
     ok(seenWiring.runDeps === d, "модуль получил ТОТ ЖЕ объект, что и agent-tools");
     ok(seenWiring.runArgs === 1, "модулю передан только deps (живого моста этим инструментам не нужно): аргументов " + seenWiring.runArgs);
-    const names = ["shellsStatus", "runCommand", "runCommandOutput", "runCommandAsAdmin", "runScript", "startBackground",
+    const names = ["shellsStatus", "runCommand", "runCommandOutput", "runCommandAsAdmin", "openAdminTerminal", "runScript", "startBackground",
       "listBackground", "backgroundOutput", "sendInput", "stopBackground", "shellStart", "shellSend", "waitUntil",
       "timeoutCommand", "retryCommand"];
     const missing = names.filter((n) => typeof seenWiring.tools[n] !== "function");
-    ok(missing.length === 0, "все пятнадцать инструментов на месте" + (missing.length ? ": нет " + missing.join(", ") : ""));
+    ok(missing.length === 0, "все шестнадцать инструментов на месте" + (missing.length ? ": нет " + missing.join(", ") : ""));
 
     console.log("\n[2] shellsStatus: оболочки этой машины");
     const shells = plain(await call("shellsStatus", {}));

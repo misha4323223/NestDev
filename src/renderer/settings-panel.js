@@ -111,6 +111,75 @@
     if (p === "g4f") probeG4fPort();
   }
 
+  // ── Роли: папки ролей ───────────────────────────────────────────────────────
+  // У каждой роли (Разработчик / Ассистент / Менеджер / Исследователь) — своя папка,
+  // и у КАЖДОГО проекта она своя. Из папки главный процесс читает файл PROMPT.md и
+  // дописывает его в системный промпт, когда чат работает в этой роли
+  // (src/role-folders.js). Здесь только путь: строки в карте roleDirs по id проекта.
+  function rolesProjectId() {
+    return String(getSettings().activeProjectId || "").trim();
+  }
+  function roleDirsMap() {
+    const s = getSettings();
+    if (!s.roleDirs || typeof s.roleDirs !== "object" || Array.isArray(s.roleDirs)) s.roleDirs = {};
+    return s.roleDirs;
+  }
+  function renderRolesUI() {
+    const box = $("roles-list");
+    if (!box) return;
+    const list = (AgentCore && AgentCore.rolesList ? AgentCore.rolesList() : []) || [];
+    const pid = rolesProjectId();
+    const cur = pid ? roleDirsMap()[pid] || {} : {};
+    const info = $("roles-project");
+    if (info) {
+      const pr = (getSettings().projects || []).find((p) => p.id === pid);
+      info.textContent = pr
+        ? "Проект: " + (pr.name || pid) + (pr.dir ? "  ·  " + pr.dir : "")
+        : "Активный проект не выбран — открой панель проекта слева и выбери проект: папки ролей хранятся ПО ПРОЕКТАМ.";
+    }
+    box.innerHTML = "";
+    for (const r of list) {
+      const row = document.createElement("div");
+      row.className = "field";
+      const label = document.createElement("label");
+      label.textContent = (r.icon ? r.icon + " " : "") + (r.title || r.id);
+      const hint = document.createElement("span");
+      hint.className = "hint";
+      hint.textContent = " (файл PROMPT.md из папки этой роли)";
+      label.appendChild(hint);
+      const wrap = document.createElement("div");
+      wrap.className = "input-row";
+      const input = document.createElement("input");
+      input.id = "role-dir-" + r.id;
+      input.spellcheck = false;
+      input.autocomplete = "off";
+      input.placeholder = "путь к папке роли";
+      input.value = pid ? cur[r.id] || "" : "";
+      input.disabled = !pid;
+      const btn = document.createElement("button");
+      btn.className = "btn btn-ghost";
+      btn.type = "button";
+      btn.textContent = "📂";
+      btn.title = "Выбрать папку для роли «" + (r.title || r.id) + "»";
+      btn.disabled = !pid;
+      btn.onclick = async () => {
+        // Системный диалог выбора папки открывается только на ПК: телефону он закрыт
+        // (src/mobile-bridge.js), поэтому там панель просто просит вписать путь руками.
+        if (window.mobileApi || !isElectron || !api.pickDirectory) {
+          toast("Выбор папки доступен в приложении на ПК — впиши путь вручную");
+          return;
+        }
+        const p = await api.pickDirectory("role");
+        if (p) input.value = p;
+      };
+      wrap.appendChild(input);
+      wrap.appendChild(btn);
+      row.appendChild(label);
+      row.appendChild(wrap);
+      box.appendChild(row);
+    }
+  }
+
   // Заполняет все поля настроек значениями из памяти (чтобы переключение провайдеров ничего не теряло)
   function fillSettingsUI() {
     $("s-ollama-url").value = getSettings().ollamaUrl || "";
@@ -175,7 +244,15 @@
     $("s-mail-smtp-port").value = getSettings().mailSmtpPort ? String(getSettings().mailSmtpPort) : "";
     $("s-mail-starttls").checked = !!getSettings().mailStarttls;
     $("s-mail-allow-send").checked = !!getSettings().mailAllowAgentSend;
+    // Прокси для внешних API: галочка, адрес и «мимо прокси» для локальных адресов.
+    if ($("s-proxy-enabled")) {
+      $("s-proxy-enabled").checked = getSettings().proxyEnabled === true;
+      $("s-proxy-url").value = getSettings().proxyUrl || "";
+      $("s-proxy-bypass-local").checked = getSettings().proxyBypassLocal !== false;
+    }
+    wireProxyButton();
     renderOtaStatus();
+    renderRolesUI();
   }
 
   // Читает значения активного провайдера из полей в settings
@@ -233,6 +310,32 @@
     getSettings().autoSwitchProfiles = !!$("s-auto-switch").checked;
     getSettings().sendAllTools = !!$("s-send-all-tools").checked;
     if ($("s-no-tools-model")) getSettings().noToolsModel = !!$("s-no-tools-model").checked;
+    // Папки ролей: пишем ТОЛЬКО для активного проекта — иначе пустая карта затёрла бы
+    // чужие проекты. Значения чистит главный процесс (src/role-folders.js), здесь
+    // только убираем пробелы по краям.
+    (() => {
+      const pid = rolesProjectId();
+      if (!pid) return;
+      const list = (AgentCore && AgentCore.rolesList ? AgentCore.rolesList() : []) || [];
+      // Поля ролей рисуются при ОТКРЫТИИ настроек. Если их ещё нет (сохранили из другой
+      // кнопки, не заходя во вкладку), карту не трогаем — иначе в файле настроек завелась
+      // бы пустая запись проекта.
+      if (!list.length || !$("role-dir-" + list[0].id)) return;
+      const map = roleDirsMap();
+      const one = map[pid] && typeof map[pid] === "object" && !Array.isArray(map[pid]) ? map[pid] : (map[pid] = {});
+      for (const r of list) {
+        const el = $("role-dir-" + r.id);
+        if (el) one[r.id] = el.value.trim();
+      }
+    })();
+    // Прокси для внешних API (src/net-proxy.js): только форма полей — годен ли
+    // адрес, решает главный процесс в момент запроса. Поля могли не появиться
+    // в старой разметке, поэтому проверяем их наличие.
+    if ($("s-proxy-enabled")) {
+      getSettings().proxyEnabled = !!$("s-proxy-enabled").checked;
+      getSettings().proxyUrl = $("s-proxy-url").value.trim();
+      getSettings().proxyBypassLocal = !!$("s-proxy-bypass-local").checked;
+    }
     // Зеркало модели активного провайдера
     getSettings().model = getSettings()[MODEL_KEY[getSettings().provider]] || "";
   }
@@ -845,6 +948,52 @@
     }
   }
 
+  // ── Прокси для внешних API: проверка связи ─────────────────────────────
+  // Проверку делает ГЛАВНЫЙ процесс (api.testProxy → settings:testProxy): в окне
+  // свой сетевой стек, и такая «проверка» рассказывала бы о другом соединении.
+  // Адрес берём ИЗ ПОЛЯ, а не из сохранённых настроек: человек жмёт «Проверить»
+  // сразу после ввода и мог ещё не сохранить.
+  async function testProxyUI() {
+    const box = $("proxy-test-status");
+    const btn = $("btn-proxy-test");
+    if (!box) return;
+    if (window.mobileApi || !isElectron || !api.testProxy) {
+      box.textContent = "Проверка прокси доступна в приложении на ПК";
+      return;
+    }
+    const url = (($("s-proxy-url") || {}).value || "").trim();
+    if (!url) {
+      box.textContent = "Впиши адрес прокси — например socks5://127.0.0.1:1080";
+      return;
+    }
+    box.textContent = "Проверяю прокси…";
+    if (btn) btn.disabled = true;
+    try {
+      const r = await api.testProxy({ proxyUrl: url });
+      if (r && r.ok) {
+        box.textContent =
+          "✅ Прокси работает" + (r.ip ? " · выходной IP: " + r.ip : "") + (r.ms ? " · " + r.ms + " мс" : "");
+      } else {
+        box.textContent = "❌ Не получилось: " + ((r && r.error) || "нет ответа");
+      }
+    } catch (e) {
+      box.textContent = "❌ Не получилось: " + ((e && e.message) || e);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // Кнопка проверки навешивается ОДИН раз: fillSettingsUI зовут при каждом
+  // открытии настроек, и повторная навеска накопила бы обработчики.
+  let proxyWired = false;
+  function wireProxyButton() {
+    if (proxyWired) return;
+    const b = $("btn-proxy-test");
+    if (!b) return;
+    proxyWired = true;
+    b.onclick = () => testProxyUI();
+  }
+
   return {
     providerLabel: providerLabel,
     updateBadge: updateBadge,
@@ -877,6 +1026,9 @@
     wireSetupFolders: wireSetupFolders,
     renderMemoryStatus: renderMemoryStatus,
     renderBrowserProfileInfo: renderBrowserProfileInfo,
+    // Прокси для внешних API: проверка связи кнопкой «Проверить».
+    testProxyUI: testProxyUI,
+    wireProxyButton: wireProxyButton,
     renderBrowserConnectInfo: renderBrowserConnectInfo,
     saveSettingsUI: saveSettingsUI,
     toggleKey: toggleKey,

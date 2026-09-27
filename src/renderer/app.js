@@ -363,6 +363,19 @@
   });
   Reasoning.wire();
 
+  // ─── Окно контекста модели (ручной выбор) — код в src/renderer/context-ui.js ───
+  // Чип заполняемости под полем ввода — кнопка: клик открывает выбор окна. Значение
+  // лежит в настройках и в прогоне перебивает авто-определение (run-ai.js) — так
+  // история сжимается вовремя, и агент не «забывает» инструменты на роутерах,
+  // которые окно модели не сообщают.
+  const ContextUI = window.ContextUI({
+    $: $,
+    toast: toast,
+    getSettings: () => settings,
+    persistSettings: () => ChatStore.persistSettings(),
+  });
+  ContextUI.wire();
+
   const ChatSend = window.ChatSend({
     $: $,
     isElectron: isElectron,

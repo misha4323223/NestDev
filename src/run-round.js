@@ -51,11 +51,23 @@ function createRunRound(deps) {
     // Функции ядра — именами, как их зовёт прогон.
     SYSTEM_PROMPT,
     buildChatRequest,
+    // Прокси для внешних API (src/net-proxy.js): в России часть провайдеров без
+    // VPN недоступна, и запрос раунда идёт через него. Модуля нет (тесты, старая
+    // сборка) или настройка выключена — работает обычный fetch, как раньше.
+    netProxy,
     consumeProviderStream,
     createThinkingStripper,
     readApiError,
     estimateTokens,
   } = deps;
+
+  // Запрос к провайдеру: через прокси, если человек его включил и цель внешняя
+  // (решение — в src/net-proxy.js). Без модуля прокси поведение прежнее, поэтому
+  // проверки раунда не меняются.
+  const providerFetch =
+    netProxy && typeof netProxy.fetchFor === "function"
+      ? (url, opts) => netProxy.fetchFor(settings, url, opts)
+      : (url, opts) => fetch(url, opts);
 
   // Сообщения запроса: справочники по сайтам стоят сразу после системного промпта —
   // они часть статичного префикса, и точка кэша остаётся на месте.
@@ -99,7 +111,7 @@ function createRunRound(deps) {
     await retry.pace();
     let res;
     try {
-      res = await fetch(req.url, {
+      res = await providerFetch(req.url, {
         method: "POST",
         headers: req.headers,
         body: req.body,

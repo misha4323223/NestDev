@@ -10,7 +10,10 @@
     root.ImageTools = factory;
   }
 })(typeof self !== "undefined" ? self : this, function (deps) {
-  const { apiHeaders, proxiedBase, readApiError } = deps || {};
+  const { apiHeaders, proxiedBase, netFetch, readApiError } = deps || {};
+  // Запрос к API: в Electron main уходит через прокси, если человек его включил
+  // (подстановка — src/net-proxy.js); в браузере и без настройки — обычный fetch.
+  const callApi = typeof netFetch === "function" ? netFetch : (url, init) => fetch(url, init);
   // База вспомогательной модели. Известным провайдерам достраиваем версию пути:
   // без неё запрос уходит на несуществующий адрес и человек видит пустую ошибку
   // («https://api.openai.com/images/generations» вместо «.../v1/images/generations»).
@@ -46,7 +49,7 @@
 
   // Чтение изображения vision-моделью: dataUrl → текстовое описание.
   async function describeImageRemote(cfg, imageDataUrl, prompt, model) {
-    const res = await fetch(proxiedBase(cfg.url) + "/chat/completions", {
+    const res = await callApi(proxiedBase(cfg.url) + "/chat/completions", {
       method: "POST",
       headers: apiHeaders("openai", cfg.key, false, cfg.project ? { "OpenAI-Project": cfg.project } : null),
       body: JSON.stringify({
@@ -301,7 +304,7 @@
       }
       if (d && d.url) {
         // Часть провайдеров отдаёт ссылку вместо base64 — скачиваем её сами.
-        const r = await fetch(proxiedUrl(String(d.url)), { signal: imageTimeout(120000) });
+        const r = await callApi(proxiedUrl(String(d.url)), { signal: imageTimeout(120000) });
         if (!r.ok) throw new Error("картинка по ссылке не скачалась: HTTP " + r.status);
         const ct = r.headers && r.headers.get ? r.headers.get("content-type") : "";
         const mediaType = String(ct || "image/png").split(";")[0].trim() || "image/png";
@@ -322,7 +325,7 @@
     const url = YANDEX_OPS_URL + encodeURIComponent(opId);
     for (let i = 0; i < 20; i++) {
       await new Promise((r) => setTimeout(r, i === 0 ? 1500 : 5000));
-      const res = await fetch(proxiedUrl(url), { headers: headers, signal: imageTimeout(30000) });
+      const res = await callApi(proxiedUrl(url), { headers: headers, signal: imageTimeout(30000) });
       if (!res.ok) throw new Error("опрос операции: HTTP " + res.status + " · " + (await readApiError(res)));
       const d = await res.json().catch(() => ({}));
       if (d && d.error) throw new Error("ART ответил ошибкой: " + String(d.error.message || JSON.stringify(d.error)).slice(0, 200));
@@ -367,7 +370,7 @@
       if (a.afterStatuses && a.afterStatuses.indexOf(lastStatus) === -1) continue;
       let res;
       try {
-        res = await fetch(proxiedUrl(a.url), {
+        res = await callApi(proxiedUrl(a.url), {
           method: "POST",
           headers: a.headers,
           body: JSON.stringify(a.body),

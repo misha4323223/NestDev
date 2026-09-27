@@ -3,6 +3,7 @@
 /* ─── Инструменты агента: команды, оболочка и фоновые процессы ───────────────
    Вынесены из agent-tools.js своим модулем (этап «дробление крупных модулей»,
    часть 40, заход 4): shellsStatus, runCommand, runCommandOutput, runCommandAsAdmin,
+   openAdminTerminal,
    runScript, startBackground, listBackground, backgroundOutput, sendInput,
    stopBackground, shellStart, shellSend, waitUntil, timeoutCommand, retryCommand.
 
@@ -39,6 +40,7 @@ function createRunTools(deps) {
     spawnCollect,
     explainExit,
     runAsAdmin,
+    openAdminTerminal,
     bgWaitFor,
     truncateText,
   } = deps;
@@ -223,6 +225,11 @@ function createRunTools(deps) {
     },
     "runCommandAsAdmin": async (args, settings) => {
         return await runAsAdmin(args.command);
+    },
+    // Живое окно PowerShell от администратора: окно остаётся открытым, а разовый
+    // вывод и ожидание конца — у runCommandAsAdmin (они и остаются для скриптов).
+    "openAdminTerminal": async (args, settings) => {
+        return await openAdminTerminal({ command: args.command });
     },
     "timeoutCommand": async (args, settings) => {
         const cmd = String(args.command || "").trim();
