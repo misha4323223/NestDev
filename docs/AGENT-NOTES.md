@@ -22,6 +22,7 @@
 
 | № | О чём | Полный текст | Строк |
 |---:|---|---|---:|
+| 80 | ключи доступа в карточке — по существующему адресу (404 на весь список) | [`notes/chast-80-klyuchi-dostupa-v-kartochke-po-sushchestvuyushchemu-adresu.md`](notes/chast-80-klyuchi-dostupa-v-kartochke-po-sushchestvuyushchemu-adresu.md) | 48 |
 | 79 | карта файла в `smoke.test.js` и бегунок в конец — читается сверху вниз | [`notes/chast-79-karta-fayla-v-smoke-test-js-i-begunok-v-konec.md`](notes/chast-79-karta-fayla-v-smoke-test-js-i-begunok-v-konec.md) | 31 |
 | 78 | журнал разложен по файлам: здесь индекс, тексты в `notes/` | [`notes/chast-78-zhurnal-razlozhen-po-faylam-indeks-vmesto-15-mb.md`](notes/chast-78-zhurnal-razlozhen-po-faylam-indeks-vmesto-15-mb.md) | 28 |
 | 77 | документы переехали в `docs/`, а передача разгружена (этапы 0 и 1) | [`notes/chast-77-dokumenty-pereehali-v-docs-a-peredacha-razgruzhe.md`](notes/chast-77-dokumenty-pereehali-v-docs-a-peredacha-razgruzhe.md) | 8 |

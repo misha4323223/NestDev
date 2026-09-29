@@ -67,9 +67,14 @@ function test(name, fn) {
 
 const read = (...p) => fs.readFileSync(path.join(ROOT, ...p), "utf8");
 const plain = (v) => JSON.parse(JSON.stringify(v));
+// Код без комментариев: путь ищем в ЖИВОМ коде, а не в тексте пояснения.
+// (В пояснении к исправлению старый путь назван намеренно — он объясняет, чего
+// делать нельзя, и поиск по сырому тексту путал бы запрет с нарушением.)
+const codeOnly = (src) => String(src).replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 
 const yandex = require(path.join(ROOT, "src", "yandex-cloud.js"));
 const ycIamLib = require(path.join(ROOT, "src", "yc-iam.js"));
+const ycConsoleLib = require(path.join(ROOT, "src", "yc-console.js"));
 const { createYcIam, checkName, checkRole, roleHuman, roleDanger, minimalRoles, keyTrouble, humanDays } = ycIamLib;
 const { createCloudTools } = require(path.join(ROOT, "src", "agent-tools-cloud.js"));
 
@@ -887,6 +892,56 @@ const urlOf = (c) => String(c.url).split("?")[0];
   await test("ycIam: набор стоит в цепочке npm test, а разведчик API — отдельной командой", () => {
     assert.ok(String(PKG.scripts.test || "").indexOf("test/yc-iam.test.js") >= 0, "набора нет в цепочке npm test");
     assert.ok(PKG.scripts["recon:yc"], "нет команды разведки API");
+  });
+
+  console.log("\n[5] Карточка консоли: ключи доступа по существующему адресу");
+
+  await test("ключи доступа: консоль и модуль ходят по одному адресу, и он существует", () => {
+    // Ресурса /iam/v1/accessKeys не существует вовсе: статические ключи живут
+    // ТОЛЬКО в AWS-совместимом API IAM (AccessKey.List). Пока карточка ходила по
+    // старому пути, она показывала 404 на обе попытки, а «добрать по каталогу»
+    // не могла в принципе — параметра folderId у метода нет. Каждый такой путь
+    // живёт в ДВУХ местах (модуль агента и реестр связей консоли), поэтому и
+    // проверяется, что адрес один и тот же.
+    const consoleSrc = read("src", "yc-console.js");
+    const iamSrc = read("src", "yc-iam.js");
+    assert.strictEqual(codeOnly(consoleSrc).indexOf("/iam/v1/accessKeys"), -1, "в консоли снова несуществующий путь ключей доступа");
+    assert.ok(iamSrc.indexOf("/iam/aws-compatibility/v1/accessKeys") >= 0, "модуль IAM потерял верный путь ключей доступа");
+    // Сам разбор тоже проверяем, иначе он мог бы прятать нарушения молча.
+    assert.ok(codeOnly('const p = "/iam/v1/accessKeys";').indexOf("/iam/v1/accessKeys") >= 0, "разбор пропускает путь в живом коде");
+    assert.strictEqual(codeOnly("// было /iam/v1/accessKeys\nconst p = 1;").indexOf("/iam/v1/accessKeys"), -1, "разбор считает комментарий нарушением");
+    const rel = (ycConsoleLib.RELATIONS.iam || []).find((r) => r.key === "accessKeys");
+    assert.ok(rel, "у сервисного аккаунта нет связи «Статические ключи»");
+    assert.strictEqual(rel.attempts.length, 1, "у связи больше одной формы запроса, а существует только одна");
+    const path = rel.attempts[0].path({ id: "sa-1", folderId: "folder-1" });
+    assert.ok(
+      path.indexOf("/iam/aws-compatibility/v1/accessKeys?serviceAccountId=") === 0,
+      "консоль ходит не по адресу AWS-совместимого API: " + path
+    );
+    assert.strictEqual(/folderId/.test(path), false, "в запросе остался folderId, которого у метода нет: " + path);
+    assert.strictEqual(rel.parentField, undefined, "у связи остался фильтр по родителю, хотя фильтровать нечего");
+  });
+
+  await test("ключи доступа: карточка их действительно читает, а прежний адрес обязан падать", async () => {
+    stub.reset();
+    const out = await ycConsoleLib.relationList("oauth-1", {
+      serviceKey: "iam",
+      relationKey: "accessKeys",
+      id: "sa-1",
+      folderId: "folder-1",
+    });
+    assert.ok(out.ok, "связь не прочиталась: " + JSON.stringify(out).slice(0, 200));
+    assert.ok(/aws-compatibility/.test(out.path), "запрос ушёл не на адрес ключей доступа: " + out.path);
+    assert.strictEqual(out.count, 1, "ключ доступа не найден: " + JSON.stringify(out.rows));
+    assert.ok(/YCAJEtest0001/.test(JSON.stringify(out.rows)), "идентификатор ключа не показан: " + JSON.stringify(out.rows));
+    // Негативный контроль в самом живом коде: прежний адрес недоступен так же,
+    // как в настоящем облаке. Без этого проверка выше была бы «зелёной» просто
+    // потому, что подменённое облако отвечает на любой путь.
+    let status = 0;
+    await yandex._fetchJson(stub.base + "/iam/v1/accessKeys?serviceAccountId=sa-1", {}, 5000).catch((e) => {
+      status = e && e.status;
+    });
+    assert.strictEqual(status, 404, "подменённое облако отвечает на несуществующий путь — проверка ничего не значит");
   });
 
   stub.server.close();

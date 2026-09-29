@@ -100,15 +100,16 @@ function startFakeYc() {
         return json(200, { recordSets: [{ name: "www.example.com.", type: "A", ttl: 600, data: ["1.2.3.4"] }] });
       }
 
-      // IAM: сервисный аккаунт и ключи. По serviceAccountId — отказ, по каталогу — работает.
+      // IAM: сервисный аккаунт и ключи. Ключи доступа отвечает ТОЛЬКО
+      // AWS-совместимый API: ресурса /iam/v1/accessKeys не существует (404 на
+      // любой запрос), а параметра folderId у метода нет — каталогом не добрать.
       if (p === "/iam/v1/serviceAccounts") {
         return json(200, { serviceAccounts: [{ id: "sa1", name: "deployer", folderId: "f1", createdAt: "2026-08-20T10:00:00Z" }] });
       }
       if (p === "/iam/v1/serviceAccounts/sa1") {
         return json(200, { id: "sa1", name: "deployer", folderId: "f1", createdAt: "2026-08-20T10:00:00Z", description: "для деплоя" });
       }
-      if (p === "/iam/v1/accessKeys") {
-        if (u.searchParams.get("serviceAccountId")) return json(403, { message: "not allowed for this subject" });
+      if (p === "/iam/aws-compatibility/v1/accessKeys") {
         return json(200, { accessKeys: [{ id: "ak1", serviceAccountId: "sa1", keyId: "KEY-1", createdAt: "2026-08-21T10:00:00Z" }] });
       }
       if (p === "/iam/v1/apiKeys") return json(200, { apiKeys: [] });
@@ -373,7 +374,11 @@ function hasXvfb() {
         err: (document.querySelector("#yc-console .ykc-err") || {}).textContent || "",
       };
     });
-    check("ключи сервисного аккаунта найдены через список по каталогу (403 → добор)", iam.rows.length === 1 && /KEY-1/.test(iam.rows[0]), iam.rows.join(" / ") || iam.err.slice(0, 90));
+    check("ключи сервисного аккаунта прочитаны", iam.rows.length === 1 && /KEY-1/.test(iam.rows[0]), iam.rows.join(" / ") || iam.err.slice(0, 90));
+    // И адрес именно тот, который существует: прежний (несуществующий) путь
+    // отдавал 404, и проверка выше была зелёной только потому, что подделка
+    // отвечала на любой путь. Теперь подделка отвечает только на настоящий адрес.
+    check("запрос ушёл на /iam/aws-compatibility/v1/accessKeys", seen.some((s) => s.indexOf("/iam/aws-compatibility/v1/accessKeys") === 0), seen.filter((s) => /accessKeys/.test(s)).join(" / "));
 
     console.log("\n[7] Контейнер: ревизии и откат («сделать активной»)");
     const cont = await page.evaluate(async () => {

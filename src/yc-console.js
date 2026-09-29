@@ -72,10 +72,15 @@ const RELATIONS = {
   ],
   iam: [
     { key: "accessKeys", title: "Статические ключи", icon: "🔑", listKey: "accessKeys",
-      // У ключей есть оба варианта: по сервисному аккаунту и по каталогу.
+      // Ключи доступа живут ТОЛЬКО в AWS-совместимом API IAM (AccessKey.List):
+      // /iam/aws-compatibility/v1/accessKeys. Ресурса /iam/v1/accessKeys не
+      // существует — на любой запрос приходит 404, — а параметра folderId у
+      // метода нет вовсе, поэтому вариант пути ОДИН: «добрать по каталогу» тут
+      // нечем, и выдуманную вторую форму запроса держать нельзя (она давала
+      // 404 и подменяла собой настоящую причину). Тот же адрес у модуля агента
+      // (src/yc-iam.js, accessKeys); совпадение путей сторожит test/yc-iam.test.js.
       attempts: [
-        { path: (c) => "/iam/v1/accessKeys?serviceAccountId=" + enc(c.id) },
-        { path: (c) => "/iam/v1/accessKeys?folderId=" + enc(c.folderId) + "&pageSize=1000", parentField: "serviceAccountId" },
+        { path: (c) => "/iam/aws-compatibility/v1/accessKeys?serviceAccountId=" + enc(c.id) + "&pageSize=1000" },
       ] },
     { key: "apiKeys", title: "API-ключи", icon: "🗝", listKey: "apiKeys",
       attempts: [
