@@ -1,6 +1,6 @@
 {
   "name": "ai-agent",
-  "version": "1.5.231",
+  "version": "1.5.232",
   "private": true,
   "description": "NestDev — чат с AI-агентом (Ollama / Groq / внешние API), файловые операции и git",
   "author": "NestDev",

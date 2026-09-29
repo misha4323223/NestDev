@@ -1,0 +1,255 @@
+# Начальный журнал проекта: Общение — Умное переключение ключей (1.5.15)
+
+Это раздел части 43 (`chast-43-*.md`): журнал версий 1.5.0 … 1.5.79 и заметки
+о проекте, инструментах и общении. Текст перенесён как есть, слово в слово.
+
+## Общение
+- Пользователь пишет по-русски и просит отвечать **исключительно на русском языке** (записано 6 сентября 2026). Все ответы — на русском, даже если код/сообщения системы на английском.
+
+## Проект: NestDev (Electron)
+- Приложение: чат с AI-агентом (Ollama / OpenAI-совместимые / Anthropic), файловые операции, git, GitHub.
+- Файлы: `src/main.js` (главный процесс Electron), `src/preload.js` (мост), `src/renderer/` (UI: app.js, index.html, styles.css, agent-core.js, markdown.js).
+- Сервер предпросмотра: `node server.js` (bun run preview, порт 8080) — только UI чата; полный функционал (файлы, git, клонирование) работает в десктоп-приложении.
+- **Живая проверка интерфейса — обязательна: `bun run test:live`** (`scripts/live-ui.js`). Поднимает
+  `server.js` на свободном порту, открывает **настоящий Chromium** (Playwright) и проверяет рельсу,
+  панели, настройки, мобильную ширину, оба пути панели плана (текст модели и инструмент `todoWrite`),
+  а также функции ядра прямо в живой странице. Браузер ставится один раз: `npx playwright install --with-deps chromium`.
+- **Сквозная проверка десктопа — тоже обязательна при правках инструментов и главного процесса:
+  `bun run test:live:desktop`** (`scripts/live-desktop.js`). Поднимает фейковый OpenAI-совместимый
+  провайдер, запускает НАСТОЯЩИЙ Electron и проводит вызов инструмента целиком: рендерер → IPC →
+  главный процесс → сеть → файл на диске (например `generateImage` пишет настоящий PNG). Под Xvfb:
+  `xvfb-run -a node scripts/live-desktop.js` (нужны `libgtk-3-0`). Перед запуском гасите старые
+  экземпляры: `pkill -f "electron/dist/electron"` — иначе занят порт отладки и тест не подключится.
+  **Почему это правило:** структурный `test/smoke.test.js` исполняет СРЕЗЫ кода, подставляя имена в область
+  видимости. Из-за этого он видел `normalizePlanTasks`, хотя в живом окне такого имени нет — вызов падал
+  `ReferenceError`, тот молча гас в потоке ответа, и панель плана не появлялась ни разу (1.5.64).
+- Репозитории GitHub: клик по строке = выбор (`github:pickRepo`), кнопка «⬇ Выгрузить» = клонирование в рабочую папку (`github:selectRepo`).
+- Публикация НОВОГО репозитория: кнопка «⬆ Опубликовать на GitHub» в панели файлов и инструмент агента `gitPublish` (общая функция `publishLocalToGithub` в main.js): создаёт репозиторий POST /user/repos (по умолчанию приватный), git init -b main (если нужно), переименовывает master→main, первый коммит, remote origin, push -u, затем PATCH default_branch. У агента заблокирована без настройки «Разрешить агенту git push». Если в папке уже есть origin — ошибка с советом использовать Push.
+- Клонирование: единая логика `cloneRepoTo` (пустые папки переиспользуются, имена папок безопасны для Windows, понятные ошибки, если git не установлен).
+- Защита от «Permission denied» при клонировании:
+  - `ensureWritableDir` делает **реальную проверку записи** (создаёт/удаляет подпапку `.ai-agent-write-test`), потому что `accessSync(W_OK)` не ловит OneDrive/сетевые/системные папки.
+  - `pickCloneBase` / `cloneBaseCandidates` подбирают первую записываемую папку по цепочке: запрошенная → сохранённая рабочая → домашняя → Документы → временная.
+  - Если git всё равно не может создать файлы (антивирус/«Контролируемый доступ к папкам» Windows блокирует git.exe) — `cloneRepoTo` повторяет клон в запасных записываемых папках.
+  - Панель проекта (`projectDir`) следует за папкой последнего склонированного репозитория (`settings.githubRepoDir`).
+- Терминал: команды агента (`runCommand`, `startBackground`, `shellSend`) дублируются в нижнюю панель терминала через `termAgentEcho`.
+- Чаты привязаны к проектам (`chat.projectId`): переключение проекта переключает на чат этого проекта (`ensureProjectChat`), выбор чата чужого проекта переключает проект (`selectChat`). Так агент не видит контекст других проектов. При старте открывается чат активного проекта.
+- Системный промпт (правило 17): запуск проекта — ТОЛЬКО через встроенный терминал (runCommand/startBackground/shellStart), dev-сервер по умолчанию на порту 5000.
+- Авто-коммит после задания агента (`agentAutoCommit`, по умолчанию ВКЛ, чекбокс в настройках): когда агент завершил задачу (emit done) и менял файлы в git-репозитории — main.js делает локальный коммит «Авто-коммит агента: <первая строка последнего сообщения>» (add -A + commit, БЕЗ push). Пропуск: план-режим, нет изменений, папка не git, остановка/ошибка. Событие `ai:event {type:"checkpoint"}` → тост в UI; после `done` панель git обновляется.
+- Хронологический вывод ответа агента (сегменты): текст и действия идут по порядку «текст → действия → текст → … → итог внизу». В app.js: `ensureSegmentForText` создаёт НОВЫЙ assistant-сегмент, если текст пришёл сразу после tool-сообщения (действие); `session.segmentIds` хранит сегменты запуска; `ensureWorkGroup` вставляет блок действий в конец списка (appendChild); `finishStream` помечает все сегменты готовыми, убирает пустые промежуточные (пустой ответ целиком → «…»), кнопки план/undo вешает на последний сегмент; `regenerate` удаляет весь запуск (от последнего user-сообщения). Сохранённая история = хронологический порядок сообщений, рендерится без изменений схемы.
+- Быстрый запуск проекта в превью (пользователь сам): в вкладке «Превью» строка команды + «▶ Запустить» / «⏹ Остановить» + живой лог. IPC: `dev:start(dir, command)` / `dev:stop` / `dev:status(dir)` (main.js: `devStart`/`devStop`/`devStatus`, `detectDevCommand` — dev→start→serve из package.json, bun если есть bun.lock/bunfig). События стримятся в `dev:event` (start/out/exit/stopped). Остановка убивает дерево процесса (bgKill) — порт освобождается. После старта превью открывается на `settings.previewUrl` (по умолчанию http://localhost:5000).
+- Мобильный доступ (LAN + PWA + PIN): телефон в той же Wi-Fi сети открывает `http://<IP-ПК>:9090` (порт настраивается), вводит PIN из Настроек → «Мобильный доступ» — и работает весь функционал ядра: чат, консоль, превью, файлы, git, GitHub. Архитектура: `src/mobile-bridge.js` (НОВЫЙ, без зависимостей) — HTTP-сервер отдаёт интерфейс + PWA (manifest /manifest.webmanifest, service worker /sw.js, иконка /icon.svg), WebSocket /ws (RFC 6455, реализован вручную) с PIN-авторизацией (5 неверных попыток → auth_lock + закрытие). RPC: клиент шлёт {t:"call",id,ch,args}, мост вызывает ТОТ ЖЕ обработчик, что и ipcMain (main.js проксирует `ipcMain.handle` → карта `ipcHandlerMap`; прокси ставится в самом верху main.js ДО всех регистраций). События: main.js проксирует `mainWindow.webContents.send` → `mobileBridge.broadcast` (ai:event/term:event/dev:event/github:event уходят на телефоны). Настройки: `mobileEnabled/mobilePort/mobilePin` в DEFAULT_SETTINGS, IPC `mobile:status` и `mobile:pinRegen` (генерация PIN в main, не в рендерере). При включении без PIN — генерируется автоматически. Мост стартует в whenReady (applySettings(loadSettings())), гасится в before-quit.
+- Клиентская часть: `src/renderer/mobile-api.js` (НОВЫЙ, подключён в index.html перед app.js). ВАЖНО: активируется ТОЛЬКО при флаге `window.__mobileBridge`, который подмешивает мост через `/bootstrap.js` (bridge-роут; в Electron и в веб-превью server.js этого файла нет — там 404 и скрипт no-op, поэтому мок-режим и preload не ломаются). Без этого флага нельзя: `window.api` появляется синхронно, и мок-превью повисло бы на неразрешимых очередях вызовов. При загрузке через мост: синхронно создаёт `window.api` (зеркало preload.js, вызовы ДО авторизации встают в очередь), по WS-открытии показывает PIN-гейт (инлайн-стили, id mobile-gate), после auth_ok — flushQueue + регистрация SW. Переподключение: при обрыве после успешной авторизации — гейт «Соединение потеряно», PIN запоминается и шлётся автоматически. `window.mobileApi.host` — хост моста; app.js в `previewOpen` подменяет `http://localhost:*` на этот хост (с телефона localhost = сам телефон), `previewOpenTab` на телефоне открывает вкладку телефона, а не ПК.
+- Адаптация UI под телефоны (styles.css, @media max-width:900px): `#sidebar` и `#project-panel` — оверлеи слева (в `#sidebar` класс `.open`), `.side-panel` — оверлей справа (94vw), `#app` height 100dvh, кнопка-бургер `btn-mobile-menu` в шапке (скрыта на десктопе), клик по чату закрывает меню.
+- Вспомогательная модель (зрение + генерация картинок, второй ключ OpenRouter): настройки `visionEnabled/visionAuto/visionUrl/visionKey/visionModel/imageModel` (DEFAULT_SETTINGS). В agent-core.js новые экспорты: `auxConfig(s)` (url/key с фолбэком на основной ключ: пустой visionKey → openaiApiKey, пустой visionUrl → openaiUrl), `describeImageRemote(cfg, dataUrl, prompt, model)` (chat/completions с image_url-частью, Bearer-авторизация, max_tokens 2048, таймаут 180с), `generateImageRemote(cfg, prompt, model, opts)` (эндпоинт OpenRouter `POST {base}/images`, тело {model, prompt, aspect_ratio?}; ответ `data[0].b64_json` + `media_type` → Buffer; таймаут 300с). Инструменты агента в main.js (`executeTool`): `analyzeImage {path, question}` — читает файл-картинку (≤8МБ), показывает её событием `ai:event {type:"image"}` и возвращает описание; `generateImage {prompt, filename, aspect_ratio}` — генерит, сохраняет в рабочую директорию (имя безопасное, расширение добавляется), шлёт `{type:"image"}` и возвращает путь. Авто-пре-пасс в runAi (после trimConversation): если `visionEnabled && visionAuto && visionModel` и в последнем user-сообщении есть image_url-части (до 3) — каждую описывает vision-моделью и ПОДМЕНЯЕТ content на текст + «[Описание присланного изображения…]» (кодер не обязан уметь видеть картинки); прогресс — события `ai:event {type:"vision", text}` → рендерятся как плашка `.vision-note` в чате. UI: блок «🖼 Зрение и генерация» в настройках (чекбоксы enabled/auto, URL, ключ с 👁, модели с ↻-подгрузкой через `loadAuxModels(kind)` → чипы в `#vision-model-hints`), иконки инструментов `analyzeImage: "👁"`, `generateImage: "🎨"`. Правило 18 в SYSTEM_PROMPT.
+- Контекст-менеджмент (фикс «агент замолкает» и «пишет код в чате вместо правки файлов»):
+  - **A. Реальное окно модели**: `modelWindow(settings, model)` в agent-core — GET {base}/models, парсит `context_length || context_window`, кэш 10 мин по base (суффиксные id вида `vendor/model:free` матчатся). В runAi бюджет = min(эвристика, окно − 4096 резерв на вывод), минимум 3000. Раньше для всех OpenAI-совместимых было жёстко 50000 — у фри-моделей окно меньше, запросы не влезали.
+  - **B. Динамические инструменты**: `selectTools(budget)` — при окне ≥ 26k шлются все 74 инструмента, иначе только ядро `CORE_TOOL_NAMES` (~36: файлы, терминал, web, askUser, vision/gen, preview). Вес схемы инструментов вычитается из бюджета истории (`histBudget`). Экономия ~30k токенов за раунд.
+  - **C. Компакция вместо жёсткой обрезки**: `compactRemote(settings, messages)` — когда история не влезает, старые витки (всё до последнего user-сообщения, голова ≥ 4000 токенов) сжимаются дешёвым вызовом модели (тот же провайдер, max_tokens 900, stream:false, таймаут 30с) в «ПАМЯТКУ ПРЕДЫДУЩЕГО КОНТЕКСТА» (роль system). `createContextManager({settings, emit, planMode})` — фабрика с состоянием запуска: компакция выполняется ОДИН раз за запуск, памятка пере-прикрепляется между раундами (обрезка `trimConversation` её не теряет); при ошибке/маленькой голове/план-режиме — тихий фолбэк на обычную обрезку. Событие `ai:event {type:"compact"}` → плашка в чате (класс `.vision-note`, кейс `compact` в app.js).
+  - **D. Пустой финальный ответ**: если раунд завершился без текста и без tool_calls (фри-модели при переполненном контексте) — один раз добавляется user-сообщение «напиши итоговый отчёт» и цикл продолжается (`reportRetried`); если и после этого пусто — в чат уходит честное сообщение «⚠ Модель не прислала итоговый текст…». `maxRounds` поднят 10 → 25 (план-режим 3). Кнопка «↩ Отменить изменения агента» при ошибке продолжает работать как раньше.
+- Правая панель «Превью + Консоль» вместо нижней: `#side-panel` — слот справа от чата (460px, ресайзится полоской `.sp-resize` на левом крае, как у панели проекта). Сверху красивый сегментированный переключатель `.sp-switch`/`.sp-btn` (data-sp: preview/console). Кнопки шапки: `btn-toggle-preview` и `btn-toggle-console` (бывш. btn-toggle-terminal). Функции в app.js: `openSidePanel`/`closeSidePanel`/`switchSideTab`/`sidePanelVisible` (вкладки `sideTab`: "preview" | "console"). Логи dev-сервера теперь ДУБЛИРУЮТСЯ в консоль (`termServerAppend` → `.term-server`, янтарный цвет, ts-info/ts-err) — открыл «Консоль» и видишь живой вывод сервера + можешь вводить команды (терминал как был).
+- Локальный self-update (OTA, вариант 3): агент может улучшать собственный код и обновлять приложение на ходу, без пересборки EXE.
+  - `src/bootstrap.js` (НОВЫЙ, стабильный, НЕ трогать) — точка входа (`package.json main` теперь указывает на него). При старте: если в `<userData>/ota/current` есть `version.json` + `src/main.js` — грузит основной код ОТТУДА, иначе из app.asar. Фолбэк: если OTA-код не загрузился (агент сломал) — бандл переименовывается в `current.broken` и стартует установленная версия. Module-фолбэк: `Module._resolveFilename` — если OTA-код требует модуль вне своего дерева (electron-updater) — до-разрешает из node_modules приложения.
+  - `src/ota.js` (НОВЫЙ, стабильный, НЕ трогать) — ядро self-update: `sources(settings)` (userData/ota + settings.otaDir + ota/ рядом с кодом), `findCandidate` (манифест с версией выше установленной), `applyBundle` (проверка sha256, распаковка base64-бандла, ПРЕФЛАЙТ синтаксиса всех JS через ELECTRON_RUN_AS_NODE, атомарный своп current → current.prev), `rollback` (prev → current + relaunch), `check` (не применяется при `global.__agentRunning`), `status`. Корень OTA переопределяется `AI_AGENT_OTA_ROOT` (для тестов).
+  - `scripts/make-ota.js` (НОВЫЙ) — сборка бандла агентом/пользователем: `node scripts/make-ota.js [--out <папка>] [--version x.y.z]`. Собирает src/** + assets/** + package.json + server.js (исключая node_modules/.git/dist/build/ota/bin/.tmp-*), прогоняет node --check по всем .js (фейл = сборка прерывается), версия = --version || авто-бамп патча (если совпадает с последним манифестом) || package.json version. Пишет `ota/manifest.json` {app, version, builtAt, files, sha256} + `ota/bundle.json` {version, files:{rel: base64}}. Папка ota/ в .gitignore.
+  - UI: Настройки → «🔄 Самосовершенствование (OTA)»: чекбокс `s-ota-enabled`, поле `s-ota-dir` (необязательный источник), `ota-status` (версия/папка/источники), кнопки `btn-ota-check` / `btn-ota-rollback` / `btn-ota-open`. IPC: `ota:status/check/rollback/openDir` (preload: otaStatus/otaCheck/otaRollback/otaOpenDir; мобильный мост подхватывает автоматически). Таймер: проверка через 5с после старта и каждые 60с (`ota.check` в whenReady). Правило 19 в SYSTEM_PROMPT: агент знает про self-update (после правок → node --check → make-ota).
+- Инструменты ОС (Windows-фокус, 10 новых → всего 84): `listProcesses` (tasklist CSV / ps, парсер `parseProcessesCsv`), `killProcess` (taskkill /T + /F, pkill/kill; ЗАПРОС ПОДТВЕРЖДЕНИЯ — через `DANGEROUS_TOOLS` в цикле runAi), `clipboardRead`/`clipboardWrite` (Electron clipboard), `screenshotDesktop` (desktopCapturer: экран или окно по подстроке заголовка; показывает через `activeEmit {type:"image"}`), `registryRead` (PowerShell Get-ItemPropertyValue; whitelist чтения — только SOFTWARE/ENVIRONMENT/SYSTEM/SECURITY), `registryWrite` (New-ItemProperty; запись только HKCU\Software и HKCU\Environment + подтверждение), `openPath` (shell.openPath), `wingetSearch`, `installExe` (скачивает .exe → тихий запуск, подтверждение). Расширен `getSystemInfo`: Windows build/CPU/GPU/RAM/IP/диски (PowerShell CIM → `parseSysInfoJson`), winget list (количество + первые 10); на mac/linux — os.cpus/totalmem/networkInterfaces. WINGET_IDS расширен (~40 программ: bun, docker, ollama, vscode, chrome, postgresql, mysql и т.д.); `installSystemPackage` при отсутствии winget пробует choco, затем scoop; при неизвестном ID советует wingetSearch. Парсеры/whitelist — чистые функции в agent-core (тестируемые).
+- Провайдер G4F (gpt4free, локальные бесплатные модели): пресет `g4f` в PRESETS (URL `http://localhost:1337/v1` — современный interference-API; старые сборки — 8080, label «G4F»), чип в настройках, подсказка `#g4f-hint` (видна только при выборе пресета — toggling в `setPreset`). Ключ не нужен: `apiHeaders` в agent-core добавляет `Authorization` только при непустом ключе. Модели грузятся обычной кнопкой ↻ (`/v1/models`). Запуск на ПК: `pip install -U g4f`, затем `g4f api` (современный interference-API — порт 1337, старые сборки — 8080).
+- G4F: АВТО-ПОДБОР ПОРТА (почему у пользователя «молчал» G4F): пресет теперь указывает на 1337, а `probeG4fBase(configuredBase, timeoutMs)` в main.js ищет живой инстанс — сначала указанный URL, затем `http://localhost:1337/v1` и `http://localhost:8080/v1` (GET /models, таймаут 2.5с). IPC `g4f:probe` (preload: `g4fProbe`) — для рендерера. app.js: `probeG4fPort()` вызывается при выборе пресета G4F в `setPreset` и при открытии настроек с активным G4F (`syncG4fProviderBox`, троттлинг 30с через `g4fProbeLastTs`); если указанный URL не отвечает, а живой g4f найден — поле URL обновляется АВТОМАТИЧЕСКИ (только если в поле был localhost/127.0.0.1, чтобы не затирать туннель/сетевой адрес — иначе просто подсказка). В `g4f:test` при ошибке GET /models тоже идёт проба порта с конкретной подсказкой («живой g4f найден на … — поправь URL»).
+- G4F: выбор провайдера в настройках (аккордеон «Провайдер G4F» под полем модели: поиск по буквам + список из ~42 провайдеров, ★ — стабильные без ключа/входа; клик вставляет маршрут «Провайдер:» в поле модели). У КАЖДОГО провайдера в реестре G4F_PROVIDERS (agent-core.js) есть `models` — типовые модели (офлайн-подсказки, 2–4 шт.). Клик по провайдеру: показывает чипы его моделей через `renderModelHints("openai", ...)` (клик по чипу дописывает модель после «Провайдер:») и параллельно `refreshG4fModels(name)` тихо дёргает `/v1/models` запущенного g4f. ВАЖНО: живой список НЕ ПОДМЕНЯЕТ реестровые модели — чипы СЛИВАЮТСЯ: сначала реестровые имена провайдера (реальные: DeepSeek-V3, Qwen…), затем алиасы от g4f (gpt-4o, default… — это глобальный каталог interference-API, у него нет разбивки по провайдерам; запрос {provider, model} матчится на стороне g4f). Дубликаты убираются, реестровые хранятся без префикса, живые — с префиксом «Провайдер:». Если g4f молчит — остаются только реестровые подсказки, ошибок в UI нет. renderModelHints показывает до 12 чипов. Гонки: `g4fModelReqSeq` — ответ применяется, только если провайдер не сменился. ЕДИНЫЙ реестр `G4F_PROVIDERS` теперь живёт в agent-core.js (экспорт; app.js берёт его оттуда же) — транспорт и UI не могут разойтись. Маршрут «Провайдер:модель» в `buildChatRequest` (openai) разбивается на отдельные поля: `provider: Провайдер` + `model: модель` без префикса — так требует современный g4f interference-API; если префикс не из реестра (например `deepseek/deepseek-r1:free` у OpenRouter) — имя не трогается. Клик по чипу модели в `renderModelHints` больше НЕ затирает «Провайдер:» — модель дописывается после двоеточия.
+- G4F: кнопка «▶» у каждого провайдера в настройках — тест с логами в консоли: IPC `g4f:test` (main.js, главный процесс — нет CORS, видны сырые статусы/тела): 1) GET {base}/models (статус, кол-во, первые модели), 2) POST {base}/chat/completions с `provider` + первой типовой моделью провайдера (max_tokens 8, stream:false) — что провайдер РЕАЛЬНО отвечает («Зарегистрируйтесь…», ошибка, или текст ответа). Логи рендерятся в панель «Консоль» (`.term-server` + классы ts-ok/ts-warn/ts-err), панель открывается автоматически (`switchSideTab("console")`), вердикт — в сообщение настроек. В браузере/превью — заглушка «доступно в приложении на ПК». Мобильный мост подхватывает канал автоматически. preload: `g4fTest(opts)`.
+- G4F: фикс «бесконечного думания» в `consumeProviderStream` (agent-core.js): (1) ошибки, которые провайдеры шлют ВНУТРИ SSE-стрима (`data: {"error":...}` — OpenAI-стиль, `{"type":"error"}` — Anthropic, NDJSON-ошибка — Ollama), теперь превращаются в исключение с текстом («Зарегистрируйтесь и повторите свой запрос» и т.п.) вместо молчаливого игнора → чат видит ошибку, а не висит; (2) таймауты: первый байт 90 с (`firstByteTimeoutMs`) и пауза между чанками 60 с (`idleTimeoutMs`) — зависший/молчащий провайдер завершается ошибкой; «первый байт» засчитывается только при реальных данных (не пустые keep-alive чанки).
+- Фикс зависаний агента на dev-серверах (важно!): `SERVER_CMD_RE` в main.js распознаёт команды-серверы (expo start, npm/bun/yarn run dev|start|serve|watch|preview, vite (не build), next dev, node server.js, uvicorn, django runserver и т.п.). Поведение: `runCommand` при таймауте серверной команды возвращает подсказку «используй startBackground + checkUrl/checkPort + stopBackground»; `runCommandOutput` для серверных команд запускает через bgSpawn (сразу возвращает id, НЕ блокируется, НЕ убивает сервер по таймауту; waitFor ждёт маркер готовности через bgWaitFor). Причина бага «не смог убить порт»: `spawnCollect` при таймауте звал `child.kill()` — на Windows это убивает только cmd.exe, а node/expo-дети оставались сиротами и держали порт, при этом процесса не было в bgProcesses → stopBackground «не найден». Исправлено: `killProcessTree` (taskkill /T /F / группа процессов) + `detached` в spawnCollect; `devStop` дополнительно освобождает порт через `killProcessesOnPort` (netstat/lsof + taskkill), даже если процесс запускал агент. `parsePortFromUrl` берёт порт из settings.previewUrl.
+
+## Инструменты (важно!)
+- `str_replace` в этой среде **не находит текст дальше ~1100 строк файла** (глюк кэша). Для правок в хвосте больших файлов (`src/main.js`, `src/renderer/app.js`) использовать временный Node-скрипт с точными заменами (`.tmp-patch*.js`, писать через write_file, запускать `node`, потом удалять), после — `node --check`.
+- **Системные библиотеки для живых прогонов — 20 сентября 2026.** В свежей Linux-песочнице живых
+  прогонов нет вообще: `npx playwright install-deps chromium` ставит Xvfb и библиотеки **Chromium**,
+  но **не ставит GTK** — Electron без него падает на старте с `error while loading shared libraries:
+  libgtk-3.so.0`. Второй вызов обязателен:
+  `apt-get update && apt-get install -y --no-install-recommends libgtk-3-0 libnotify4 libxss1 libxtst6 xdg-utils libsecret-1-0`
+  (и `npx playwright install chromium` — браузер для `test:live`). После этого работают
+  `test:live:desktop` (123 ✅), `test:live:deploy` (43 ✅), `test:live:yc` (38 ✅), `test:live` (65 ✅).
+  Шум в выводе движка — **не поломка**: `Failed to connect to the bus` (в контейнере нет D-Bus)
+  и `APPIMAGE env is not defined` (это electron-updater). Запуск приложения вручную:
+  `xvfb-run -a -s "-screen 0 1440x900x24" ./node_modules/electron/dist/electron . --no-sandbox --disable-gpu`.
+  Единственный прогон, которому это не помогает, — `test:live:yc:real`: он требует настоящий
+  `YC_OAUTH_TOKEN` и **создаёт платные ресурсы**, поэтому намеренно не запускается без согласия.
+- **Electron 44: буфер обмена стал асинхронным — 20 сентября 2026.** Проверено на живом движке
+  44.4.3: `clipboard.readText()` и `clipboard.writeText()` возвращают Promise, а `clipboard.readBuffer`
+  в 44 больше нет. Обе точки вызова (`clipboardRead`/`clipboardWrite` в `src/agent-tools.js`) ждут
+  результат через `await`, сторож — `test/clipboard-tools.test.js`.
+## Сохранённые OpenAI-подключения (несколько ключей) — 9 сентября 2026
+- `settings.openaiProfiles` — массив `{ id, name, url, apiKey, model, project }`; `settings.openaiActiveProfile` — id активного; `settings.autoSwitchProfiles` — авто-переключение при ошибке.
+- Хранение: `openaiProfiles` добавлен в `SECRET_KEYS` (secrets.js) — ключи шифруются (safeStorage/DPAPI), в settings.json их нет.
+- Миграция: старые `openaiUrl`+`openaiApiKey` → первый профиль «p-main» (и в main.js normalizeSettings, и в app.js normalize) — только если `openaiProfiles` вообще не было.
+- UI: `s-openai-profile` (select), кнопки `btn-profile-save` (💾 сохранить/обновить), `btn-profile-delete` (🗑), чекбокс `s-auto-switch` — в блоке openai-fields (index.html).
+- Выбор профиля → `applyOpenaiProfile` заполняет поля URL/ключ/модель/проект (активный профиль зеркалится в openaiUrl/openaiApiKey — весь остальной код чата/теста не менялся).
+- Авто-переключение: main.js catch авто-повтора runAi (только provider=openai, autoSwitchProfiles, ≥2 профилей с ключами) → `switchOpenaiProfile` по кругу → saveSettings → событие `profile_switched` → renderer показывает пометку в чате и перечитывает настройки (`api.getSettings`). Браузерный путь: `tryWebAutoSwitch` в webSend (счётчик webAutoSwitches — защита от бесконечного круга).
+
+## OTA: кнопка «🗑 Сбросить OTA» — 9 сентября 2026
+- Проблема: локально собранный OTA-бандл (scripts/make-ota.js → ota/ рядом с кодом) может быть нерабочим; bootstrap.js грузит код из userData/ota/current, а findCandidate применяет бандл с версией СТРОГО выше установленной — поэтому нерабочий бандл «переживает» переустановку кода с GitHub (папка ota/ рядом с кодом остаётся источником).
+- Решение: `ota.reset(removeSource, settings)` в ota.js — удаляет userData/ota (применённый бандл) и, при removeSource=true, папку ota/ рядом с кодом. IPC `ota:reset`, кнопка «🗑 Сбросить OTA» в Настройки → Self-update (с confirmModal). После сброса — перезапуск приложения.
+- Вручную: удалить ota/ рядом с кодом проекта и %APPDATA%/<AppName>/ota (userData) — или выключить чекбокс OTA в настройках.
+
+## Версия 1.5.0 (OTA-бандл в репо) — 9 сентября 2026
+- package.json version = 1.5.0 — выше любой локально накопленной версии сломанных бандлов («на тройке» — 1.3.x/1.0.3x).
+- ota/manifest.json + ota/bundle.json (рабочий бандл из актуального кода) коммитятся в репо (.gitignore: ota/* с исключениями !ota/manifest.json !ota/bundle.json).
+- Механика: OTA применяет бандл, если manifest.version СТРОГО выше установленной (userData/ota/current/version.json). 1.5.0 > любая сломанная 1.x.y < 1.5 → применится поверх без ручной чистки.
+- Пересобрать бандл вручную: node scripts/make-ota.js [--version X.Y.Z].
+
+## Настройки: вкладки + аккордеон провайдеров — 9 сентября 2026
+- Вкладки (.stab / .settings-tab-body): Модель, Зрение, Проект и GitHub, Мобильный, Секреты, Self-update. Кнопки «Проверить подключение»/«Сохранить» — в общем футере .settings-footer (видны всегда). Открытие настроек → вкладка «Модель» (showSettingsTab).
+- Провайдеры — аккордеон (.acc[data-acc]): setProviderUI раскрывает карточку активного провайдера (бейдж «✓ активен»), клик по заголовку (.acc-head) раскрывает/сворачивает вручную без смены выбора.
+- Все id элементов настроек сохранены — JS не ломался (проверено скриптом: отсутствует только динамический #file-editor).
+- OTA-бандл пересобран в 1.5.1 (после 1.5.0) — новый UI доедет до ПК поверх сломанной версии.
+
+## Панель действий агента над полем ввода — 9 сентября 2026
+- ensureWorkGroup теперь вставляет панель «Выполняю действия» в #work-panel (между #typing и #input-bar), а не в ленту #messages. Новый запуск очищает панель (одна панель за раз).
+- Осталось в ленте: размышления (thinking), текст ответа, ошибки; действия (инструменты, правки кода) — в живой панели над полем ввода.
+- Стили: #work-panel (padding, flex-shrink:0), карточка max-height 240px + скролл при развороте.
+- OTA-бандл: 1.5.3.
+
+## Кликабельные ссылки в чате — 9 сентября 2026
+- markdown.js inline(): голые URL (https?://...) теперь автолинкуются (с обрезкой хвостовой пунктуации .,;:!?)]), markdown-ссылки [text](url) — как раньше.
+- main.js: setWindowOpenHandler + will-navigate на mainWindow — http(s) открываются в браузере пользователя (shell.openExternal), а не в новом окне Electron.
+- Стили .bubble.md a уже были (цвет + underline).
+- OTA-бандл: 1.5.4.
+
+## Пресеты провайдеров — в аккордеон — 9 сентября 2026
+- Блок чипов «Провайдер» внутри карточки OpenAI-совместимых обёрнут в мини-аккордеон (.mini-acc, data-acc-head="presets"): свёрнут по умолчанию, раскрывается кликом. Обработчик аккордеона: карточки провайдеров выбирают/сворачивают, вложенные блоки — просто toggle.
+- OTA-бандл: 1.5.5.
+
+## Жёсткое отключение OTA (bootstrap) — 9 сентября 2026
+- Проблема: bootstrap.js грузит main.js из userData/ota/current, ЕСЛИ там валидный бандл — старый OTA-код перекрывает новый код из папки/EXE, даже после пересборки.
+- Фикс: bootstrap.js теперь читает settings.json из userData — при otaEnabled === false грузит код ТОЛЬКО из установки (ASAR_DIR), игнорируя current.
+- Порядок действий пользователя: Настройки → Self-update → снять «Разрешить локальные обновления на ходу» → Сохранить → запустить собранный EXE из нового кода. Или удалить %APPDATA%\<AppName>\ota (кнопка «🗑 Сбросить OTA»).
+- OTA-бандл: 1.5.6 (обновлённый bootstrap.js попадёт и в current при следующем применении).
+
+## OTA: главное правило версий (1.5.7)
+
+Проблема: свежескачанный код не загружался — bootstrap.js брал применённый
+бандл из userData/ota/current всегда, когда OTA не выключен в настройках,
+даже если бандл старее установленного кода.
+
+Решение (src/bootstrap.js):
+- Бандл грузится ТОЛЬКО если его версия СТРОГО НОВЕЕ установленной
+  (package.json рядом с кодом / app.asar). Свежий код всегда побеждает
+  устаревший бандл, вручную ничего удалять не нужно.
+- Если бандл есть, но не новее установленного — он автоматически удаляется
+  (не висит мёртвым грузом и не путает панель Self-update).
+
+Дополнительно (src/ota.js): findCandidate тоже пропускает бандлы не новее
+установленной версии приложения — обновление не накатывается по кругу.
+
+Проверка: versionGt согласован в обоих файлах (1.5.7>1.5.6 ✓, равенство ✗,
+1.10>1.9 ✓, мусор ✗). Бандл v1.5.7 собран (17 JS проверены).
+
+## Yandex Cloud (1.5.8): хостинг и инфраструктура из приложения
+
+Интеграция с Yandex Cloud REST API (чистый Node, без yc CLI):
+- **src/yandex-cloud.js** (новый модуль): OAuth-токен → IAM-токен (кэш, авто-обновление ~12 ч);
+  эндпоинты грузятся динамически с https://api.cloud.yandex.net/endpoints (фолбэк — известные адреса);
+  списки ресурсов по 13 сервисам (API Gateway, Certificate Manager, CDN, DNS, Logging, Postbox,
+  Container Registry, IAM, Lockbox, YDB, Object Storage, Serverless Containers, VPC);
+  создание (ydb, lockbox, containerRegistry, storage, dns, serverlessContainers, vpc) и удаление
+  с ожиданием операции (/operations/{id}).
+- **Авторизация**: OAuth-токен (тот же, что у yc CLI) → secrets.json (зашифрованно), кнопка
+  «🔑 Получить токен» открывает oauth.yandex.ru. Первый каталог выбирается автоматически.
+- **UI**: вкладка «☁️ Yandex Cloud» в настройках (токен, каталог, разрешения агента);
+  вкладка «Cloud» в правой панели (рядом с Превью/Консоль) — дашборд-сетка карточек
+  13 сервисов с живыми счётчиками, клик по карточке — список ресурсов, «＋ Создать», «🗑» с подтверждением.
+- **Агент**: инструменты ycStatus / ycList / ycCreate / ycDelete (TOOL_DEFINITIONS + промпт №28).
+  Создание/удаление агентом — только при включённых чекбоксах разрешений (по умолчанию выключены).
+  Платные ресурсы — только по явной просьбе пользователя. В веб-версии — заглушка «только в desktop».
+- Файлы: src/yandex-cloud.js (новый), src/secrets.js, src/main.js (IPC yc:* ×9, инструменты ×4),
+  src/preload.js, src/renderer/agent-core.js, src/renderer/app.js, src/renderer/index.html,
+  src/renderer/styles.css, package.json (1.5.8), ota/ (бандл).
+- Postbox управляется через AWS-совместимый API (в списке эндпоинтов отсутствует) —
+  карточка дашборда честно покажет «API недоступно», создание адреса — в консоли Yandex Cloud.
+
+## Yandex Cloud этап 2 (1.5.9): деплой, сводка, статусы/логи, ycDeploy
+
+- **Деплой одной кнопкой**: вкладка Cloud → «🚀 Задеплоить проект» (рабочая директория).
+  Конвейер: Dockerfile (свой или сгенерированный по типу: node/python/статика) → docker login
+  cr.yandex (IAM) → docker build → push в Container Registry (реестр создаётся сам) →
+  Serverless Container (создаётся/обновляется) → публичный доступ (SA + роль
+  serverless.containers.invoker на каталог через updateAccessBindings) → deployRevision →
+  URL контейнера. Прогресс шагов живой (событие yc_step), результат — URL + кнопка «Открыть».
+- **Облако в цифрах**: сводка над дашбордом — всего ресурсов и сервисов с ресурсами.
+- **Статусы и логи**: в списке контейнеров — бейдж статуса (ACTIVE/CREATING/ERROR/DELETING),
+  кнопка «↗» (открыть URL) и «📜» (логи через yc CLI: yc logging read; Logging REST для
+  чтения не существует — только gRPC/CLI; без yc — подсказка).
+- **Вход по коду (device flow)**: для Yandex Cloud требует регистрации собственного
+  OAuth-приложения с device flow (публичный client_id yc CLI его не поддерживает) —
+  сделана быстрая альтернатива: кнопка «📋 Вставить» из буфера обмена рядом с токеном.
+- **Инструменты агента**: ycDeploy (directory, name, public) — деплой проекта из чата;
+  ycLogs (service, id) — логи контейнера. Промпт №28 дополнен. ycDeploy требует
+  «Разрешить агенту создавать ресурсы» (реестр/контейнер/SA) — платный.
+- Файлы: src/yandex-cloud.js (деплой-хелперы), src/main.js (yc:deploy/yc:logs,
+  ycGenerateDockerfile, total/activeServices), src/preload.js, src/renderer/agent-core.js,
+  src/renderer/app.js (деплой UI, сводка, статусы, вставка из буфера),
+  src/renderer/index.html, src/renderer/styles.css, package.json (1.5.9), ota/ (бандл).
+
+## ВКонтакте: гайд и поддержка (1.5.10)
+
+- **Справочник агента** `src/agent-guides/vk.md` (полный гайд по фронту ВК:
+  роутинг, поиск людей, профиль, диалоги, селектор [role="textbox"], Enter-отправка,
+  ленивая загрузка, дубликаты, vk.com/vk.ru). Читается агентом по требованию:
+  readFile(path: "agent-guide:vk") — хук в main.js (executeTool), не раздувает контекст.
+- **Промпт №29 «ВКонтакте»**: маршруты, contenteditable-поле, порядок
+  click→fill→Enter, ожидание и перечитывание, уточнение дубликатов, вход вручную.
+- **browserFill улучшен**: при сбое page.fill автоматически делает клик по полю →
+  Ctrl+A (очистка) → keyboard.insertText (корректно триггерит события ввода в
+  contenteditable/SPA — ВК и аналоги). Возвращает способ вставки (fill/insertText).
+- Файлы: src/agent-guides/vk.md (новый), src/browser-tools.js (fallback fill),
+  src/main.js (agent-guide:* хук), src/renderer/agent-core.js (промпт №29),
+  package.json (1.5.10), ota/ (бандл).
+
+## Анализ переписок + фундамент для КП (1.5.11)
+
+- **Методология** `src/agent-guides/chat-analysis.md` (новый справочник, читается
+  через readFile(path: "agent-guide:chat-analysis")): определение человека по уликам
+  (коллега/начальник/друг/родственник/клиент/поставщик), суть переписки (2–4 предложения),
+  формат-таблица «Человек | Кто он | Суть | Важность | Следующий шаг»,
+  профиль клиента (потребность, бюджет/сроки, возражения, тон) + фундамент для КП
+  (2–4 пункта, следующий шаг, аргументы из его слов). Длинные истории — частями (PageUp + browserText).
+- **Промпт №30 «Анализ переписок»**: краткий алгоритм + ссылки на справочники
+  (chat-analysis, vk). Применяется к ВК, чатам, письмам, файлам.
+- Файлы: src/agent-guides/chat-analysis.md (новый), src/renderer/agent-core.js (промпт №30),
+  package.json (1.5.11), ota/ (бандл).
+
+## ВК: боевой опыт (1.5.12)
+- Гайд `src/agent-guides/vk.md` обновлён полным опытом из песочницы: al_im.php-редирект,
+  работа только в существующей вкладке (новые — без сессии), browserText вместо скриншотов,
+  фильтр левого меню, сценарий анализа переписок.
+- Добавлена таблица известных контактов (Евгения Пимашина, Online_заявки, Дмитрий Соболев,
+  Сергей Бухтеев) и бизнес-контекст (Бумеранги-Тула / Positive-store / BMGBRAND;
+  пользователь — Михаил Пимашин). Используется для быстрого определения типа отношений
+  и подготовки КП клиентам (чат Online_заявки — основной канал входящих).
+- Пункт 29 промпта дополнен боевыми правилами ВК.
+
+## Похудение промпта (1.5.13)
+- Пункты 28–30 (Yandex Cloud / ВК / анализ переписок) сжаты: 3732 → 2174 символа.
+- Весь промпт: ~19.3k → ~17.7k символов. Детали — в agent-guides (vk.md, chat-analysis.md),
+  читаются по требованию, в контексте не висят.
+
+## Serper — усиленный поиск для агента (1.5.14)
+- Новое поле в Настройках → 🔒 Секреты → «🔎 Поиск для агента»: Serper API-ключ (хранится зашифрованно в secrets.json).
+- webSearch: при наличии ключа идёт в Google через Serper (10 результатов, ru), иначе — прежний DuckDuckGo.
+- Ошибки (403 неверный ключ, таймаут, HTTP) сообщаются понятным текстом.
+- Файлы: src/secrets.js (serperApiKey в SECRET_KEYS), src/main.js (DEFAULT_SETTINGS + webSearch case + импорт),
+  src/renderer/agent-core.js (webSearchSerper + webSearch), src/renderer/{index.html,app.js} (поле и его сохранение).
+
+## Умное переключение ключей (1.5.15)
+- Проблема: авто-переключение профилей срабатывало на ЛЮБУЮ ошибку (включая 400, контент, сеть)
+  и не имело пауз — лишние ротации ключей, риск «долбления» провайдера.
+- Решение: классификатор classifyKeyError (agent-core.js, общий для desktop и web):
+  переключаем ключ только на 401/403 (неверный ключ, кулдаун 10 мин), 402/insufficient_quota
+  (баланс, 5 мин), 429/rate limit (лимит, 1 мин). Ошибки запроса/контента/сети ключ не меняют.
+- Cooldown на профиль (main.js: profileCooldown; app.js: webProfileCooldown): провинившийся
+  ключ пропускается, пока не отлежится. Если все в кулдауне — переключения нет.
+- UI-подсказка у чекбокса «Авто-переключение» обновлена (умное поведение + напоминание
+  использовать свои аккаунты, не обходить лимиты бесплатного тарифа).
+- Тесты: 18/18 (классификатор + switchOpenaiProfile с cooldown на реальном коде).
+
+

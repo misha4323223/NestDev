@@ -19,6 +19,7 @@
    «всегда молчит», а такой страж хуже отсутствующего. */
 
 const assert = require("assert");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
@@ -63,6 +64,38 @@ const missingInReadme = (readme, names) => names.filter((n) => !readme.includes(
 const HANDOFF = read("docs", "HANDOFF.md");
 const ISTORIYA = read("docs", "istoriya.md");
 const README = read("docs", "README.md");
+const NOTES_INDEX = read("docs", "AGENT-NOTES.md");
+
+// ── Журнал по файлам (часть 78) ──────────────────────────────────────────────
+// Ссылки на файлы журнала — только из строк таблиц индекса, в том порядке, в
+// каком они там записаны. Ссылка внутри текста (у части 43 она есть) строкой
+// таблицы не является и в разбор не попадает: иначе файл считался бы дважды.
+const tableLinks = (src) =>
+  src
+    .split("\n")
+    .filter((l) => /^\|/.test(l))
+    .map((l) => (/(\]\(([^)]+\.md)\))/.exec(l) || [])[2])
+    .filter(Boolean);
+const digestOf = (contents) => {
+  const h = crypto.createHash("sha256");
+  for (const c of contents) h.update(c);
+  return h.digest("hex");
+};
+// Сколько «## Часть N» напечатано в самом индексе: там их быть не должно.
+const partHeadings = (src) => (src.match(/^## Часть \d+/gm) || []).length;
+// Файл журнала, пропавший с диска, — это не «пустой текст», а ошибка чтения.
+const journalContents = (links) =>
+  links.map((l) => {
+    const p = path.join(ROOT, "docs", l);
+    if (!fs.existsSync(p)) throw new Error("файл журнала пропал: " + l);
+    return fs.readFileSync(p, "utf8");
+  });
+
+// Отпечаток содержимого всех файлов журнала. Меняется только вместе с текстом
+// частей: подмена, пропажа или лишний файл ломают его сразу.
+const JOURNAL_DIGEST = "ba51c93e1f9112be4d1c9277594783a63d09f78648343401b41738d6643e9ba4";
+const JOURNAL_PARTS = 67; // частей в индексе (у частей с «заходом» свои строки)
+const JOURNAL_FILES = 9; // файлов начального журнала внутри части 43
 
 // Части, которые обязаны быть в истории: свежие сверху, без пропусков.
 const PARTS = Array.from({ length: 24 }, (_, i) => 74 - i);
@@ -125,7 +158,79 @@ const SECTIONS = ["1", "2", "3", "4", "5", "6", "6.1", "6.2", "6.3", "6.4", "7",
     }
   });
 
-  console.log("\n[3] Негативные контроли: страж обязан ловить, а не молчать");
+  console.log("\n[3] Журнал разложен по файлам (часть 78)");
+
+  const links = tableLinks(NOTES_INDEX);
+  // Строки таблиц индекса, разобранные по её столбцам: «| 77 | о чём |[файл](путь) | строк |».
+  const rows = NOTES_INDEX.split("\n")
+    .filter((l) => /^\|/.test(l))
+    .map((l) => /^\|\s*(\d+)\s*\|([^|]*)\|[^|]*\]\(([^)]+\.md)\)\s*\|\s*(\d+)\s*\|/.exec(l))
+    .filter(Boolean)
+    .map((m) => ({ num: m[1], title: m[2].trim(), link: m[3], lines: Number(m[4]) }));
+  const partRows = rows.filter((r) => /^notes\/chast-/.test(r.link));
+  const journalRows = rows.filter((r) => /^notes\/начальный-журнал\//.test(r.link));
+  const partLinks = partRows.map((r) => r.link);
+  const journalLinks = journalRows.map((r) => r.link);
+  const notesDir = path.join(ROOT, "docs", "notes");
+  const journalDir = path.join(notesDir, "начальный-журнал");
+
+  await test("журнал: индекс знает каждую часть и каждый файл журнала", () => {
+    assert.strictEqual(partLinks.length, JOURNAL_PARTS, "в индексе не " + JOURNAL_PARTS + " частей: " + partLinks.length);
+    assert.strictEqual(journalLinks.length, JOURNAL_FILES, "в индексе не " + JOURNAL_FILES + " файлов начального журнала");
+    const onDisk = fs.readdirSync(notesDir).filter((f) => /^chast-\d.*\.md$/.test(f)).sort();
+    const inIndex = partLinks.map((l) => l.replace(/^notes\//, "")).sort();
+    assert.deepStrictEqual(onDisk, inIndex, "файлы в notes/ и строки индекса разошлись");
+    const journalOnDisk = fs.readdirSync(journalDir).filter((f) => f.endsWith(".md")).sort();
+    const journalInIndex = journalLinks.map((l) => l.replace(/^notes\/начальный-журнал\//, "")).sort();
+    assert.deepStrictEqual(journalOnDisk, journalInIndex, "файлы начального журнала и индекс разошлись");
+    assert.ok(NOTES_INDEX.includes("notes/"), "индекс не говорит, где лежат тексты");
+    assert.ok(README.includes("notes/"), "docs/README.md молчит о папке notes/");
+  });
+
+  await test("журнал: каждый файл начинается своей частью и не пуст", () => {
+    for (const row of partRows) {
+      const body = journalContents([row.link])[0];
+      assert.ok(body.startsWith("## Часть " + row.num), "файл части " + row.num + " начинается не со своей части");
+      assert.ok(body.trim().length > 200, "часть " + row.num + " почти пуста");
+    }
+    for (const row of journalRows) {
+      const body = journalContents([row.link])[0];
+      assert.ok(body.startsWith("# Начальный журнал"), "файл начального журнала без шапки");
+      assert.ok(body.trim().length > 200, "кусок начального журнала почти пуст");
+    }
+  });
+
+  await test("журнал: отпечаток содержимого совпадает с записанным", () => {
+    assert.strictEqual(digestOf(journalContents(links)), JOURNAL_DIGEST, "содержимое журнала изменилось или потерялось");
+    assert.strictEqual(partHeadings(NOTES_INDEX), 0, "в индексе снова напечатаны тексты частей");
+    assert.ok(Buffer.byteLength(NOTES_INDEX) < 200 * 1024, "индекс вырос до размера журнала");
+  });
+
+  console.log("\n[4] Негативные контроли: страж обязан ловить, а не молчать");
+
+  await test("подменённый файл журнала обязан ломать отпечаток", () => {
+    const fake = journalContents(links).slice();
+    fake[0] = fake[0] + "\nдописано после разбора\n";
+    assert.notStrictEqual(digestOf(fake), JOURNAL_DIGEST, "подмена файла не замечена");
+  });
+
+  await test("пропавший файл журнала обязан падать, а не читаться пустым", () => {
+    assert.throws(() => journalContents(["notes/такого-файла-нет.md"]), /пропал/, "пропажа файла не замечена");
+    assert.ok(journalContents(links).every((c) => c.length > 200), "живой файл прочитался пустым");
+  });
+
+  await test("файл части, забытый в индексе, обязан быть замечен", () => {
+    const onDisk = ["chast-1-a.md", "chast-2-b.md", "chast-3-c.md"];
+    const inIndex = ["notes/chast-1-a.md", "notes/chast-3-c.md"];
+    const orphans = onDisk.filter((f) => !inIndex.includes("notes/" + f));
+    assert.deepStrictEqual(orphans, ["chast-2-b.md"], "файл вне индекса не замечен");
+  });
+
+  await test("вернувшийся в индекс текст части обязан падать", () => {
+    const fake = "# Индекс\n\n## Часть 77: снова весь текст здесь\n";
+    assert.strictEqual(partHeadings(fake), 1, "текст части в индексе не замечен");
+    assert.strictEqual(partHeadings(NOTES_INDEX), 0, "живой индекс принят за журнал");
+  });
 
   await test("подложный HANDOFF с историей обязан падать", () => {
     const fake = "Обновлено сегодня.\n\nРанее, после части 60 чекбоксы облака больше не сбрасываются.\n";
