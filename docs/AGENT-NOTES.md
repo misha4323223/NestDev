@@ -22,6 +22,7 @@
 
 | № | О чём | Полный текст | Строк |
 |---:|---|---|---:|
+| 82 | визитка — бюджет по знакам (код снова виден), а устаревшая проверка прогона стала поведенческой | [`notes/chast-82-vizitka-uzhata-do-znakov-a-proverka-stala-povedencheskoy.md`](notes/chast-82-vizitka-uzhata-do-znakov-a-proverka-stala-povedencheskoy.md) | 70 |
 | 81 | `smoke.test.js` разложен по группам — 14 файлов вместо 19 257 строк в одном | [`notes/chast-81-smoke-test-razlozhen-po-gruppam-14-faylov.md`](notes/chast-81-smoke-test-razlozhen-po-gruppam-14-faylov.md) | 95 |
 | 80 | ключи доступа в карточке — по существующему адресу (404 на весь список) | [`notes/chast-80-klyuchi-dostupa-v-kartochke-po-sushchestvuyushchemu-adresu.md`](notes/chast-80-klyuchi-dostupa-v-kartochke-po-sushchestvuyushchemu-adresu.md) | 48 |
 | 79 | карта файла в `smoke.test.js` и бегунок в конец — читается сверху вниз | [`notes/chast-79-karta-fayla-v-smoke-test-js-i-begunok-v-konec.md`](notes/chast-79-karta-fayla-v-smoke-test-js-i-begunok-v-konec.md) | 31 |

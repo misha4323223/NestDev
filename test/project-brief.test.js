@@ -49,14 +49,13 @@ function test(name, fn) {
 }
 
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", "out", "coverage"]);
-const HEAD_SRC = require("child_process").execSync("git show HEAD:src/main.js", { encoding: "utf8", maxBuffer: 1 << 28 });
 const MAIN_SRC = fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8");
 const MODULE_SRC = fs.readFileSync(path.join(ROOT, "src", "project-brief.js"), "utf8");
 
 function mk() {
   const calls = { shells: 0, ycArgs: [] };
   const state = { shells: "bash, cmd", yc: "Yandex Cloud: каталог «prod» (b1g)" };
-  const { buildProjectBrief } = createProjectBrief({
+  const { buildProjectBrief, BRIEF_LIMITS } = createProjectBrief({
     fs,
     path,
     SKIP_DIRS,
@@ -72,7 +71,9 @@ function mk() {
       return state.yc;
     },
   });
-  return { buildProjectBrief, calls, state };
+  // Пределы берём из самого модуля: у каждого проверяющего своя копия числа
+  // разошлась бы с кодом молча (это уже случилось с живым прогоном, часть 82).
+  return { buildProjectBrief, limits: BRIEF_LIMITS, calls, state };
 }
 
 function project(files) {
@@ -139,10 +140,19 @@ function project(files) {
     for (let i = 0; i < 120; i++) files["wide/f" + i + ".js"] = "";
     const dir = project(files);
     try {
-      const brief = mk().buildProjectBrief(dir);
+      const m = mk();
+      const brief = m.buildProjectBrief(dir);
       assert.strictEqual(brief.indexOf("a/b/c/3.js"), -1, "визитка ушла на третий уровень");
       const tree = (brief.match(/Структура \((\d+) записей\)/) || [])[1];
-      assert.ok(Number(tree) <= 80, "структура не ограничена: " + tree);
+      assert.ok(Number(tree) > 0 && Number(tree) <= m.limits.treeMax, "структура не ограничена: " + tree);
+      // Длинная полка сворачивается: 12 имён и одна строка со счётчиком. Проверяем
+      // ИМЕНА записей, а не подстроку: "/… ещё" встречается и в других строках.
+      const shownWide = (brief.match(/\n📄 wide\/f\d+\.js/g) || []).length;
+      assert.strictEqual(shownWide, m.limits.dirFiles, "из широкой папки показано не " + m.limits.dirFiles + " файлов, а " + shownWide);
+      assert.ok(/📄 wide\/… ещё 108 файлов/.test(brief), "хвост широкой папки не свёрнут со счётчиком:\n" + brief.slice(0, 400));
+      // Папки хвостом не считаются: они в визитке всегда — иначе на проекте с
+      // длинными именами файлов пропадал бы и src/.
+      assert.ok(/📁 a\/b\//.test(brief), "папка пропала вместе с хвостом файлов");
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -271,11 +281,43 @@ function project(files) {
     );
     assert.ok(/buildProjectBrief,\n/.test(MAIN_SRC.slice(runAt)), "визитка не отдана прогону");
     assert.ok(!/require\(|__dirname/.test(MODULE_SRC), "модуль сам достаёт состояние вместо внедрения");
-    // Тело визитки в модуле обязано совпадать с прежним текстом из HEAD байт в байт.
-    const headAt = HEAD_SRC.indexOf("// Краткая «визитка» проекта");
-    const headEnd = HEAD_SRC.indexOf("\n// ═══════════════════ Системные программы и окружение");
-    const before = HEAD_SRC.slice(headAt, headEnd).replace(/\s+$/, "");
-    assert.ok(MODULE_SRC.indexOf(before) >= 0, "текст визитки разошёлся с прежним main.js");
+  });
+
+  await test("настоящий проект: код виден, а размер держится бюджетом по знакам", () => {
+    // Здесь стоял страж «тело визитки совпадает с прежним main.js байт в байт», и он
+    // стал слеп: после выноса модуля того текста в main.js больше нет, то есть он
+    // сравнивал с ПУСТОЙ строкой и зеленел всегда. Заменён настоящей проверкой того,
+    // ради чего визитка и ограничивается.
+    //
+    // Беда, которую он должен был ловить (нашлась в живом прогоне, часть 82): журнал
+    // работ — 70 файлов с именами по 70+ знаков в ОДНОЙ папке. Пока предел считался
+    // записями, эти имена съедали бюджет целиком, и до src/ обход не доходил вовсе.
+    const shelf = "docs/notes/chast-";
+    const files = { "package.json": JSON.stringify({ name: "p" }), "src/index.js": "", "src/lib/util.js": "" };
+    for (let i = 0; i < 70; i++) files[shelf + i + "-ochen-dlinnoe-imya-fayla-zhurnala.md"] = "";
+    // Негативный контроль: без бюджетного предела одна эта полка весит больше
+    // бюджета структуры — значит страй не «зелёный по построению».
+    const raw = Object.keys(files).filter((f) => f.startsWith(shelf)).reduce((n, f) => n + f.length + 4, 0);
+    const dir = project(files);
+    try {
+      const m = mk();
+      assert.ok(raw > m.limits.treeChars, "подложная полка слишком коротка для контроля: " + raw);
+      const brief = m.buildProjectBrief(dir);
+      const tree = Number((brief.match(/Структура \((\d+) записей\)/) || [])[1]);
+      assert.ok(tree > 0 && tree <= m.limits.treeMax, "структура не ограничена: " + tree);
+      assert.ok(brief.length < 6000, "визитка большого проекта распухла: " + brief.length + " знаков");
+      // Главное свойство визитки: код проекта виден. Длинная полка не имеет права
+      // вытеснить его — именно это и было сломано.
+      assert.ok(/📁 src\//.test(brief), "кода проекта не видно: полка длинных имён съела бюджет");
+      assert.ok(/📄 src\/index\.js/.test(brief) && /📁 src\/lib\//.test(brief), "содержимое src/ не показано");
+      // Хвост полки — одна строка со счётчиком, а не 70 имён.
+      const shown = (brief.match(/\n📄 docs\/notes\//g) || []).length;
+      assert.strictEqual(shown, m.limits.dirFiles + 1, "из полки показано не " + m.limits.dirFiles + " имён и счётчик, а " + shown);
+      assert.ok(/📄 docs\/notes\/… ещё 58 файлов/.test(brief), "хвост полки не свёрнут со счётчиком");
+      assert.strictEqual(brief.indexOf("chast-30-"), -1, "в визитку попал хвост полки");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");

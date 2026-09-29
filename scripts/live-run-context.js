@@ -27,7 +27,9 @@
      [2] остановленный прогон оставил чекпоинт с результатом инструмента, а сам
          «Стоп» завершился мягко и зажёг кнопку «▶ Продолжить»;
      [3] «продолжай»: работа вернулась в запрос к модели, человеку сказано об этом;
-     [4] обычный финал чекпоинт убирает, а чужой чат чужую работу не подхватывает.
+     [4] обычный финал чекпоинт убирает, а чужой чат чужую работу не подхватывает;
+    [5] упавший последний шаг работу НЕ закрывает (часть 68), а обычный финал после
+        него — закрывает: продолжение действительно доводит дело до конца.
 
    Ничего в репозитории приложения не пишется: работа идёт в temp-папках. */
 
@@ -107,6 +109,9 @@ const mkWin = (id) => {
 // run2: простой финальный ответ.
 let phase = "run1";
 let served = 0;
+// Счётчик запросов ВНУТРИ фазы: `served` общий, а разделам [5] важно, какой это
+// запрос именно у них (первый — вызов инструмента, второй — финал).
+const phaseServed = new Map();
 const bodies = [];
 const sse = (chunks) => chunks.map((c) => "data: " + JSON.stringify(c) + "\n\n").join("") + "data: [DONE]\n\n";
 const textChunks = (text) => [
@@ -131,10 +136,29 @@ const provider = http.createServer((req, res) => {
       return res.end(JSON.stringify({ error: { message: "нет такого пути" } }));
     }
     served++;
+    const inPhase = (phaseServed.get(phase) || 0) + 1;
+    phaseServed.set(phase, inPhase);
     let parsed = {};
     try { parsed = JSON.parse(body || "{}"); } catch {}
     const entry = { phase: phase, messages: parsed.messages || [] };
     bodies.push(entry);
+    // runFail: первый шаг — инструмент, который ОБЯЗАН упасть (файла нет), дальше
+    // модель завершает ответ тихо. Именно так выглядит случай части 68: работа НЕ
+    // доведена, а последний шаг упал — чекпоинт обязан остаться.
+    if (phase === "runFail" && inPhase === 1) {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      return res.end(sse(callChunks("call_read_missing", "readFile", { path: path.join(work, "нет-такого-файла.txt") })));
+    }
+    if (phase === "runFail") {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      return res.end(sse(textChunks("Файла нет — оставляю как есть, продолжу по кнопке.")));
+    }
+    // runFailResume: человек нажал «продолжай», модель делает УСПЕШНЫЙ шаг (читает
+    // настоящий файл) и потом завершает ответ — такой финал работу закрывает.
+    if (phase === "runFailResume" && inPhase === 1) {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      return res.end(sse(callChunks("call_read_again", "readFile", { path: path.join(work, "read.txt") })));
+    }
     if (phase === "run1" && served === 1) {
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       return res.end(sse(callChunks("call_read_1", "readFile", { path: path.join(work, "read.txt") })));
@@ -236,7 +260,13 @@ const callIpc = (channel, ...args) => {
   ok(mainSrc.indexOf('require("./run-context.js")') >= 0, "main.js подключает модуль контекста прогона");
   ok(/const \{ runAi \} = createRunAi\(\{[\s\S]{0,400}?createRunContext,/.test(mainSrc), "модуль передан прогону");
   ok(/const runCtx = createRunContext\(\{/.test(runAiSrc), "прогон собирает модуль в начале работы");
-  ok(/if \(!stopNote\) runCtx\.close\(\);/.test(runAiSrc), "обычный финал закрывает чекпоинт");
+  // Здесь раньше стояла проверка ТЕКСТА run-ai.js («if (!stopNote) runCtx.close();»).
+  // Она устарела молча: часть 68 добавила в это же условие упавший шаг и оборванный
+  // ответ, а поправлен был только набор (test/run-context.test.js) — и живой прогон
+  // годами краснел на устаревшей строке, ничего не проверяя по существу.
+  // Правило проекта: структуру кода сторожит НАБОР, а живой прогон проверяет поведение —
+  // обычный финал здесь наблюдается по делу (чекпоинт исчезает, раздел [4]), а упавший
+  // шаг — в разделе [5].
   ok(seen.ctx === 0, "до первого прогона модуль не создаётся зря");
 
   const saved = await callIpc("settings:set", {
@@ -328,6 +358,43 @@ const callIpc = (channel, ...args) => {
   ok(seen.ctx === 3, "модуль собран каждым прогоном (собрано: " + seen.ctx + ")");
   ok(seen.ctxDeps && seen.ctxDeps.id === OTHER_CHAT, "последний прогон собрал модуль на СВОЙ чат: " + JSON.stringify(seen.ctxDeps && seen.ctxDeps.id));
   ok(!fs.existsSync(path.join(ROOT, ".agent", "runs")), "чекпоинты не легли в репозиторий приложения");
+
+  console.log("\n[5] упавший последний шаг работу НЕ закрывает, а финал после него — закрывает");
+  const FAIL_CHAT = "chat-live-run-context-fail";
+  const failFile = path.join(work, ".agent", "runs", FAIL_CHAT + ".json");
+  phase = "runFail";
+  const beforeFail = events.length;
+  const r4 = await callIpc("ai:send", [{ role: "user", content: "прочитай файл, которого нет" }], { chatId: FAIL_CHAT, role: "developer" });
+  ok(r4 && r4.ok === true, "прогон с упавшим шагом завершился без ошибки: " + JSON.stringify(r4 && r4.error));
+  // Ядро правила части 68: ответ модели закончился, но работа НЕ доведена — чекпоинт
+  // остаётся, иначе человек ищет «продолжай» руками и теряет весь ход прогона.
+  ok(fs.existsSync(failFile), "упавший шаг НЕ закрыл чекпоинт — работу есть чем продолжить");
+  const failNotices = events.slice(beforeFail).filter((e) => e.ev && e.ev.type === "notice").map((e) => e.ev.text);
+  ok(failNotices.some((t) => /закончился ошибкой/.test(t)), "человеку назван упавший шаг: " + JSON.stringify(failNotices).slice(0, 200));
+  const failResume = events.slice(beforeFail).filter((e) => e.ev && e.ev.type === "resume").slice(-1)[0];
+  ok(!!failResume && /ошибку/.test(failResume.ev.reason), "кнопка «▶ Продолжить» зажглась после упавшего шага: " + JSON.stringify(failResume && failResume.ev.reason));
+  // Продолжение: работа вернулась в контекст, модель сделала УСПЕШНЫЙ шаг, довела
+  // дело до конца — теперь чекпоинт закрывается (иначе он висел бы вечно).
+  phase = "runFailResume";
+  const resumeBodyAt = bodies.length;
+  // Окно чата — как в окне: просьба человека, тихий ответ модели и «продолжай».
+  // Опора возврата — последняя реплика человека, которая есть В чекпоинте, поэтому
+  // без исходной просьбы работа бы не вернулась (проверено на этом же прогоне).
+  const beforeResume = events.length;
+  const r5 = await callIpc("ai:send", [
+    { role: "user", content: "прочитай файл, которого нет" },
+    { role: "assistant", content: "Файла нет — оставляю как есть, продолжу по кнопке." },
+    { role: "user", content: "продолжай" },
+  ], { chatId: FAIL_CHAT, role: "developer" });
+  ok(r5 && r5.ok === true, "продолжение после упавшего шага прошло: " + JSON.stringify(r5 && r5.error));
+  const resumeNotices = events.slice(beforeResume).filter((e) => e.ev && e.ev.type === "notice").map((e) => e.ev.text);
+  ok(resumeNotices.some((t) => /Продолжаю с места остановки/.test(t)), "человеку сказано, что работа вернулась: " + JSON.stringify(resumeNotices).slice(0, 200));
+  const failRun = bodies.slice(resumeBodyAt).filter((b) => b.phase === "runFailResume")[0] || { messages: [] };
+  ok(
+    failRun.messages.filter((m) => m.role === "tool").length === 1,
+    "в запрос продолжения вернулась работа прошлого шага: " + failRun.messages.filter((m) => m.role === "tool").length
+  );
+  ok(!fs.existsSync(failFile), "обычный финал после упавшего шага чекпоинт убрал");
 
   console.log(failures ? "\n❌ Провалов: " + failures : "\n✅ Все живые проверки пройдены");
   provider.close();
