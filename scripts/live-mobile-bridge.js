@@ -52,6 +52,17 @@ const ok = (cond, msg) => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Отказы шагов старта (src/lifecycle.js) печатаются через console.error и НЕ валят прогон —
+// поэтому раньше дыра в подменном окне жила в логе молча. Собираем их, чтобы шаг
+// «окно» (и любой другой стартовый) был проверкой, а не комментарием (часть 84).
+const lifecycleErrors = [];
+const realConsoleError = console.error;
+console.error = function () {
+  const line = Array.prototype.map.call(arguments, (a) => (a && a.stack) || String(a)).join(" ");
+  if (line.indexOf("[lifecycle]") >= 0) lifecycleErrors.push(line);
+  return realConsoleError.apply(console, arguments);
+};
+
 // Свободный порт: мост поднимается на нём, и туда же стучится «телефон».
 const freePort = () =>
   new Promise((resolve) => {
@@ -82,6 +93,11 @@ const mkWin = (id) => {
       on: () => {},
       once: () => {},
       openDevTools: () => {},
+      // Настоящий Electron отдаёт этот метод на webContents — его же зовёт
+      // src/app-window.js (ссылки из чата не должны открываться новым окном).
+      // Без него шаг «окно» жизненного цикла падал, отказ уходил в лог, а прогон
+      // всё равно был зелёным — незаметная дыра (часть 84).
+      setWindowOpenHandler: () => {},
     },
     isDestroyed: () => false,
     isFocused: () => true,
@@ -230,6 +246,9 @@ function phone(url) {
   const call = (ev, ch, ...args) => handlers.get(ch)(ev, ...args);
 
   console.log("\n[1] мост главного процесса поднялся на порту из настроек");
+  ok(lifecycleErrors.length === 0,
+    "стартовые шаги жизненного цикла прошли целиком, включая шаг «окно»" +
+    (lifecycleErrors.length ? ": " + lifecycleErrors[0].split("\n")[0] : ""));
   // Включаем мобильный доступ ТЕМ ЖЕ путём, каким это делает человек в настройках:
   // галочка → settings:set → мост получает настройки и поднимается (тот же код, что
   // и при запуске приложения; так прогон не зависит от порядка жизненного цикла).

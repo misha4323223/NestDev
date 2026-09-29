@@ -201,6 +201,24 @@ fs.writeFileSync(plainFile, "x");
     assert.strictEqual(api.repoNameFromUrl(null), "repo");
   });
 
+  // Ловушка части 84: разделитель — не только "/". Локальный путь Windows вида
+  // C:\Users\...\репо иначе целиком считался «именем папки», имя уходило в git как
+  // абсолютный путь назначения, и клон шёл источником сам в себя (живой прогон
+  // test:live:github на Windows: "destination path already exists").
+  await test("repoNameFromUrl: путь Windows и UNC разбирается на последнюю часть, а не становится именем целиком", () => {
+    const { api } = makePaths();
+    assert.strictEqual(
+      api.repoNameFromUrl("C:\\Users\\booom\\AppData\\Local\\Temp\\live-gh-work-6x8teQ\\источник"),
+      "источник",
+      "полный путь Windows ушёл в имя папки — git получит абсолютный destination"
+    );
+    assert.strictEqual(api.repoNameFromUrl("D:\\проекты\\репозиторий.git"), "репозиторий");
+    assert.strictEqual(api.repoNameFromUrl("C:\\projects\\trailing..."), "trailing", "правило точек действует и для путей");
+    assert.strictEqual(api.repoNameFromUrl("\\\\server\\share\\репо"), "репо", "UNC-путь не стал пустым именем");
+    // Обычные адреса не задеты: слэши в URL по-прежнему работают.
+    assert.strictEqual(api.repoNameFromUrl("https://github.com/u/repo.git"), "repo");
+  });
+
   await test("stripUrlCreds: токен не остаётся в адресе, обычная ссылка не портится", () => {
     const { api } = makePaths();
     assert.strictEqual(api.stripUrlCreds("https://user:TOKEN@github.com/u/r.git"), "https://github.com/u/r.git");

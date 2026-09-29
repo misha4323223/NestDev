@@ -269,6 +269,36 @@ function withTimers(fn) {
     assert.ok(MODULE_SRC.includes("setAppUserModelId"), "пропала настройка AppUserModelID для Windows");
   });
 
+  // Ловушка части 84: живой прогон гоняет НАСТОЯЩИЙ createWindow на подменном окне.
+  // Подмена обязана отдавать те же методы, что модуль вызывает, иначе шаг «окно»
+  // жизненного цикла падает в console.error, прогон остаётся зелёным, а проверки
+  // работают на окне, собранном не до конца (так и было: у мобильного прогона
+  // webContents не хватало setWindowOpenHandler — все проверки ✅ при кричащем логе).
+  await test("подменные окна живых прогонов отдают createWindow все его методы (шаг «окно» не падает молча)", () => {
+    const wcMethods = Array.from(MODULE_SRC.matchAll(/win\.webContents\.(\w+)/g), (m) => m[1]);
+    const winMethods = Array.from(MODULE_SRC.matchAll(/\bwin\.(\w+)/g), (m) => m[1]).filter((m) => m !== "webContents");
+    assert.ok(wcMethods.includes("setWindowOpenHandler"), "модуль больше не запрещает открытие новых окон по ссылкам");
+    assert.ok(wcMethods.includes("on") && wcMethods.includes("send"), "проводка webContents исказилась");
+    assert.ok(winMethods.includes("loadFile") && winMethods.includes("on"), "проводка окна исказилась");
+    for (const file of ["live-mobile-bridge.js", "live-terminal.js"]) {
+      const live = read("scripts", file);
+      // Смотрим именно на блок подменного окна, а не на весь файл: иначе метод
+      // «on» находился бы в любой строке кода и проверка ничего не стерегла.
+      const wcAt = live.search(/webContents\s*[:=]/);
+      assert.ok(wcAt >= 0, file + ": в подменном окне нет webContents");
+      const wcBlock = live.slice(wcAt, wcAt + 600);
+      for (const m of new Set(wcMethods)) {
+        assert.ok(new RegExp("\\b" + m + "\\b").test(wcBlock), file + ": в webContents подменного окна нет " + m);
+      }
+      const winAt = live.search(/function FakeWindow|const mkWin/);
+      assert.ok(winAt >= 0, file + ": подменное окно не найдено");
+      const winBlock = live.slice(winAt, winAt + 1600);
+      for (const m of new Set(winMethods)) {
+        assert.ok(new RegExp("\\b" + m + "\\b").test(winBlock), file + ": в подменном окне нет " + m);
+      }
+    }
+  });
+
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало");
   process.exit(failed ? 1 : 0);
 })();

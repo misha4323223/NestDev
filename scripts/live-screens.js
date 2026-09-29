@@ -15,7 +15,10 @@
    Проверяется то, что видно только на живом коде:
 
      [1] страница действительно загрузилась и отрисовалась — цвет пикселя по
-         центру снимка совпадает с цветом страницы;
+         центру снимка совпадает с цветом страницы, а размер снимка сверяется
+         с КОНТРОЛЬНЫМ окном тех же параметров: константа «1280×800» на дисплее
+         с плотностью 125–150% ложно падала (снимок приходил 1440×876 — часть 84),
+         хотя модуль отработал ровно по спецификации;
      [2] снимок — настоящий JPEG, который Electron умеет разобрать обратно;
      [3] png:true даёт настоящий PNG, а ужатие сохраняет пропорции;
      [4] файл на диске читается как картинка и совпадает со снимком побайтно;
@@ -86,6 +89,27 @@ const windows = () => BrowserWindow.getAllWindows().length;
 
 app.whenReady().then(async () => {
   console.log("\\n[1] Настоящее невидимое окно и настоящая страница");
+
+  // Контрольное окно создаём и грузим СРАЗУ, до снимка модуля. В этой сборке Electron
+  // связка «снимок страницы + закрытие окна» отравляет СЛЕДУЮЩУЮ загрузку страницы в новом
+  // окне (ERR_FAILED (-2), хотя сервер видит запрос) — поэтому контроль никогда не грузится
+  // после чужого закрытия (это и было причиной падения контроля, часть 84).
+  // Сверять размер с константой нельзя: плотность экрана (Windows 125–150%) переводит окно
+  // в физические точки, и снимок честно отработавшего модуля приходил 1440×876 (часть 84).
+  const ctl = new BrowserWindow({
+    show: false,
+    width: 1280,
+    height: 800,
+    useContentSize: true,
+    webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
+  });
+  let ctlErr = "";
+  try {
+    await ctl.loadURL(process.env.PAGE_URL);
+  } catch (e) {
+    ctlErr = (e && e.message) || String(e);
+  }
+
   const t0 = Date.now();
   const shot = await screens.screenshotUrl(process.env.PAGE_URL);
   const took = Date.now() - t0;
@@ -101,7 +125,22 @@ app.whenReady().then(async () => {
   const img = nativeImage.createFromDataURL(shot.dataUrl);
   ok(!img.isEmpty(), "Electron разбирает снимок обратно в картинку");
   const sz = img.getSize();
-  ok(sz.width === 1280 && sz.height === 800, "размер снимка 1280×800 (а не " + sz.width + "×" + sz.height + ")");
+
+  // Снимок модуля сверяется с КОНТРОЛЬНЫМ окном тех же параметров (1280×800,
+  // useContentSize), снятым на этой же машине: если параметры модуля изменятся,
+  // снимок перестанет совпадать с контрольным окном — проверка упадёт.
+  let ctlSize = null;
+  try {
+    const ctlImg = await ctl.webContents.capturePage();
+    ctlSize = nativeImage.createFromBuffer(screens.encodeShot(ctlImg, {}).buf).getSize();
+  } catch (e) {
+    ctlErr = ctlErr || ((e && e.message) || String(e));
+  }
+  // Контрольное окно НЕ закываем здесь: оно держится живым до конца прогона (ловушка
+  // части 84 — см. [4] и [5]).
+  ok(!!ctlSize && sz.width === ctlSize.width && sz.height === ctlSize.height,
+    "снимок совпадает с контрольным окном 1280×800 на этой машине: " + sz.width + "×" + sz.height +
+    (ctlSize ? " (контроль: " + ctlSize.width + "×" + ctlSize.height + ")" : " — контроль не снялся: " + ctlErr));
 
   // Пиксель по центру: подпись стоит в углу, поэтому центр — цвет страницы.
   const bmp = img.toBitmap();
@@ -118,23 +157,33 @@ app.whenReady().then(async () => {
   const small = screens.encodeShot(img, { maxWidth: 480 });
   const smallImg = nativeImage.createFromBuffer(small.buf);
   const ssz = smallImg.getSize();
-  ok(Math.abs(ssz.width - 480) <= 2 && Math.abs(ssz.height - 300) <= 2, "ужатие до 480 сохранило пропорции (" + ssz.width + "×" + ssz.height + ")");
+  // Ожидаемая высота считается от ФАКТИЧЕСКОГО размера снимка, а не от константы:
+  // пропорции обязаны сохраняться для любого размера страницы (часть 84).
+  const expSmallH = Math.round((480 * sz.height) / sz.width);
+  ok(Math.abs(ssz.width - 480) <= 2 && Math.abs(ssz.height - expSmallH) <= 2,
+    "ужатие до 480 сохранило пропорции (" + ssz.width + "×" + ssz.height + ", ждали 480×" + expSmallH + ")");
   const asIs = screens.encodeShot(img, { maxWidth: 4000 });
   const asIsSize = nativeImage.createFromBuffer(asIs.buf).getSize();
-  ok(asIsSize.width === 1280 && asIsSize.height === 800, "маленькая картинка не растягивается (" + asIsSize.width + "×" + asIsSize.height + ")");
+  ok(asIsSize.width === sz.width && asIsSize.height === sz.height,
+    "маленькая картинка не растягивается (" + asIsSize.width + "×" + asIsSize.height + ", снимок " + sz.width + "×" + sz.height + ")");
 
   console.log("\\n[3] Файл на диске: расширение по типу и побайтное совпадение");
   const jpg = screens.saveScreenshotPng(buf, "page", shot.mime);
   ok(fs.existsSync(jpg) && /\\.jpg$/.test(jpg), "снимок лёг в userData/screenshots как " + path.basename(jpg));
   const back = nativeImage.createFromPath(jpg);
-  ok(!back.isEmpty() && back.getSize().width === 1280, "файл читается обратно как картинка 1280 по ширине");
+  ok(!back.isEmpty() && back.getSize().width === sz.width && back.getSize().height === sz.height,
+    "файл читается обратно картинкой снимка (" + back.getSize().width + "×" + back.getSize().height + ")");
   ok(fs.readFileSync(jpg).equals(buf), "файл совпадает со снимком побайтно");
   const pngFile = screens.saveScreenshotPng(png.buf, "page", "image/png");
   ok(/\\.png$/.test(pngFile) && fs.readFileSync(pngFile).slice(0, 4).equals(PNG_MAGIC), "PNG сохранён как PNG (" + path.basename(pngFile) + ")");
   ok(path.dirname(jpg) === path.join(process.env.USER_DATA, "screenshots"), "папка снимков — userData/screenshots");
 
   console.log("\\n[4] Окно не остаётся висеть");
-  ok(windows() === 0, "после снимка открытых окон: " + windows());
+  // Контрольное окно ещё живо и держится до самого конца: в этой сборке Electron
+  // закрытие ПОСЛЕДНЕГО снятого окна «отравляет» следующую загрузку страницы в новом
+  // окне — она падает с ERR_FAILED, минуя настоящий сетевой отказ (ловушка части 84).
+  // Модуль своё окно обязан был закрыть сам — здесь это и видно.
+  ok(windows() === 1, "после снимка открыто только контрольное окно: " + windows());
 
   console.log("\\n[5] Неудачная загрузка: причина сразу, а не по таймауту");
   const t1 = Date.now();
@@ -142,7 +191,9 @@ app.whenReady().then(async () => {
   const tookBad = Date.now() - t1;
   ok(bad.ok === false && !!bad.err, "отказ отдан ошибкой: " + String(bad.err).slice(0, 90));
   ok(tookBad < 20000, "отказ пришёл за " + tookBad + " мс (не по 30-секундному таймауту)");
-  ok(windows() === 0, "после отказа открытых окон: " + windows());
+  ok(windows() === 1, "после отказа контрольное окно по-прежнему живо: " + windows());
+  if (!ctl.isDestroyed()) ctl.destroy();
+  ok(windows() === 0, "контрольное окно закрыто — открытых окон: " + windows());
 
   console.log("\\nЖИВОЙ ПРОГОН: " + (failures ? failures + " падений" : "всё чисто"));
   app.exit(failures ? 1 : 0);

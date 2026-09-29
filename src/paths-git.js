@@ -212,7 +212,11 @@ function agentWorkDir(settings) {
 function repoNameFromUrl(url) {
   let u = String(url || "").trim().replace(/\/+$/, "");
   if (u.includes("git@") && u.includes(":")) u = "https://" + u.slice(u.indexOf(":") + 1);
-  let name = (u.split("/").pop() || "repo").replace(/\.git$/i, "").replace(/[. ]+$/g, "").trim();
+  // Разделитель — и "/", и "\\": локальный путь Windows (C:\\Users\\...\\репо) иначе
+  // целиком считался «именем папки», git получал абсолютный путь назначения и клонировал
+  // источник сам в себя («destination path already exists» — находка живого прогона
+  // test:live:github на Windows, часть 84). UNC-путь (\\server\\share\\репо) тоже разбирается.
+  let name = (u.split(/[\\/]/).pop() || "repo").replace(/\.git$/i, "").replace(/[. ]+$/g, "").trim();
   if (!name || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(name)) name = "repo";
   return name;
 }
