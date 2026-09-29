@@ -75,7 +75,7 @@ const CORE_SRC = read("src", "renderer", "agent-core.js");
 const PROMPTS_SRC = read("src", "renderer", "prompts.js");
 const POLICY_SRC = read("src", "tool-policy.js");
 const GUIDE_SRC = read("src", "agent-guides", "yc.md");
-const SMOKE_SRC = read("test", "smoke.test.js");
+const SMOKE_SRC = require(path.join(__dirname, "smoke", "source.js")); // текст всего набора smoke (часть 81)
 const PKG = JSON.parse(read("package.json"));
 
 // ── Подменённый Container Registry ─────────────────────────────────────────

@@ -618,7 +618,7 @@ function tileByName(env, name) {
 
   await test("набор стоит в цепочке npm test, а сторож знает новую сводку", () => {
     assert.ok(/node test\/yc-ui\.test\.js/.test(PKG.scripts.test), "набор не подключён к цепочке npm test");
-    const smoke = read("test", "smoke.test.js");
+    const smoke = require(path.join(__dirname, "smoke", "source.js")); // текст всего набора smoke (часть 81)
     assert.ok(smoke.indexOf('chip("Ошибки API", failed.length') > 0, "сторож не следит за строкой здоровья");
     assert.ok(smoke.indexOf('err.className = "yc-card-err"') > 0, "сторож перестал требовать текст ошибки сервиса");
     // Сам сторож тоже проверяем: он обязан ЗАПРЕЩАТЬ текст отказа в свёрнутой
