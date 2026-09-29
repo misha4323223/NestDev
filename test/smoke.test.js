@@ -23,6 +23,111 @@
      панелями статичен (иначе блюры пересчитываются в каждом кадре и интерфейс «жуёт»).
 */
 
+/* ── Карта файла: что здесь лежит ────────────────────────────────────────────
+   КАРТА:START
+   | строка | набор | что проверяет |
+   |---:|---|---|
+   | 249 | testDevRun | Быстрый запуск превью (src/renderer/dev-run.js) |
+   | 337 | testChatActions | Удобство чата (src/renderer/chat-actions.js) |
+   | 489 | testWebChat | Веб-режим (src/renderer/web-chat.js) |
+   | 695 | testChatThinking | Блок размышлений модели (src/renderer/chat-thinking.js, этап 3.7) |
+   | 854 | testChatEvents | Сегменты ответа: лог «текст → действия → текст» (этап 3.7, часть 2) |
+   | 1214 | testChatSegments | сегменты ответа: текст после действия открывает новое сообщение |
+   | 1354 | testChatRender | Отрисовка сообщения: текст, вложения, кнопки (этап 3.7, часть 3) |
+   | 1515 | testTasksMission | Роли, дела и миссия (src/renderer/tasks-mission.js) |
+   | 1847 | testUiSearch | поиск кусков интерфейса: uiFind находит код в модуле, в app.js и не угадывает |
+   | 1894 | testAgentCore | 1. agent-core |
+   | 2484 | testAppUiTools | 1b. app-ui-tools |
+   | 2512 | testAgentStore | 1.5 agent-store: память проекта и точки отката |
+   | 2613 | testUnifiedPatch | 1.6 unified-patch: применение diff |
+   | 2677 | testCodeIndex | 1.7 code-index: семантический поиск |
+   | 2745 | testSecrets | 2. secrets |
+   | 2831 | testOta | 3. ota |
+   | 2916 | testBrowserTools | 4. browser-tools (без браузера) |
+   | 3009 | testBrowserBrain | 4c. Браузерная карта страницы (browserSnapshot) и умные действия |
+   | 3320 | testAppUiRefs | 1c. app-инструменты: стабильные ref вместо номеров [N] |
+   | 3631 | testYcDiagnosis | Yandex Cloud по отчёту песочницы: адреса, повторы, пачки, UX |
+   | 3792 | testVault | 4d. Менеджер паролей (vault) |
+   | 3963 | testVaultUi | 4e. Интерфейс паролей: реальный код app.js + мини-DOM |
+   | 4080 | testSecretsPanel | 4f. Секреты: панель (src/renderer/secrets-panel.js) |
+   | 4307 | testMobilePanel | Мобильный доступ: панель подключения телефона (этап 3.6) |
+   | 4538 | testSessionExtras | 4c. Сессия и контекст: индикатор, профиль браузера, «Дописать ответ» |
+   | 4668 | testMobileBridge | 4b. mobile-bridge: rate-limit PIN |
+   | 4937 | testMobileGate | 4c. mobile-api: страница входа с телефона |
+   | 4990 | testServer | 5. server.js (API-защита) |
+   | 5035 | testSelfDev | 10. self-dev: защита критичной инфраструктуры самообновления |
+   | 5070 | testHighlight | 10. self-dev: защита критичной инфраструктуры самообновления |
+   | 5139 | testChatPersistence | 11. Хранение чатов: атомарная запись, .bak-восстановление, автосейв |
+   | 5332 | testMail | 6.5 mail: почта (SMTP/IMAP) |
+   | 5427 | testYandexCloud | Yandex Cloud: логи внутренним API + встроенный yc CLI |
+   | 6388 | testShellAndCdp | 5. Оболочка (shell), коды ошибок, установщики и свой Chrome по CDP |
+   | 7040 | testContextMemory | Память диалогов: сжатые памятки контекста по датам |
+   | 7220 | testYcFolderPersistence | Каталог Yandex Cloud: сохранение настроек не должно его стирать |
+   | 7332 | testPlanPanel | план: модуль на месте, оболочка только собирает его |
+   | 7996 | testBrowserOverlays | 1d. Слои поверх страницы: диалоги, force-клик, JS на странице |
+   | 8424 | testBrowserReplayData | Ускорение агента: батчинг, скриншоты JPEG, порог компакции |
+   | 8733 | testAgentSpeedups | батчинг: правило 35 в промпте + параллельный набор read-only инструментов |
+   | 8862 | testChatFeed | Лента: умная прокрутка и очередь кадра (этап 3.7, часть 4) |
+   | 9063 | testOtaCodeVersion | Строки действий агента и группа работ (этап 3.7, часть 5) |
+   | 9137 | testBootGuard | дозор запуска: решения — имя файла, место падения, чего не хватает |
+   | 9342 | testChatWork | строки действий: строка, ссылка на файл и группа работ работают, как раньше |
+   | 9504 | testStreamThrottle | Стрим и печать: работа не чаще одного кадра |
+   | 9602 | testBrowserSpeed | Скорость работы в браузере: ожидание, фреймы, submit, browserAct |
+   | 9791 | testBrowserSenses | 1e. «Чувства» агента: прокрутка, наведение, сеть, ожидание покоя |
+   | 10149 | testPowerShellSession | Живая сессия PowerShell: один процесс на все системные справки |
+   | 10281 | testPromptCacheAndUsage | Кэш промпта: статичный префикс и метрики токенов |
+   | 10709 | testToolRouter | Роутер инструментов: реестр групп и чистая функция выбора |
+   | 10952 | testOllamaWindow | Ollama: реальное окно модели, num_ctx и удержание модели в памяти |
+   | 11318 | testChatContextTransfer | Контекст длинного чата и кнопка «Продолжить контекст» |
+   | 11367 | testLongChatRecovery | Выросший чат: агент не должен «писать что-то и отключаться» |
+   | 11497 | testSettingsRedesign | Настройки: вертикальная навигация, поиск, липкий футер |
+   | 11806 | testProjectPanel | Панель проекта (этап 7) |
+   | 11959 | testCommandPalette | Палитра команд: свой модуль (этап 8) |
+   | 12169 | testSidePanel | Правая панель, рельса, консоль и превью: свой модуль (этап 9) |
+   | 12430 | testSettingsPanel | панель настроек: модуль на месте, оболочка только собирает его |
+   | 12653 | testSettingsSearchLogic | поиск настроек: фильтрует по всем вкладкам, включая карточки провайдеров |
+   | 12783 | testOpenaiProfiles | Сохранённые OpenAI-подключения (этап 3.8, часть 2) |
+   | 12919 | testLeftRail | 4d. Левая рельса (как в Replit): разметка + живая логика |
+   | 13072 | testSandboxObstacles | 4e. Преграды из отчёта песочницы: лимит 429, ленивые списки, формат шагов |
+   | 13221 | testTasks | 1.65 дела: сроки, CRUD, панель по срокам, напоминания |
+   | 13543 | testYcConsole | 1.66 консоль Yandex Cloud: карточка ресурса и связанные объекты |
+   | 13645 | testToolPolicy | Политика инструментов и журнал действий |
+   | 13871 | testDeploy | Деплой: рецепты, состояние, движок |
+   | 14674 | testYcCosts | стоимость: формула контейнера совпадает с примерами из документации |
+   | 14764 | testYcSplit | Вынесенный Yandex Cloud: служебный слой и IPC-мост |
+   | 14890 | testDeployIpc | Вынесенный мост деплоя |
+   | 14996 | testMailIpc | Вынесенный почтовый мост |
+   | 15078 | testFsGitIpc | Вынесенные модули: стражи, файловая панель и git |
+   | 15302 | testAgentTools | Реестр инструментов: обработчики получают окружение main.js |
+   | 16151 | testProviderConfig | Разрез транспорта, часть 1: подключение к провайдеру |
+   | 16278 | testProviderTransport | Разрез транспорта, часть 2: сообщения, запрос, стрим, окно модели |
+   | 16439 | testContextWindow | Разрез ядра: контекст и компакция |
+   | 16644 | testWebTools | Разрез ядра: веб-модуль |
+   | 16752 | testImageTools | Разрез ядра: вспомогательная модель (зрение + генерация изображений) |
+   | 16886 | testCoreSplit | Разрез ядра: связность |
+   | 17061 | testMissionGuard | Сторож миссий: петля «продолжай — нет, ты продолжай» (1.5.114) |
+   | 17243 | testMissions | миссии: цель, план и журнал ложатся файлами рядом с проектом |
+   | 17710 | testSelfIndex | карта файла: каждый номер строки указывает на своё объявление |
+   | 17771 | testSecretScopes | Выдача секретов по назначению (1.5.84) |
+   | 18000 | testOneNavigation | Одна навигация: рельса слева, шапка — действия чата (1.5.90) |
+   | 18138 | testRealE2E | E2E настоящего облака (scripts/live-yc-real.js, 1.5.97) |
+   | 18301 | testProductionGate | Приёмка production: сломанное не уезжает в прод (1.5.97) |
+   | 18486 | testVkFieldFixes | 4f. Отчёт песочницы по ВК: честные ответы инструментов |
+   | 18767 | testG4fPanel | Выбор провайдера G4F в настройках (src/renderer/g4f-panel.js, этап A, часть 2) |
+   КАРТА:END
+
+   Номера строк — начало объявления набора. Их сверяет сторож в конце файла
+   (testSelfIndex): дописал новый набор — допиши строку в карту, иначе прогон
+   покраснеет и скажет, чего не хватает. Карта без сторожа врёт молча, а это
+   хуже, чем её отсутствие.
+
+   Все наборы идут ОДНИМ процессом: они делят подмену require, временные папки
+   и счётчики, а часть проверок пишет файл и читает его следующей проверкой.
+   Поэтому бегунок один и стоит в КОНЦЕ файла (раньше был в середине, из-за
+   чего файл нельзя было читать сверху вниз); порядок вызовов в нём — часть
+   логики, а не украшение.
+*/
+
 const assert = require("assert");
 const fs = require("fs");
 const os = require("os");
@@ -17539,98 +17644,123 @@ async function testMissions() {
   });
 }
 
-(async () => {
-  console.log("Smoke-тесты: " + path.basename(__filename));
-  await testAgentCore();
-  await testAppUiTools();
-  await testAppUiRefs();
-  await testAgentStore();
-  await testContextMemory();
-  await testUnifiedPatch();
-  await testCodeIndex();
-  await testSecrets();
-  await testOta();
-  await testBrowserTools();
-  await testBrowserBrain();
-  await testBrowserOverlays();
-  await testHighlight();
-  await testMobileBridge();
-  await testMobileGate();
-  await testChatPersistence();
-  await testSessionExtras();
-  await testVault();
-  await testVaultUi();
-  await testSecretsPanel();
-  await testMobilePanel();
-  await testMail();
-  await testYandexCloud();
-  await testYcDiagnosis();
-  await testYcFolderPersistence();
-  await testShellAndCdp();
-  await testServer();
-  await testSelfDev();
-  await testPlanPanel();
-  await testStreamThrottle();
-  await testBrowserSpeed();
-  await testBrowserSenses();
-  await testBrowserReplayData();
-  await testAgentSpeedups();
-  await testPowerShellSession();
-  await testPromptCacheAndUsage();
-  await testToolRouter();
-  await testOllamaWindow();
-  await testChatContextTransfer();
-  await testSettingsRedesign();
-  await testSettingsSearchLogic();
-  await testOpenaiProfiles();
-  await testProjectPanel();
-  await testSettingsPanel();
-  await testG4fPanel();
-  await testLeftRail();
-  await testSandboxObstacles();
-  await testVkFieldFixes();
-  await testLongChatRecovery();
-  await testTasks();
-  await testMissions();
-  await testMissionGuard();
-  await testYcConsole();
-  await testDeploy();
-  await testToolPolicy();
-  await testYcCosts();
-  await testYcSplit();
-  await testDeployIpc();
-  await testMailIpc();
-  await testFsGitIpc();
-  await testAgentTools();
-  await testWebTools();
-  await testImageTools();
-  await testCoreSplit();
-  await testUiSearch();
-  await testDevRun();
-  await testChatActions();
-  await testWebChat();
-  await testChatThinking();
-  await testChatSegments();
-  await testChatEvents();
-  await testChatRender();
-  await testChatFeed();
-  await testChatWork();
-  await testBootGuard();
-  await testOtaCodeVersion();
-  await testTasksMission();
-  await testProviderConfig();
-  await testProviderTransport();
-  await testContextWindow();
-  await testSecretScopes();
-  await testOneNavigation();
-  await testSidePanel();
-  await testCommandPalette();
-  await testRealE2E();
-  await testProductionGate();
-  console.log("\nИтог: " + passed + " прошло, " + failed + " упало");
-  process.exit(failed ? 1 : 0);
-})();
 
+// ── Карта файла: она не должна врать при росте ─────────────────────────────
+// Файл на 19 тысяч строк держится на карте в шапке. Но карта стареет: набор
+// переехал, а номер строки остался — и она врёт молча, то есть хуже, чем её
+// отсутствие. Поэтому карту проверяет она же: сторож читает ЭТОТ файл, берёт
+// строки между маркерами КАРТА:START и КАРТА:END и сверяет номера строк, состав
+// наборов и список вызовов бегунка. Разбор вынесен в чистые функции, чтобы их
+// можно было проверить подложным текстом: страж без негативного контроля
+// неотличим от «всегда молчит».
+function mapRows(src) {
+  const a = src.indexOf("КАРТА:START");
+  const b = src.indexOf("КАРТА:END");
+  const block = a >= 0 && b > a ? src.slice(a, b) : "";
+  return block
+    .split("\n")
+    .map((l) => /^\s*\|\s*(\d+)\s*\|\s*(test[A-Za-z0-9_]+)\s*\|/.exec(l))
+    .filter(Boolean)
+    .map((m) => ({ line: Number(m[1]), name: m[2] }));
+}
+function declaredSuites(src) {
+  return [...src.matchAll(/^(?:async )?function (test[A-Za-z0-9_]+)\(/gm)].map((m) => ({
+    name: m[1],
+    line: src.slice(0, m.index).split("\n").length,
+  }));
+}
+function runnerCalls(src) {
+  const at = src.lastIndexOf("(async () => {");
+  const block = at < 0 ? "" : src.slice(at);
+  return [...block.matchAll(/^\s*await (test[A-Za-z0-9_]+)\(\);\s*$/gm)].map((m) => m[1]);
+}
+// Проблемы карты: пусто — карта верна. Возвращается список строк, а не boolean,
+// чтобы падение говорило, ЧТО именно разъехалось.
+function mapProblems(src) {
+  const lines = src.split("\n");
+  const rows = mapRows(src);
+  const declared = declaredSuites(src);
+  const problems = [];
+  if (!rows.length) problems.push("карта не найдена (маркеры КАРТА:START / КАРТА:END)");
+  for (const r of rows) {
+    const text = (lines[r.line - 1] || "").trim();
+    if (!new RegExp("^(?:async )?function " + r.name + "\\(").test(text)) {
+      problems.push("строка " + r.line + ": там не объявление " + r.name);
+    }
+  }
+  const rowNames = rows.map((r) => r.name).sort();
+  const declNames = declared.map((d) => d.name).sort();
+  if (new Set(rowNames).size !== rowNames.length) problems.push("в карте набор повторяется");
+  const missing = declNames.filter((n) => rowNames.indexOf(n) < 0);
+  const extra = rowNames.filter((n) => declNames.indexOf(n) < 0);
+  if (missing.length) problems.push("в карте нет наборов: " + missing.join(", "));
+  if (extra.length) problems.push("в карте лишние имена: " + extra.join(", "));
+  const calls = runnerCalls(src);
+  if (calls.length !== new Set(calls).size) problems.push("бегунок зовёт набор дважды");
+  const notCalled = declNames.filter((n) => calls.indexOf(n) < 0);
+  if (notCalled.length) problems.push("бегунок не зовёт: " + notCalled.join(", "));
+  if (calls.length !== declNames.length) {
+    problems.push("вызовов в бегунке " + calls.length + ", наборов " + declNames.length);
+  }
+  const lastLine = lines.filter((l) => l.trim()).pop() || "";
+  if (lastLine !== "})();") problems.push("бегунок не последний в файле: " + lastLine.slice(0, 40));
+  return problems;
+}
+
+async function testSelfIndex() {
+  const src = fs.readFileSync(__filename, "utf8");
+
+  await test("карта файла: каждый номер строки указывает на своё объявление", () => {
+    const lines = src.split("\n");
+    const rows = mapRows(src);
+    assert.ok(rows.length >= 80, "в карте подозрительно мало строк: " + rows.length);
+    for (const r of rows) {
+      const text = (lines[r.line - 1] || "").trim();
+      assert.ok(
+        new RegExp("^(?:async )?function " + r.name + "\\(").test(text),
+        "строка " + r.line + " — это не " + r.name + ": " + text.slice(0, 60)
+      );
+    }
+  });
+
+  await test("карта файла: в ней есть каждый набор файла и нет лишних", () => {
+    const rows = mapRows(src).map((r) => r.name).sort();
+    const declared = declaredSuites(src).map((d) => d.name).sort();
+    assert.deepStrictEqual(rows, declared, "состав карты и файла разошёлся");
+  });
+
+  await test("карта файла: бегунок в конце зовёт каждый набор ровно раз", () => {
+    const calls = runnerCalls(src);
+    const declared = declaredSuites(src).map((d) => d.name).sort();
+    assert.strictEqual(calls.length, new Set(calls).size, "набор вызван дважды");
+    assert.deepStrictEqual(calls.slice().sort(), declared, "список вызовов и наборы разошлись");
+    const lastLine = src.split("\n").filter((l) => l.trim()).pop();
+    assert.strictEqual(lastLine, "})();", "бегунок не последний в файле");
+  });
+
+  await test("карта файла: подложная карта обязана падать (негативный контроль)", () => {
+    const body = [
+      "/* КАРТА:START",
+      "| @@ | testOne | что-то |",
+      "КАРТА:END */",
+      "",
+      "function testOne() {",
+      "}",
+      "",
+      "(async () => {",
+      "  await testOne();",
+      "})();",
+    ];
+    const at = body.indexOf("function testOne() {") + 1;
+    const withNumber = (n) => body.map((l) => l.replace("@@", String(n))).join("\n");
+    assert.deepStrictEqual(mapProblems(withNumber(at)), [], "верная карта признана плохой");
+    const problems = mapProblems(withNumber(at + 2));
+    assert.ok(
+      problems.some((p) => new RegExp("строка " + (at + 2)).test(p)),
+      "неверный номер строки не замечен: " + problems.join("; ")
+    );
+  });
+}
 // ── Выдача секретов по назначению (1.5.84) ───────────────────────────────────
 // Переменные агента раньше получала ЛЮБАЯ команда: и сборка проекта, и git, и
 // облако. Теперь переменную можно выдать конкретному инструменту (или группе).
@@ -19027,3 +19157,102 @@ async function testG4fPanel() {
     assert.strictEqual(env.$("g4f-provider-list").children.length, 3, "после очистки список не вернулся");
   });
 }
+
+
+// ── Запуск: все наборы по порядку, одним процессом ─────────────────────────
+// Порядок вызовов — часть логики: часть проверок пишет файл и читает его
+// следующей проверкой. Новый набор дописывается концом, а строка о нём — в
+// карту файла (шапка); за расхождением следит testSelfIndex.
+(async () => {
+  console.log("Smoke-тесты: " + path.basename(__filename));
+  await testAgentCore();
+  await testAppUiTools();
+  await testAppUiRefs();
+  await testAgentStore();
+  await testContextMemory();
+  await testUnifiedPatch();
+  await testCodeIndex();
+  await testSecrets();
+  await testOta();
+  await testBrowserTools();
+  await testBrowserBrain();
+  await testBrowserOverlays();
+  await testHighlight();
+  await testMobileBridge();
+  await testMobileGate();
+  await testChatPersistence();
+  await testSessionExtras();
+  await testVault();
+  await testVaultUi();
+  await testSecretsPanel();
+  await testMobilePanel();
+  await testMail();
+  await testYandexCloud();
+  await testYcDiagnosis();
+  await testYcFolderPersistence();
+  await testShellAndCdp();
+  await testServer();
+  await testSelfDev();
+  await testPlanPanel();
+  await testStreamThrottle();
+  await testBrowserSpeed();
+  await testBrowserSenses();
+  await testBrowserReplayData();
+  await testAgentSpeedups();
+  await testPowerShellSession();
+  await testPromptCacheAndUsage();
+  await testToolRouter();
+  await testOllamaWindow();
+  await testChatContextTransfer();
+  await testSettingsRedesign();
+  await testSettingsSearchLogic();
+  await testOpenaiProfiles();
+  await testProjectPanel();
+  await testSettingsPanel();
+  await testG4fPanel();
+  await testLeftRail();
+  await testSandboxObstacles();
+  await testVkFieldFixes();
+  await testLongChatRecovery();
+  await testTasks();
+  await testMissions();
+  await testMissionGuard();
+  await testYcConsole();
+  await testDeploy();
+  await testToolPolicy();
+  await testYcCosts();
+  await testYcSplit();
+  await testDeployIpc();
+  await testMailIpc();
+  await testFsGitIpc();
+  await testAgentTools();
+  await testWebTools();
+  await testImageTools();
+  await testCoreSplit();
+  await testUiSearch();
+  await testDevRun();
+  await testChatActions();
+  await testWebChat();
+  await testChatThinking();
+  await testChatSegments();
+  await testChatEvents();
+  await testChatRender();
+  await testChatFeed();
+  await testChatWork();
+  await testBootGuard();
+  await testOtaCodeVersion();
+  await testTasksMission();
+  await testProviderConfig();
+  await testProviderTransport();
+  await testContextWindow();
+  await testSecretScopes();
+  await testOneNavigation();
+  await testSidePanel();
+  await testCommandPalette();
+  await testRealE2E();
+  await testProductionGate();
+  await testSelfIndex();
+
+  console.log("\nИтог: " + passed + " прошло, " + failed + " упало");
+  process.exit(failed ? 1 : 0);
+})();
