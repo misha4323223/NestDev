@@ -76,6 +76,6 @@
   },
   "dependencies": {
     "electron-updater": "^6.8.9",
-    "playwright": "^1.49.1"
+    "playwright": "1.63.0"
   }
 }
