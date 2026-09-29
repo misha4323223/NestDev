@@ -425,6 +425,11 @@ async function listService(oauthToken, folderId, svcDef, opts) {
 async function resourcesStatus(oauthToken, folderId, opts) {
   // Раньше все 13 сервисов опрашивались залпом: поодиночке каждый отвечает,
   // а вместе — таймауты. Идём небольшими пачками (по умолчанию 3).
+  //
+  // Наружу отдаём И русское имя (ru), а не только официальное английское: полка
+  // в окне и поиск по ней работают по тому, что человек ВИДИТ («Сети VPC», «DNS-
+  // зоны»), и без этого поля панель молча называла все сервисы по-английски,
+  // хотя подпись брала из ru. Поймал живой прогон test:live:yc.
   // Таймаут для дашборда короткий и без повторов: карточка со сбоем лучше, чем
   // минуты ожидания (серийный вызов может позволить себе 25 с и 2 попытки).
   const o = Object.assign({ timeoutMs: 12000, retries: 1 }, opts || {});
@@ -437,9 +442,9 @@ async function resourcesStatus(oauthToken, folderId, opts) {
       chunk.map(async (svcDef) => {
         try {
           const r = await listService(oauthToken, folderId, svcDef, o);
-          return { key: svcDef.key, title: svcDef.title, icon: svcDef.icon, ok: true, count: r.count, items: r.items, error: "" };
+          return { key: svcDef.key, ru: svcDef.ru, title: svcDef.title, icon: svcDef.icon, ok: true, count: r.count, items: r.items, error: "" };
         } catch (e) {
-          return { key: svcDef.key, title: svcDef.title, icon: svcDef.icon, ok: false, count: 0, items: [], error: (e && e.message) || String(e) };
+          return { key: svcDef.key, ru: svcDef.ru, title: svcDef.title, icon: svcDef.icon, ok: false, count: 0, items: [], error: (e && e.message) || String(e) };
         }
       })
     );

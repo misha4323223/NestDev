@@ -138,6 +138,14 @@ async function testYcDiagnosis() {
       const broken = res.filter((s) => !s.ok);
       assert.ok(broken.length > 0 && broken.every((s) => /Сеть:|Таймаут:|\[/.test(s.error)), "непонятная ошибка: " + (broken[0] || {}).error);
       assert.ok(res.find((s) => s.key === "vpc" && s.ok), "vpc должен был ответить");
+      // Русское имя едет вместе с английским: полка в окне и поиск по ней
+      // работают по тому, что человек ВИДИТ («Сети VPC», «DNS-зоны»). Однажды
+      // это поле потерялось, и панель молча стала английской — поймал живой
+      // прогон test:live:yc, а здесь то же самое видно без окна и за секунду.
+      const namesLost = res.filter((s) => s.ru !== (yc.SERVICES.find((d) => d.key === s.key) || {}).ru);
+      assert.strictEqual(namesLost.length, 0, "полка не получает русское имя сервиса: " + JSON.stringify(namesLost.map((s) => s.key + "=" + s.ru)));
+      const notRu = res.filter((s) => !/[А-Яа-яЁё]/.test(String(s.ru || "")));
+      assert.strictEqual(notRu.length, 0, "сервисы названы не по-русски: " + notRu.map((s) => s.key).join(", "));
     });
 
     await test("yc: классификация ошибок (сеть / таймаут / API с адресом)", () => {

@@ -262,26 +262,43 @@ function hasXvfb() {
     console.log("\n[3] Дашборд: клик по имени ресурса открывает карточку");
     const dash = await page.evaluate(async () => {
       const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-      // Ждём карточки по состоянию, а не по паузе: окно поднимается не мгновенно.
+      // Ждём плитки по состоянию, а не по паузе: окно поднимается не мгновенно.
       // Плюс переоткрываем панель, если первый кадр вышел пустым: сразу после
       // сохранения токена главный процесс может ещё не успеть его подхватить, и
-      // дашборд рисуется без карточек. Так сделал бы и человек — но тест сообщает,
+      // полка рисуется без плиток. Так сделал бы и человек — но тест сообщает,
       // что понадобилась вторая попытка: молчаливое повторение скрыло бы причину.
-      let cards = [];
+      //
+      // Ищем по РУССКОМУ имени внутри плитки («.yc-tile-name») — по тому, что
+      // человек видит на экране. Держаться внутреннего класса нельзя: полка
+      // стала «.yc-tile» в части 74, а прогон ещё долго искал «.yc-card» и был
+      // красным не потому, что сломалась консоль, а потому что разошёлся словарь.
+      let tiles = [];
       let attempts = 0;
-      for (let a = 0; a < 3 && !cards.length; a++) {
+      const tileName = (t) => {
+        const n = t.querySelector(".yc-tile-name");
+        return n ? n.textContent : "";
+      };
+      const tileVpc = () => tiles.find((t) => tileName(t).includes("Сети VPC"));
+      for (let a = 0; a < 3 && !tileVpc(); a++) {
         attempts++;
         const rail = document.getElementById("rail-cloud");
         if (!rail) return { ok: false, error: "нет рельсы облака" };
         rail.click();
-        for (let i = 0; i < 40 && !cards.length; i++) {
+        for (let i = 0; i < 40 && !tileVpc(); i++) {
           await wait(250);
-          cards = [...document.querySelectorAll("#yc-dash .yc-card")];
+          tiles = [...document.querySelectorAll("#yc-dash .yc-tile")];
         }
       }
-      const vpc = cards.find((c) => c.textContent.includes("Virtual Private Cloud"));
-      if (!vpc) return { ok: false, error: "нет карточки VPC", attempts, cards: cards.map((c) => c.textContent.slice(0, 40)) };
-      vpc.click();
+      const vpc = tileVpc();
+      if (!vpc) {
+        // Называем, ЧТО видели: без этого «нет плитки» не отличить от «полка
+        // не нарисовалась» и «имя сервиса изменилось», а прогон — один.
+        const seen = tiles.map((t) => tileName(t) + "(" + t.textContent.replace(/\s+/g, " ").trim().slice(0, 24) + ")");
+        return { ok: false, error: "нет плитки «Сети VPC» — на полке: " + (seen.join(", ") || "пусто"), attempts, shelf: [] };
+      }
+      // Щёлкаем по ИМЕНИ, как человек: клик всплывает к плитке, и та раскрывает
+      // список ресурсов — ровно этот путь и проверяем.
+      vpc.querySelector(".yc-tile-name").click();
       await wait(600);
       const names = [...document.querySelectorAll("#yc-dash .yc-item-name")];
       const target = names.find((n) => n.textContent.includes("default"));
@@ -295,6 +312,9 @@ function hasXvfb() {
         title: (document.querySelector("#yc-console .ykc-title") || {}).textContent || "",
         sub: (document.querySelector("#yc-console .ykc-sub") || {}).textContent || "",
         attempts,
+        // Имена всех плиток: полка обязана назвать сервисы так, как они
+        // называются в консоли облака, — по этим именам человек и ищет.
+        shelf: tiles.map(tileName),
       };
     });
     check(
@@ -304,6 +324,12 @@ function hasXvfb() {
     );
     check("дашборд уступил место карточке", dash.dashHidden);
     check("в шапке — сервис и имя ресурса", dash.sub === "Virtual Private Cloud" && dash.title === "default", dash.sub + " · " + dash.title);
+    // Имена на полке — русские: подпись берётся из поля ru, которое главный
+    // процесс однажды перестал отдавать, и полка молча стала английской
+    // (а поиск «по тому, что видно» перестал находить). Прогон стережёт это.
+    const shelf = dash.shelf || [];
+    const notRu = shelf.filter((n) => !/[А-Яа-яЁё]/.test(n));
+    check("на полке сервисы названы по-русски", shelf.length >= 10 && notRu.length === 0, notRu.length ? "по-английски: " + notRu.join(", ") : "плиток: " + shelf.length + ": " + shelf.slice(0, 4).join(", ") + "…");
 
     console.log("\n[4] Обзор ресурса: поля и связанные объекты");
     const card = await page.evaluate(() => {
@@ -378,7 +404,14 @@ function hasXvfb() {
     // И адрес именно тот, который существует: прежний (несуществующий) путь
     // отдавал 404, и проверка выше была зелёной только потому, что подделка
     // отвечала на любой путь. Теперь подделка отвечает только на настоящий адрес.
-    check("запрос ушёл на /iam/aws-compatibility/v1/accessKeys", seen.some((s) => s.indexOf("/iam/aws-compatibility/v1/accessKeys") === 0), seen.filter((s) => /accessKeys/.test(s)).join(" / "));
+    //
+    // В `seen` лежит ВСЯ строка запроса («GET /путь?запрос») — сравнивать её с
+    // одним путём нельзя: проверка молча краснела, хотя запрос уходил верный.
+    check(
+      "запрос ушёл на /iam/aws-compatibility/v1/accessKeys с аккаунтом",
+      seen.some((s) => /^GET \/iam\/aws-compatibility\/v1\/accessKeys\?.*serviceAccountId=sa1/.test(s)),
+      seen.filter((s) => /accessKeys/.test(s)).join(" / ") || "таких запросов не было"
+    );
 
     console.log("\n[7] Контейнер: ревизии и откат («сделать активной»)");
     const cont = await page.evaluate(async () => {
@@ -457,15 +490,21 @@ function hasXvfb() {
         document.getElementById("rail-cloud").click();
         await wait(250);
       }
-      let dns = null;
+      // Тут, наоборот, нужна КНОПКА создания внутри плитки, поэтому берём имя
+      // плитки по-русски, а кнопку — по классу «.yc-tile-add» (кнопка без
+      // подписи-имени: у неё текст «＋ Создать»).
+      let dnsTile = null;
       let add = null;
       for (let i = 0; i < 40 && !add; i++) {
         await wait(250);
-        const cards = [...document.querySelectorAll("#yc-dash .yc-card")];
-        dns = cards.find((c) => c.textContent.includes("Cloud DNS"));
-        add = dns ? dns.querySelector(".yc-add") : null;
+        const tiles = [...document.querySelectorAll("#yc-dash .yc-tile")];
+        dnsTile = tiles.find((t) => {
+          const name = t.querySelector(".yc-tile-name");
+          return !!name && name.textContent.includes("DNS-зоны");
+        });
+        add = dnsTile ? dnsTile.querySelector(".yc-tile-add") : null;
       }
-      if (!dns) return { ok: false, error: "нет карточки Cloud DNS" };
+      if (!dnsTile) return { ok: false, error: "нет плитки «DNS-зоны»" };
       if (!add) return { ok: false, error: "нет кнопки создания" };
       add.click();
       await wait(1500);

@@ -3048,14 +3048,6 @@ body::after {
 }
 .yc-perms { margin-top: 8px; }
 
-.yc-dash-top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 10px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
-}
 .yc-dash-status {
   font-size: 12px;
   color: rgba(255, 255, 255, 0.7);
@@ -3076,59 +3068,16 @@ body::after {
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   gap: 10px;
 }
-.yc-card {
-  background: rgba(255, 255, 255, 0.045);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 12px;
-  cursor: pointer;
-  overflow: hidden;
-  transition: border-color 0.15s ease, background 0.15s ease;
-}
-.yc-card:hover { border-color: rgba(14, 165, 233, 0.45); }
-.yc-card.open { border-color: rgba(14, 165, 233, 0.6); background: rgba(14, 165, 233, 0.05); }
-.yc-card-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 12px;
-  background: rgba(0, 0, 0, 0.22);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-}
-.yc-card-icon { font-size: 16px; }
-.yc-card-title {
-  font-size: 12.5px;
-  font-weight: 600;
-  color: rgba(255, 255, 255, 0.92);
-  line-height: 1.25;
-}
-.yc-card-body {
-  padding: 10px 12px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  min-height: 34px;
-}
-.yc-card-count {
-  font-size: 13px;
-  font-weight: 600;
-  color: rgba(255, 255, 255, 0.85);
-}
-.yc-card-count.err { color: #f87171; }
-.yc-add { flex-shrink: 0; }
+/* Прежние правила плитки облака (.yc-card, .yc-card-head/-icon/-title/-body/
+   -count/-list, .yc-add) удалены в части 83: полка с части 74 рисует `yc-tile`,
+   `yc-tile-name` и `yc-tile-add`, и мёртвые правила были третьим словарём —
+   из-за них устаревший селектор живого прогона выглядел живым. Живёт только
+   текст ошибки сервиса, его панель правда ставит (`yc-card-err`). */
 .yc-card-err {
   font-size: 11px;
   color: #f87171;
   padding: 0 12px 10px;
   word-break: break-word;
-}
-.yc-card-list {
-  border-top: 1px solid rgba(255, 255, 255, 0.07);
-  max-height: 220px;
-  overflow-y: auto;
-  padding: 6px 10px;
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.55);
 }
 .yc-item {
   display: flex;
@@ -3150,27 +3099,12 @@ body::after {
 
 
 /* ── Yandex Cloud: сводка, деплой, статусы ── */
-.yc-dash-title {
-  font-size: 13px;
-  font-weight: 700;
-  color: rgba(255, 255, 255, 0.95);
-  flex-shrink: 0;
-}
 .yc-summary {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
   padding: 8px 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-}
-.yc-summary-item {
-  font-size: 12px;
-  font-weight: 600;
-  color: rgba(255, 255, 255, 0.85);
-  background: rgba(14, 165, 233, 0.08);
-  border: 1px solid rgba(14, 165, 233, 0.25);
-  border-radius: 8px;
-  padding: 3px 10px;
 }
 .yc-deploy-box {
   margin: 10px 12px;

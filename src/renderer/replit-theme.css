@@ -262,7 +262,6 @@ input[type="radio"] { accent-color: var(--accent) !important; }
 .yc-deploy-result,
 .yc-status.active { color: var(--ok) !important; }
 .yc-conn-status.err,
-.yc-card-count.err,
 .yc-card-err,
 .yc-step.err,
 .yc-status.error { color: var(--danger) !important; }

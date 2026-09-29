@@ -255,7 +255,6 @@
   animation: yc-skel-shift 1.3s ease-in-out infinite;
 }
 #sp-cloud .yc-skel-tile { height: 96px; }
-#sp-cloud .yc-skel-line { height: 12px; border-radius: 6px; margin: 6px 0; }
 @keyframes yc-skel-shift {
   0% { background-position: 200% 0; }
   100% { background-position: -60% 0; }

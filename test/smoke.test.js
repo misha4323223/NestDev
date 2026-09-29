@@ -48,11 +48,11 @@
    | test/smoke/02-browser.js     |   1826 | testBrowserSpeed        | Скорость работы в браузере: ожидание, фреймы, submit, browserAct |
    | test/smoke/02-browser.js     |   2015 | testBrowserSenses       | 1e. «Чувства» агента: прокрутка, наведение, сеть, ожидание покоя |
    | test/smoke/03-cloud.js       |     34 | testYcDiagnosis         | Yandex Cloud по отчёту песочницы: адреса, повторы, пачки, UX |
-   | test/smoke/03-cloud.js       |    194 | testYandexCloud         | Yandex Cloud: логи внутренним API + встроенный yc CLI |
-   | test/smoke/03-cloud.js       |   1158 | testYcFolderPersistence | Каталог Yandex Cloud: сохранение настроек не должно его стирать |
-   | test/smoke/03-cloud.js       |   1268 | testYcConsole           | 1.66 консоль Yandex Cloud: карточка ресурса и связанные объекты |
-   | test/smoke/03-cloud.js       |   1366 | testYcCosts             | стоимость: формула контейнера совпадает с примерами из документации |
-   | test/smoke/03-cloud.js       |   1456 | testYcSplit             | Вынесенный Yandex Cloud: служебный слой и IPC-мост |
+   | test/smoke/03-cloud.js       |    202 | testYandexCloud         | Yandex Cloud: логи внутренним API + встроенный yc CLI |
+   | test/smoke/03-cloud.js       |   1166 | testYcFolderPersistence | Каталог Yandex Cloud: сохранение настроек не должно его стирать |
+   | test/smoke/03-cloud.js       |   1276 | testYcConsole           | 1.66 консоль Yandex Cloud: карточка ресурса и связанные объекты |
+   | test/smoke/03-cloud.js       |   1374 | testYcCosts             | стоимость: формула контейнера совпадает с примерами из документации |
+   | test/smoke/03-cloud.js       |   1464 | testYcSplit             | Вынесенный Yandex Cloud: служебный слой и IPC-мост |
    | test/smoke/04-deploy.js      |     34 | testDeploy              | Деплой: рецепты, состояние, движок |
    | test/smoke/04-deploy.js      |    842 | testDeployIpc           | Вынесенный мост деплоя |
    | test/smoke/04-deploy.js      |    950 | testRealE2E             | E2E настоящего облака (scripts/live-yc-real.js, 1.5.97) |

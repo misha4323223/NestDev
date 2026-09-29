@@ -25,6 +25,10 @@
        ресурсы и деньги, рисует плитки с иконками, фильтрует (поиск + «с
        ресурсами» / «ошибки»), показывает хвосты по клику и перечитывает деньги
        по кнопке ↻ — а не просто «строка на месте».
+     • селекторы ЖИВОГО прогона сходятся с окном: scripts/live-yc-console.js щёлкает
+       по тем же классам и id, которые панель и карточка правда рисуют. Иначе
+       переделка панели краснит прогон молча, а привычный красный цвет перестаёт
+       быть проверкой («известное и не моё»).
      • негативные контроли (то, ради чего набор и написан):
        ① без модуля иконок панель не падает — плитки те же, иконок нет;
        ② биллинг отказал — ресурсы всё равно видны, а вместо суммы честное
@@ -626,6 +630,63 @@ function tileByName(env, name) {
     // поэтому знак обратный тому, что в панели.)
     assert.ok(smoke.indexOf("card.appendChild(err)") > 0, "сторож не проверяет текст отказа в свёрнутой плитке");
     assert.ok(PANEL_SRC.indexOf("card.appendChild(err)") < 0, "свёрнутая плитка печатает полный текст отказа");
+  });
+
+  // Живой прогон консоли (scripts/live-yc-console.js) ходит по окну ТЕМИ ЖЕ
+  // селекторами, что и человек глазами: плитка сервиса, список ресурсов, карточка
+  // и её поля. Пока это две копии правды, переделка панели оставляет прогон
+  // красным МОЛЧА — так и вышло: с части 74 полка стала «.yc-tile», а прогон ещё
+  // много частей искал «.yc-card», и его красный цвет списывали на «известное и
+  // не моё». Поэтому здесь сторож: каждый класс и id из живого прогона обязан
+  // существовать в разметке и в коде, который рисует окно.
+  await test("живой прогон консоли щёлкает по селекторам, которые панель правда рисует", () => {
+    const live = read("scripts", "live-yc-console.js");
+    // Что окно РИСУЕТ: классы из разметки и из строк, которыми панель и карточка
+    // собирают узлы. Сравнение ТОЧНОЕ по токену: «yc-card» не должен «находиться»
+    // внутри «yc-card-err» — иначе сторож снова станет слепым.
+    const classes = new Set();
+    const addClasses = (s) => String(s).split(/\s+/).filter(Boolean).forEach((c) => classes.add(c));
+    for (const m of HTML_SRC.matchAll(/class="([^"]*)"/g)) addClasses(m[1]);
+    for (const src of [PANEL_SRC, CONSOLE_SRC]) {
+      for (const m of src.matchAll(/"([^"\n]*)"|'([^'\n]*)'/g)) addClasses(m[1] !== undefined ? m[1] : m[2]);
+    }
+    // id рисует не только разметка: карточку ресурса окно создаёт само
+    // (`b = el("div", ...); b.id = "yc-console"`), поэтому смотрим и на это.
+    const ids = new Set([...HTML_SRC.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
+    for (const src of [PANEL_SRC, CONSOLE_SRC]) {
+      for (const m of src.matchAll(/\.id\s*=\s*"([^"]+)"/g)) ids.add(m[1]);
+    }
+
+    const audit = (src) => {
+      const bad = [];
+      let checked = 0;
+      let queries = 0;
+      for (const m of src.matchAll(/(?:querySelector(?:All)?|getElementById)\(\s*"([^"]+)"/g)) {
+        queries++;
+        const sel = m[1];
+        for (const idm of sel.match(/#[\w-]+/g) || []) {
+          if (!ids.has(idm.slice(1))) bad.push(sel + " — в разметке нет " + idm);
+        }
+        for (const cm of sel.match(/\.[\w-]+/g) || []) {
+          const name = cm.slice(1);
+          if (!/^(yc|ykc)-/.test(name)) continue; // остальные классы — общие для окна
+          checked++;
+          if (!classes.has(name)) bad.push(sel + " — окно не рисует ." + name);
+        }
+      }
+      return { bad, checked, queries };
+    };
+
+    const now = audit(live);
+    assert.strictEqual(now.bad.length, 0, "селекторы живого прогона разошлись с окном:\n      " + now.bad.join("\n      "));
+    // Сторож сам не должен молча стать пустым: если регексп перестанет что-то
+    // находить, «ноль проблем» превратится в ложь.
+    assert.ok(now.queries >= 20, "в прогоне найдено подозрительно мало запросов к разметке: " + now.queries);
+    assert.ok(now.checked >= 10, "проверено классов: " + now.checked);
+
+    // Негативный контроль: вернувшийся старый селектор обязан быть назван.
+    const broken = audit(live.split(".yc-tile").join(".yc-card"));
+    assert.ok(broken.bad.some((p) => /\.yc-card\b/.test(p)), "сторож не заметил вернувшийся «.yc-card»: " + JSON.stringify(broken.bad));
   });
 
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало\n");
