@@ -124,6 +124,8 @@
           sticky: [...webSticky],
           roleGroups: AgentCore.rolePlan(opts.role || "dev").groups,
           maxTokens: AgentCore.routerMaxTokens(budget, systemWeight, baseWeight),
+          // Уже включённые группы считаем по окну, а не по потолку схем.
+          stickyMaxTokens: AgentCore.routerMaxTokens(budget, systemWeight, baseWeight, { windowOnly: true }),
         });
         for (const gid of route.groups) webSticky.add(gid);
         webTools = route.tools;

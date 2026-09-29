@@ -78,6 +78,7 @@ const YC_RESOURCE_TYPES = {
   containerRegistry: "container-registry.registry",
   storage: "storage.bucket",
   serverlessContainers: "serverless.container",
+  cloudFunctions: "serverless.function",
   vpc: "vpc.network",
   ydb: "ydb.database",
 };

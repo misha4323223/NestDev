@@ -139,10 +139,14 @@ const CAPABILITIES = [
   { cap: "clipboard.read", risk: RISK.MEDIUM, tools: ["clipboardRead"] },
   { cap: "clipboard.write", risk: RISK.MEDIUM, tools: ["clipboardWrite"] },
   // ── Yandex Cloud ──
-  { cap: "cloud.read", risk: RISK.LOW, tools: ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycDb", "ycLogs", "ycCosts"] },
+  { cap: "cloud.read", risk: RISK.LOW, tools: ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycVpc", "ycCompute", "ycIam", "ycFunctions", "ycBilling", "ycCdn", "ycDb", "ycLogs", "ycCosts"] },
   // Создание/удаление/деплой в облаке: свои чекбоксы ycAllowAgent*, подтверждение не дублируем.
   { cap: "cloud.create", risk: RISK.HIGH, tools: ["ycCreate"] },
   { cap: "cloud.delete", risk: RISK.HIGH, tools: ["ycDelete"] },
+  // Машины: как и у сети (ycVpc), создание, питание и удаление живут ВНУТРИ
+  // инструмента ycCompute и проверяются теми же чекбоксами ycAllowAgent*.
+  // Отдельная галочка «разрешить ВМ» означала бы, что человек разрешил сеть,
+  // но забыл про машины — и агент упирался бы в отказ без объяснения.
   { cap: "cloud.deploy", risk: RISK.HIGH, tools: ["ycDeploy"] },
   { cap: "cloud.cli.install", risk: RISK.MEDIUM, tools: ["ycInstall"] },
   // ── таблицы (Excel и Google Sheets) ──

@@ -43,7 +43,38 @@ const SOURCES = {
   lockbox: "https://yandex.cloud/ru/docs/lockbox/pricing",
   ydb: "https://yandex.cloud/ru/docs/ydb/pricing/serverless",
   vpc: "https://yandex.cloud/ru/docs/vpc/pricing",
+  compute: "https://yandex.cloud/ru/docs/compute/pricing",
+  functions: "https://yandex.cloud/ru/docs/functions/pricing",
+  cdn: "https://yandex.cloud/ru/docs/cdn/pricing",
+  certificateManager: "https://yandex.cloud/ru/docs/certificate-manager/pricing",
 };
+
+// ── Compute Cloud: тарифы вычислительных ресурсов ──────────────────────────
+// Числа взяты из таблицы цен Compute Cloud (платформа Intel Ice Lake,
+// это и есть standard-v3) и VPC, действуют с 30 апреля 2026. Складываются:
+//   цена часа ядра ЗАВИСИТ от уровня производительности: 20%, 50% или 100%.
+// Именно поэтому «2 ядра» в облаке — не одна цена, а три разных.
+const VM_VCPU_HOUR = { 20: 0.52, 50: 0.75, 100: 1.24 };
+const VM_RAM_GB_HOUR = 0.33;
+// Прерываемая машина: та же конфигурация, но облако вправе её выключить в любой
+// момент — поэтому дешевле втрое-вчетверо.
+const VM_PREEMPT_VCPU_HOUR = { 20: 0.166, 50: 0.2371, 100: 0.34 };
+const VM_PREEMPT_RAM_GB_HOUR = 0.083;
+
+// Тип диска → цена за ГБ×час. Имена те же, что в API (typeId).
+const DISK_PRICES = {
+  "network-hdd": { perGbHour: 0.0048, title: "стандартный диск (HDD)" },
+  "network-ssd": { perGbHour: 0.0199, title: "быстрый диск (SSD)" },
+  "network-ssd-nonreplicated": { perGbHour: 0.0147, title: "нереплицируемый диск (SSD)" },
+  "network-ssd-io-m3": { perGbHour: 0.0332, title: "сверхбыстрое сетевое хранилище (SSD)" },
+};
+// Хранение снимка и образа — одна цена, 0,0051 ₽ за ГБ×час. Считается не по
+// размеру диска, а по ФАКТИЧЕСКОМУ объёму снимка: он обычно меньше.
+const SNAPSHOT_GB_HOUR = 0.0051;
+// Публичный адрес: 0,26352 ₽ за час, пока он есть. Если статический адрес
+// НЕ привязан к работающему ресурсу, добавляется резервирование 0,34038 ₽/час.
+const PUBLIC_IP_HOUR = 0.26352;
+const IDLE_STATIC_IP_HOUR = 0.34038;
 
 // Тарифы региона Россия, с НДС (₽). Меняются — при обновлении править только тут.
 const UNIT = {
@@ -56,6 +87,11 @@ const UNIT = {
   containerFreeCalls: 1_000_000,
   // Container Registry: 0,004575 ₽ за ГБ×час хранения
   registryGbHour: 0.004575,
+  // Compute Cloud (см. таблицы выше) — вынесено отдельными именами, чтобы
+  // карточка машины могла показать «сколько уже накопилось».
+  vmRamGbHour: VM_RAM_GB_HOUR,
+  publicIpHour: PUBLIC_IP_HOUR,
+  idleStaticIpHour: IDLE_STATIC_IP_HOUR,
   // Object Storage, стандартное хранилище: 0,0033 ₽ за ГБ×час, 1 ГБ/мес бесплатно
   storageGbHour: 0.0033,
   storageFreeGbHour: 720,
@@ -64,6 +100,13 @@ const UNIT = {
   dnsAuthPerMillion: 37.94,
   // Lockbox: 0,0274 ₽ за версию секрета×час
   lockboxVersionHour: 0.0274,
+  // Cloud CDN: 150 ₽ за ресурс в месяц пакетом (150 ГБ исходящего трафика и
+  // 100 млн запросов включены), дальше 1,054 ₽ за ГБ и 1 ₽ за 100 тыс. запросов.
+  cdnResourceMonth: 150,
+  cdnIncludedGb: 150,
+  cdnIncludedRequests: 100000000,
+  cdnEgressPerGb: 1.054,
+  cdnPer100kRequests: 1,
   // Исходящий трафик: первые 100 ГБ в месяц бесплатно
   egressFreeGb: 100,
   egressPerGb: 1.42,
@@ -118,6 +161,88 @@ function containerCost(o) {
   };
 }
 
+// ── Cloud Functions: по формуле из документации ───────────────────────────────
+// Стоимость = 6,48 ₽ × Память(ГБ) × время(ч) + 18,97 ₽ × млн вызовов, минус
+// бесплатный пакет (10 ГБ×час и 1 млн вызовов в месяц). Отличий от контейнеров
+// два: у функций НЕТ платы за vCPU (только память) и свой ножной, зато самый
+// щедрый для «редко зовут» бесплатный пакет — 1 млн вызовов против 1 млн у всех.
+// Работа в подготовленном экземпляре (provisioned) тарифицируется отдельно, и
+// приложение её не включает.
+const FUNCTIONS_GB_HOUR = 6.48;
+const FUNCTIONS_PER_MILLION_CALLS = 18.97;
+const FUNCTIONS_FREE_GB_HOUR = 10;
+const FUNCTIONS_FREE_CALLS = 1000000;
+const FUNCTIONS_PROVISIONED_GB_HOUR = 2.72;
+const FUNCTIONS_PROVISIONED_IDLE_GB_HOUR = 1.42;
+
+function functionsCost(o) {
+  const opt = o || {};
+  const memoryMb = Number(opt.memoryMb) > 0 ? Number(opt.memoryMb) : 128;
+  const calls = Number(opt.calls) >= 0 ? Number(opt.calls) : 10000;
+  const msPerCall = Number(opt.msPerCall) > 0 ? Number(opt.msPerCall) : 100;
+  const hours = (calls * msPerCall) / 3600000;
+  const gbHours = (memoryMb / 1024) * hours;
+  const ram = rub(Math.max(0, gbHours - FUNCTIONS_FREE_GB_HOUR) * FUNCTIONS_GB_HOUR);
+  const request = rub(Math.max(0, calls - FUNCTIONS_FREE_CALLS) / 1000000 * FUNCTIONS_PER_MILLION_CALLS);
+  return {
+    memoryMb, calls, msPerCall,
+    hours: Math.round(hours * 1000) / 1000,
+    gbHours: Math.round(gbHours * 1000) / 1000,
+    ram, request, total: rub(ram + request),
+    rows: [
+      { label: "память " + memoryMb + " МБ × " + fmtHours(hours) + " работы (" + (Math.round(gbHours * 1000) / 1000).toString().replace(".", ",") + " ГБ×час)", value: ram, unit: "ГБ×час" },
+      { label: "вызовы " + fmtCalls(calls), value: request, unit: "млн вызовов" },
+    ],
+  };
+}
+
+function functionsEstimate(o) {
+  const opt = o || {};
+  const memoryMb = Number(opt.memoryMb) > 0 ? Number(opt.memoryMb) : 128;
+  const msPerCall = Number(opt.msPerCall) > 0 ? Number(opt.msPerCall) : 100;
+  // Три честных сценария вместо одной цифры: у функций ответ зависит не от
+  // «времени существования», а только от того, сколько её зовут.
+  const rare = functionsCost({ memoryMb, msPerCall, calls: 10000 });
+  const alive = functionsCost({ memoryMb, msPerCall, calls: 1000000 });
+  const hot = functionsCost({ memoryMb, msPerCall, calls: 10000000 });
+  const level = hot.total >= 1000 ? "high" : hot.total >= 50 ? "medium" : "low";
+  return {
+    key: "cloudFunctions",
+    title: "Cloud Functions",
+    kind: "function",
+    level,
+    levelLabel: LEVELS[level].label,
+    needsConfirm: level !== "free",
+    approxMonth: hot.total,
+    what: "функция " + memoryMb + " МБ и " + msPerCall + " мс на вызов",
+    memoryMb,
+    scenarios: [
+      { title: "редко зовут — 10 тыс. вызовов", cost: rare },
+      { title: "живая — 1 млн вызовов", cost: alive },
+      { title: "нагруженная — 10 млн вызовов", cost: hot },
+    ],
+    rows: alive.rows,
+    free: [
+      "1 млн вызовов в месяц",
+      "10 ГБ×час выполнения — в месяц, остаток не переносится",
+      "сама функция и её версии не тарифицируются вовсе: пока её не зовут, она бесплатна",
+    ],
+    save: [
+      "память 128 МБ вместо 512 — вчетверо меньше плата за ГБ×час",
+      "код быстрее — дешевле: платят за время выполнения, а не за факт вызова",
+      "триггеры и вызовы по расписанию не тарифицируются: платят только сами запуски кода",
+    ],
+    notes: [
+      "Подготовленные экземпляры (provisioned) тарифицируются отдельно: 2,72 ₽ за ГБ×час работы и 1,42 ₽ за ГБ×час простоя. Приложение их не включает.",
+      "Навыки Алисы через платформу Яндекс Диалоги не тарифицируются вовсе.",
+    ],
+    source: SOURCES.functions,
+    priceList: PRICE_LIST,
+    calculator: CALCULATOR,
+    pricedAt: PRICED_AT,
+  };
+}
+
 function fmtHours(h) {
   if (h < 1) return (Math.round(h * 1000) / 1000).toString().replace(".", ",") + " ч";
   return (Math.round(h * 10) / 10).toString().replace(".", ",") + " ч";
@@ -127,6 +252,185 @@ function fmtCalls(c) {
   if (c >= 1000000) return (Math.round((c / 1000000) * 10) / 10).toString().replace(".", ",") + " млн";
   if (c >= 1000) return Math.round(c / 1000) + " тыс";
   return String(c);
+}
+
+// ── Машина: почасовые ресурсы + диски + адрес ────────────────────────────────
+// Одна правда о том, сколько стоит машина, для панели, агента и карточки.
+// Платят за время РАБОТЫ: остановленная машина не тарифицируется, но её диски
+// и закреплённый адрес — тарифицируются ВСЕГДА. Именно эта разница чаще всего
+// и удивляет в счёте, поэтому в оценке она видна отдельными строками.
+const VM_CORES_DEFAULT = 2;
+const VM_MEMORY_GB_DEFAULT = 2;
+const VM_DISK_GB_DEFAULT = 20;
+const VM_HOURS_MONTH_WORKDAY = 8 * 22; // 8 часов в день, 22 рабочих дня
+
+function diskPriceOf(typeId) {
+  return DISK_PRICES[String(typeId || "")] || DISK_PRICES["network-ssd"];
+}
+
+// Цена часа работы машины без дисков и адреса.
+function vmResourcesHour(o) {
+  const opt = o || {};
+  const cores = Number(opt.cores) > 0 ? Number(opt.cores) : VM_CORES_DEFAULT;
+  const fraction = VM_VCPU_HOUR[Number(opt.coreFraction)] ? Number(opt.coreFraction) : 20;
+  const memoryGb = Number(opt.memoryGb) > 0 ? Number(opt.memoryGb) : VM_MEMORY_GB_DEFAULT;
+  const preemptible = opt.preemptible === true;
+  const vcpuRate = (preemptible ? VM_PREEMPT_VCPU_HOUR : VM_VCPU_HOUR)[fraction];
+  const ramRate = preemptible ? VM_PREEMPT_RAM_GB_HOUR : VM_RAM_GB_HOUR;
+  return {
+    cores,
+    fraction,
+    memoryGb,
+    preemptible,
+    vcpu: rub(cores * vcpuRate),
+    ram: rub(memoryGb * ramRate),
+    get total() {
+      return rub(this.vcpu + this.ram);
+    },
+  };
+}
+
+// Внимание: gb — ГИГАБАЙТЫ. Размер из API приходит в БАЙТАХ (disk.size), а поле
+// из настроек — в гигабайтах: перед вызовом делите байты на 1073741824.
+function diskMonth(gb, typeId) {
+  const p = diskPriceOf(typeId);
+  return rub(Number(gb) * p.perGbHour * HOURS_MONTH);
+}
+
+function ipMonth(o) {
+  const opt = o || {};
+  if (!opt.publicIp) return { total: 0, idle: 0, rows: [] };
+  const active = rub(PUBLIC_IP_HOUR * HOURS_MONTH);
+  // Простаивающий статический адрес дороже работающего: к плате за адрес
+  // добавляется плата за резервирование.
+  const idle = rub((PUBLIC_IP_HOUR + IDLE_STATIC_IP_HOUR) * HOURS_MONTH);
+  return {
+    total: active,
+    idle,
+    rows: [
+      { label: "публичный адрес × " + HOURS_MONTH + " ч", value: active },
+      { label: "…если адрес простаивает", value: idle },
+    ],
+  };
+}
+
+// Оценка машины: три сценария вместо одной цифры — так же, как у контейнера.
+// «Круглосуточно» — норма для сайта, «рабочий день» — для машины разработчика,
+// «остановлена» — то, что человек часто не учитывает: диски всё равно платные.
+function vmEstimate(o) {
+  const opt = o || {};
+  const res = vmResourcesHour(opt);
+  const diskGb = Number(opt.diskSizeGb) > 0 ? Number(opt.diskSizeGb) : VM_DISK_GB_DEFAULT;
+  const diskType = String(opt.diskTypeId || opt.diskType || "network-ssd");
+  const disk = diskMonth(diskGb, diskType);
+  const snapGb = Number(opt.snapshotGb) >= 0 ? Number(opt.snapshotGb) : 0;
+  const snapshot = rub(snapGb * SNAPSHOT_GB_HOUR * HOURS_MONTH);
+  const ip = ipMonth(opt);
+  const diskInfo = diskPriceOf(diskType);
+
+  const rowsFor = (hours, title) => {
+    const rows = [
+      { label: "процессор " + res.cores + " × " + res.fraction + "% × " + hours + " ч", value: rub(res.vcpu * hours) },
+      { label: "память " + res.memoryGb + " ГБ × " + hours + " ч", value: rub(res.ram * hours) },
+      { label: "диск " + diskGb + " ГБ — платный всегда", value: disk },
+    ];
+    if (snapGb) rows.push({ label: "снимки " + snapGb + " ГБ", value: snapshot });
+    if (ip.total) rows.push({ label: "публичный адрес", value: ip.total });
+    const total = rub(rows.reduce((a, r) => a + r.value, 0));
+    // cost — та же форма, что у сценариев контейнера: её печатает formatLines
+    // и её читает панель, поэтому у сценария машины не своя форма.
+    return { title, hours, rows, total, cost: { total, rows } };
+  };
+
+  const full = rowsFor(HOURS_MONTH, "работает круглосуточно");
+  const workday = rowsFor(VM_HOURS_MONTH_WORKDAY, "работает по 8 часов в рабочие дни");
+  // Когда машина остановлена, остаются только диски, снимки и адрес.
+  const stoppedRows = [
+    { label: "диск " + diskGb + " ГБ — платный и у остановленной машины", value: disk },
+  ];
+  if (snapGb) stoppedRows.push({ label: "снимки " + snapGb + " ГБ", value: snapshot });
+  if (ip.total) stoppedRows.push({ label: "публичный адрес", value: ip.total });
+  const stoppedTotal = rub(stoppedRows.reduce((a, r) => a + r.value, 0));
+  const stopped = { title: "остановлена (платят только диски и адрес)", hours: 0, rows: stoppedRows, total: stoppedTotal, cost: { total: stoppedTotal, rows: stoppedRows } };
+
+  const level = full.total >= 2000 ? "high" : full.total >= 200 ? "medium" : "low";
+  const notes = [
+    "Время с выключенной машиной не тарифицируется: `stop` реально экономит деньги.",
+    "Но диски тарифицируются независимо от того, запущена машина или нет — и после её удаления тоже.",
+    "Прерываемая машина дешевле втрое, но облако может выключить её в любой момент: только для тестов.",
+  ];
+  if (opt.publicIp) {
+    notes.push("Публичный адрес берут отдельно, и простаивающий статический дороже работающего: " + money(ip.idle) + " в месяц против " + money(ip.total) + ".");
+  }
+  const save = [
+    "уровень 20% вместо 100% снижает плату за процессор почти в два с половиной раза при том же числе ядер",
+    "стандартный диск (HDD) вместо быстрого (SSD) вчетверо дешевле — подходит для данных и бэкапов",
+    "останавливай машину, когда она не нужна: за выключенное время счёт не идёт",
+  ];
+  if (diskType === "network-ssd") save.push("быстрый диск нужен для системы; большой диск с данными дешевле держать стандартным");
+
+  return {
+    key: "compute",
+    title: "Виртуальная машина (Compute Cloud)",
+    kind: "vm",
+    level,
+    levelLabel: LEVELS[level].label,
+    needsConfirm: true,
+    approxMonth: full.total,
+    what:
+      res.cores + " × " + res.fraction + "% vCPU, " + res.memoryGb + " ГБ памяти, " +
+      diskGb + " ГБ (" + diskInfo.title + "), " + (res.preemptible ? "прерываемая" : "обычная") +
+      (opt.publicIp ? ", с публичным адресом" : ", без публичного адреса"),
+    cores: res.cores,
+    coreFraction: res.fraction,
+    memoryGb: res.memoryGb,
+    diskGb,
+    diskTypeId: diskType,
+    scenarios: [full, workday, stopped],
+    rows: full.rows,
+    billed: [
+      "каждый час в статусе «работает» — с посекундной точностью",
+      "диски — всегда, включая время с выключенной машиной и после её удаления",
+      "снимки дисков — пока их не удалят",
+      "публичный адрес — пока он есть (простаивающий статический дороже)",
+    ],
+    free: [],
+    notes,
+    save,
+    source: SOURCES.compute,
+    priceList: PRICE_LIST,
+    calculator: CALCULATOR,
+    pricedAt: PRICED_AT,
+  };
+}
+
+// Снимок диска отдельной строкой: он не входит в цену машины, но переживает её.
+function snapshotEstimate(o) {
+  const opt = o || {};
+  const gb = Number(opt.gb) > 0 ? Number(opt.gb) : 20;
+  const total = rub(gb * SNAPSHOT_GB_HOUR * HOURS_MONTH);
+  return {
+    key: "computeSnapshot",
+    title: "Снимок диска",
+    kind: "resource",
+    level: total >= 500 ? "medium" : "low",
+    levelLabel: LEVELS[total >= 500 ? "medium" : "low"].label,
+    needsConfirm: true,
+    approxMonth: total,
+    what: gb + " ГБ снимка",
+    rows: [{ label: "хранение " + gb + " ГБ × " + HOURS_MONTH + " ч", value: total }],
+    billed: ["хранение каждого гигабайта снимка, за каждый час"],
+    free: [],
+    notes: [
+      "Снимок тарифицируется по СВОЕМУ объёму, а не по размеру диска: он обычно меньше.",
+      "Снимок переживает машину и диск — это его плюс и его цена. Ненужные снимки стоит удалять.",
+    ],
+    save: ["чисти старые снимки: " + money(rub(SNAPSHOT_GB_HOUR * HOURS_MONTH)) + " за ГБ в месяц"],
+    source: SOURCES.compute,
+    priceList: PRICE_LIST,
+    calculator: CALCULATOR,
+    pricedAt: PRICED_AT,
+  };
 }
 
 // Постоянная работа контейнера: 720 часов без остановки — так выглядит
@@ -156,6 +460,56 @@ const SERVICES = {
       "Исходящий трафик в интернет: первые 100 ГБ в месяц бесплатно, дальше 1,42 ₽ за ГБ.",
     ],
     source: SOURCES.vpc,
+  },
+  // Статический адрес закрепляется и освобождается из карточки сети (ycVpc) — не
+  // через ycCreate, потому что адрес живёт в конкретной зоне. Платный, и особенно
+  // платный простаивающим. Точной цены за час на дату сбора тарифов подтвердить не
+  // удалось, поэтому числа здесь НЕТ — только факт тарификации и ссылка на прайс.
+  // Придумывать цену нельзя: пусть лучше будет ссылка, чем выдуманная цифра.
+  vpcAddress: {
+    title: "Статический IP-адрес (VPC)",
+    level: "low",
+    billed: [
+      "каждый час существования адреса — с момента закрепления и до освобождения",
+      "отдельно — резервирование, пока статический адрес ни к чему не привязан (0,34038 ₽/час)",
+    ],
+    free: [],
+    // Цена подтверждена таблицей цен VPC: 0,26352 ₽ за адрес×час, а неактивный
+    // статический дороже ровно на стоимость резервирования (0,34038 ₽/час).
+    calc: (p) => {
+      const count = Number(p && p.count) > 0 ? Number(p.count) : 1;
+      const idle = p && p.idle === true;
+      const rate = idle ? PUBLIC_IP_HOUR + IDLE_STATIC_IP_HOUR : PUBLIC_IP_HOUR;
+      const total = rub(count * rate * HOURS_MONTH);
+      return {
+        total,
+        rows: [
+          { label: (idle ? "простаивающий адрес × " : "адрес × ") + count + " × " + HOURS_MONTH + " ч", value: total },
+        ],
+        what: count + (idle ? " простаивающий статический адрес" : " публичный адрес") + " на весь месяц",
+      };
+    },
+    notes: [
+      "Простаивающий адрес тарифицируется так же, как привязанный: «закрепить про запас» — это платить ни за что.",
+      "Адрес выдаётся в конкретной зоне и в другую зону не переносится.",
+      "Освобождённый адрес уходит в облако: вернуть именно его уже нельзя, а всё, что на него указывало (DNS, белые списки), перестанет работать.",
+    ],
+    source: SOURCES.vpc,
+  },
+  cloudFunctions: {
+    title: "Cloud Functions (функции)",
+    level: "low",
+    billed: [
+      "каждый вызов функции (сверх 1 млн в месяц)",
+      "время выполнения: 6,48 ₽ за ГБ×час памяти (сверх 10 ГБ×час в месяц)",
+    ],
+    free: ["1 млн вызовов в месяц", "10 ГБ×час выполнения в месяц", "сама функция, версии и триггеры — бесплатно"],
+    calc: (p) => functionsCost(p || {}),
+    notes: [
+      "Функция не тарифицируется за простой: пока её не зовут, она не стоит ничего. Это дешевле машины, которую надо держать.",
+      "Плата идёт за ПАМЯТЬ × время выполнения: быстрый код дешевле медленного при том же числе вызовов.",
+    ],
+    source: SOURCES.functions,
   },
   dns: {
     title: "Cloud DNS (публичная зона)",
@@ -259,6 +613,90 @@ const SERVICES = {
     ],
     source: SOURCES.ydb,
   },
+  // Cloud CDN: платит РЕСУРС, а не трафик: 150 ₽ в месяц за каждый ресурс пакетом
+  // (в пакет входят 150 ГБ исходящего трафика и 100 млн запросов). Деньги уходят
+  // и при нулевом трафике — поэтому создание ресурса требует согласия, а
+  // остановить счёт можно только удалением ресурса.
+  cdn: {
+    title: "Cloud CDN (HTTPS-сайт)",
+    level: "medium",
+    billed: [
+      "каждый CDN-ресурс — 150 ₽ в месяц пакетом, независимо от трафика",
+      "исходящий трафик сверх 150 ГБ на ресурс — 1,054 ₽ за ГБ",
+      "запросы сверх 100 млн на ресурс — 1 ₽ за 100 тыс. запросов",
+      "отдельно: экранирование источников, выгрузка логов, выделенная IP-адресация",
+    ],
+    free: ["150 ГБ исходящего трафика и 100 млн запросов на каждый ресурс — уже в пакете", "сам сертификат от Let's Encrypt — бесплатно"],
+    calc: (p) => {
+      const resources = Number(p && p.resources) > 0 ? Number(p && p.resources) : 1;
+      const gb = Number(p && p.gb) > 0 ? Number(p && p.gb) : 0;
+      const requests = Number(p && p.requests) > 0 ? Number(p && p.requests) : 0;
+      const base = rub(resources * 150);
+      const extraGb = Math.max(0, gb - resources * 150);
+      const extraReq = Math.max(0, requests - resources * 100000000);
+      const traffic = rub(extraGb * 1.054);
+      const calls = rub(Math.ceil(extraReq / 100000) * 1);
+      return {
+        total: rub(base + traffic + calls),
+        rows: [
+          { label: "ресурсы: " + resources + " × 150 ₽ (пакет)", value: base },
+          { label: "трафик сверх пакета: " + extraGb + " ГБ", value: traffic },
+          { label: "запросы сверх пакета: " + fmtCalls(extraReq), value: calls },
+        ],
+        what: resources + " CDN-ресурс(ов) на весь месяц",
+      };
+    },
+    notes: [
+      "Ресурс стоит денег ВСЕГДА: пакет списывается вперёд, поэтому «сделал и забыл» — это 150 ₽ в месяц за каждый сайт.",
+      "Удалить ресурс = перестать платить: остаток пакета при удалении обнуляется и на другой ресурс не переносится.",
+      "Трафик между бакетом Object Storage и CDN-серверами не тарифицируется: платишь за то, что уходит клиентам.",
+    ],
+    source: SOURCES.cdn,
+  },
+  certificateManager: {
+    title: "Certificate Manager (сертификат)",
+    level: "free",
+    billed: [],
+    free: [
+      "выпуск сертификата Let's Encrypt",
+      "автоматическое продление выпущенного сертификата",
+      "хранение загруженных сертификатов (но продлевать их придётся самому)",
+    ],
+    notes: [
+      "Certificate Manager не тарифицируется вовсе — это самый дешёвый способ получить https на своём домене.",
+      "Платит сервис, который сертификат носит: статический сайт — это CDN-ресурс (см. оценку cdn).",
+    ],
+    source: SOURCES.certificateManager,
+  },
+  // Машина: оценку считает vmEstimate (ниже) — по формуле из документации, как
+  // у контейнера. Здесь только описание и тариф-ссылка, чтобы costs.has("compute")
+  // был правдой и подсказка в интерфейсе работала.
+  compute: {
+    title: "Виртуальная машина (Compute Cloud)",
+    level: "high",
+    billed: [
+      "каждый час в статусе «работает» — тарификация посекундная",
+      "диски — всегда, включая время с выключенной машиной и после её удаления",
+      "снимки дисков и публичный адрес — отдельно",
+    ],
+    free: [],
+    notes: [
+      "Машина не тарифицируется, пока остановлена, — но её диски и адрес тарифицируются всегда.",
+      "Именно поэтому «просто оставить» дороже, чем удалить: остаются платные хвосты.",
+    ],
+    source: SOURCES.compute,
+  },
+  computeSnapshot: {
+    title: "Снимок диска (Compute Cloud)",
+    level: "low",
+    billed: ["хранение каждого гигабайта снимка, за каждый час"],
+    free: [],
+    notes: [
+      "Снимок считается по своему объёму, а не по размеру диска, — он обычно меньше.",
+      "Снимок переживает и машину, и диск: это его смысл и его цена.",
+    ],
+    source: SOURCES.compute,
+  },
   serverlessContainers: {
     title: "Serverless Containers (контейнер)",
     level: "medium",
@@ -343,6 +781,8 @@ function keys() {
 
 function levelOf(key) {
   if (key === "serverlessContainers") return "medium";
+  if (key === "cloudFunctions") return "low";
+  if (key === "compute" || key === "vm") return "high";
   const s = SERVICES[key];
   return s ? s.level : "medium";
 }
@@ -356,6 +796,9 @@ function levelInfo(key) {
 function estimate(key, params) {
   const k = String(key || "").trim();
   if (k === "serverlessContainers" || k === "container") return containerEstimate(params);
+  if (k === "compute" || k === "vm") return vmEstimate(params);
+  if (k === "computeSnapshot" || k === "snapshot") return snapshotEstimate(params);
+  if (k === "cloudFunctions" || k === "functions" || k === "function") return functionsEstimate(params);
   const s = SERVICES[k];
   if (!s) return null;
   let calc = null;
@@ -454,7 +897,29 @@ module.exports = {
   estimate,
   estimateContainerConfig,
   containerCost,
+  // Cloud Functions: тарифы из документации и одна арифметика на всех.
+  functionsEstimate,
+  functionsCost,
+  FUNCTIONS_GB_HOUR,
+  FUNCTIONS_PER_MILLION_CALLS,
+  FUNCTIONS_FREE_GB_HOUR,
+  FUNCTIONS_FREE_CALLS,
+  FUNCTIONS_PROVISIONED_GB_HOUR,
+  FUNCTIONS_PROVISIONED_IDLE_GB_HOUR,
   idleMonth,
+  // Compute: одна правда о цене машины — её читает и панель, и агент.
+  vmEstimate,
+  vmResourcesHour,
+  diskMonth,
+  diskPriceOf,
+  ipMonth,
+  snapshotEstimate,
+  VM_VCPU_HOUR,
+  VM_PREEMPT_VCPU_HOUR,
+  DISK_PRICES,
+  PUBLIC_IP_HOUR,
+  IDLE_STATIC_IP_HOUR,
+  SNAPSHOT_GB_HOUR,
   needsConfirm,
   hint,
   formatLines,

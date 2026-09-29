@@ -3659,7 +3659,7 @@ async function testYcDiagnosis() {
 
     await test("UI: ошибки дашборда и списка каталогов видны текстом", () => {
       assert.ok(uiSrc.includes('err.className = "yc-card-err"'), "ошибка сервиса не показывается текстом");
-      assert.ok(uiSrc.includes("⚠️ Не ответили:"), "сводка не сообщает, сколько сервисов упало");
+      assert.ok(uiSrc.includes('chip("Ошибки API", failed.length'), "строй здоровья не сообщает, сколько сервисов упало");
       assert.ok(uiSrc.includes("⏳ Загрузка каталогов…"), "нет состояния загрузки каталогов");
       assert.ok(uiSrc.includes("Каталоги не загрузились"), "пустой список каталогов не объясняет причину");
       assert.ok(htmlSrc.includes("галочка = РАЗРЕШЕНО"), "семантика чекбоксов разрешений не пояснена");
@@ -5583,11 +5583,11 @@ async function testYandexCloud() {
 
   await test("Yandex Cloud: инструменты, алиасы промпта, мост и интерфейс согласованы", () => {
     const names = core.TOOL_DEFINITIONS.map((d) => d.function && d.function.name);
-    for (const n of ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycDb", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"]) {
+    for (const n of ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycVpc", "ycCompute", "ycIam", "ycFunctions", "ycBilling", "ycCdn", "ycDb", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"]) {
       assert.ok(names.includes(n), "нет инструмента " + n);
     }
     const prompt = core.SYSTEM_PROMPT || "";
-    for (const n of ["ycLogs", "ycInstall"]) assert.ok(prompt.includes(n), "в промпте нет " + n);
+    for (const n of ["ycLogs", "ycInstall", "ycCdn"]) assert.ok(prompt.includes(n), "в промпте нет " + n);
     assert.ok(/yc init не нужен/.test(prompt), "в промпте нет пояснения про автоматическую авторизацию");
     const full = modelPrompt(); // промпт + автоподключаемый справочник группы cloud (промпт-диета)
     assert.ok(/внутренним API/i.test(full) && /Cloud Logging/.test(full), "в промпте не сказано, что логи идут внутренним API");
@@ -5597,7 +5597,7 @@ async function testYandexCloud() {
     const installDef = core.TOOL_DEFINITIONS.find((d) => d.function && d.function.name === "ycInstall");
     assert.ok(/userData\/bin/.test(installDef.function.description), "описание ycInstall без папки установки");
     const preload = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
-    for (const s of ["ycCliStatus", "ycInstallCli"]) assert.ok(preload.includes(s), "в preload нет " + s);
+    for (const s of ["ycCliStatus", "ycInstallCli", "ycCdn"]) assert.ok(preload.includes(s), "в preload нет " + s);
     const html = fs.readFileSync(path.join(ROOT, "src", "renderer", "index.html"), "utf8");
     for (const id of ["btn-yc-install-cli", "yc-cli-status"]) assert.ok(html.includes('id="' + id + '"'), "в index.html нет " + id);
     // Панель Yandex Cloud вынесена в src/renderer/yc-panel.js (этап 2 разбора app.js):
@@ -14664,7 +14664,7 @@ async function testYcSplit() {
       "yc:status", "yc:setToken", "yc:folders", "yc:setFolder", "yc:setPermissions",
       "yc:logout", "yc:console:overview", "yc:console:list", "yc:console:rollback", "yc:console:secretVersion", "yc:console:dnsRecord", "yc:console:registryImage", "yc:console:storageObject", "yc:console:bucketAccess",
       "yc:resources", "yc:costs", "yc:create", "yc:delete", "yc:logs",
-      "yc:cliStatus", "yc:installCli",
+      "yc:cliStatus", "yc:installCli", "yc:vpc", "yc:compute", "yc:iam", "yc:functions", "yc:billing", "yc:cdn",
     ];
     for (const ch of channels) {
       assert.ok(!main.includes('ipcMain.handle("' + ch + '"'), "канал остался в main.js: " + ch);
@@ -14680,7 +14680,7 @@ async function testYcSplit() {
     assert.ok(main.includes('require("./yc-service.js")') && main.includes('require("./yc-ipc.js")'), "main.js не подключает вынесенные модули");
     assert.ok(/registerYcIpc\(\{ ipcMain/.test(main), "IPC-мост не регистрируется");
     const found = [...ipcSrc.matchAll(/ipcMain\.handle\("(yc:[^"]+)"/g)].map((m) => m[1]);
-    assert.strictEqual(found.length, 21, "каналов в мосте должно быть 21 (yc:deploy остаётся мостом деплоя): " + found.length);
+    assert.strictEqual(found.length, 27, "каналов в мосте должно быть 27 (yc:deploy остаётся мостом деплоя): " + found.length);
   });
 
   await test("Yandex Cloud: служебный слой работает сам, без main.js", () => {

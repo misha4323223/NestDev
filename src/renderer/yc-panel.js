@@ -38,6 +38,9 @@
     iam: ["сервисный аккаунт", "сервисных аккаунта", "сервисных аккаунтов"],
     lockbox: ["секрет", "секрета", "секретов"],
     ydb: ["база", "базы", "баз"],
+    // Машины пришли на полку позже остальных (часть 75): без своей формы счёт
+    // говорил бы «1 ресурс» там, где человек ждёт «1 машина».
+    compute: ["машина", "машины", "машин"],
     storage: ["бакет", "бакета", "бакетов"],
     serverlessContainers: ["контейнер", "контейнера", "контейнеров"],
     vpc: ["сеть", "сети", "сетей"],
@@ -47,6 +50,15 @@
   let ycDashKey = ""; // ключ развёрнутой карточки дашборда
   let ycTotal = null; // всего ресурсов в каталоге («Облако в цифрах»)
   let ycActiveServices = null; // сервисов с ресурсами
+  // Панель «полкой»: официальные иконки сервисов (yc-logos.js), поиск и
+  // фильтр по полке, строка здоровья облака с балансом и платными хвостами.
+  const YCL = typeof YcLogos !== "undefined" ? YcLogos : null;
+  let ycFilter = "all"; // all | used | err
+  let ycSearch = "";
+  let ycLeaksOpen = false;
+  let ycHealth = null; // ответ ycBilling(overview): платёжный аккаунт и хвосты
+  let ycHealthErr = "";
+  let ycHealthBusy = false;
 
   function ycNounPlural(key, n) {
     const forms = YC_FORMS[key] || ["ресурс", "ресурса", "ресурсов"];
@@ -189,9 +201,14 @@
     statusEl.textContent = "Каталог: " + (st.folderName || st.folderId || "—") + (st.iamOk === false ? " · ⚠️ " + (st.error || "") : "");
     if (!force && ycServicesCache) {
       ycRenderDash();
+      ycLoadHealth();
       return;
     }
-    box.innerHTML = '<div class="yc-loading">Загрузка ресурсов…</div>';
+    ycMountBrand();
+    ycMountCredit();
+    box.innerHTML = "";
+    box.appendChild(ycSkeleton(6));
+    ycRenderHealth();
     let r;
     try {
       r = await api.ycResources();
@@ -201,176 +218,462 @@
     if (!r || !r.ok) {
       statusEl.textContent = "⚠️ " + ((r && r.error) || "Ошибка загрузки");
       box.innerHTML = "";
+      const bad = document.createElement("div");
+      bad.className = "yc-empty";
+      bad.textContent = "Ресурсы не загрузились: " + ((r && r.error) || "облако не ответило") + ". Проверь токен и каталог, затем нажми ↻.";
+      box.appendChild(bad);
+      ycLoadHealth(!!force);
       return;
     }
     ycServicesCache = r.services;
     ycTotal = r.total != null ? r.total : null;
     ycActiveServices = r.activeServices != null ? r.activeServices : null;
     ycRenderDash();
+    ycLoadHealth(!!force);
   }
 
-  function ycRenderSummary(total, active) {
+  // ── Деньги, фильтр и иконки: всё, что делает панель «полкой» ────────────
+  function ycMoney(v) {
+    const n = Number(v);
+    if (!isFinite(n)) return "—";
+    const parts = Math.abs(n).toFixed(2).split(".");
+    return (n < 0 ? "−" : "") + parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, " ") + "," + parts[1] + " ₽";
+  }
+
+  function ycTiles() {
+    const q = ycSearch.trim().toLowerCase();
+    return (ycServicesCache || []).filter((s) => {
+      if (ycFilter === "used" && !(s.ok && s.count > 0)) return false;
+      if (ycFilter === "err" && s.ok) return false;
+      if (!q) return true;
+      const hay = [s.ru, s.title, s.key, YCL ? YCL.official(s.key) : ""].join(" ").toLowerCase();
+      return hay.indexOf(q) >= 0;
+    });
+  }
+
+  // Русское имя — то, как сервис называется в консоли облака; официальное
+  // английское имя остаётся в подсказке (и в заголовке SVG при наведении).
+  function ycServiceName(s) {
+    return (s && (s.ru || s.title)) || "Сервис";
+  }
+
+  function ycLogoEl(key) {
+    const box = document.createElement("span");
+    box.className = "yc-tile-logo";
+    if (YCL) {
+      box.innerHTML = YCL.svgFor(key);
+      const off = YCL.official(key);
+      if (off) box.title = "Иконка сервиса: " + off;
+    }
+    return box;
+  }
+
+  // Знак платформы вставляем ровно один раз: внутри него есть id (clipPath), и
+  // вторая вставка сломала бы ссылки.
+  function ycMountBrand() {
+    const host = $("yc-brand-mark");
+    if (!host || host.dataset.filled === "1" || !YCL) return;
+    host.innerHTML = YCL.uniqueIds(YCL.brand());
+    host.dataset.filled = "1";
+  }
+
+  // Подпись под панелью: откуда иконки и — прямо — что приложение не продукт
+  // Яндекс.Облака. Так требует и брендбук (никакой «причастности» Яндекса).
+  function ycMountCredit() {
+    const el = $("yc-credit");
+    if (!el || el.dataset.filled === "1" || !YCL) return;
+    const link = document.createElement("a");
+    link.href = "#";
+    link.textContent = "библиотека брендбука";
+    link.title = YCL.SOURCE;
+    link.onclick = (e) => {
+      e.preventDefault();
+      if (isElectron) api.openExternal(YCL.SOURCE);
+    };
+    el.appendChild(document.createTextNode("Иконки сервисов — официальная "));
+    el.appendChild(link);
+    el.appendChild(document.createTextNode(" Yandex Cloud (апрель 2026). Приложение работает с вашим аккаунтом Yandex Cloud и не является продуктом Яндекс.Облака."));
+    el.dataset.filled = "1";
+  }
+
+  function ycSkeleton(n) {
+    const grid = document.createElement("div");
+    grid.className = "yc-grid";
+    for (let i = 0; i < n; i += 1) {
+      const t = document.createElement("div");
+      t.className = "yc-skel yc-skel-tile";
+      grid.appendChild(t);
+    }
+    return grid;
+  }
+
+  // Строка здоровья: сколько ресурсов, что не ответило, баланс и — главное —
+  // платные хвосты в рублях. Деньги берём у биллинга (он один знает баланс и
+  // правило «что такое хвост»), но ждать его полка не обязана.
+  function ycRenderHealth() {
     const sum = $("yc-summary");
     if (!sum) return;
+    if (!ycServicesCache && !ycHealth && !ycHealthErr && !ycHealthBusy) {
+      sum.classList.add("hidden");
+      return;
+    }
     sum.classList.remove("hidden");
     sum.innerHTML = "";
-    const mk = (text) => {
-      const s = document.createElement("span");
-      s.className = "yc-summary-item";
-      s.textContent = text;
-      return s;
+    const row = document.createElement("div");
+    row.className = "yc-health";
+    const chip = (label, value, opt) => {
+      const o = opt || {};
+      const node = document.createElement(o.onClick ? "button" : "span");
+      node.className = "yc-chip" + (o.cls ? " " + o.cls : "") + (o.onClick ? " yc-chip-link" : "");
+      if (o.onClick) {
+        node.type = "button";
+        node.onclick = o.onClick;
+      }
+      if (o.title) node.title = o.title;
+      node.appendChild(document.createTextNode(label + " "));
+      const b = document.createElement("b");
+      b.textContent = value == null ? "—" : String(value);
+      node.appendChild(b);
+      return node;
     };
-    sum.appendChild(mk("🧮 Ресурсов: " + (total == null ? "—" : total)));
-    sum.appendChild(mk("Сервисов с ресурсами: " + (active == null ? "—" : active)));
+    row.appendChild(chip("Ресурсов", ycTotal == null ? "—" : ycTotal, { title: "Всего ресурсов в каталоге" }));
+    row.appendChild(chip("Сервисов с ресурсами", ycActiveServices == null ? "—" : ycActiveServices, {}));
     const failed = (ycServicesCache || []).filter((s) => !s.ok);
     if (failed.length) {
-      sum.appendChild(mk("⚠️ Не ответили: " + failed.length + " — " + failed.map((s) => s.title).slice(0, 3).join(", ")));
+      row.appendChild(
+        chip("Ошибки API", failed.length, {
+          cls: "err",
+          title: failed.map((s) => s.title + ": " + (s.error || "нет ответа")).join("\n"),
+        })
+      );
     }
+
+    const h = ycHealth;
+    if (ycHealthBusy) {
+      row.appendChild(chip("Деньги", "проверяю…", {}));
+    } else if (ycHealthErr) {
+      row.appendChild(
+        chip("Баланс", "не видно", {
+          cls: "warn",
+          title: "Биллинг недоступен: " + ycHealthErr + "\nЧастая причина — нет роли billing.viewer: без неё облако не отдаёт платёжные аккаунты.",
+        })
+      );
+    } else if (h && h.account) {
+      const negative = Number(h.account.balance) < 0;
+      row.appendChild(
+        chip("Баланс", h.account.balanceHuman || ycMoney(h.account.balance), {
+          cls: negative ? "err" : "ok",
+          title:
+            (h.account.name ? "Платёжный аккаунт «" + h.account.name + "» · " : "") +
+            (h.account.active ? "активен" : "ВЫКЛЮЧЕН") +
+            (negative ? " · баланс в минусе: новые ресурсы не создадутся" : ""),
+        })
+      );
+    } else if (h) {
+      row.appendChild(chip("Баланс", "аккаунта нет", { cls: "warn", title: "Платёжный аккаунт не найден: облако не привязано к счёту." }));
+    }
+    if (h && h.leaks) {
+      const leaks = h.leaks;
+      row.appendChild(
+        chip("Хвосты", leaks.count + " · " + ycMoney(leaks.total) + "/мес", {
+          cls: leaks.count ? "warn" : "ok",
+          onClick: leaks.count
+            ? () => {
+                ycLeaksOpen = !ycLeaksOpen;
+                ycRenderHealth();
+              }
+            : undefined,
+          title: leaks.count ? "Платные хвосты: за что платят, хотя уже не нужно. Клик — список." : "Платных хвостов нет: диски привязаны к машинам, лишнего не видно.",
+        })
+      );
+      if (leaks.running && leaks.running.length) {
+        row.appendChild(
+          chip("Работает", leaks.running.length + " · " + ycMoney(leaks.live) + "/мес", {
+            title: "Работающие машины — это текущий счёт, а не мусор: круглосуточно столько.",
+          })
+        );
+      }
+    }
+    // Деньги умеют больше, чем сводка: пороги-бюджеты, услуги и живые цены по
+    // слову. Это тоже действия, поэтому вход в них — здесь, рядом с балансом, а
+    // не спрятан в настройках.
+    if (window.YcActions && window.YcActions.forService("billing").length) {
+      row.appendChild(
+        chip("Деньги", "подробнее", {
+          onClick: () => ycOpenActions("billing", "", "Биллинг"),
+          title: "Платёжные аккаунты, пороги-бюджеты, услуги и цены по слову — без агента",
+        })
+      );
+    }
+    sum.appendChild(row);
+
+    if (ycLeaksOpen && h && h.leaks && h.leaks.tails && h.leaks.tails.length) {
+      const box = document.createElement("div");
+      box.className = "yc-leaks";
+      const head = document.createElement("div");
+      head.className = "yc-leaks-head";
+      head.textContent = "Платные хвосты — " + h.leaks.tails.length + " на " + ycMoney(h.leaks.total) + " в месяц";
+      box.appendChild(head);
+      for (const t of h.leaks.tails.slice().sort((a, b) => (Number(b.month) || 0) - (Number(a.month) || 0))) {
+        const line = document.createElement("div");
+        line.className = "yc-leak";
+        const why = document.createElement("span");
+        why.className = "yc-leak-why";
+        why.textContent = t.why;
+        why.appendChild(document.createElement("br"));
+        const todo = document.createElement("span");
+        todo.className = "yc-leak-todo";
+        todo.textContent = "Что делать: " + t.todo;
+        why.appendChild(todo);
+        const summ = document.createElement("span");
+        summ.className = "yc-leak-sum";
+        summ.textContent = "≈ " + (t.monthHuman || ycMoney(t.month));
+        line.appendChild(why);
+        line.appendChild(summ);
+        box.appendChild(line);
+      }
+      sum.appendChild(box);
+    }
+  }
+
+  // Деньги спрашиваем отдельным запросом и не блокируя полку: биллинг может
+  // быть недоступен (нет роли), а ресурсы при этом видны — и молчать об этом
+  // нельзя, поэтому «Баланс не видно» с причиной, а не пустое место.
+  async function ycLoadHealth(force) {
+    if (!isElectron || !api.ycBilling) {
+      ycHealthErr = "биллинг доступен в desktop-приложении";
+      ycRenderHealth();
+      return;
+    }
+    if (ycHealthBusy) return;
+    if (ycHealth && !force) {
+      ycRenderHealth();
+      return;
+    }
+    ycHealthBusy = true;
+    ycRenderHealth();
+    let r;
+    try {
+      r = await api.ycBilling({ op: "overview" });
+    } catch (e) {
+      r = { ok: false, error: (e && e.message) || String(e) };
+    }
+    ycHealthBusy = false;
+    if (r && r.ok) {
+      ycHealth = r;
+      ycHealthErr = "";
+    } else {
+      ycHealth = null;
+      ycHealthErr = (r && r.error) || "биллинг не ответил";
+    }
+    ycRenderHealth();
+  }
+
+  // Список ресурсов раскрытой плитки: имя ведёт в карточку ресурса (обзор и
+  // связанные объекты), справа — состояние, адрес, логи и удаление.
+  function ycResourceList(s) {
+    const list = document.createElement("div");
+    list.className = "yc-tile-list";
+    if (!s.ok) {
+      list.textContent = "Ошибка API: " + (s.error || "недоступно");
+      return list;
+    }
+    if (!s.items || !s.items.length) {
+      list.textContent = "Ресурсов нет — нажми «＋ Создать».";
+      return list;
+    }
+    for (const it of s.items.slice(0, 50)) {
+      const row = document.createElement("div");
+      row.className = "yc-item";
+      const nm = document.createElement("span");
+      nm.className = "yc-item-name ykc-openable";
+      nm.textContent = it.name || it.id || "—";
+      nm.title = "Открыть карточку ресурса (" + (it.id || "") + ")";
+      // Клик по имени — вход в карточку: поля ресурса и связанные объекты
+      // (подсети, образы, ключи, ревизии). Раньше список был тупиком.
+      nm.onclick = (e) => {
+        e.stopPropagation();
+        if (!window.YcConsole) return;
+        window.YcConsole.open({
+          serviceKey: s.key,
+          title: ycServiceName(s),
+          item: it,
+          folderId: (ycStatusCache && ycStatusCache.folderId) || "",
+        });
+      };
+      row.appendChild(nm);
+      const actions = document.createElement("div");
+      actions.className = "yc-item-actions";
+      // Действия по КОНКРЕТНОМУ ресурсу: то, ради чего список вообще нужен.
+      // Сервис без набора действий кнопки не получает — пустая кнопка хуже её
+      // отсутствия.
+      if (window.YcActions && window.YcActions.forService(s.key).length) {
+        const act = document.createElement("button");
+        act.type = "button";
+        act.className = "btn btn-ghost btn-small";
+        act.textContent = "⚙";
+        act.title = "Что можно сделать с «" + (it.name || it.id) + "» прямо здесь (не через агента)";
+        act.onclick = (e) => {
+          e.stopPropagation();
+          ycOpenActions(s.key, it.name || it.id || "", ycServiceName(s));
+        };
+        actions.appendChild(act);
+      }
+      if (s.key === "serverlessContainers" && it.status) {
+        const st = document.createElement("span");
+        st.className = "yc-status " + String(it.status).toLowerCase();
+        st.textContent = it.status;
+        actions.appendChild(st);
+      }
+      if (s.key === "serverlessContainers" && it.url) {
+        const go = document.createElement("button");
+        go.type = "button";
+        go.className = "btn btn-ghost btn-small";
+        go.textContent = "↗";
+        go.title = "Открыть URL контейнера: " + it.url;
+        go.onclick = (e) => {
+          e.stopPropagation();
+          if (isElectron) api.openExternal(it.url);
+        };
+        actions.appendChild(go);
+      }
+      if (s.key === "serverlessContainers") {
+        const lg = document.createElement("button");
+        lg.type = "button";
+        lg.className = "btn btn-ghost btn-small";
+        lg.textContent = "📜";
+        lg.title = "Логи контейнера (нужен yc CLI)";
+        lg.onclick = async (e) => {
+          e.stopPropagation();
+          let lr;
+          try {
+            lr = await api.ycLogs(s.key, it.id);
+          } catch (err) {
+            lr = { ok: false, error: (err && err.message) || String(err) };
+          }
+          if (lr && lr.ok && lr.logs && lr.logs.length) {
+            toast("📜 Логи: " + lr.logs.length + " записей — открыты в консоли приложения");
+            termAppend("📜 Логи контейнера:\n" + lr.logs.slice(-30).join("\n"));
+          } else {
+            toast("❌ " + ((lr && lr.error) || "Логов нет за последние 3 часа"));
+          }
+        };
+        actions.appendChild(lg);
+      }
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "btn btn-danger btn-small";
+      del.textContent = "🗑";
+      del.title = "Удалить «" + (it.name || it.id) + "» (необратимо)";
+      del.onclick = (e) => {
+        e.stopPropagation();
+        ycDeleteFlow(s.key, s.title, it);
+      };
+      actions.appendChild(del);
+      row.appendChild(actions);
+      list.appendChild(row);
+    }
+    if (s.items.length > 50) {
+      const more = document.createElement("div");
+      more.className = "yc-item-more";
+      more.textContent = "… и ещё " + (s.items.length - 50);
+      list.appendChild(more);
+    }
+    return list;
   }
 
   function ycRenderDash() {
     const box = $("yc-dash");
     if (!box) return;
+    ycMountBrand();
+    ycMountCredit();
     box.innerHTML = "";
-    ycRenderSummary(ycTotal, ycActiveServices);
-    const svcs = ycServicesCache || [];
+    ycRenderHealth();
+    if (!ycServicesCache) {
+      box.appendChild(ycSkeleton(6));
+      return;
+    }
+    const svcs = ycTiles();
+    if (!svcs.length) {
+      const empty = document.createElement("div");
+      empty.className = "yc-empty";
+      empty.textContent =
+        ycSearch.trim() || ycFilter !== "all"
+          ? "Ничего не нашлось: сбрось поиск или выбери «Все»."
+          : "Список сервисов пуст — нажми ↻, чтобы спросить облако снова.";
+      box.appendChild(empty);
+      return;
+    }
     const grid = document.createElement("div");
     grid.className = "yc-grid";
     for (const s of svcs) {
       const card = document.createElement("div");
-      card.className = "yc-card" + (ycDashKey === s.key ? " open" : "");
-      card.title = s.ok ? "Клик — список ресурсов" : (s.error ? s.error : "API недоступно");
-      const head = document.createElement("div");
-      head.className = "yc-card-head";
-      const icon = document.createElement("span");
-      icon.className = "yc-card-icon";
-      icon.textContent = s.icon || "☁️";
-      const title = document.createElement("span");
-      title.className = "yc-card-title";
-      title.textContent = s.title;
-      head.appendChild(icon);
-      head.appendChild(title);
+      card.className = "yc-tile" + (ycDashKey === s.key ? " open" : "");
+      card.title = s.ok
+        ? YCL && YCL.official(s.key)
+          ? "Клик — список ресурсов. Сервис Yandex Cloud: " + YCL.official(s.key)
+          : "Клик — список ресурсов"
+        : s.error
+          ? s.error
+          : "API недоступно";
+      const top = document.createElement("div");
+      top.className = "yc-tile-top";
+      top.appendChild(ycLogoEl(s.key));
       const body = document.createElement("div");
-      body.className = "yc-card-body";
+      body.className = "yc-tile-body";
+      const title = document.createElement("div");
+      title.className = "yc-tile-name";
+      title.textContent = ycServiceName(s);
       const count = document.createElement("div");
-      count.className = "yc-card-count" + (s.ok ? "" : " err");
+      count.className = "yc-tile-count" + (s.ok ? "" : " err");
       count.textContent = s.ok ? ycNounPlural(s.key, s.count) : "⚠ ошибка API";
+      body.appendChild(title);
       body.appendChild(count);
+      top.appendChild(body);
+      const dot = document.createElement("span");
+      dot.className = "yc-tile-dot" + (s.ok ? (s.count > 0 ? " on" : "") : " err");
+      top.appendChild(dot);
+      card.appendChild(top);
       if (!s.ok) {
         const err = document.createElement("div");
         err.className = "yc-card-err";
         err.textContent = String(s.error || "API недоступно").slice(0, 200);
-        body.appendChild(err);
+        card.appendChild(err);
       }
-      if (s.ok && YC_CREATABLE.includes(s.key)) {
-        const add = document.createElement("button");
-        add.type = "button";
-        add.className = "btn btn-small yc-add";
-        add.textContent = "＋ Создать";
-        add.title = "Создать новый ресурс («" + s.title + "»). Может быть платным.";
-        add.onclick = (e) => {
-          e.stopPropagation();
-          ycCreateFlow(s.key, s.title);
-        };
-        body.appendChild(add);
-      }
-      card.appendChild(head);
-      card.appendChild(body);
-      if (ycDashKey === s.key) {
-        const list = document.createElement("div");
-        list.className = "yc-card-list";
-        if (!s.ok) {
-          list.textContent = "Ошибка API: " + (s.error || "недоступно");
-        } else if (!s.items || !s.items.length) {
-          list.textContent = "Ресурсов нет — нажми «＋ Создать».";
-        } else {
-          for (const it of s.items.slice(0, 50)) {
-            const row = document.createElement("div");
-            row.className = "yc-item";
-            const nm = document.createElement("span");
-            nm.className = "yc-item-name ykc-openable";
-            nm.textContent = it.name || it.id || "—";
-            nm.title = "Открыть карточку ресурса (" + (it.id || "") + ")";
-            // Клик по имени — вход в карточку: поля ресурса и связанные объекты
-            // (подсети, образы, ключи, ревизии). Раньше список был тупиком.
-            nm.onclick = (e) => {
-              e.stopPropagation();
-              if (!window.YcConsole) return;
-              window.YcConsole.open({
-                serviceKey: s.key,
-                title: s.title,
-                item: it,
-                folderId: (ycStatusCache && ycStatusCache.folderId) || "",
-              });
-            };
-            row.appendChild(nm);
-            const actions = document.createElement("div");
-            actions.className = "yc-item-actions";
-            if (s.key === "serverlessContainers" && it.status) {
-              const st = document.createElement("span");
-              st.className = "yc-status " + String(it.status).toLowerCase();
-              st.textContent = it.status;
-              actions.appendChild(st);
-            }
-            if (s.key === "serverlessContainers" && it.url) {
-              const go = document.createElement("button");
-              go.type = "button";
-              go.className = "btn btn-ghost btn-small";
-              go.textContent = "↗";
-              go.title = "Открыть URL контейнера: " + it.url;
-              go.onclick = (e) => {
-                e.stopPropagation();
-                if (isElectron) api.openExternal(it.url);
-              };
-              actions.appendChild(go);
-            }
-            if (s.key === "serverlessContainers") {
-              const lg = document.createElement("button");
-              lg.type = "button";
-              lg.className = "btn btn-ghost btn-small";
-              lg.textContent = "📜";
-              lg.title = "Логи контейнера (нужен yc CLI)";
-              lg.onclick = async (e) => {
-                e.stopPropagation();
-                let r;
-                try {
-                  r = await api.ycLogs(s.key, it.id);
-                } catch (err) {
-                  r = { ok: false, error: (err && err.message) || String(err) };
-                }
-                if (r && r.ok && r.logs && r.logs.length) {
-                  toast("📜 Логи: " + r.logs.length + " записей — открыты в консоли приложения");
-                  termAppend("📜 Логи контейнера:\n" + r.logs.slice(-30).join("\n"));
-                } else {
-                  toast("❌ " + ((r && r.error) || "Логов нет за последние 3 часа"));
-                }
-              };
-              actions.appendChild(lg);
-            }
-            const del = document.createElement("button");
-            del.type = "button";
-            del.className = "btn btn-danger btn-small";
-            del.textContent = "🗑";
-            del.title = "Удалить «" + (it.name || it.id) + "» (необратимо)";
-            del.onclick = (e) => {
-              e.stopPropagation();
-              ycDeleteFlow(s.key, s.title, it);
-            };
-            actions.appendChild(del);
-            row.appendChild(actions);
-            list.appendChild(row);
-          }
-          if (s.items.length > 50) {
-            const more = document.createElement("div");
-            more.className = "yc-item-more";
-            more.textContent = "… и ещё " + (s.items.length - 50);
-            list.appendChild(more);
-          }
+      const canCreate = s.ok && YC_CREATABLE.includes(s.key);
+      const canAct = !!(window.YcActions && window.YcActions.forService(s.key).length);
+      if (canCreate || canAct) {
+        const btns = document.createElement("div");
+        btns.className = "yc-tile-btns";
+        if (canCreate) {
+          const add = document.createElement("button");
+          add.type = "button";
+          add.className = "yc-tile-add";
+          add.textContent = "＋ Создать";
+          add.title = "Создать новый ресурс («" + ycServiceName(s) + "»). Может быть платным.";
+          add.onclick = (e) => {
+            e.stopPropagation();
+            ycCreateFlow(s.key, s.title);
+          };
+          btns.appendChild(add);
         }
-        card.appendChild(list);
+        if (canAct) {
+          const act = document.createElement("button");
+          act.type = "button";
+          act.className = "yc-tile-add";
+          act.textContent = "⚙ Действия";
+          act.title = "Создать машину, выдать роль, выкатить версию, выпустить сертификат — в этом окне, без агента.";
+          act.onclick = (e) => {
+            e.stopPropagation();
+            ycOpenActions(s.key, "", ycServiceName(s));
+          };
+          btns.appendChild(act);
+        }
+        card.appendChild(btns);
       }
+      if (ycDashKey === s.key) card.appendChild(ycResourceList(s));
       card.onclick = () => {
-        // Возврат к дашборду закрывает карточку ресурса — иначе она перекрывала бы
+        // Возврат к полке закрывает карточку ресурса — иначе она перекрывала бы
         // список, который пользователь только что открыл.
         if (window.YcConsole && window.YcConsole.isOpen()) window.YcConsole.close();
         ycDashKey = ycDashKey === s.key ? "" : s.key;
@@ -379,6 +682,29 @@
       grid.appendChild(card);
     }
     box.appendChild(grid);
+  }
+
+  // Общее окно действий облака (src/renderer/yc-actions.js): список действий
+  // сервиса, формы, цена и подтверждение. Панель передаёт только то, чего модуль
+  // не знает, — какой сервис открыт и что перечитать после успеха.
+  function ycOpenActions(serviceKey, target, title) {
+    const A = window.YcActions;
+    if (!A) {
+      toast("❌ Действия облака работают в приложении на ПК (desktop).");
+      return;
+    }
+    if (window.YcConsole && window.YcConsole.isOpen()) window.YcConsole.close();
+    A.open({
+      service: serviceKey,
+      target: target || "",
+      targetLabel: title || "",
+      onDone: () => {
+        // Действие изменило облако — полка обязана перечитаться, иначе покажет
+        // то, чего уже нет (или не покажет того, что появилось).
+        ycServicesCache = null;
+        ycLoadDashboard(true);
+      },
+    });
   }
 
   function ycCreateFlow(serviceKey, title) {
@@ -543,14 +869,14 @@
     return { create, del, upd, pub };
   }
   $("s-yc-allow-create").onchange = () => {
-    toast(saveYcPerms().create ? "Агенту разрешено создавать ресурсы" : "Создание агентом выключено");
+    toast(saveYcPerms().create ? "Агенту разрешено создавать ресурсы, ключи и функции" : "Создание агентом выключено");
   };
   $("s-yc-allow-delete").onchange = () => {
-    toast(saveYcPerms().del ? "Агенту разрешено удалять ресурсы" : "Удаление агентом выключено");
+    toast(saveYcPerms().del ? "Агенту разрешено удалять ресурсы, машины, снимки, аккаунты и функции" : "Удаление агентом выключено");
   };
   $("s-yc-allow-update").onchange = () => {
     const p = saveYcPerms();
-    toast(p.upd ? "Агенту разрешено менять контейнеры и деплоить ревизии" : "Правка контейнеров агентом выключена");
+    toast(p.upd ? "Агенту разрешено менять контейнеры, правила сети, машины, роли и функции" : "Правка контейнеров, правил сети, машин, ролей и функций агентом выключена");
   };
   $("s-yc-allow-public").onchange = () => {
     toast(saveYcPerms().pub ? "Агенту разрешено открывать бакет для чтения из интернета" : "Публичный доступ к бакету агентом выключен");
@@ -583,9 +909,28 @@
   }
   $("btn-yc-dash-refresh").onclick = () => {
     ycServicesCache = null;
+    ycHealth = null; // баланс и хвосты меняются без нас — перечитываем
     ycLoadDashboard(true);
   };
   $("btn-yc-dash-settings").onclick = () => openSettings("yandex");
+  // Поиск и фильтр правят полку на месте, без обращения к облаку: данные уже
+  // загружены, а ждать сеть ради перерисовки списка незачем.
+  if ($("yc-search")) {
+    $("yc-search").oninput = () => {
+      ycSearch = $("yc-search").value;
+      ycRenderDash();
+    };
+  }
+  const ycFilterBox = $("yc-filter");
+  if (ycFilterBox && ycFilterBox.querySelectorAll) {
+    for (const b of ycFilterBox.querySelectorAll(".yc-filter-btn")) {
+      b.onclick = () => {
+        ycFilter = b.dataset ? b.dataset.flt || "all" : "all";
+        for (const x of ycFilterBox.querySelectorAll(".yc-filter-btn")) x.classList.toggle("active", x === b);
+        ycRenderDash();
+      };
+    }
+  }
   // Из настроек — сразу открыть дашборд
   if ($("btn-yc-open-dash")) {
     $("btn-yc-open-dash").onclick = () => {

@@ -1017,6 +1017,80 @@ const githubIpc = registerGithubIpc({
 // же имена, что и раньше, и работают без изменений.
 const { createYcService } = require("./yc-service.js");
 const { registerYcIpc } = require("./yc-ipc.js");
+// Сеть VPC: подсети, группы безопасности, статические адреса — своим модулем
+// (чистый Node, как yc-db.js: тел запросов в оболочке не появляется).
+const { createYcVpc } = require("./yc-vpc.js");
+const ycVpc = createYcVpc({
+  fetchJson: yandexCloud._fetchJson,
+  endpoint: yandexCloud.endpoint,
+  getIamToken: yandexCloud.getIamToken,
+  waitOperation: yandexCloud.waitOperation,
+  serviceError: yandexCloud.serviceError,
+  isNetworkError: yandexCloud.isNetworkError,
+});
+// Виртуальные машины: список, питание, создание, удаление, снимки, serial-консоль
+// и метрики — своим модулем (чистый Node, как yc-vpc.js). Метрики живут в
+// отдельном сервисе Monitoring, поэтому модуль получает и его адрес через тот
+// же каталог эндпоинтов.
+// IAM: сервисные аккаунты, их роли и ключи — своим модулем (чистый Node).
+// Cloud Functions: функции, версии, теги и вызов — своим модулем (чистый Node).
+// Чтение ответа ТЕКСТОМ (fetchText) нужно потому, что вызов возвращает то, что
+// вернул код функции: это может быть текст, HTML или вовсе пустой ответ.
+const { createYcFunctions } = require("./yc-functions.js");
+const ycFunctions = createYcFunctions({
+  fetchJson: yandexCloud._fetchJson,
+  fetchText: yandexCloud._fetchText,
+  endpoint: yandexCloud.endpoint,
+  getIamToken: yandexCloud.getIamToken,
+  waitOperation: yandexCloud.waitOperation,
+  serviceError: yandexCloud.serviceError,
+  isNetworkError: yandexCloud.isNetworkError,
+});
+// Биллинг: платёжные аккаунты, пороги-бюджеты, живой каталог цен (SKU) и
+// «платные хвосты» в деньгах. Своим модулем (чистый Node, как остальные yc-*).
+// Модулю передаются машины и сеть: правило «что такое платный хвост» живёт в
+// одном месте (ycCompute.paidLeftovers), а не в двух.
+const { createYcBilling } = require("./yc-billing.js");
+const ycBilling = createYcBilling({
+  fetchJson: yandexCloud._fetchJson,
+  endpoint: yandexCloud.endpoint,
+  getIamToken: yandexCloud.getIamToken,
+  waitOperation: yandexCloud.waitOperation,
+  serviceError: yandexCloud.serviceError,
+  isNetworkError: yandexCloud.isNetworkError,
+  ycCompute,
+  ycVpc,
+});
+// HTTPS-сайт на своём домене: сертификат Certificate Manager (Let's Encrypt) и
+// CDN-ресурс, который раздаёт файлы из бакета. Своим модулем (чистый Node, как
+// остальные yc-*): сертификат и «то, что его носит» — два сервиса в одной задаче.
+const { createYcCdn } = require("./yc-cdn.js");
+const ycCdn = createYcCdn({
+  fetchJson: yandexCloud._fetchJson,
+  endpoint: yandexCloud.endpoint,
+  getIamToken: yandexCloud.getIamToken,
+  waitOperation: yandexCloud.waitOperation,
+  serviceError: yandexCloud.serviceError,
+  isNetworkError: yandexCloud.isNetworkError,
+});
+const { createYcIam } = require("./yc-iam.js");
+const ycIam = createYcIam({
+  fetchJson: yandexCloud._fetchJson,
+  endpoint: yandexCloud.endpoint,
+  getIamToken: yandexCloud.getIamToken,
+  waitOperation: yandexCloud.waitOperation,
+  serviceError: yandexCloud.serviceError,
+  isNetworkError: yandexCloud.isNetworkError,
+});
+const { createYcCompute } = require("./yc-compute.js");
+const ycCompute = createYcCompute({
+  fetchJson: yandexCloud._fetchJson,
+  endpoint: yandexCloud.endpoint,
+  getIamToken: yandexCloud.getIamToken,
+  waitOperation: yandexCloud.waitOperation,
+  serviceError: yandexCloud.serviceError,
+  isNetworkError: yandexCloud.isNetworkError,
+});
 const ycService = createYcService({ app, path, net, secrets, yandexCloud, ycCli, ycLogs, ycEnsurePath, loadSettings });
 const {
   ycConfig,
@@ -1030,7 +1104,7 @@ const {
   ycCliStatus,
   ycCliInstall,
 } = ycService;
-registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, loadSettings, saveSettings, svc: ycService });
+registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, loadSettings, saveSettings, svc: ycService });
 
 // Память диалогов: каналы дневника памяток и запись самой памятки при сжатии контекста
 // (её кладёт прогон через onMemo). Собирается ПОСЛЕ путей-и-git и миссий: зеркало
@@ -1276,7 +1350,14 @@ const { executeTool } = createToolRegistry({
   ycJsonArg,
   ycRevisionLine,
   ycRevisionDetails,
+  ycVpc,
+  ycCompute,
+  ycIam,
+  ycFunctions,
+  ycBilling,
+  ycCdn,
   readYcLogsText,
+
   ycCliStatus,
   ycCliInstall,
   runCloudDeploy,

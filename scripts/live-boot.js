@@ -214,7 +214,13 @@ function bootWindow(preload, fetchImpl) {
   const globals = [
     ["AgentCore", "object"], ["Prompts", "object"], ["ToolSchemas", "object"], ["ContextWindow", "function"],
     ["ProviderConfig", "object"], ["ProviderTransport", "function"], ["WebTools", "object"], ["ImageTools", "function"],
-    ["MdRender", "object"], ["Highlight", "object"], ["QR", "object"], ["YcConsole", "object"],
+    ["MdRender", "object"], ["Highlight", "object"], ["QR", "object"],
+    // Официальные логотипы Яндекс.Облака: панель берёт их из YcLogos, и без модуля
+    // плитки служб молча рисовались бы запасным значком. Проверяем, что он поднялся.
+    ["YcLogos", "object"], ["YcConsole", "object"],
+    // Действия облака: панель и консоль зовут их на каждом клике, поэтому модуль
+    // обязан подняться вместе с ними — забытый тег виден именно здесь.
+    ["YcActions", "object"],
     ["YcPanel", "function"], ["DeployPanel", "object"], ["DevRun", "function"],
     ["MobilePanel", "function"],
     ["BootGuard", "object"],

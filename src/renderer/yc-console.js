@@ -133,6 +133,13 @@
     back.title = "К списку сервисов";
     back.onclick = close;
     head.appendChild(back);
+    // Иконка сервиса — та же официальная, что на полке: карточка не должна
+    // выглядеть «другой программой».
+    if (window.YcLogos && state.serviceKey) {
+      const logo = el("span", "ykc-logo");
+      logo.innerHTML = window.YcLogos.svgFor(state.serviceKey);
+      head.appendChild(logo);
+    }
     const titles = el("div", "ykc-titles");
     const sub = el("div", "ykc-sub", (data && data.subtitle) || state.serviceTitle || "Yandex Cloud");
     const title = el("div", "ykc-title", (data && data.title) || item.name || item.id || "ресурс");
@@ -143,6 +150,22 @@
     refresh.title = "Обновить карточку";
     refresh.onclick = () => open({ serviceKey: state.serviceKey, title: state.serviceTitle, item: state.item, folderId: state.folderId });
     head.appendChild(refresh);
+    // Действия по ЭТОМУ ресурсу (машина, аккаунт, функция, сертификат): до части 75
+    // они были только у агента. Что именно доступно сервису — решает набор
+    // действий, поэтому кнопка есть ровно там, где есть что делать.
+    if (window.YcActions && window.YcActions.forService(state.serviceKey).length) {
+      const acts = el("button", "btn btn-ghost btn-small", "⚙ Действия");
+      acts.title = "Что можно сделать с «" + (item.name || item.id || "ресурсом") + "» в облаке";
+      acts.onclick = () => {
+        window.YcActions.open({
+          service: state.serviceKey,
+          target: item.name || item.id || "",
+          targetLabel: state.serviceTitle || "",
+          onDone: () => open({ serviceKey: state.serviceKey, title: state.serviceTitle, item: state.item, folderId: state.folderId }),
+        });
+      };
+      head.appendChild(acts);
+    }
     box.appendChild(head);
 
     if (state.error) {

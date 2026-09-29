@@ -1,0 +1,185 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   ДЕЙСТВИЯ ОБЛАКА В ПАНЕЛИ (кнопки, формы, ответ)
+   ---------------------------------------------------------------------------
+   Подключается ПОСЛЕ yc-panel.css и живёт внутри той же панели `#sp-cloud`,
+   поэтому все селекторы начинаются с `#sp-cloud`: иначе `.yc-act-btn` подрался
+   бы с кнопками всего окна.
+
+   СТИЛЬ ТОТ ЖЕ, ЧТО У ПОЛКИ, и по той же причине: monochrome.css гасит
+   `box-shadow` и `backdrop-filter` с `!important`, значит глубина — это ступени
+   фона, границы и цвет края. Платные и необратимые действия помечены ЦВЕТОМ
+   КРАЯ (жёлтый/красный) и подписью, а не «страшными» тенями: цвет читается
+   глазом, но не кричит.
+
+   Рамка результата — единственное место, где вообще показывается секрет. Она
+   заметно отличается от обычного ответа (жёлтая граница) именно затем, чтобы
+   её нельзя было пропустить: облако отдаёт секрет один раз.                    */
+
+#sp-cloud .yc-act {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 12px 18px;
+  overflow-y: auto;
+}
+#sp-cloud .yc-act.hidden { display: none; }
+
+#sp-cloud .yc-act-head { display: flex; align-items: center; gap: 9px; }
+#sp-cloud .yc-act-back {
+  flex: 0 0 auto;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 11.5px;
+  padding: 4px 9px;
+  cursor: pointer;
+}
+#sp-cloud .yc-act-back:hover { color: var(--text); border-color: var(--yc-blue-line); }
+#sp-cloud .yc-act-title { font-size: 13px; color: var(--text); min-width: 0; }
+#sp-cloud .yc-act-title b { font-weight: 700; }
+#sp-cloud .yc-act-target {
+  font-size: 11.5px;
+  color: var(--yc-blue);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#sp-cloud .yc-act-note {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  background: var(--yc-blue-soft);
+  border: 1px solid var(--yc-blue-line);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+
+/* ── Список действий ───────────────────────────────────────────────────── */
+#sp-cloud .yc-act-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 6px;
+}
+#sp-cloud .yc-act-btn {
+  text-align: left;
+  background: var(--yc-tile);
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.35;
+  padding: 9px 10px;
+  cursor: pointer;
+  transition: background 0.14s, border-color 0.14s;
+}
+#sp-cloud .yc-act-btn:hover { background: var(--yc-tile-hover); border-color: var(--border); }
+#sp-cloud .yc-act-btn.paid { border-left-color: var(--warn); }
+#sp-cloud .yc-act-btn.danger { border-left-color: var(--danger); }
+#sp-cloud .yc-act-btn.danger:hover { background: rgba(255, 107, 107, 0.08); }
+
+/* ── Форма действия ────────────────────────────────────────────────────── */
+#sp-cloud .yc-act-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--yc-tile);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  padding: 10px 11px 11px;
+}
+#sp-cloud .yc-act-form-title { font-size: 13px; font-weight: 600; color: var(--text); }
+#sp-cloud .yc-act-field { display: flex; flex-direction: column; gap: 3px; }
+#sp-cloud .yc-act-field.check { flex-direction: row; align-items: center; gap: 7px; }
+#sp-cloud .yc-act-label { font-size: 11.5px; color: var(--text-dim); }
+#sp-cloud .yc-act-input {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  padding: 6px 8px;
+  min-width: 0;
+}
+#sp-cloud .yc-act-input:focus { outline: none; border-color: var(--yc-blue-line); }
+#sp-cloud textarea.yc-act-input { resize: vertical; font-family: inherit; }
+#sp-cloud .yc-act-check { accent-color: var(--yc-blue); flex: 0 0 auto; }
+#sp-cloud .yc-act-hint { font-size: 11px; line-height: 1.45; color: var(--text-faint); }
+#sp-cloud .yc-act-actionsrow { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+
+/* ── Ответ облака ──────────────────────────────────────────────────────── */
+#sp-cloud .yc-act-out {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: var(--bg-card);
+  border: 1px solid var(--ok);
+  border-radius: 11px;
+  padding: 9px 10px;
+}
+#sp-cloud .yc-act-out.hidden { display: none; }
+#sp-cloud .yc-act-out.bad { border-color: var(--danger); }
+#sp-cloud .yc-act-out-head { font-size: 12px; font-weight: 600; color: var(--text); }
+#sp-cloud .yc-act-line {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+#sp-cloud .yc-act-warn {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--warn);
+  overflow-wrap: anywhere;
+}
+#sp-cloud .yc-act-busy { font-size: 12px; color: var(--text-dim); }
+
+/* Секрет: жёлтая рамка, моноширинный текст, «показывается один раз». */
+#sp-cloud .yc-act-secret {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 4px;
+  background: rgba(217, 180, 91, 0.08);
+  border: 1px solid rgba(217, 180, 91, 0.5);
+  border-radius: 10px;
+  padding: 8px 9px;
+}
+#sp-cloud .yc-act-secret-title { font-size: 11.5px; color: var(--warn); line-height: 1.45; }
+#sp-cloud .yc-act-secret-value {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  background: var(--bg-input);
+  border-radius: 7px;
+  padding: 6px 7px;
+}
+
+/* ── Журнал сделанного (без секретов — только подписи) ─────────────────── */
+#sp-cloud .yc-act-log { display: flex; flex-direction: column; gap: 3px; }
+#sp-cloud .yc-act-log-title {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+#sp-cloud .yc-act-log-line {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 900px) {
+  #sp-cloud .yc-act-grid { grid-template-columns: 1fr; }
+  #sp-cloud .yc-act { padding: 10px 10px 16px; }
+}

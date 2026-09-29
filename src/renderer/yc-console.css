@@ -15,6 +15,13 @@
 .ykc-head { display: flex; align-items: flex-start; gap: 8px; }
 .ykc-back { flex-shrink: 0; }
 .ykc-titles { flex: 1; min-width: 0; }
+/* Иконка сервиса в шапке карточки — официальная, как на полке */
+.ykc-logo {
+  width: 30px; height: 30px; flex: 0 0 auto;
+  border-radius: 8px; overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+}
+.ykc-logo svg { width: 100%; height: 100%; display: block; }
 .ykc-sub { font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.05em; }
 .ykc-title { font-size: 15px; font-weight: 600; margin-top: 2px; word-break: break-word; }
 .ykc-open { align-self: flex-start; }

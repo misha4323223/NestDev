@@ -14,7 +14,11 @@ const { createYcDb } = require("./yc-db.js"); // таблицы и записи 
    значения секрета ревизия ссылается на несуществующий ключ), ycDns (записи
    зоны Cloud DNS — без записи созданный домен никуда не ведёт) и ycRegistry
    (образы Container Registry: посмотреть и почистить, иначе каждая выкатка
-   оставляет в платном хранилище ещё один образ навсегда), а следом — ycStorage
+   оставляет в платном хранилище ещё один образ навсегда), а следом — ycBilling
+   (деньги: платёжный аккаунт и баланс, пороги-бюджеты, НАСТОЯЩИЕ цены из
+   каталога облака и «платные хвосты» в рублях за месяц), ycCdn (HTTPS-сайт:
+   бесплатный сертификат Certificate Manager и CDN-ресурс, который его носит)
+   и ycStorage
    (файлы в бакете Object Storage: посмотреть, положить, забрать и убрать; без
    этого созданный «бакет для файлов и статики» оставался пустой полкой).
 
@@ -48,6 +52,12 @@ function createCloudTools(deps) {
     ycJsonArg,
     ycRevisionLine,
     ycRevisionDetails,
+    ycVpc,
+    ycCompute,
+    ycIam,
+    ycFunctions,
+    ycBilling,
+    ycCdn,
     readYcLogsText,
     ycCliStatus,
     ycCliInstall,
@@ -91,7 +101,9 @@ function createCloudTools(deps) {
             rows.join("\n") +
             cloudDeployBrief(agentWorkDir(loadSettings())) +
             "\n\nСоздание: ycCreate(service, name). Доступны: " + yandexCloud.creatableKeys().join(", ") + ". Удаление: ycDelete(service, id) — id виден в ycList." +
-    "\nСтоимость: ycCosts(service) — проверь ДО создания и назови ориентир пользователю. Платное создаётся только с confirm: true после его согласия."
+    "\nСтоимость: ycCosts(service) — проверь ДО создания и назови ориентир пользователю. Платное создаётся только с confirm: true после его согласия." +
+    "\nМашины: ycCompute — список, карточка, наборы конфигураций, создание, питание, удаление, снимки, serial-консоль и метрики." +
+    " Машина платит за каждый час работы, а её диски — и после удаления: предложи остановку вместо простоя и снимок перед удалением."
           );
         } catch (e) {
           return "Ошибка Yandex Cloud: " + ((e && e.message) || String(e));
@@ -239,7 +251,7 @@ function createCloudTools(deps) {
         if (!ref) return "Ошибка: укажи container — имя или id контейнера. Список: ycList(service: \"serverlessContainers\").";
         // Чтение разрешено всегда; смена настроек и ревизии — только с чекбоксом.
         if ((action === "deploy" || action === "rollback" || action === "update") && !cfg.allowUpdate) {
-          return "⛔ Менять контейнеры и деплоить ревизии агенту ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту менять контейнеры». Чтение доступно и сейчас: action overview / revisions / revision.";
+          return "⛔ Менять контейнеры и деплоить ревизии агенту ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту менять контейнеры и правила сети». Чтение доступно и сейчас: action overview / revisions / revision.";
         }
         try {
           const cont = await ycFindContainerByRef(cfg, ref);
@@ -467,6 +479,241 @@ function createCloudTools(deps) {
           return "Yandex Cloud (ycDns, action=" + action + "): " + ((e && e.message) || String(e));
         }
     },
+    // ── Сеть VPC: подсети, группы безопасности, статические адреса ──────────
+    // Сеть создавать было чем (ycCreate service vpc), а всё, ради чего сеть
+    // существует, — нечем: подсеть, группу безопасности и статический адрес
+    // делали только в консоли облака. Без подсети не поднимется машина, без
+    // группы безопасности она окажется открыта всему интернету, а без
+    // статического адреса её публичный IP сменится после первой перезагрузки.
+    // Тела запросов живут в src/yc-vpc.js — здесь выбор действия, права и
+    // человеческий ответ.
+    "ycVpc": async (args, settings) => {
+        const cfg = ycConfig(loadSettings());
+        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
+        if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud.";
+        const action = String(args.action || "list").trim().toLowerCase();
+        const ACTIONS = ["list", "subnets", "addsubnet", "delsubnet", "groups", "addgroup", "delgroup", "addrule", "delrule", "addresses", "reserve", "release"];
+        if (ACTIONS.indexOf(action) < 0) {
+          return "Ошибка: неизвестное действие ycVpc «" + action + "». Доступно: " + ACTIONS.join(", ") + ".";
+        }
+        const needsCreate = ["addsubnet", "addgroup", "reserve"].indexOf(action) >= 0;
+        const needsUpdate = ["addrule", "delrule"].indexOf(action) >= 0;
+        const needsDelete = ["delsubnet", "delgroup", "release"].indexOf(action) >= 0;
+        if (needsCreate && !cfg.allowCreate) {
+          return "⛔ Создавать ресурсы сети агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту создавать ресурсы». Посмотреть сеть и адреса можно и сейчас: ycVpc { action: \"list\" }.";
+        }
+        if (needsUpdate && !cfg.allowUpdate) {
+          return "⛔ Менять правила групп безопасности агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту менять контейнеры и правила сети». Посмотреть правила можно и сейчас: ycVpc { action: \"groups\" }.";
+        }
+        if (needsDelete && !cfg.allowDelete) {
+          return "⛔ Удалять ресурсы сети агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту удалять ресурсы». Посмотреть, что есть, можно и сейчас: ycVpc { action: \"list\" }.";
+        }
+        try {
+          const where = "«" + (cfg.folderName || cfg.folderId) + "»";
+
+          if (action === "list") {
+            const nets = await ycVpc.networks(cfg.oauth, cfg.folderId);
+            const subs = await ycVpc.subnets(cfg.oauth, cfg.folderId);
+            const groups = await ycVpc.securityGroups(cfg.oauth, cfg.folderId);
+            const addrs = await ycVpc.addresses(cfg.oauth, cfg.folderId);
+            const rows = ["Сеть VPC в каталоге " + where];
+            rows.push("- сети (" + nets.length + "): " + (nets.length ? nets.map((n) => n.name + " (" + n.id + ")").join(", ") : "нет — создать: ycCreate { service: \"vpc\", name: \"my-net\" }"));
+            rows.push("- подсети (" + subs.length + "): " + (subs.length ? subs.map((s) => s.name + " · " + s.zoneId + " · " + (s.v4CidrBlocks || []).join(",")).join("; ") : "нет — без подсети виртуальная машина не поднимется"));
+            rows.push("- группы безопасности (" + groups.length + "): " + (groups.length ? groups.map((g) => g.name + " (правил: вход " + g.ingress + ", выход " + g.egress + ")").join("; ") : "нет"));
+            const busy = addrs.filter((a) => a.used).length;
+            rows.push("- статические адреса (" + addrs.length + ", привязано " + busy + "): " + (addrs.length ? addrs.map((a) => a.address + (a.used ? " (занят)" : " (простаивает)")).join("; ") : "нет"));
+            const idle = addrs.filter((a) => !a.used);
+            if (idle.length) {
+              rows.push("");
+              rows.push("⚠ Простаивают " + idle.length + " статических адрес(а): " + idle.map((a) => a.name + " " + a.address).join(", ") + ". За простаивающий адрес облако берёт плату как за занятый — если он не нужен, освободи: ycVpc { action: \"release\", address: \"имя или id\" }.");
+            }
+            rows.push("");
+            rows.push("Подробнее: ycVpc { action: \"subnets\" | \"groups\" | \"addresses\" }. Создать подсеть: ycVpc { action: \"addsubnet\", name, network, zone, cidr }.");
+            return rows.join("\n");
+          }
+
+          if (action === "subnets") {
+            const subs = await ycVpc.subnets(cfg.oauth, cfg.folderId);
+            if (!subs.length) {
+              return "Подсетей в каталоге " + where + " нет — создать: ycVpc { action: \"addsubnet\", name: \"app-subnet-a\", network: \"<имя сети>\", zone: \"ru-central1-a\", cidr: \"10.10.0.0/24\" }. Список сетей: ycVpc { action: \"list\" }.";
+            }
+            const nets = await ycVpc.networks(cfg.oauth, cfg.folderId);
+            const nameById = {};
+            for (const n of nets) nameById[n.id] = n.name;
+            const rows = subs.map(
+              (s) =>
+                "• " + s.name + " (" + s.id + ") · зона " + (s.zoneId || "—") + " · " + ((s.v4CidrBlocks || []).join(", ") || "—") +
+                (s.v6CidrBlocks && s.v6CidrBlocks.length ? ", " + s.v6CidrBlocks.join(", ") : "") +
+                " · сеть " + (nameById[s.networkId] || s.networkId || "—")
+            );
+            return "Подсети в каталоге " + where + " (" + subs.length + "):\n" + rows.join("\n") +
+              "\n\nСвободный диапазон рядом с занятыми: " + (ycVpc.suggestCidr(subs) || "подобрать не удалось — укажи cidr сам") + ".";
+          }
+
+          if (action === "addsubnet") {
+            const subs = await ycVpc.subnets(cfg.oauth, cfg.folderId);
+            const cidr = args.cidr || args.v4CidrBlocks || ycVpc.suggestCidr(subs);
+            const made = await ycVpc.createSubnet(cfg.oauth, {
+              folderId: cfg.folderId,
+              name: args.name,
+              network: args.network || args.networkId,
+              zoneId: args.zone || args.zoneId,
+              cidr,
+              description: args.description,
+            });
+            const range = (made.v4CidrBlocks || []).join(", ");
+            return "✅ Подсеть создана: " + made.name + " (" + made.id + ")\nЗона: " + (made.zoneId || "—") + " · диапазон: " + (range || "—") +
+              (args.cidr || args.v4CidrBlocks ? "" : "\nДиапазон " + range + " предложен как свободный — в каталоге он ни с чем не пересекается") +
+              "\n\nДальше: группа безопасности — ycVpc { action: \"addgroup\", name: \"app-sg\", network: \"<имя сети>\" }, потом правило входа — ycVpc { action: \"addrule\", group: \"app-sg\", direction: \"ingress\", protocol: \"tcp\", port: 22, cidr: \"203.0.113.10/32\" }.";
+          }
+
+          if (action === "delsubnet") {
+            const ref = args.subnet || args.name || args.id;
+            const subs = await ycVpc.subnets(cfg.oauth, cfg.folderId);
+            const s = ycVpc.matchByIdOrName(subs, ref) || (subs.length === 1 && !ref ? subs[0] : null);
+            if (!s) {
+              return "Не нашёл подсеть «" + (ref || "") + "»." + (ref ? "" : " Подсетей несколько — укажи subnet.") + "\nВ каталоге: " + (subs.map((x) => x.name + " (" + x.id + ")").join(", ") || "подсетей нет");
+            }
+            await ycVpc.deleteSubnet(cfg.oauth, s.id);
+            const left = await ycVpc.subnets(cfg.oauth, cfg.folderId);
+            return "🗑 Подсеть удалена: " + s.name + " (" + s.id + "), диапазон " + ((s.v4CidrBlocks || []).join(", ") || "—") +
+              "\nОсталось подсетей: " + left.length + (left.length ? " — " + left.map((x) => x.name).join(", ") : "") +
+              (left.length ? "" : "\n\n⚠ Напоминание: в каталоге больше нет подсетей — виртуальную машину в этой сети не поднять.");
+          }
+
+          if (action === "groups") {
+            const groups = await ycVpc.securityGroups(cfg.oauth, cfg.folderId);
+            if (!groups.length) {
+              return "Групп безопасности в каталоге " + where + " нет. Создать: ycVpc { action: \"addgroup\", name: \"app-sg\", network: \"<имя сети>\" } — группа без правил НИЧЕГО не пускает, правила добавляются отдельно.";
+            }
+            const chunks = groups.map((g) => {
+              const head = "• " + g.name + " (" + g.id + ") · " + (g.defaultForNetwork ? "группа по умолчанию" : "правил: вход " + g.ingress + ", выход " + g.egress);
+              const rules = (g.rules || []).map((r) => "    – " + ycVpc.ruleHuman(r));
+              return [head].concat(rules).join("\n");
+            });
+            return "Группы безопасности в каталоге " + where + " (" + groups.length + "):\n" + chunks.join("\n") +
+              "\n\nДобавить правило: ycVpc { action: \"addrule\", group: \"имя\", direction: \"ingress\", protocol: \"tcp\", port: 22, cidr: \"203.0.113.10/32\" }. Убрать: ycVpc { action: \"delrule\", group: \"имя\", direction: \"ingress\", protocol: \"tcp\", port: 22, cidr: \"203.0.113.10/32\" }. ВАЖНО: порт 22 стоит открывать не всему интернету, а конкретному адресу (/32) — правило с cidr 0.0.0.0/0 пускает к машине кого угодно.";
+          }
+
+          if (action === "addgroup") {
+            const made = await ycVpc.createSecurityGroup(cfg.oauth, {
+              folderId: cfg.folderId,
+              name: args.name,
+              network: args.network || args.networkId,
+              description: args.description,
+              rules: args.rules,
+            });
+            return "✅ Группа безопасности создана: " + made.name + " (" + made.id + ")\n" +
+              "Правила: " + ((made.rules || []).length ? "\n" + made.rules.map((r) => "  – " + ycVpc.ruleHuman(r)).join("\n") : "нет — группа пока ничего не пускает и ничего не выпускает") +
+              "\n\nДальше: ycVpc { action: \"addrule\", group: \"" + made.name + "\", direction: \"ingress\", protocol: \"tcp\", port: 22, cidr: \"<адрес пользователя>/32\" }.";
+          }
+
+          if (action === "delgroup") {
+            const ref = args.group || args.name || args.id;
+            const groups = await ycVpc.securityGroups(cfg.oauth, cfg.folderId);
+            const g = ycVpc.matchByIdOrName(groups, ref) || (groups.length === 1 && !ref ? groups[0] : null);
+            if (!g) {
+              return "Не нашёл группу «" + (ref || "") + "»." + (ref ? "" : " Групп несколько — укажи group.") + "\nВ каталоге: " + (groups.map((x) => x.name + " (" + x.id + ")").join(", ") || "групп нет");
+            }
+            await ycVpc.deleteSecurityGroup(cfg.oauth, g.id);
+            const left = await ycVpc.securityGroups(cfg.oauth, cfg.folderId);
+            return "🗑 Группа безопасности удалена: " + g.name + " (" + g.id + ")" +
+              "\nОсталось групп: " + left.length + (left.length ? " — " + left.map((x) => x.name).join(", ") : "") +
+              "\n\nЧто удалилось вместе с ней: её правила. Ресурсы, которые были к ней привязаны (сетевые интерфейсы машин), остались — проверь их доступность в интернет.";
+          }
+
+          if (action === "addrule" || action === "delrule") {
+            const ref = args.group || args.sg || args.sgId || args.id;
+            const groups = await ycVpc.securityGroups(cfg.oauth, cfg.folderId);
+            const g = ycVpc.matchByIdOrName(groups, ref) || (groups.length === 1 && !ref ? groups[0] : null);
+            if (!g) {
+              return "Не нашёл группу «" + (ref || "") + "»." + (ref ? "" : " Групп несколько — укажи group.") + "\nВ каталоге: " + (groups.map((x) => x.name + " (" + x.id + ")").join(", ") || "групп нет — создать: ycVpc { action: \"addgroup\", name: \"app-sg\", network: \"<имя сети>\" }");
+            }
+            const rule = {
+              direction: args.direction,
+              protocol: args.protocol,
+              port: args.port != null ? args.port : args.ports,
+              cidr: args.cidr || args.source,
+              sg: args.sourceGroup || args.fromGroup,
+              target: args.target,
+              description: args.description,
+            };
+            const r = await ycVpc.updateSecurityGroupRules(
+              cfg.oauth,
+              action === "addrule" ? { sgId: g.id, add: rule } : { sgId: g.id, remove: rule }
+            );
+            const human = (action === "addrule" ? r.added : r.removed).map((x) => ycVpc.ruleHuman(x));
+            const head = r.changed
+              ? (action === "addrule" ? "✅ Правило добавлено: " : "🗑 Правило удалено: ")
+              : "Такое правило уже есть — ничего не менял: ";
+            const ruled = r.changed ? human.join(", ") : (r.skipped || []).map((x) => ycVpc.ruleHuman(x)).join(", ");
+            const now = (r.rules || []).map((x) => "  – " + ycVpc.ruleHuman(x));
+            return head + ruled + "\nГруппа «" + (r.group.name || g.name) + "» теперь:\n" + (now.length ? now.join("\n") : "  – правил нет") +
+              (action === "addrule" && String(args.cidr || args.source || "") === "0.0.0.0/0"
+                ? "\n\n⚠ Правило открыто ВСЕМУ интернету (0.0.0.0/0). Скажи пользователю прямо: доступ к этому порту получит любой. Для SSH правильнее адрес пользователя с маской /32."
+                : "");
+          }
+
+          if (action === "addresses") {
+            const addrs = await ycVpc.addresses(cfg.oauth, cfg.folderId);
+            if (!addrs.length) {
+              return "Статических адресов в каталоге " + where + " нет. Закрепить: ycVpc { action: \"reserve\", name: \"web-ip\", zone: \"ru-central1-a\" } — адрес платный, пока он не привязан к машине, облако берёт за него плату.";
+            }
+            const rows = addrs.map(
+              (a) =>
+                "• " + a.address + " · " + a.name + " (" + a.id + ") · зона " + (a.zoneId || "—") +
+                (a.used ? " · привязан" : " · ПРОСТАИВАЕТ") + (a.deletionProtection ? " · защита от удаления" : "")
+            );
+            const idle = addrs.filter((a) => !a.used);
+            return "Статические адреса в каталоге " + where + " (" + addrs.length + "):\n" + rows.join("\n") +
+              (idle.length
+                ? "\n\n⚠ Простаивают (" + idle.length + ") и всё равно тарифицируются: " + idle.map((a) => a.address + " " + a.name).join(", ") + ". Освободить ненужные: ycVpc { action: \"release\", address: \"имя или id\" } — освобождённый адрес вернётся в облако, и вернуть именно его уже не получится."
+                : "\n\nВсе закреплённые адреса привязаны к ресурсам.");
+          }
+
+          if (action === "reserve") {
+            const made = await ycVpc.reserveAddress(cfg.oauth, {
+              folderId: cfg.folderId,
+              name: args.name,
+              zoneId: args.zone || args.zoneId,
+              address: args.address,
+              description: args.description,
+              deletionProtection: args.protection === true || args.deletionProtection === true,
+            });
+            let price = "";
+            try {
+              const est = ycCosts.estimate("vpcAddress", {});
+              if (est) price = ycCosts.formatLines(est).join(" ");
+            } catch (e) {
+              price = "";
+            }
+            return "✅ Статический адрес закреплён: " + (made.address || "(адрес появится через несколько секунд)") + "\nИмя: " + made.name + " (" + made.id + ") · зона " + (made.zoneId || "—") +
+              (price ? "\n\nСтоимость: " + price : "") +
+              "\n\nПока адрес не привязан к работающей машине, облако тарифицирует его как простаивающий — не оставляй его «про запас». Привязать: при создании виртуальной машины укажи этот адрес; посмотреть состояние: ycVpc { action: \"addresses\" }.";
+          }
+
+          if (action === "release") {
+            const ref = args.address || args.name || args.id;
+            const addrs = await ycVpc.addresses(cfg.oauth, cfg.folderId);
+            const a = ycVpc.matchByIdOrName(addrs, ref) || (addrs.length === 1 && !ref ? addrs[0] : null);
+            if (!a) {
+              return "Не нашёл адрес «" + (ref || "") + "»." + (ref ? "" : " Адресов несколько — укажи address.") + "\nВ каталоге: " + (addrs.map((x) => x.address + " " + x.name).join(", ") || "адресов нет");
+            }
+            if (a.used) {
+              return "⛔ Адрес " + a.address + " привязан к работающему ресурсу. Сначала отвяжи его (удали или останови машину с этим адресом), иначе освобождение уберёт IP из-под живой машины. Если это точно нужно — сделай это в консоли облака, где видно, от чего отваливается адрес.";
+            }
+            await ycVpc.releaseAddress(cfg.oauth, a.id);
+            const left = await ycVpc.addresses(cfg.oauth, cfg.folderId);
+            return "🗑 Адрес освобождён: " + a.address + " (" + a.name + "). Плата за него больше не начисляется.\nОсталось адресов: " + left.length +
+              "\n\nВАЖНО: этот IP ушёл в облако — вернуть именно его нельзя. Всё, что на него указывало (DNS, белые списки), станет нерабочим.";
+          }
+
+          return "Ошибка: действие " + action + " не обработано.";
+        } catch (e) {
+          return "Yandex Cloud (ycVpc, action=" + action + "): " + ((e && e.message) || String(e));
+        }
+    },
+
     // ── Container Registry: образы и их чистка ─────────────────────────────
     // Реестр чистить было нечем: список образов читался только карточкой панели,
     // а удаление образа жило в скрипте E2E. Между тем образы копятся с каждой
@@ -796,6 +1043,1099 @@ function createCloudTools(deps) {
           return "Yandex Cloud (ycDb, action=" + action + "): " + ((e && e.message) || String(e));
         }
     },
+
+    // ── Виртуальные машины: жизнь машины целиком ────────────────────────────
+    // Машина — это «компьютер в дата-центре», и до сих пор агент не мог ни
+    // поднять, ни посмотреть, ни остановить её: облако было набором полок, а
+    // сервер человек поднимал руками в чужой консоли. Здесь весь цикл: список и
+    // карточка, создание с ценой и согласием, питание, удаление вместе с
+    // дисками, снимки, serial-консоль (единственный «экран» машины) и метрики
+    // (машина работает или просто числится).
+    //
+    // Тел запросов здесь нет — вся работа с API живёт в src/yc-compute.js.
+    //
+    // Ключа SSH тут НЕТ намеренно. Пара ключей стоит денег в виде доступа:
+    // у кого личный ключ, у того и машина. Вернуть личный ключ в ответ
+    // инструмента — значит положить его в историю переписки и в журнал прогона.
+    // Поэтому ключ делает человек в панели (там он сразу ложится в секреты), а
+    // агент только принимает готовую публичную строку при создании машины.
+    "ycCompute": async (args, settings) => {
+        const cfg = ycConfig(loadSettings());
+        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
+        if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud.";
+        const action = String(args.action || "list").trim().toLowerCase();
+        const ACTIONS = [
+          "list", "card", "presets", "create", "delete", "start", "stop", "restart",
+          "serial", "metrics", "disks", "snapshot", "delsnapshot", "cleansnapshots", "restoredisk", "leftovers",
+        ];
+        if (ACTIONS.indexOf(action) < 0) {
+          return "Ошибка: неизвестное действие ycCompute «" + action + "». Доступно: " + ACTIONS.join(", ") + ".";
+        }
+        const needsCreate = ["create", "snapshot", "restoredisk"].indexOf(action) >= 0;
+        const needsUpdate = ["start", "stop", "restart"].indexOf(action) >= 0;
+        const needsDelete = ["delete", "delsnapshot"].indexOf(action) >= 0 || (action === "cleansnapshots" && args.dryRun === false);
+        if (needsCreate && !cfg.allowCreate) {
+          return "⛔ Создавать машины агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту создавать ресурсы». Посмотреть, что уже есть, можно и сейчас: ycCompute { action: \"list\" }.";
+        }
+        if (needsUpdate && !cfg.allowUpdate) {
+          return "⛔ Запускать и останавливать машины агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту менять контейнеры и правила сети». Посмотреть машины можно и сейчас: ycCompute { action: \"list\" }.";
+        }
+        if (needsDelete && !cfg.allowDelete) {
+          return "⛔ Удалять машины и снимки агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту удалять ресурсы». Посмотреть, что есть, можно и сейчас: ycCompute { action: \"list\" }.";
+        }
+        try {
+          const where = "«" + (cfg.folderName || cfg.folderId) + "»";
+          const ref = String(args.instance || args.name || args.id || args.instanceId || "").trim();
+
+          if (action === "presets") {
+            const rows = [];
+            for (const key of ycCompute.PRESET_KEYS) {
+              const p = ycCompute.PRESETS[key];
+              const est = ycCosts.estimate("compute", { cores: p.cores, coreFraction: p.coreFraction, memoryGb: p.memoryGb, diskSizeGb: p.diskSizeGb, diskTypeId: p.diskTypeId });
+              rows.push(
+                "• " + key + " — " + p.title + ": " + p.cores + " × " + p.coreFraction + "%, " + p.memoryGb + " ГБ памяти, диск " +
+                  p.diskSizeGb + " ГБ (" + p.diskTypeId + ") · круглосуточно ≈ " + ycCosts.money(est.approxMonth) + " в месяц. " + p.note
+              );
+            }
+            return "Наборы конфигурации машины (" + where + "):\n" + rows.join("\n") +
+              "\n\nСоздать: ycCompute { action: \"create\", name: \"web-1\", preset: \"small\", subnet: \"<имя подсети>\", publicIp: true, sshPublicKey: \"<публичный ключ>\", confirm: true }." +
+              "\nВажно: у машины нет экрана и нет пароля. Если не передать sshPublicKey, войти в неё будет нельзя — ключ делает человек в панели.";
+          }
+
+          if (action === "list") {
+            const instances = await ycCompute.instances(cfg.oauth, cfg.folderId);
+            const disks = await ycCompute.disks(cfg.oauth, cfg.folderId);
+            const snapshots = await ycCompute.snapshots(cfg.oauth, cfg.folderId);
+            const subnets = ycVpc ? await ycVpc.subnets(cfg.oauth, cfg.folderId).catch(() => []) : [];
+            const addresses = ycVpc ? await ycVpc.addresses(cfg.oauth, cfg.folderId).catch(() => []) : [];
+            const leftovers = ycCompute.paidLeftovers({ instances, disks, snapshots, addresses });
+            if (!instances.length) {
+              const canVm = subnets.length ? " Создать: ycCompute { action: \"create\", name: \"web-1\", preset: \"small\", subnet: \"" + subnets[0].name + "\", publicIp: true, confirm: true }." : " Но сначала нужна подсеть — без неё машина не встанет: ycVpc { action: \"addsubnet\", name: \"app-subnet-a\", network: \"<имя сети>\", zone: \"ru-central1-a\", cidr: \"10.10.0.0/24\" }.";
+              return "Машин в каталоге " + where + " нет." + canVm +
+                (leftovers.total ? "\n\n⚠ Платные хвосты: " + leftovers.lines.join("; ") + "." : "");
+            }
+            const rows = instances.map((i) => {
+              const st = i.running ? "▶ " : i.busy ? "… " : "⏸ ";
+              return (
+                st + i.name + " — " + i.statusHuman + " · " + i.zoneId + " · " + i.cores + " × " + (i.coreFraction || 100) + "% / " + i.memoryHuman +
+                " · " + (i.externalIp || "без внешнего адреса") + (i.preemptible ? " · прерываемая" : "") + " · id " + i.id
+              );
+            });
+            const lines = ["Машины в каталоге " + where + " (" + instances.length + "):", rows.join("\n")];
+            const stopped = instances.filter((i) => !i.running && !i.busy);
+            if (stopped.length) {
+              lines.push("");
+              lines.push("⏸ Остановлены (" + stopped.length + "): " + stopped.map((i) => i.name).join(", ") + " — сама машина за это не платит, но её диски платят. Запустить: ycCompute { action: \"start\", instance: \"имя\" }.");
+            }
+            const busy = instances.filter((i) => i.busy);
+            if (busy.length) lines.push("… В работе прямо сейчас: " + busy.map((i) => i.name + " (" + i.statusHuman + ")").join(", ") + " — подожди.");
+            if (leftovers.total) {
+              lines.push("");
+              lines.push("⚠ Платные хвосты: " + leftovers.lines.join("; ") + ". Это то, за что платят, хотя уже никому не нужно: диски без машины, снимки удалённых дисков, простаивающие адреса.");
+            }
+            lines.push("");
+            lines.push("Подробнее: ycCompute { action: \"card\", instance: \"имя\" }. Цены конфигураций: ycCompute { action: \"presets\" }. Наборы: " + ycCompute.PRESET_KEYS.join(", ") + ".");
+            return lines.join("\n");
+          }
+
+          if (action === "card") {
+            if (!ref) return "Ошибка: укажи instance — имя или id машины (список: ycCompute { action: \"list\" }).";
+            const inst = await ycCompute.findInstance(cfg.oauth, cfg.folderId, ref);
+            if (!inst) return "Не нашёл машину «" + ref + "». Список: ycCompute { action: \"list\" }.";
+            const disks = await ycCompute.disks(cfg.oauth, cfg.folderId);
+            const snapshots = await ycCompute.snapshots(cfg.oauth, cfg.folderId);
+            const subnets = ycVpc ? await ycVpc.subnets(cfg.oauth, cfg.folderId).catch(() => []) : [];
+            const groups = ycVpc ? await ycVpc.securityGroups(cfg.oauth, cfg.folderId).catch(() => []) : [];
+            const boot = disks.find((d) => d.id === inst.bootDisk.diskId) || null;
+            const est = ycCosts.estimate("compute", {
+              cores: inst.cores,
+              coreFraction: inst.coreFraction,
+              memoryGb: Math.round(inst.memory / (1024 * 1024 * 1024)),
+              diskSizeGb: boot ? Math.round(boot.size / (1024 * 1024 * 1024)) : 20,
+              diskTypeId: boot ? boot.typeId : "network-ssd",
+              publicIp: inst.hasExternalIp,
+            });
+            return ycCompute.cardLines(inst, { disks, snapshots, subnets, securityGroups: groups }).join("\n") +
+              "\n\n" + ycCosts.formatText(est) +
+              "\n\nЧто можно сделать сейчас: " +
+              (inst.running ? "ycCompute { action: \"stop\", instance: \"" + inst.name + "\" } — остановить (за выключенное время не платят)" : "ycCompute { action: \"start\", instance: \"" + inst.name + "\" } — запустить") +
+              ", ycCompute { action: \"serial\", instance: \"" + inst.name + "\" } — посмотреть, что происходит внутри, ycCompute { action: \"metrics\", instance: \"" + inst.name + "\" } — нагрузка.";
+          }
+
+          if (action === "disks") {
+            const disks = await ycCompute.disks(cfg.oauth, cfg.folderId);
+            if (!disks.length) return "Дисков в каталоге " + where + " нет.";
+            const rows = disks.map((d) => {
+              // d.size — БАЙТЫ (так его отдаёт API), а тариф считается за ГИГАБАЙТ.
+              const month = ycCosts.diskMonth(d.size / 1073741824, d.typeId);
+              return (
+                "• " + d.name + " — " + d.sizeHuman + " · " + d.typeId + " · " + d.zoneId + " · ≈ " + ycCosts.money(month) + " в месяц · " +
+                (d.attached ? "занят машиной" : "⚠ НИ К ЧЕМУ НЕ ПРИВЯЗАН — платите, а пользы нет") +
+                " · id " + d.id
+              );
+            });
+            const orphan = disks.filter((d) => !d.attached);
+            return "Диски в каталоге " + where + " (" + disks.length + "):\n" + rows.join("\n") +
+              (orphan.length ? "\n\n⚠ Дисков без машины: " + orphan.length + " (" + orphan.map((d) => d.name + " " + d.sizeHuman).join(", ") + "). Сделай снимок, если данные нужны, и удали — иначе платишь каждый час." : "") +
+              "\n\nСнимок диска: ycCompute { action: \"snapshot\", disk: \"имя\", confirm: true }.";
+          }
+
+          if (action === "leftovers") {
+            const instances = await ycCompute.instances(cfg.oauth, cfg.folderId);
+            const disks = await ycCompute.disks(cfg.oauth, cfg.folderId);
+            const snapshots = await ycCompute.snapshots(cfg.oauth, cfg.folderId);
+            const addresses = ycVpc ? await ycVpc.addresses(cfg.oauth, cfg.folderId).catch(() => []) : [];
+            const l = ycCompute.paidLeftovers({ instances, disks, snapshots, addresses });
+            if (!l.total) {
+              return "Платных хвостов в каталоге " + where + " нет: каждый диск привязан к машине, снимков удалённых дисков нет, простаивающих статических адресов нет.";
+            }
+            const rows = [];
+            for (const d of l.disks) rows.push("• диск без машины: " + d.name + " " + d.sizeHuman + " (" + d.typeId + ") — ≈ " + ycCosts.money(ycCosts.diskMonth(d.size / 1073741824, d.typeId)) + " в месяц");
+            for (const s of l.snapshots) rows.push("• снимок удалённого диска: " + s.name + " " + s.storageHuman + " (возраст " + (s.ageDays != null ? s.ageDays + " дн." : "неизвестен") + ")");
+            for (const a of l.addresses) rows.push("• простаивающий статический адрес: " + (a.address || a.name) + " — облако берёт за него плату как за занятый");
+            return "Платные хвосты в каталоге " + where + " (" + l.total + "):\n" + rows.join("\n") +
+              "\n\nЭто деньги за то, что уже не используется. Прежде чем удалять — предложи пользователю снимок (" +
+              "ycCompute { action: \"snapshot\", disk: \"имя\", confirm: true }), потому что удаление диска необратимо. " +
+              "Освободить адрес: ycVpc { action: \"release\", address: \"имя\" }. Старые снимки: ycCompute { action: \"cleansnapshots\", keep: 2 } (сначала покажет, что удалит).";
+          }
+
+          if (action === "create") {
+            const est = ycCosts.estimate("compute", {
+              cores: args.cores,
+              coreFraction: args.coreFraction,
+              memoryGb: args.memoryGb,
+              diskSizeGb: args.diskSizeGb,
+              diskTypeId: args.diskType || args.diskTypeId,
+              publicIp: args.publicIp === true || !!args.staticAddress,
+            });
+            if (args.confirm !== true) {
+              return "Машина платная — она тарифицируется за каждый час работы.\n\n" + ycCosts.formatText(est) +
+                "\n\nНазови пользователю ориентир цены и получи согласие (askUser), затем повтори вызов с confirm: true." +
+                "\nЕсли он не сказал конфигурацию — предложи готовый набор: ycCompute { action: \"presets\" }.";
+            }
+            const r = await ycCompute.createInstance(cfg.oauth, {
+              folderId: cfg.folderId,
+              name: args.name,
+              preset: args.preset,
+              zone: args.zone || args.zoneId,
+              platform: args.platform,
+              cores: args.cores,
+              memoryGb: args.memoryGb,
+              coreFraction: args.coreFraction,
+              imageFamily: args.imageFamily || args.image,
+              imageId: args.imageId,
+              diskType: args.diskType || args.diskTypeId,
+              diskSizeGb: args.diskSizeGb,
+              subnet: args.subnet,
+              subnetId: args.subnetId,
+              securityGroupIds: args.securityGroupIds || args.securityGroups,
+              sshPublicKey: args.sshPublicKey,
+              sshUser: args.sshUser,
+              publicIp: args.publicIp === true || !!args.staticAddress,
+              staticAddress: args.staticAddress,
+              preemptible: args.preemptible,
+              dataDiskSizeGb: args.dataDiskSizeGb,
+              description: args.description,
+            });
+            const real = ycCosts.estimate("compute", {
+              cores: r.cores,
+              coreFraction: r.coreFraction,
+              memoryGb: Math.round(r.memoryBytes / (1024 * 1024 * 1024)),
+              diskSizeGb: Math.round(r.diskSizeBytes / (1024 * 1024 * 1024)),
+              diskTypeId: r.diskTypeId,
+              publicIp: r.publicIp,
+            });
+            const i = r.instance;
+            const lines = [
+              "✅ Машина создана: " + i.name + " (" + i.id + ")",
+              "  " + r.cores + " × " + r.coreFraction + "% vCPU · " + Math.round(r.memoryBytes / (1024 * 1024 * 1024)) + " ГБ памяти · диск " +
+                Math.round(r.diskSizeBytes / (1024 * 1024 * 1024)) + " ГБ (" + r.diskTypeId + ") · зона " + i.zoneId,
+              "  подсеть: " + r.subnet.name + " (" + r.subnet.zoneId + ")",
+              "  адреса: " + (i.externalIp ? i.externalIp + " снаружи, " : "") + (i.internalIp || "внутренний появится через несколько секунд"),
+              "  состояние: " + i.statusHuman + " — машине нужно время на загрузку, это нормально",
+              "",
+              ycCosts.formatText(real),
+            ];
+            if (r.warnings.length) {
+              lines.push("");
+              for (const w of r.warnings) lines.push("⚠ " + w);
+            }
+            lines.push("");
+            lines.push("Дальше: загрузка занимает минуту-другую. Что происходит внутри, видно в serial-консоли: ycCompute { action: \"serial\", instance: \"" + i.name + "\" }. Нагрузка: ycCompute { action: \"metrics\", instance: \"" + i.name + "\" }.");
+            return lines.join("\n");
+          }
+
+          if (action === "start" || action === "stop" || action === "restart") {
+            if (!ref) return "Ошибка: укажи instance — имя или id машины (список: ycCompute { action: \"list\" }).";
+            const inst = await ycCompute.findInstance(cfg.oauth, cfg.folderId, ref);
+            if (!inst) return "Не нашёл машину «" + ref + "». Список: ycCompute { action: \"list\" }.";
+            const r = await ycCompute.power(cfg.oauth, action, inst, { folderId: cfg.folderId });
+            const lines = [r.message];
+            if (r.warnings && r.warnings.length) {
+              lines.push("");
+              for (const w of r.warnings) lines.push("⚠ " + w);
+            }
+            if (action === "start" && inst.externalIp) {
+              lines.push("");
+              lines.push("Появился адрес: " + (r.instance.externalIp || inst.externalIp) + " — если он изменился, обнови DNS и белые списки.");
+            }
+            return lines.join("\n");
+          }
+
+          if (action === "serial") {
+            if (!ref) return "Ошибка: укажи instance — имя или id машины.";
+            const r = await ycCompute.serialOutput(cfg.oauth, { folderId: cfg.folderId, instance: ref, lines: args.lines });
+            if (r.empty) return r.message;
+            return "Serial-консоль машины «" + r.instance.name + "» (порт " + r.port + "), последние " + r.lines.length + " строк:\n```\n" + r.lines.join("\n") + "\n```\n" +
+              "\nЭто то, что машина «говорит» при загрузке и работе: здесь видно, поднялась ли служба, что мешает запуску и какие ошибки пишет ядро. Если консоль пуста — машина создана без serial-port-enable в метаданных.";
+          }
+
+          if (action === "metrics") {
+            if (!ref) return "Ошибка: укажи instance — имя или id машины.";
+            const r = await ycCompute.metrics(cfg.oauth, { folderId: cfg.folderId, instance: ref, minutes: args.minutes });
+            const rows = [];
+            for (const m of r.metrics) {
+              const s = m.summary;
+              rows.push("• " + m.title + ": " + (s.count ? "в среднем " + m.format(s.avg) + ", максимум " + m.format(s.max) : "данных нет"));
+            }
+            return "Нагрузка машины «" + r.instance.name + "» за " + r.minutes + " мин:\n" + rows.join("\n") +
+              (r.errors.length ? "\n(не удалось получить: " + r.errors.map((e) => e.name).join(", ") + ")" : "") +
+              "\n\n" + r.lines.join("\n");
+          }
+
+          if (action === "snapshot") {
+            if (args.confirm !== true) {
+              const gb = Number(args.sizeGb) > 0 ? Number(args.sizeGb) : 20;
+              const est = ycCosts.estimate("computeSnapshot", { gb });
+              return "Снимок диска хранится и тарифицируется, пока его не удалят.\n\n" + ycCosts.formatText(est) +
+                "\n\nПолучи согласие пользователя и повтори с confirm: true. Снимок — единственная защита от «удалил и потерял»: предложи его ДО удаления машины.";
+            }
+            const r = await ycCompute.createSnapshot(cfg.oauth, {
+              folderId: cfg.folderId,
+              disk: args.disk,
+              diskId: args.diskId,
+              instance: args.instance,
+              name: args.snapshotName || args.snapshot,
+              description: args.description,
+            });
+            return "✅ Снимок «" + r.snapshot.name + "» создан (" + r.snapshot.storageHuman + ", диск " + r.disk.name + ").\nid: " + r.snapshot.id +
+              "\n\nВосстановить из него диск: ycCompute { action: \"restoredisk\", snapshot: \"" + r.snapshot.name + "\", zone: \"" + r.disk.zoneId + "\", confirm: true }." +
+              (r.warnings.length ? "\n\n⚠ " + r.warnings.join("\n⚠ ") : "");
+          }
+
+          if (action === "delsnapshot") {
+            const snapRef = String(args.snapshot || args.snapshotId || args.name || "").trim();
+            if (!snapRef) return "Ошибка: укажи snapshot — имя или id снимка. Список снимков видно в ycCompute { action: \"cleansnapshots\" } (он покажет и то, что уже можно удалить).";
+            const r = await ycCompute.deleteSnapshot(cfg.oauth, { folderId: cfg.folderId, snapshot: snapRef });
+            return "🗑 " + r.message + "\nЭто необратимо: из удалённого снимка диск уже не восстановить.";
+          }
+
+          if (action === "cleansnapshots") {
+            const r = await ycCompute.cleanSnapshots(cfg.oauth, {
+              folderId: cfg.folderId,
+              disk: args.disk,
+              keep: args.keep,
+              olderThanDays: args.olderThanDays,
+              dryRun: args.dryRun !== false,
+            });
+            const lines = [r.message];
+            if (r.kept.length) lines.push("\nОстаются:\n" + r.kept.map((s) => "• " + s.name + " (" + (s.ageDays != null ? s.ageDays + " дн." : "возраст неизвестен") + ")").join("\n"));
+            if (r.doomed.length) lines.push("\n" + (r.dryRun ? "К удалению" : "Удалены") + ":\n" + r.doomed.map((s) => "• " + s.name + " — " + s.storageHuman + " (" + (s.ageDays != null ? s.ageDays + " дн." : "возраст неизвестен") + ")").join("\n"));
+            if (r.failed.length) lines.push("\nНе удалось: " + r.failed.map((f) => f.snapshot.name + " — " + f.error).join("; "));
+            if (r.dryRun && r.doomed.length) {
+              lines.push("\nНичего не удалено: сначала показываем. Назови пользователю объём и получи согласие, затем повтори с dryRun: false.");
+            }
+            return lines.join("\n");
+          }
+
+          if (action === "restoredisk") {
+            const snapRef = String(args.snapshot || args.snapshotId || "").trim();
+            if (!snapRef) return "Ошибка: укажи snapshot — имя или id снимка.";
+            if (args.confirm !== true) {
+              return "Восстановление создаёт НОВЫЙ диск — он тарифицируется отдельно, а машины у него нет.\nПолучи согласие пользователя и повтори с confirm: true.";
+            }
+            const r = await ycCompute.restoreDisk(cfg.oauth, {
+              folderId: cfg.folderId,
+              snapshot: snapRef,
+              name: args.diskName || args.name,
+              zone: args.zone || args.zoneId,
+              diskType: args.diskType,
+              sizeGb: args.sizeGb,
+            });
+            return "✅ " + r.message + "\nid диска: " + r.disk.id +
+              "\n\nПоднять машину с этих данных: ycCompute { action: \"create\", name: \"…\", bootDiskId: \"" + r.disk.id + "\", confirm: true }." +
+              (r.warnings.length ? "\n\n⚠ " + r.warnings.join("\n⚠ ") : "");
+          }
+
+          return "Ошибка: действие " + action + " не обработано.";
+        } catch (e) {
+          return "Yandex Cloud (ycCompute, action=" + action + "): " + ((e && e.message) || String(e));
+        }
+    },
+
+    // IAM: сервисные аккаунты, роли и ключи. Раньше приложение умело только
+    // «завести аккаунт под выкатку» внутри деплоя — посмотреть, какие аккаунты
+    // есть, что им выдано и чем они входят, было нечем. Тела запросов живут в
+    // src/yc-iam.js: здесь выбор действия, права и человеческий ответ.
+    "ycIam": async (args, settings) => {
+        const cfg = ycConfig(loadSettings());
+        if (!ycIam) return "Ошибка: модуль IAM (src/yc-iam.js) не подключён в этой сборке.";
+        const action = String(args.action || "list").trim().toLowerCase();
+        const ACTIONS = ["list", "card", "keys", "rolemap", "suggest", "roles", "create", "update", "delete", "grant", "revoke", "newkey", "delkey"];
+        if (ACTIONS.indexOf(action) < 0) {
+          return "Ошибка: неизвестное действие ycIam «" + action + "». Доступно: " + ACTIONS.join(", ") + ".";
+        }
+        // «Какие роли бывают» и «чего хватит для задачи» — это знание приложения,
+        // а не облака: отвечаем ДО проверок подключения, иначе агент не подскажет
+        // роль раньше, чем пользователь вставит токен.
+        if (action === "rolemap") {
+          const rows = ycIam.ROLE_CATALOG.map((r) => "• " + r.id + " — " + r.title + (r.note ? " (" + r.note + ")" : ""));
+          return "Роли Yandex Cloud, которые чаще всего нужны:\n" + rows.join("\n") +
+            "\n\nШирокие роли (действуют на ВЕСЬ каталог): " + ycIam.PRIMITIVE_ROLES.join(", ") + ". Не выдавай их «на всякий случай» — узкая роль делает ровно то, что нужно." +
+            "\nКаких ролей хватает для задачи: ycIam { action: \"suggest\" }. Полный живой список ролей облака: ycIam { action: \"roles\", filter: \"storage\" }.";
+        }
+        if (action === "suggest") {
+          const task = String(args.task || "").trim();
+          if (!task) {
+            return "Для какой задачи подобрать роли? Доступные: " + ycIam.TASK_KEYS.join(", ") + ".\nПример: ycIam { action: \"suggest\", task: \"site\" }.";
+          }
+          const m = ycIam.minimalRoles(task);
+          if (!m) return "Не знаю такой задачи «" + task + "». Доступные: " + ycIam.TASK_KEYS.join(", ") + ".";
+          return "Для задачи «" + m.title + "» хватает ролей: " + m.roles.join(", ") + "." + (m.note ? "\n" + m.note : "") +
+            "\nВыдать: ycIam { action: \"grant\", account: \"<имя сервисного аккаунта>\", role: \"" + m.roles[0] + "\" }." +
+            "\nЕсли аккаунта ещё нет: ycIam { action: \"create\", name: \"sa-site\", description: \"зачем он нужен\" }.";
+        }
+        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
+        if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud.";
+        const account = String(args.account || args.serviceAccount || args.name || args.id || "").trim();
+        const needsCreate = ["create", "newkey"].indexOf(action) >= 0;
+        const needsUpdate = ["update", "grant", "revoke"].indexOf(action) >= 0;
+        const needsDelete = ["delete", "delkey"].indexOf(action) >= 0;
+        if (needsCreate && !cfg.allowCreate) {
+          return "⛔ Заводить сервисные аккаунты и ключи агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту создавать ресурсы». Посмотреть, что уже есть, можно и сейчас: ycIam { action: \"list\" }.";
+        }
+        if (needsUpdate && !cfg.allowUpdate) {
+          return "⛔ Менять роли и настройки аккаунтов агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту менять контейнеры и правила сети» — он же разрешает правку прав. Посмотреть роли можно и сейчас: ycIam { action: \"list\" }.";
+        }
+        if (needsDelete && !cfg.allowDelete) {
+          return "⛔ Удалять сервисные аккаунты и ключи агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту удалять ресурсы». Посмотреть, что есть, можно и сейчас: ycIam { action: \"list\" }.";
+        }
+        try {
+          const where = "«" + (cfg.folderName || cfg.folderId) + "»";
+
+          if (action === "list") {
+            const ov = await ycIam.overview(cfg.oauth, cfg.folderId);
+            const lines = ["Сервисные аккаунты в каталоге " + where + " (" + ov.accounts.length + ")"];
+            lines.push(...ov.lines);
+            lines.push("");
+            lines.push("Подробнее про один аккаунт: ycIam { action: \"card\", account: \"имя\" }. Его ключи: ycIam { action: \"keys\", account: \"имя\" }.");
+            lines.push("Завести новый: ycIam { action: \"create\", name: \"sa-site\", description: \"зачем нужен\" }, потом УЗКУЮ роль: ycIam { action: \"grant\", account: \"sa-site\", role: \"storage.editor\" }.");
+            lines.push("Ключ нужен только тому, кто работает ВНЕ облака (скрипт, выкатка, машина): ycIam { action: \"newkey\", account: \"sa-site\", kind: \"access\", confirm: true }.");
+            return lines.join("\n");
+          }
+
+          if (action === "card") {
+            if (!account) return "Ошибка: укажи account — имя или id сервисного аккаунта. Список: ycIam { action: \"list\" }.";
+            const acc = await ycIam.findServiceAccount(cfg.oauth, cfg.folderId, account);
+            if (!acc) return "Не нашёл сервисный аккаунт «" + account + "» в каталоге " + where + ". Список: ycIam { action: \"list\" }.";
+            const keys = await ycIam.allKeys(cfg.oauth, acc.id).catch(() => null);
+            const roles = await ycIam.bindingsFor(cfg.oauth, cfg.folderId, acc.id).catch(() => []);
+            return ycIam.cardLines(acc, { keys, roles, keysError: keys ? "" : "список ключей прочитать не удалось (проверь права на iam.serviceAccounts.get)" }).join("\n");
+          }
+
+          if (action === "keys") {
+            if (!account) return "Ошибка: укажи account — имя или id сервисного аккаунта (список: ycIam { action: \"list\" }).";
+            const acc = await ycIam.resolveAccount(cfg.oauth, cfg.folderId, account);
+            const k = await ycIam.allKeys(cfg.oauth, acc.id);
+            if (!k.total) {
+              return "У аккаунта «" + acc.name + "» ключей нет: снаружи облака под ним войти нельзя, а всё, что ходит под ним, обязано работать внутри облака." +
+                "\nНужен ключ? ycIam { action: \"newkey\", account: \"" + acc.name + "\", kind: \"access\", confirm: true } — ключ доступа (объектное хранилище, скрипты, бэкапы), kind: \"api\" — API-ключ (вызов API сервисов), kind: \"authorized\" — ключ подписи (SSH к машине).";
+            }
+            const rows = k.keys.map((x) => {
+              const kind = x.kind === "access" ? "доступ" : x.kind === "api" ? "API" : "подпись";
+              return "• " + kind + ": " + (x.description || x.keyId || x.id) + " · " + x.usedHuman + " · id " + x.id + (x.expiresAt ? " · истекает " + x.expiresAt : "");
+            });
+            return "Ключи аккаунта «" + acc.name + "» (" + k.total + "):\n" + rows.join("\n") +
+              (k.troubles.length ? "\n\n⚠ " + k.troubles.join("\n⚠ ") : "") +
+              (k.errors.length ? "\n\nЧасть ключей не прочиталась: " + k.errors.join("; ") : "") +
+              "\n\nСекрета здесь нет и не будет: облако показывает его ТОЛЬКО в момент создания. Лишний ключ удаляется: ycIam { action: \"delkey\", kind: \"access|api|authorized\", keyId: \"id из списка\", account: \"" + acc.name + "\" }.";
+          }
+
+          if (action === "roles") {
+            const filter = String(args.filter || "").trim();
+            const list = await ycIam.roles(cfg.oauth, filter);
+            const known = list.filter((r) => r.known);
+            const rows = list.slice(0, 60).map((r) => "• " + r.id + (r.known && r.kind ? " [" + r.kind + "]" : "") + (r.description ? " — " + r.description : ""));
+            return "Роли облака" + (filter ? " по фильтру «" + filter + "»" : "") + " (" + list.length + "):\n" + rows.join("\n") +
+              (list.length > 60 ? "\n…и ещё " + (list.length - 60) + " — уточни filter." : "") +
+              "\n\nЧеловеческие пояснения к частым ролям: ycIam { action: \"rolemap\" }. Известных приложению ролей в этом списке: " + known.length + ".";
+          }
+
+          if (action === "create") {
+            const r = await ycIam.createServiceAccount(cfg.oauth, {
+              folderId: cfg.folderId,
+              name: args.name,
+              description: args.description,
+              labels: args.labels,
+              expiresAt: args.expiresAt,
+            });
+            return "✅ " + r.message + "\n\n⚠ " + (r.warnings || []).join("\n⚠ ") +
+              "\n\nДальше: ycIam { action: \"grant\", account: \"" + r.account.name + "\", role: \"<узкая роль>\" } — какие роли нужны для задачи, подскажет ycIam { action: \"suggest\", task: \"site\" }.";
+          }
+
+          if (action === "update") {
+            const r = await ycIam.updateServiceAccount(cfg.oauth, {
+              folderId: cfg.folderId,
+              account,
+              newName: args.newName,
+              description: args.description,
+            });
+            return (r.changed ? "✅ " : "") + r.message;
+          }
+
+          if (action === "delete") {
+            if (!account) return "Ошибка: укажи account — имя или id сервисного аккаунта, который надо удалить (список: ycIam { action: \"list\" }).";
+            const r = await ycIam.deleteServiceAccount(cfg.oauth, { folderId: cfg.folderId, account });
+            return "🗑 " + r.message + ((r.warnings || []).length ? "\n\n⚠ " + r.warnings.join("\n⚠ ") : "") +
+              "\n\nЭто необратимо: вернуть аккаунт нельзя, можно только завести новый и выдать ему роль заново.";
+          }
+
+          if (action === "grant") {
+            const r = await ycIam.grantRole(cfg.oauth, { folderId: cfg.folderId, account, role: args.role });
+            return (r.changed ? "✅ " : "") + r.message +
+              "\nРоли аккаунта «" + r.account.name + "»: " + (r.roles.join(", ") || "нет") +
+              ((r.warnings || []).length ? "\n\n⚠ " + r.warnings.join("\n⚠ ") : "");
+          }
+
+          if (action === "revoke") {
+            const r = await ycIam.revokeRole(cfg.oauth, { folderId: cfg.folderId, account, role: args.role });
+            return (r.changed ? "✅ " : "") + r.message +
+              "\nОстались роли: " + (r.roles.join(", ") || "НЕТ — аккаунт больше ничего не может") +
+              ((r.warnings || []).length ? "\n\n⚠ " + r.warnings.join("\n⚠ ") : "");
+          }
+
+          if (action === "newkey") {
+            if (!account) return "Ошибка: укажи account — имя или id сервисного аккаунта, для которого создаётся ключ.";
+            const kind = String(args.kind || args.type || "access").trim().toLowerCase();
+            const kindHuman = kind === "api" ? "API-ключ (вызов API сервисов: API Gateway, функции)" : kind === "authorized" || kind === "key" ? "ключ подписи (вход по SSH к машине)" : "ключ доступа (объектное хранилище, скрипты, бэкапы)";
+            if (args.confirm !== true) {
+              return "Ключ — это ДОСТУП: облако отдаст секрет РОВНО ОДИН раз, обратно его не покажут ни в списке, ни здесь.\nЧто будет создано: " + kindHuman + " для аккаунта «" + account + "»." +
+                "\nПолучи согласие пользователя и повтори с confirm: true. Место секрета — хранилище секретов (ycSecret / Lockbox), а не переписка.";
+            }
+            const opts = {
+              folderId: cfg.folderId,
+              account,
+              description: args.description,
+              expiresAt: args.expiresAt,
+              scopes: args.scopes,
+              algorithm: args.algorithm,
+            };
+            const r = kind === "api" ? await ycIam.createApiKey(cfg.oauth, opts) : kind === "authorized" || kind === "key" ? await ycIam.createAuthorizedKey(cfg.oauth, opts) : await ycIam.createAccessKey(cfg.oauth, opts);
+            const secret = String(r.secret || r.privateKey || "");
+            return "✅ " + r.message +
+              "\n\nСЕКРЕТ — показывается один раз:\n" + secret +
+              "\n\n⚠ " + (r.warnings || []).join("\n⚠ ") +
+              "\n\nСохрани его в хранилище секретов (ycSecret) или попроси пользователя записать — в переписке и журнале прогона секрету не место. Если ключ создан «на посмотреть» — удали: ycIam { action: \"delkey\", kind: \"" + (kind === "api" ? "api" : kind === "authorized" || kind === "key" ? "authorized" : "access") + "\", keyId: \"" + (r.key.id || r.key.keyId) + "\", account: \"" + r.account.name + "\" }.";
+          }
+
+          if (action === "delkey") {
+            let keyId = String(args.keyId || args.id || "").trim();
+            const kind = String(args.kind || args.type || "").trim();
+            if (!keyId) return "Ошибка: укажи keyId — id ключа из списка (ycIam { action: \"keys\", account: \"имя\" }).";
+            // В списке рядом с id видно и keyId (тот, что похож на AWS-ключ), и
+            // человек скопирует то, что видит. Если назван аккаунт — приводим
+            // ссылку к id, который принимает API.
+            if (account) {
+              const acc = await ycIam.resolveAccount(cfg.oauth, cfg.folderId, account);
+              const k = await ycIam.allKeys(cfg.oauth, acc.id);
+              const found = k.keys.find((x) => x.id === keyId || x.keyId === keyId) || null;
+              if (found) keyId = found.id;
+            }
+            const r = await ycIam.deleteKeyByKind(cfg.oauth, kind, keyId);
+            return "🗑 " + r.message + "\nВсё, что ходило этим ключом, больше не войдёт в облако — если это был рабочий скрипт или выкатка, они сломаются.";
+          }
+
+          return "Ошибка: действие " + action + " не обработано.";
+        } catch (e) {
+          return "Yandex Cloud (ycIam, action=" + action + "): " + ((e && e.message) || String(e));
+        }
+    },
+
+    // Cloud Functions: функции, версии, теги, вызов и публичный доступ. Раньше
+    // их не было видно даже в списке ресурсов, и «сделать что-то, что отвечает в
+    // интернете и стоит копейки» агент не мог предложить. Тела запросов живут в
+    // src/yc-functions.js: здесь выбор действия, права и человеческий ответ.
+    "ycFunctions": async (args, settings) => {
+        const cfg = ycConfig(loadSettings());
+        if (!ycFunctions) return "Ошибка: модуль Cloud Functions (src/yc-functions.js) не подключён в этой сборке.";
+        const action = String(args.action || "list").trim().toLowerCase();
+        const ACTIONS = ["list", "card", "versions", "runtimes", "create", "update", "delete", "deploy", "invoke", "tag", "untag", "delversion", "public", "private", "access"];
+        if (ACTIONS.indexOf(action) < 0) {
+          return "Ошибка: неизвестное действие ycFunctions «" + action + "». Доступно: " + ACTIONS.join(", ") + ".";
+        }
+        // Список языков — знание облака, но и без подключённого облака агент
+        // должен подсказать, на чём писать функцию.
+        if (action === "runtimes" && !cfg.oauth) {
+          return "Частые языки выполнения Cloud Functions: " + ycFunctions.RUNTIMES_HINT.join(", ") + ".\nТочный список облака появится после подключения (Настройки → «☁️ Yandex Cloud») — тогда сработает ycFunctions { action: \"runtimes\" }.";
+        }
+        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
+        if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud.";
+        const ref = String(args.function || args.name || args.id || "").trim();
+        const needsCreate = ["create", "deploy"].indexOf(action) >= 0;
+        const needsUpdate = ["update", "tag", "untag", "public", "private"].indexOf(action) >= 0;
+        const needsDelete = ["delete", "delversion"].indexOf(action) >= 0;
+        if (needsCreate && !cfg.allowCreate) {
+          return "⛔ Создавать функции агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту создавать ресурсы». Посмотреть, что уже есть, можно и сейчас: ycFunctions { action: \"list\" }.";
+        }
+        if (needsUpdate && !cfg.allowUpdate) {
+          return "⛔ Менять функции агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту менять контейнеры и правила сети» — он же разрешает теги, публичность и переменные версий. Посмотреть можно и сейчас: ycFunctions { action: \"list\" }.";
+        }
+        if (needsDelete && !cfg.allowDelete) {
+          return "⛔ Удалять функции и их версии агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту удалять ресурсы». Посмотреть, что есть, можно и сейчас: ycFunctions { action: \"list\" }.";
+        }
+        try {
+          const where = "«" + (cfg.folderName || cfg.folderId) + "»";
+
+          if (action === "list") {
+            const ov = await ycFunctions.overview(cfg.oauth, cfg.folderId);
+            const lines = ["Функции Cloud Functions в каталоге " + where + " (" + ov.functions.length + ")"];
+            lines.push(...ov.lines);
+            lines.push("");
+            lines.push("Подробнее: ycFunctions { action: \"card\", function: \"имя\" }. Версии: action: \"versions\". Вызвать: action: \"invoke\".");
+            lines.push("Создать и выкатить первую версию: ycFunctions { action: \"create\", name: \"hello-func\" } → ycFunctions { action: \"deploy\", function: \"hello-func\", zipFile: \"index.zip\", runtime: \"nodejs22\", entrypoint: \"index.handler\" }.");
+            lines.push("Важно: функции бесплатны, пока их не зовут (первые 1 млн вызовов и 10 ГБ×час в месяц не тарифицируются), поэтому для «редкого» и «по расписанию» это дешевле машины.");
+            return lines.join("\n");
+          }
+
+          if (action === "runtimes") {
+            const list = await ycFunctions.runtimes(cfg.oauth).catch(() => []);
+            return "Языки выполнения Cloud Functions (" + list.length + "):\n" + list.join(", ") +
+              "\n\nЧастые: " + ycFunctions.RUNTIMES_HINT.slice(0, 8).join(", ") + ". Версия языка — часть идентификатора (nodejs22, а не node22).";
+          }
+
+          if (action === "card") {
+            if (!ref) return "Ошибка: укажи function — имя или id (список: ycFunctions { action: \"list\" }).";
+            const fn = await ycFunctions.findFunction(cfg.oauth, cfg.folderId, ref);
+            if (!fn) return "Не нашёл функцию «" + ref + "» в каталоге " + where + ". Список: ycFunctions { action: \"list\" }.";
+            const vers = await ycFunctions.versions(cfg.oauth, fn.id).catch(() => []);
+            const binds = await ycFunctions.accessBindings(cfg.oauth, fn.id).catch(() => []);
+            const isPublic = ycFunctions.isPublic(binds);
+            const url = await ycFunctions.invokeUrlOf(cfg.oauth, fn);
+            return ycFunctions.cardLines(fn, { versions: vers, public: isPublic, url }).join("\n");
+          }
+
+          if (action === "versions") {
+            if (!ref) return "Ошибка: укажи function — имя или id функции.";
+            const fn = await ycFunctions.findFunction(cfg.oauth, cfg.folderId, ref);
+            if (!fn) return "Не нашёл функцию «" + ref + "» в каталоге " + where + ".";
+            const vers = await ycFunctions.versions(cfg.oauth, fn.id);
+            if (!vers.length) {
+              return "У функции «" + fn.name + "» нет ни одной версии: она не отвечает и вызвать её нельзя. Выкатить код: ycFunctions { action: \"deploy\", function: \"" + fn.name + "\", zipFile: \"index.zip\", runtime: \"nodejs22\", entrypoint: \"index.handler\" }.";
+            }
+            const active = ycFunctions.activeVersion(vers);
+            const rows = vers.map((v) => {
+              const t = v.tags.length ? " · теги: " + v.tags.join(", ") : "";
+              return "• " + v.id.slice(0, 8) + (active && v.id === active.id ? " (отвечает по умолчанию)" : "") + " · " + v.runtime + " · " + v.memoryHuman + " · " + v.statusHuman + " · " + v.ageHuman + t + (v.envCount ? " · переменных: " + v.envCount : "");
+            });
+            const warns = [];
+            for (const v of vers) warns.push(...ycFunctions.versionTrouble(v, vers));
+            const tags = ycFunctions.stableTags(vers);
+            return "Версии функции «" + fn.name + "» (" + vers.length + "):\n" + rows.join("\n") +
+              "\n\nПостоянные адреса: " + (tags.length ? tags.map((x) => x.tag + " → ?tag=" + x.tag).join("; ") : "НЕТ — адрес без тега всегда ведёт на самую новую версию, значит следующая выкатка меняет то, что отвечает. Поставь тег: ycFunctions { action: \"tag\", function: \"" + fn.name + "\", tag: \"v1\" }") +
+              (warns.length ? "\n\n⚠ " + warns.join("\n⚠ ") : "");
+          }
+
+          if (action === "create") {
+            const r = await ycFunctions.createFunction(cfg.oauth, {
+              folderId: cfg.folderId,
+              name: args.name,
+              description: args.description,
+              labels: args.labels,
+            });
+            return "✅ " + r.message + "\n\n⚠ " + (r.warnings || []).join("\n⚠ ");
+          }
+
+          if (action === "update") {
+            const r = await ycFunctions.updateFunction(cfg.oauth, {
+              folderId: cfg.folderId,
+              function: ref,
+              newName: args.newName,
+              description: args.description,
+              labels: args.labels,
+            });
+            return (r.changed ? "✅ " : "") + r.message;
+          }
+
+          if (action === "deploy") {
+            if (!ref) return "Ошибка: укажи function — имя функции (или создай её: ycFunctions { action: \"create\", name: \"hello-func\" }).";
+            const r = await ycFunctions.createVersion(cfg.oauth, {
+              folderId: cfg.folderId,
+              function: ref,
+              runtime: args.runtime,
+              entrypoint: args.entrypoint || args.handler,
+              memoryMb: args.memoryMb != null ? args.memoryMb : args.memory,
+              timeoutSec: args.timeoutSec != null ? args.timeoutSec : args.timeout,
+              environment: args.environment || args.env,
+              tag: args.tag,
+              description: args.description,
+              serviceAccountId: args.serviceAccountId,
+              zipFile: args.zipFile || args.file,
+              contentBase64: args.contentBase64,
+              sourceVersionId: args.sourceVersionId,
+              package: args.package,
+              networkId: args.networkId,
+              concurrency: args.concurrency,
+              secrets: args.secrets,
+            });
+            return "✅ " + r.message + "\n\n⚠ " + (r.warnings || []).join("\n⚠ ") +
+              "\n\nПроверь, что отвечает: ycFunctions { action: \"invoke\", function: \"" + r.function.name + "\" }. Что внутри: ycLogs { service: \"cloudFunctions\", id: \"" + r.function.id + "\" }.";
+          }
+
+          if (action === "invoke") {
+            if (!ref) return "Ошибка: укажи function — имя функции.";
+            const r = await ycFunctions.invoke(cfg.oauth, {
+              folderId: cfg.folderId,
+              function: ref,
+              tag: args.tag,
+              payload: args.payload,
+              timeoutMs: args.timeoutMs,
+            });
+            const head = (r.ok ? "✅ " : "⚠ ") + r.message + "\nАдрес: " + r.url;
+            const body = r.text ? "\nОтвет" + (r.json ? " (JSON)" : "") + ":\n" + r.text + (r.truncated ? "\n…(ответ обрезан)" : "") : "\nФункция вернула пустой ответ.";
+            return head + body + (r.hint ? "\n\n" + r.hint : "");
+          }
+
+          if (action === "tag" || action === "untag") {
+            if (!ref) return "Ошибка: укажи function — имя функции.";
+            const r = await ycFunctions.setTag(cfg.oauth, {
+              folderId: cfg.folderId,
+              function: ref,
+              version: args.version || args.versionId,
+              tag: args.tag,
+              remove: action === "untag",
+            });
+            return (r.changed ? "✅ " : "") + r.message + (r.url && action === "tag" ? "\nАдрес: " + r.url : "") +
+              ((r.warnings || []).length ? "\n\n⚠ " + r.warnings.join("\n⚠ ") : "");
+          }
+
+          if (action === "delversion") {
+            if (!ref) return "Ошибка: укажи function — имя функции.";
+            const r = await ycFunctions.deleteVersion(cfg.oauth, { folderId: cfg.folderId, function: ref, version: args.version || args.versionId });
+            return "🗑 " + r.message + ((r.warnings || []).length ? "\n\n⚠ " + r.warnings.join("\n⚠ ") : "");
+          }
+
+          if (action === "delete") {
+            if (!ref) return "Ошибка: укажи function — имя функции, которую надо удалить (список: ycFunctions { action: \"list\" }).";
+            if (args.confirm !== true) {
+              const fn = await ycFunctions.findFunction(cfg.oauth, cfg.folderId, ref);
+              if (!fn) return "Не нашёл функцию «" + ref + "» в каталоге " + where + ".";
+              const vers = await ycFunctions.versions(cfg.oauth, fn.id).catch(() => []);
+              const binds = await ycFunctions.accessBindings(cfg.oauth, fn.id).catch(() => []);
+              const isPublic = ycFunctions.isPublic(binds);
+              return "Удаление функции «" + fn.name + "» необратимо: уйдут ВСЕ её версии (" + vers.length + ") и их теги" +
+                (isPublic ? ", а публичный адрес перестанет работать у всех, кто им пользовался" : "") + ".\n" +
+                "Если функция кому-то отвечает, сначала предложи пользователю перенести вызов на новую версию или на другую функцию." +
+                "\nПолучи согласие и повтори с confirm: true.";
+            }
+            const r = await ycFunctions.deleteFunction(cfg.oauth, { folderId: cfg.folderId, function: ref });
+            return "🗑 " + r.message + ((r.warnings || []).length ? "\n\n⚠ " + r.warnings.join("\n⚠ ") : "");
+          }
+
+          if (action === "public" || action === "private") {
+            if (!ref) return "Ошибка: укажи function — имя функции.";
+            const r = await ycFunctions.setPublic(cfg.oauth, {
+              folderId: cfg.folderId,
+              function: ref,
+              tag: args.tag,
+              on: action === "public",
+            });
+            return (r.changed ? "✅ " : "") + r.message + ((r.warnings || []).length ? "\n\n⚠ " + r.warnings.join("\n⚠ ") : "");
+          }
+
+          if (action === "access") {
+            if (!ref) return "Ошибка: укажи function — имя функции.";
+            const fn = await ycFunctions.findFunction(cfg.oauth, cfg.folderId, ref);
+            if (!fn) return "Не нашёл функцию «" + ref + "» в каталоге " + where + ".";
+            const binds = await ycFunctions.accessBindings(cfg.oauth, fn.id);
+            const isPublic = ycFunctions.isPublic(binds);
+            const rows = binds.length
+              ? binds.map((b) => "• " + b.roleId + " → " + (b.isPublic ? "все (allUsers)" : b.subjectId + " (" + b.subjectType + ")")).join("\n")
+              : "прямых привязок нет: вызывать может только владелец каталога и роли из IAM";
+            return "Кому разрешено вызывать функцию «" + fn.name + "»:\n" + rows +
+              "\n\n" + (isPublic
+                ? "Функция ПУБЛИЧНАЯ: её может вызвать кто угодно из интернета. Закрыть: ycFunctions { action: \"private\", function: \"" + fn.name + "\" }."
+                : "Функция закрытая: чтобы её вызвали снаружи, нужна роль " + ycFunctions.INVOKER_ROLE + " у вызывающего либо публичность (ycFunctions { action: \"public\" }) — но тогда её позовёт кто угодно.");
+          }
+
+          return "Ошибка: действие " + action + " не обработано.";
+        } catch (e) {
+          return "Yandex Cloud (ycFunctions, action=" + action + "): " + ((e && e.message) || String(e));
+        }
+    },
+
+    // Биллинг: платёжный аккаунт, пороги и «за что мы платим». Только чтение —
+    // и это не упущение: менять деньги по API облако не даёт вообще. Поэтому ни
+    // один чекбокс разрешений к инструменту не относится: посмотреть, сколько
+    // уходит и на что, агент обязан мочь всегда, а не когда разрешили тратить.
+    "ycBilling": async (args, settings) => {
+        const cfg = ycConfig(loadSettings());
+        if (!ycBilling) return "Ошибка: модуль биллинга (src/yc-billing.js) не подключён в этой сборке.";
+        const action = String(args.action || "overview").trim().toLowerCase();
+        const ACTIONS = ["overview", "accounts", "account", "budgets", "price", "services", "leaks"];
+        if (ACTIONS.indexOf(action) < 0) {
+          return "Ошибка: неизвестное действие ycBilling «" + action + "». Доступно: " + ACTIONS.join(", ") + ".\nБиллинг только ЧИТАЕТ: он ничего не создаёт, не меняет и не удаляет.";
+        }
+        if (!cfg.oauth) {
+          return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud». Ориентиры по цене работают и без подключения: ycCosts(service).";
+        }
+        if ((action === "overview" || action === "leaks") && !cfg.folderId) {
+          return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud — без него не видно, за что платят. Баланс и пороги каталога не требуют: ycBilling { action: \"accounts\" }.";
+        }
+        try {
+          const where = "«" + (cfg.folderName || cfg.folderId) + "»";
+
+          if (action === "accounts") {
+            const list = await ycBilling.accounts(cfg.oauth);
+            if (!list.length) return "Платёжных аккаунтов нет: облако не привязано к счёту — платные ресурсы создавать некуда.";
+            return "Платёжные аккаунты (" + list.length + "):\n" + [].concat.apply([], list.map(ycBilling.accountLines)).join("\n") +
+              "\n\nБаланс — это НЕ расход: отрицательный баланс означает, что облако скоро остановит ресурсы. Пороги: ycBilling { action: \"budgets\", account: \"id\" }. Сумма счёта — только в консоли (Биллинг → Расходы).";
+          }
+
+          if (action === "account") {
+            const acc = await ycBilling.findAccount(cfg.oauth, args.account);
+            return ycBilling.accountLines(acc).join("\n") +
+              "\n\nПороги этого аккаунта: ycBilling { action: \"budgets\", account: \"" + acc.id + "\" }.";
+          }
+
+          if (action === "services") {
+            const list = await ycBilling.services(cfg.oauth);
+            return "Услуги, которые облако тарифицирует (" + list.length + "):\n" +
+              list.map((x) => "• " + x.name + " — " + x.id).join("\n") +
+              "\n\nЦену ищи по названию: ycBilling { action: \"price\", query: \"быстрый диск\" }. Сузить до услуги: ycBilling { action: \"price\", query: \"диск\", serviceId: \"" + ((list[0] || {}).id || "") + "\" }.";
+          }
+
+          if (action === "price") {
+            const query = String(args.query || args.what || "").trim();
+            if (!query) return "Ошибка: скажи, чью цену искать — ycBilling { action: \"price\", query: \"быстрый диск\" }. Слова: диск, ядро, память, функция, бакет, запрос.";
+            const r = await ycBilling.priceSearch(cfg.oauth, {
+              query: query,
+              currency: args.currency,
+              serviceId: args.serviceId,
+              billingAccountId: args.account,
+              limit: args.limit,
+            });
+            return "Цены из живого каталога облака по запросу «" + query + "»:\n" + r.lines.join("\n") +
+              (r.total ? "\n\nСвой ориентир по ресурсу: ycCosts(service). Если облако говорит другое число — верь облаку и скажи пользователю, что наш ориентир устарел." : "");
+          }
+
+          if (action === "budgets") {
+            const acc = await ycBilling.findAccount(cfg.oauth, args.account);
+            const list = await ycBilling.budgets(cfg.oauth, acc.id);
+            if (!list.length) {
+              return "Порогов-бюджетов у аккаунта «" + (acc.name || acc.id) + "» нет. Это значит, что о перерасходе человек узнает по факту, а не заранее.\n" +
+                "Порог задаётся в консоли (Биллинг → Бюджеты): по API для создания нужен id пользователя для уведомлений, которого агент не знает и угадывать не должен.";
+            }
+            return "Пороги аккаунта «" + (acc.name || acc.id) + "» (" + list.length + "):\n" + [].concat.apply([], list.map(ycBilling.budgetLines)).join("\n") +
+              "\n\nПорог — это предупреждение, а не расход: сумму счёта облако по API не отдаёт (она в консоли, Биллинг → Расходы).";
+          }
+
+          if (action === "leaks") {
+            const l = await ycBilling.leaks(cfg.oauth, cfg.folderId);
+            return "Деньги, которые уходят в каталоге " + where + ":\n" + l.lines.join("\n") +
+              (l.count ? "\n\nПорядок действий: сначала предложи пользователю снимок (ycCompute { action: \"snapshot\", disk: \"имя\", confirm: true }), потом удаление — и только с его согласия. Сам ничего не удаляй." : "");
+          }
+
+          if (action === "overview") {
+            const ov = await ycBilling.overview(cfg.oauth, cfg.folderId, { account: args.account, currency: args.currency });
+            const lines = ["Деньги в Yandex Cloud" + (cfg.folderId ? " (каталог " + where + ")" : "")];
+            lines.push.apply(lines, ov.lines);
+            lines.push("");
+            lines.push("Что дальше: цены — ycBilling { action: \"price\", query: \"...\" }; хвосты — ycBilling { action: \"leaks\" }; баланс и пороги — ycBilling { action: \"accounts\" } и { action: \"budgets\" }. Оценка ДО создания ресурса — ycCosts.");
+            return lines.join("\n");
+          }
+
+          return "Ошибка: действие " + action + " не обработано.";
+        } catch (e) {
+          return "Yandex Cloud (ycBilling, action=" + action + "): " + ((e && e.message) || String(e));
+        }
+    },
+    // HTTPS-сайт на своём домене: сертификат Certificate Manager (бесплатный,
+    // Let's Encrypt) и ресурс Cloud CDN, который раздаёт файлы из бакета по
+    // https. Без этого «свой сайт» оставался либо http, либо чужим хостингом:
+    // сертификат и CDN делались только в консоли облака. Тела запросов живут в
+    // src/yc-cdn.js: здесь выбор действия, права и человеческий ответ.
+    "ycCdn": async (args, settings) => {
+        const cfg = ycConfig(loadSettings());
+        if (!ycCdn) return "Ошибка: модуль сертификатов и CDN (src/yc-cdn.js) не подключён в этой сборке.";
+        const action = String(args.action || "overview").trim().toLowerCase();
+        const ACTIONS = ["overview", "certs", "cert", "certnew", "certimport", "certupdate", "certdel", "cdn", "cdninfo", "cdncreate", "cdnupdate", "cdnpurge", "cdndel", "origins", "origincreate", "originupdate", "origindel"];
+        if (ACTIONS.indexOf(action) < 0) {
+          return "Ошибка: неизвестное действие ycCdn «" + action + "». Доступно: " + ACTIONS.join(", ") + ".\nЭто про HTTPS-сайт: сертификат (Certificate Manager) и CDN-ресурс (Cloud CDN).";
+        }
+        if (!cfg.oauth) {
+          return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud». Ориентир по цене CDN работает и без подключения: ycCosts(\"cdn\").";
+        }
+        if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud — сертификат и CDN-ресурс живут в каталоге.";
+        const ref = String(args.certificate || args.cert || args.resource || args.cdn || args.group || args.id || args.name || args.cname || args.domain || "").trim();
+        // Права: создание — сертификат и CDN-ресурс, правка — привязка
+        // сертификата, включение/выключение и очистка кэша, удаление — снос.
+        const needsCreate = ["certnew", "certimport", "cdncreate", "origincreate"].indexOf(action) >= 0;
+        const needsUpdate = ["certupdate", "cdnupdate", "cdnpurge", "originupdate"].indexOf(action) >= 0;
+        const needsDelete = ["certdel", "cdndel", "origindel"].indexOf(action) >= 0;
+        if (needsCreate && !cfg.allowCreate) {
+          return "⛔ Создавать сертификаты и CDN-ресурсы агентом ЗАПРЕЧЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту создавать ресурсы». Посмотреть, что уже есть, можно и сейчас: ycCdn { action: \"overview\" }.";
+        }
+        if (needsUpdate && !cfg.allowUpdate) {
+          return "⛔ Менять сертификаты и CDN агентом ЗАПРЕЧЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту менять контейнеры и правила сети» — он же разрешает привязку сертификата, включение ресурса и очистку кэша. Посмотреть можно и сейчас: ycCdn { action: \"overview\" }.";
+        }
+        if (needsDelete && !cfg.allowDelete) {
+          return "⛔ Удалять сертификаты и CDN-ресурсы агентом ЗАПРЕЧЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту удалять ресурсы». Посмотреть, что есть, можно и сейчас: ycCdn { action: \"overview\" }.";
+        }
+        try {
+          const where = "«" + (cfg.folderName || cfg.folderId) + "»";
+
+          if (action === "overview") {
+            const certs = await ycCdn.certOverview(cfg.oauth, cfg.folderId);
+            const cdn = await ycCdn.cdnOverview(cfg.oauth, cfg.folderId);
+            const lines = ["HTTPS-сайт в каталоге " + where + ": сертификаты и CDN"];
+            lines.push("");
+            lines.push("Сертификаты (" + certs.certificates.length + ")");
+            lines.push(...certs.lines);
+            lines.push("");
+            lines.push("CDN-ресурсы (" + cdn.resources.length + ")");
+            lines.push(...cdn.lines);
+            lines.push("");
+            lines.push("Что дальше. Выпустить бесплатный сертификат: ycCdn { action: \"certnew\", name: \"site-cert\", domains: [\"cdn.example.com\"] } — и добавить запись подтверждения в DNS (её показывает action \"cert\").");
+            lines.push("Сделать сайт по https из бакета: ycCdn { action: \"cdncreate\", cname: \"cdn.example.com\", bucket: \"имя-бакета\", certificate: \"имя-сертификата\", confirm: true } — это ПЛАТНО (150 ₽/мес за ресурс), спрашивай согласие.");
+            lines.push("Порядок важен: сначала сертификат ВЫПУЩЕН (статус Issued), потом ресурс, потом CNAME домена на адрес провайдера. HTTPS заработает не сразу: проверка домена может занять часы, изменения в CDN — до 15 минут.");
+            return lines.join("\n");
+          }
+
+          if (action === "certs") {
+            const ov = await ycCdn.certOverview(cfg.oauth, cfg.folderId);
+            return "Сертификаты в каталоге " + where + " (" + ov.certificates.length + "):\n" + ov.lines.join("\n") +
+              "\n\nПодробнее: ycCdn { action: \"cert\", certificate: \"имя\" }. Выпустить: action \"certnew\" (бесплатно, Let's Encrypt).";
+          }
+
+          if (action === "cert") {
+            if (!ref) return "Ошибка: укажи certificate — имя, id или домен (список: ycCdn { action: \"certs\" }).";
+            const c = await ycCdn.requireCertificate(cfg.oauth, cfg.folderId, ref);
+            const out = ycCdn.certLines(c);
+            const plan = ycCdn.challengePlan(c);
+            if (plan.length) {
+              out.push("");
+              out.push("Проверка прав на домен:");
+              out.push(...ycCdn.planLines(plan));
+              out.push("Запись добавляется в DNS-зону домена. Если домен ведёт Cloud DNS — это ycDns { action: \"add\", ... }; если домен у другого регистратора — запись добавляет человек.");
+              if (c.challengeType === "DNS") out.push("CNAME-запись подтверждается один раз и дальше продления проходят сами; TXT придётся обновлять каждые 60 дней — поэтому бери CNAME.");
+            }
+            return out.join("\n");
+          }
+
+          if (action === "certnew") {
+            if (!args.domains && !args.domain) return "Ошибка: укажи domains — для каких доменов сертификат (например [\"cdn.example.com\"] или [\"example.com\", \"*.example.com\"]).";
+            const r = await ycCdn.requestCertificate(cfg.oauth, {
+              folderId: cfg.folderId,
+              name: args.name || "site-cert",
+              domains: args.domains || args.domain,
+              challengeType: args.challengeType,
+              description: args.description,
+              deletionProtection: args.deletionProtection,
+            });
+            const out = ["✅ " + r.message];
+            if (r.certificate) out.push(...ycCdn.certLines(r.certificate));
+            if (r.lines && r.lines.length) {
+              out.push("");
+              out.push("Что добавить, чтобы домен подтвердился:");
+              out.push(...r.lines);
+            }
+            out.push("");
+            for (const w of r.warnings || []) out.push("⚠ " + w);
+            return out.join("\n");
+          }
+
+          if (action === "certimport") {
+            const pem = args.certificateText || args.pem;
+            if (!pem || !(args.privateKey || args.key)) return "Ошибка: нужны и сертификат, и приватный ключ (полные PEM-файлы). Обычно проще взять бесплатный сертификат у облака: ycCdn { action: \"certnew\", domains: [...] }.";
+            const r = await ycCdn.importCertificate(cfg.oauth, {
+              folderId: cfg.folderId,
+              name: args.name || "site-cert",
+              certificate: pem,
+              chain: args.chain,
+              privateKey: args.privateKey || args.key,
+              description: args.description,
+            });
+            return "✅ " + r.message + "\n" + (r.warnings || []).map((w) => "⚠ " + w).join("\n");
+          }
+
+          if (action === "certupdate") {
+            if (!ref) return "Ошибка: укажи certificate — имя или id сертификата.";
+            const r = await ycCdn.updateCertificate(cfg.oauth, {
+              folderId: cfg.folderId,
+              certificate: ref,
+              certificateText: args.certificateText || args.pem,
+              privateKey: args.privateKey || args.key,
+              chain: args.chain,
+              newName: args.newName,
+              description: args.description,
+              labels: args.labels,
+              deletionProtection: args.deletionProtection,
+            });
+            return (r.changed ? "✅ " : "") + r.message;
+          }
+
+          if (action === "certdel") {
+            if (!ref) return "Ошибка: укажи certificate — имя или id сертификата.";
+            const r = await ycCdn.deleteCertificate(cfg.oauth, { folderId: cfg.folderId, certificate: ref, confirm: args.confirm === true });
+            if (!r.deleted) {
+              const out = ["⛔ Пока ничего не удаляю. " + r.message];
+              for (const w of r.warnings || []) out.push("  • " + w);
+              out.push("");
+              out.push("Получи согласие пользователя и повтори с confirm: true.");
+              return out.join("\n");
+            }
+            return "✅ " + r.message + "\n" + (r.warnings || []).map((w) => "⚠ " + w).join("\n");
+          }
+
+          if (action === "cdn" || action === "cdnlist") {
+            const ov = await ycCdn.cdnOverview(cfg.oauth, cfg.folderId);
+            return "CDN-ресурсы в каталоге " + where + " (" + ov.resources.length + "):\n" + ov.lines.join("\n") +
+              "\n\nПодробнее: ycCdn { action: \"cdninfo\", resource: \"домен\" }. Создать сайт из бакета: action \"cdncreate\" (платно, нужно согласие).";
+          }
+
+          if (action === "cdninfo") {
+            if (!ref) return "Ошибка: укажи resource — домен или id ресурса (список: ycCdn { action: \"cdn\" }).";
+            const r = await ycCdn.requireResource(cfg.oauth, cfg.folderId, ref);
+            const out = ycCdn.cdnLines(r);
+            if (r.providerCname) {
+              out.push("");
+              out.push("Домен должен указывать на CDN, а не на бакет: " + r.cname + " CNAME " + r.providerCname + ".");
+            }
+            return out.join("\n");
+          }
+
+          if (action === "cdncreate") {
+            if (!(args.cname || args.domain)) return "Ошибка: укажи cname — основной домен сайта (например cdn.example.com). Он задаётся один раз и потом не меняется.";
+            if (!(args.bucket || args.bucketName || args.originGroupId)) {
+              return "Ошибка: укажи источник — bucket: \"имя-бакета\" (проще всего) или originGroupId. Без источника CDN неоткуда брать файлы.";
+            }
+            const est = ycCosts && ycCosts.estimate ? ycCosts.estimate("cdn", {}) : null;
+            const r = await ycCdn.createResource(cfg.oauth, {
+              folderId: cfg.folderId,
+              cname: args.cname || args.domain,
+              bucket: args.bucket || args.bucketName,
+              originGroupId: args.originGroupId,
+              certificate: args.certificate || args.certificateId || args.sslCertificateId,
+              secondaryHostnames: args.secondaryHostnames || args.altDomains,
+              website: args.website,
+              originProtocol: args.originProtocol,
+              active: args.active,
+              options: args.options,
+              labels: args.labels,
+              confirm: args.confirm === true,
+            });
+            if (!r.created) {
+              const out = ["⛔ Пока ничего не создаю. " + r.message];
+              if (est) out.push(...ycCosts.formatLines(est).map((l) => "  " + l));
+              for (const w of r.warnings || []) out.push("  • " + w);
+              out.push("");
+              out.push("Назови пользователю цену и что получится, получи согласие и повтори с confirm: true.");
+              return out.join("\n");
+            }
+            const out = ["✅ " + r.message];
+            out.push(...(r.lines || []));
+            out.push("");
+            for (const w of r.warnings || []) out.push("⚠ " + w);
+            return out.join("\n");
+          }
+
+          if (action === "cdnupdate") {
+            if (!ref) return "Ошибка: укажи resource — домен или id CDN-ресурса.";
+            const r = await ycCdn.updateResource(cfg.oauth, {
+              folderId: cfg.folderId,
+              resource: ref,
+              certificate: args.certificate || args.certificateId || args.sslCertificateId,
+              disableSsl: args.disableSsl === true,
+              originGroupId: args.originGroupId,
+              secondaryHostnames: args.secondaryHostnames || args.altDomains,
+              active: args.active,
+              originProtocol: args.originProtocol,
+              options: args.options,
+              labels: args.labels,
+              cname: args.cname,
+            });
+            return (r.changed ? "✅ " : "") + r.message + "\n" + (r.warnings || []).map((w) => "⚠ " + w).join("\n");
+          }
+
+          if (action === "cdnpurge") {
+            if (!ref) return "Ошибка: укажи resource — домен или id CDN-ресурса.";
+            const r = await ycCdn.purgeCache(cfg.oauth, {
+              folderId: cfg.folderId,
+              resource: ref,
+              paths: args.paths || args.path,
+              all: args.all === true || args.full === true,
+            });
+            return "✅ " + r.message + "\n" + (r.warnings || []).map((w) => "⚠ " + w).join("\n");
+          }
+
+          if (action === "cdndel") {
+            if (!ref) return "Ошибка: укажи resource — домен или id CDN-ресурса.";
+            const r = await ycCdn.deleteResource(cfg.oauth, { folderId: cfg.folderId, resource: ref, confirm: args.confirm === true });
+            if (!r.deleted) {
+              const out = ["⛔ Пока ничего не удаляю. " + r.message];
+              for (const w of r.warnings || []) out.push("  • " + w);
+              out.push("");
+              out.push("Получи согласие пользователя и повтори с confirm: true.");
+              return out.join("\n");
+            }
+            return "✅ " + r.message + "\n" + (r.warnings || []).map((w) => "⚠ " + w).join("\n");
+          }
+
+          if (action === "origins") {
+            const groups = await ycCdn.originGroups(cfg.oauth, cfg.folderId);
+            if (!groups.length) return "Групп источников в каталоге " + where + " нет. Обычно их и не нужно создавать руками: cdncreate с bucket: \"имя-бакета\" делает группу сам.";
+            return "Группы источников в каталоге " + where + " (" + groups.length + "):\n" +
+              groups.map((g) => "• " + g.name + " — источников: " + g.origins.length + (g.origins.length ? " (" + g.origins.map((o) => o.human).join("; ") + ")" : "") + " · id " + g.id).join("\n");
+          }
+
+          if (action === "origincreate") {
+            const src = args.origins || args.source || args.bucket;
+            if (!src) return "Ошибка: укажи origin — domains: [{ bucket: \"имя-бакета\" }] или [{ source: \"files.example.com\" }].";
+            const r = await ycCdn.createOriginGroup(cfg.oauth, { folderId: cfg.folderId, name: args.name, origins: src, useNext: args.useNext });
+            return "✅ " + r.message + "\n" + (r.warnings || []).map((w) => "⚠ " + w).join("\n");
+          }
+
+          if (action === "originupdate") {
+            if (!ref) return "Ошибка: укажи group — имя или id группы источников.";
+            const r = await ycCdn.updateOriginGroup(cfg.oauth, {
+              folderId: cfg.folderId,
+              group: ref,
+              newName: args.newName,
+              origins: args.origins,
+              useNext: args.useNext,
+            });
+            return (r.changed ? "✅ " : "") + r.message + "\n" + (r.warnings || []).map((w) => "⚠ " + w).join("\n");
+          }
+
+          if (action === "origindel") {
+            if (!ref) return "Ошибка: укажи group — имя или id группы источников.";
+            const r = await ycCdn.deleteOriginGroup(cfg.oauth, { folderId: cfg.folderId, group: ref, confirm: args.confirm === true, force: args.force === true });
+            if (!r.deleted) {
+              const out = ["⛔ Пока ничего не удаляю. " + r.message];
+              for (const w of r.warnings || []) out.push("  • " + w);
+              out.push("");
+              out.push("Получи согласие пользователя и повтори с confirm: true.");
+              return out.join("\n");
+            }
+            return "✅ " + r.message;
+          }
+
+          return "Ошибка: действие " + action + " не обработано.";
+        } catch (e) {
+          return "Yandex Cloud (ycCdn, action=" + action + "): " + ((e && e.message) || String(e));
+        }
+    },
+
   };
 }
 

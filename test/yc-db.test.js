@@ -477,9 +477,14 @@ function buildTool(over, settingsOver) {
   });
 
   await test("ycDb: группа облака, правила промпта и список инструментов знают его", () => {
-    assert.ok(/"ycStorage", "ycDb", "ycCosts"/.test(CORE_SRC), "группы облака нет в ядре роутера");
+    // Проверяем СМЫСЛ («имя в группе облака»), а не соседство строк: точная
+    // последовательность имён ломается от появления любого соседнего инструмента
+    // (так и вышло с ycVpc), и падение было бы не про ycDb, а про порядок слов.
+    const cloudGroup = CORE_SRC.slice(CORE_SRC.indexOf('id: "cloud"'), CORE_SRC.indexOf('id: "cloud"') + 900);
+    assert.ok(/"ycDb"/.test(cloudGroup), "ycDb не в группе облака в ядре роутера");
     assert.ok(/ycDb \(таблицы и записи/.test(PROMPTS_SRC), "правило 28 не знает ycDb");
-    assert.ok(/ycStorage, ycDb, ycCosts/.test(PROMPTS_SRC), "список инструментов не знает ycDb");
+    const toolLine = PROMPTS_SRC.split("\n").find((l) => l.startsWith("Доступные инструменты:")) || "";
+    assert.ok(toolLine.includes("ycDb"), "список инструментов не знает ycDb");
   });
 
   await test("ycDb: права выданы на чтение, а создание/удаление — через разрешения облака", () => {
@@ -493,7 +498,11 @@ function buildTool(over, settingsOver) {
   });
 
   await test("ycDb: сторож smoke знает инструмент, а цепочка npm test — набор", () => {
-    assert.ok(/\"ycStorage\", \"ycDb\", \"ycCreate\"/.test(SMOKE_SRC), "список инструментов в smoke не знает ycDb");
+    // И здесь — имя в списке сторожа, а не соседство строк: точная
+    // последовательность ломается от соседнего инструмента (ycVpc).
+    const smokeAt = SMOKE_SRC.indexOf('for (const n of ["ycStatus"');
+    assert.ok(smokeAt > 0, "в smoke нет списка облачных инструментов");
+    assert.ok(/"ycDb"/.test(SMOKE_SRC.slice(smokeAt, smokeAt + 400)), "список инструментов в smoke не знает ycDb");
     assert.ok(PKG.scripts.test.indexOf("test/yc-db.test.js") >= 0, "набор не в цепочке npm test");
   });
 

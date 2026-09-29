@@ -178,6 +178,17 @@ contextBridge.exposeInMainWorld("api", {
   ycConsoleRegistryImage: (args) => ipcRenderer.invoke("yc:console:registryImage", args || {}),
   ycConsoleStorageObject: (args) => ipcRenderer.invoke("yc:console:storageObject", args || {}),
   ycConsoleBucketAccess: (args) => ipcRenderer.invoke("yc:console:bucketAccess", args || {}),
+  // Сеть VPC: один канал на раздел (подсети, группы безопасности, статические адреса).
+  ycVpc: (args) => ipcRenderer.invoke("yc:vpc", args || {}),
+  ycCompute: (args) => ipcRenderer.invoke("yc:compute", args || {}),
+  // IAM: сервисные аккаунты, роли и ключи (один канал на раздел, как у сети).
+  ycIam: (args) => ipcRenderer.invoke("yc:iam", args || {}),
+  // Cloud Functions: функции, версии, теги, вызов и публичность.
+  ycFunctions: (args) => ipcRenderer.invoke("yc:functions", args || {}),
+  // Биллинг: платёжные аккаунты, пороги и «за что мы платим» (только чтение).
+  ycBilling: (args) => ipcRenderer.invoke("yc:billing", args || {}),
+  // Сертификаты и CDN: HTTPS-сайт на своём домене (сертификат + CDN-ресурс).
+  ycCdn: (args) => ipcRenderer.invoke("yc:cdn", args || {}),
   ycCosts: (serviceKey, params) => ipcRenderer.invoke("yc:costs", serviceKey, params || {}),
   ycCreate: (serviceKey, name, opts) => ipcRenderer.invoke("yc:create", serviceKey, name, opts || {}),
   ycDelete: (serviceKey, resourceId) => ipcRenderer.invoke("yc:delete", serviceKey, resourceId),

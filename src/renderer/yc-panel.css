@@ -1,0 +1,279 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   ПАНЕЛЬ YANDEX CLOUD: ПОЛКА СЕРВИСОВ
+   ---------------------------------------------------------------------------
+   Подключается ПОСЛЕДНЕЙ (после replit-theme.css): всё здесь — про панель
+   облака, и никакому другому слою незачем её перекрывать. Отсюда же следует
+   главное правило файла: каждый селектор начинается с `#sp-cloud`, иначе
+   новые правила подрались бы с общими `.card`, `.chip`, `.btn` со всего окна.
+
+   ПОЧЕМУ «СТЕКЛО» ЗДЕСЬ БЕЗ ТЕНЕЙ И РАЗМЫТИЯ. monochrome.css гасит
+   `box-shadow` и `backdrop-filter` глобально и с `!important` — и правильно
+   делает: размытие под каждым элементом заставляет браузер пересобирать его
+   на каждой перерисовке. Поэтому глубина делается СВЕТОМ и ГРАНИЦЕЙ, а не
+   тенью: три ступени фона (`--bg` → `--bg-card` → плитка при наведении),
+   тонкая граница, акцентная подсветка края у раскрытой плитки. Это и есть
+   тот «тёмный глянец», который не стоит ни одного лишнего кадра.
+
+   ЛОГОТИПЫ. Иконки сервисов приходят из src/renderer/yc-logos.js — это
+   официальные SVG из библиотеки брендбука Yandex Cloud, вставленные в
+   разметку как есть (их нельзя перекрашивать или обрезать). Размер плитки
+   задан под них: 32×32 со скруглением 8, поэтому иконка не растягивается.
+
+   ФИРМЕННЫЙ ЦВЕТ. Синий знака Yandex Cloud (#2A9FFF) объявлен здесь одной
+   переменной `--yc-blue` и используется ТОЛЬКО как акцент: подсветка края,
+   активный фильтр, ссылка ресурса. Интерфейс остаётся тёмным нейтральным —
+   панель не должна выглядеть как чужой сайт внутри нашего окна. */
+
+#sp-cloud {
+  --yc-blue: #2a9fff;
+  --yc-blue-soft: rgba(42, 159, 255, 0.14);
+  --yc-blue-line: rgba(42, 159, 255, 0.34);
+  --yc-tile: #17171a;
+  --yc-tile-hover: #1e1e23;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+}
+
+/* ── Шапка: знак, название, каталог и действия ─────────────────────────── */
+#sp-cloud .yc-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 12px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  background: linear-gradient(180deg, var(--yc-blue-soft), rgba(42, 159, 255, 0) 72%);
+}
+#sp-cloud .yc-head-brand { display: flex; align-items: center; gap: 9px; min-width: 0; flex: 1 1 auto; }
+#sp-cloud .yc-brand-mark {
+  width: 30px; height: 30px; flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--yc-blue-line);
+  border-radius: 9px;
+  background: rgba(42, 159, 255, 0.1);
+}
+#sp-cloud .yc-brand-mark svg { width: 19px; height: 19px; display: block; }
+#sp-cloud .yc-head-text { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
+#sp-cloud .yc-head-title { font-size: 13px; font-weight: 700; letter-spacing: 0.01em; color: var(--text); }
+#sp-cloud .yc-dash-status {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#sp-cloud .yc-dash-btns { display: flex; gap: 5px; flex-shrink: 0; }
+
+/* ── Поиск и фильтр над полкой ─────────────────────────────────────────── */
+#sp-cloud .yc-tools { display: flex; align-items: center; gap: 7px; padding: 10px 12px 8px; }
+#sp-cloud .yc-search {
+  flex: 1 1 auto; min-width: 0;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 6px 10px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+}
+#sp-cloud .yc-search::placeholder { color: var(--text-faint); }
+#sp-cloud .yc-search:focus { outline: none; border-color: var(--yc-blue-line); }
+#sp-cloud .yc-filter {
+  display: flex; gap: 2px; flex-shrink: 0;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 2px;
+}
+#sp-cloud .yc-filter-btn {
+  background: transparent;
+  border: none;
+  border-radius: 7px;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 11.5px;
+  padding: 4px 8px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+#sp-cloud .yc-filter-btn:hover { color: var(--text); }
+#sp-cloud .yc-filter-btn.active { background: var(--yc-blue-soft); color: var(--text); }
+
+/* ── Строка здоровья облака (деньги и хвосты) ──────────────────────────── */
+#sp-cloud .yc-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 12px 10px;
+  border-bottom: none;
+}
+#sp-cloud .yc-health { display: flex; flex-wrap: wrap; gap: 6px; }
+#sp-cloud .yc-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 4px 10px;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 11.5px;
+  line-height: 1.3;
+}
+#sp-cloud .yc-chip b { color: var(--text); font-size: 12px; font-weight: 600; }
+#sp-cloud .yc-chip.ok { border-color: rgba(46, 204, 143, 0.32); }
+#sp-cloud .yc-chip.warn { border-color: rgba(242, 176, 7, 0.38); }
+#sp-cloud .yc-chip.err { border-color: rgba(255, 107, 107, 0.4); color: #ffb3b3; }
+#sp-cloud .yc-chip-link { cursor: pointer; }
+#sp-cloud .yc-chip-link:hover { border-color: var(--yc-blue-line); color: var(--text); }
+
+#sp-cloud .yc-leaks {
+  display: flex; flex-direction: column; gap: 5px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+#sp-cloud .yc-leaks-head { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-faint); }
+#sp-cloud .yc-leak { display: flex; gap: 8px; align-items: baseline; font-size: 11.5px; line-height: 1.45; color: var(--text-dim); }
+#sp-cloud .yc-leak-why { flex: 1 1 auto; min-width: 0; }
+#sp-cloud .yc-leak-sum { flex: 0 0 auto; color: var(--text); font-weight: 600; white-space: nowrap; }
+#sp-cloud .yc-leak-todo { color: var(--text-faint); font-size: 11px; }
+
+/* ── Полка: плитки сервисов с официальными иконками ────────────────────── */
+#sp-cloud .yc-dash {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: block;
+  padding: 0 12px 12px;
+}
+#sp-cloud .yc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(152px, 1fr));
+  gap: 8px;
+}
+#sp-cloud .yc-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+  background: var(--yc-tile);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  padding: 10px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+#sp-cloud .yc-tile:hover { background: var(--yc-tile-hover); border-color: #3a3a40; }
+/* Раскрытая плитка занимает всю строку: внутри таблица ресурсов, а не подпись. */
+#sp-cloud .yc-tile.open {
+  grid-column: 1 / -1;
+  border-color: var(--yc-blue-line);
+  background: linear-gradient(180deg, var(--yc-blue-soft), rgba(42, 159, 255, 0) 64%), var(--yc-tile);
+}
+#sp-cloud .yc-tile-top { display: flex; align-items: flex-start; gap: 9px; min-width: 0; }
+#sp-cloud .yc-tile-logo {
+  width: 32px; height: 32px; flex: 0 0 auto;
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+}
+#sp-cloud .yc-tile-logo svg { width: 100%; height: 100%; display: block; }
+#sp-cloud .yc-tile-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1 1 auto; }
+#sp-cloud .yc-tile-name { font-size: 12.5px; font-weight: 600; line-height: 1.28; color: var(--text); }
+#sp-cloud .yc-tile-count { font-size: 11.5px; color: var(--text-dim); }
+#sp-cloud .yc-tile-count.err { color: #f87171; }
+#sp-cloud .yc-tile-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: var(--text-faint); }
+#sp-cloud .yc-tile-dot.on { background: var(--yc-blue); }
+#sp-cloud .yc-tile-dot.err { background: var(--danger); }
+#sp-cloud .yc-tile-add {
+  margin-top: auto;
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 11.5px;
+  padding: 4px 8px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease;
+}
+#sp-cloud .yc-tile-add:hover { border-color: var(--yc-blue-line); color: var(--text); }
+/* Две кнопки в плитке («Создать» и «Действия») стоят в строку: список сервисов
+   без действий их не получает вовсе, поэтому ряд появляется только там, где о
+   чём говорить. */
+#sp-cloud .yc-tile-btns { display: flex; gap: 6px; margin-top: auto; }
+#sp-cloud .yc-tile-btns .yc-tile-add { margin-top: 0; flex: 1 1 auto; min-width: 0; white-space: nowrap; }
+
+/* Список ресурсов раскрытой плитки (имена кликабельны: карточка ресурса) */
+#sp-cloud .yc-tile-list {
+  display: flex; flex-direction: column; gap: 1px;
+  border-top: 1px solid var(--border-soft);
+  margin-top: 2px;
+  padding-top: 7px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+#sp-cloud .yc-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 6px;
+  border-radius: 8px;
+  border-bottom: none;
+}
+#sp-cloud .yc-item:hover { background: rgba(255, 255, 255, 0.05); }
+#sp-cloud .yc-item-name {
+  flex: 1 1 auto; min-width: 0;
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#sp-cloud .yc-item-name.ykc-openable { cursor: pointer; }
+#sp-cloud .yc-item-name.ykc-openable:hover { color: var(--yc-blue); text-decoration: underline; text-underline-offset: 2px; }
+#sp-cloud .yc-item-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+#sp-cloud .yc-item-more { padding: 5px 2px; color: var(--text-faint); font-size: 11.5px; }
+#sp-cloud .yc-card-err { font-size: 11px; color: #ffb3b3; line-height: 1.4; word-break: break-word; }
+#sp-cloud .yc-status {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  text-transform: lowercase;
+}
+#sp-cloud .yc-status.running, #sp-cloud .yc-status.active { border-color: rgba(46, 204, 143, 0.4); color: #8fe0bb; }
+#sp-cloud .yc-status.stopped, #sp-cloud .yc-status.creating { border-color: rgba(242, 176, 7, 0.4); color: #f2cf7a; }
+#sp-cloud .yc-status.error { border-color: rgba(255, 107, 107, 0.45); color: #ffb3b3; }
+
+/* ── Загрузка: скелетоны вместо одинокой надписи ───────────────────────── */
+#sp-cloud .yc-skel {
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.085), rgba(255, 255, 255, 0.04));
+  background-size: 200% 100%;
+  animation: yc-skel-shift 1.3s ease-in-out infinite;
+}
+#sp-cloud .yc-skel-tile { height: 96px; }
+#sp-cloud .yc-skel-line { height: 12px; border-radius: 6px; margin: 6px 0; }
+@keyframes yc-skel-shift {
+  0% { background-position: 200% 0; }
+  100% { background-position: -60% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #sp-cloud .yc-skel { animation: none; }
+}
+#sp-cloud .yc-loading { color: var(--text-faint); font-size: 12.5px; padding: 14px 2px; text-align: left; }
+#sp-cloud .yc-empty { color: var(--text-faint); font-size: 12px; line-height: 1.5; padding: 14px 4px; }
+
+/* ── Подвал: откуда иконки и что мы не Яндекс ──────────────────────────── */
+#sp-cloud .yc-foot { padding: 8px 12px 12px; border-top: 1px solid var(--border-soft); }
+#sp-cloud .yc-credit { font-size: 10.5px; line-height: 1.5; color: var(--text-faint); }
+#sp-cloud .yc-credit a { color: var(--text-dim); text-decoration: underline; text-underline-offset: 2px; }
+
+/* ── Узкая панель и телефон: плитки мельче, шапка переносится ─────────── */
+@media (max-width: 900px) {
+  #sp-cloud .yc-head { flex-wrap: wrap; }
+  #sp-cloud .yc-dash-btns { width: 100%; justify-content: flex-end; }
+  #sp-cloud .yc-grid { grid-template-columns: repeat(auto-fill, minmax(136px, 1fr)); }
+}

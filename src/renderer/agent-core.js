@@ -1203,8 +1203,9 @@
     {
       id: "cloud",
       title: "Yandex Cloud",
-      keywords: ["yandex", "яндекс", "облак", "cloud", "серверлес", "serverless", "бакет", "s3"],
-      names: ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycDb", "ycCosts", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"],
+      keywords: ["yandex", "яндекс", "облак", "cloud", "серверлес", "serverless", "бакет", "s3",
+        "cdn", "сертификат", "https", "домен", "static site", "хостинг"],
+      names: ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycVpc", "ycCompute", "ycIam", "ycFunctions", "ycBilling", "ycCdn", "ycDb", "ycCosts", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"],
     },
     {
       id: "sheets",
@@ -1216,12 +1217,17 @@
   ];
 
   // Потолок «веса» выбранных схем (в токенах): база + группы должны укладываться сюда.
-  // База стоит ~6 950 (40 схем), «браузер» ~7 085, «система» ~2 270, «проект» ~1 950.
-  // 16 500 = база + 2–3 группы: тихая задача остаётся ~6.9k вместо 30.5k, а нужные
-  // группы почти всегда помещаются. Если потолок всё же срезал группу — main.js
-  // пишет об этом в «Консоль» (dropped), а предохранители A/B доберут её при работе.
+  // База стоит ~6 950 (40 схем), «браузер» ~7 085, «система» ~2 270, «проект» ~1 950,
+  // «облако» ~12 000 (18 инструментов Yandex Cloud: сеть, машины, IAM, функции,
+  // биллинг — каждая часть со своими предупреждениями).
+  // 23 000 = база + 1–2 большие группы: тихая задача остаётся ~6.9k вместо 30.5k, а
+  // САМАЯ БОЛЬШАЯ группа помещается вместе с базой. Прежние 16 500 перестали
+  // вмещать каталог облака, и «яндекс облако» в описании задачи не включало ни
+  // одного облачного инструмента (группа режется целиком — потолок сравнивается с
+  // базой + группой). Если потолок всё же срезал группу — прогон пишет об этом в
+  // «Консоль» (dropped), а предохранители A/B доберут её при работе.
   // База не режется никогда: без файлов/терминала/git агент не работает.
-  const ROUTER_MAX_TOKENS = 16500;
+  const ROUTER_MAX_TOKENS = 23000;
 
   const _toolByGroupName = new Map(); // имя → id группы (для предохранителя A)
   const _groupNames = new Map();      // id → [имена]
@@ -1397,17 +1403,24 @@
   const MIN_HISTORY_TOKENS = 1000;
   // Потолок веса схем: не больше ROUTER_MAX_TOKENS и не больше того, что реально
   // остаётся от окна после системного промпта и минимальной истории.
-  function routerMaxTokens(budget, systemWeight, baseWeight) {
+  function routerMaxTokens(budget, systemWeight, baseWeight, opts) {
     const b = Math.max(0, Math.round(Number(budget) || 0));
     const sys = Math.max(0, Math.round(Number(systemWeight) || 0));
     const base = Math.max(0, Math.round(Number(baseWeight) || 0));
     const spare = b - sys - MIN_HISTORY_TOKENS;
+    // windowOnly: остаток ОКНА без политического потолка схем. Так считается предел
+    // для групп, которые уже включены (см. stickyMaxTokens в routeTools): окно —
+    // единственный настоящий предел, а ROUTER_MAX_TOKENS — способ не набирать
+    // лишние группы с ходу.
+    if (opts && opts.windowOnly) return Math.max(base, spare);
     return Math.max(base, Math.min(ROUTER_MAX_TOKENS, Math.max(base, spare)));
   }
 
   function routeTools(opts) {
     const o = opts || {};
     const sticky = new Set(o.sticky || []);
+    // Что было включено ДО этого раунда: такие группы политический потолок не режет.
+    const before = new Set(sticky);
     // Группы активной роли — с первого раунда (стабильный префикс запроса и никаких
     // «дополнений на ходу», из-за которых промахивается кэш провайдера).
     for (const g of o.roleGroups || []) if (g) sticky.add(g);
@@ -1431,6 +1444,8 @@
       }
     }
     const maxTokens = Math.max(BASE_TOOL_WEIGHT, o.maxTokens || ROUTER_MAX_TOKENS);
+    // Предел для уже включённых групп: только окно, но никогда не строже обычного.
+    const stickyMaxTokens = Math.max(maxTokens, Math.round(Number(o.stickyMaxTokens) || 0));
     // Группы добавляем по силе сигнала; при равном счёте — по порядку реестра
     // (детерминированно). Сортировка влияет только на ПОРЯДОК ДОБАВЛЕНИЯ, а не на
     // порядок схем в запросе — он всегда канонический.
@@ -1445,7 +1460,12 @@
     const used = [];
     const dropped = [];
     for (const g of wanted) {
-      if (weight + g.tokens <= maxTokens) {
+      // Группу, которая уже в наборе, потолок схем не выкидывает: он существует,
+      // чтобы НЕ НАБИРАТЬ лишнего, а не чтобы терять нужное на середине работы.
+      // Если из-за уже включённых групп потолок всё равно пройден — дальше мерим
+      // по окну: там выкидывает только физическая нехватка места.
+      const limit = before.has(g.id) || weight > maxTokens ? stickyMaxTokens : maxTokens;
+      if (weight + g.tokens <= limit) {
         used.push(g.id);
         weight += g.tokens;
       } else {

@@ -24,9 +24,19 @@
 
 const KNOWN_ENDPOINTS = {
   "iam": "https://iam.api.cloud.yandex.net",
+  // Машины в каталоге эндпоинтов называются просто compute (часть 75 добавила
+  // их на полку дашборда; без этой строки первый же опрос отвечал «Эндпоинт
+  // сервиса «Compute Cloud» не найден» — облако при этом было ни при чём).
+  "compute": "https://compute.api.cloud.yandex.net",
   "resource-manager": "https://resource-manager.api.cloud.yandex.net",
   "operation": "https://operation.api.cloud.yandex.net",
   "serverless-containers": "https://serverless-containers.api.cloud.yandex.net",
+  "serverless-functions": "https://serverless-functions.api.cloud.yandex.net",
+  // Вызов функции идёт НЕ в API сервиса: это публичный адрес её кода
+  // (https://functions.yandexcloud.net/<id>?tag=<тег>), куда ходят браузер, бот
+  // и API Gateway. Отдельный ключ нужен потому, что «эндпоинт сервиса» из
+  // каталога и «адрес вызова» — разные машины в облаке.
+  "functions-invoke": "https://functions.yandexcloud.net",
   "container-registry": "https://container-registry.api.cloud.yandex.net",
   "ydb": "https://ydb.api.cloud.yandex.net",
   "lockbox": "https://lockbox.api.cloud.yandex.net",
@@ -82,6 +92,25 @@ async function fetchJson(url, opts, timeoutMs) {
       throw err;
     }
     return body;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Понятное объяснение ошибок API (коды HTTP + типовые причины Yandex Cloud).
+// Ответ ТЕКСТОМ, а не JSON: так отвечает код функции (ответ может быть и пустым).
+// Статус возвращаем наружу, а не бросаем ошибку: 403, 404 и 504 у вызова значат
+// разное, и объяснить их должен тот, кто знает имя функции и тег.
+async function fetchText(url, opts, timeoutMs) {
+  const t = timeoutMs || 30000;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), t);
+  try {
+    const res = await fetch(url, Object.assign({ signal: ctrl.signal, redirect: "follow" }, opts || {}));
+    const text = await res.text().catch(() => "");
+    return { status: res.status, ok: res.ok, text: text, contentType: res.headers.get("content-type") || "" };
+  } catch (e) {
+    throw new Error(serviceError(e, url, ""));
   } finally {
     clearTimeout(timer);
   }
@@ -293,26 +322,33 @@ async function listFolders(oauthToken, cloudId) {
 }
 
 // ── Сервисы дашборда ────────────────────────────────────────────────────────
-// Каждый сервис: key (для IPC), title, icon (emoji), svc (id эндпоинта),
-// listPath (GET list по каталогу), listKey (поле массива в ответе).
+// Каждый сервис: key (для IPC), ru (русское имя — как в консоли облака),
+// title (официальное английское название), svc (id эндпоинта), listPath
+// (GET list по каталогу), listKey (поле массива в ответе). Иконка сервиса
+// (официальный логотип) живёт рядом с панелью — src/renderer/yc-logos.js.
 const SERVICES = [
-  { key: "apiGateway", title: "API Gateway", icon: "🔀", svc: "serverless-apigateway", listPath: "/apigateways/v1/apigateways", listKey: "apigateways" },
-  { key: "certificateManager", title: "Certificate Manager", icon: "🔐", svc: "certificate-manager", listPath: "/certificate-manager/v1/certificates", listKey: "certificates" },
-  { key: "cdn", title: "Cloud CDN", icon: "🌍", svc: "cdn", listPath: "/cdn/v1/resources", listKey: "resources" },
-  { key: "dns", title: "Cloud DNS", icon: "🌐", svc: "dns", listPath: "/dns/v1/zones", listKey: "zones" },
-  { key: "logging", title: "Cloud Logging", icon: "📜", svc: "logging", listPath: "/logging/v1/logGroups", listKey: "groups" },
+  { key: "apiGateway", ru: "API-шлюз", title: "API Gateway", icon: "🔀", svc: "serverless-apigateway", listPath: "/apigateways/v1/apigateways", listKey: "apigateways" },
+  { key: "certificateManager", ru: "Сертификаты", title: "Certificate Manager", icon: "🔐", svc: "certificate-manager", listPath: "/certificate-manager/v1/certificates", listKey: "certificates" },
+  { key: "cdn", ru: "CDN и сайты", title: "Cloud CDN", icon: "🌍", svc: "cdn", listPath: "/cdn/v1/resources", listKey: "resources" },
+  { key: "dns", ru: "DNS-зоны", title: "Cloud DNS", icon: "🌐", svc: "dns", listPath: "/dns/v1/zones", listKey: "zones" },
+  { key: "logging", ru: "Логи", title: "Cloud Logging", icon: "📜", svc: "logging", listPath: "/logging/v1/logGroups", listKey: "groups" },
   // Cloud Postbox — это SES-совместимый API (Amazon SES v2), а НЕ обычный REST
   // каталога: путь /postbox/v1/addresses не существует (проверено — быстрый 404),
   // список адресов — GET /v2/email/identities, авторизация — X-YaCloud-SubjectToken
   // с IAM-токеном СЕРВИСНОГО аккаунта (роль postbox.viewer), Authorization не нужен.
-  { key: "postbox", title: "Cloud Postbox", icon: "📮", svc: "postbox", listPath: "/v2/email/identities", listKey: "Identities", auth: "subject", query: "ses" },
-  { key: "containerRegistry", title: "Container Registry", icon: "📦", svc: "container-registry", listPath: "/container-registry/v1/registries", listKey: "registries" },
-  { key: "iam", title: "Identity and Access Management", icon: "🗝️", svc: "iam", listPath: "/iam/v1/serviceAccounts", listKey: "serviceAccounts" },
-  { key: "lockbox", title: "Lockbox", icon: "🔒", svc: "lockbox", listPath: "/lockbox/v1/secrets", listKey: "secrets" },
-  { key: "ydb", title: "Managed Service for YDB", icon: "🗄️", svc: "ydb", listPath: "/ydb/v1/databases", listKey: "databases" },
-  { key: "storage", title: "Object Storage", icon: "🪣", svc: "storage-api", listPath: "/storage/v1/buckets", listKey: "buckets" },
-  { key: "serverlessContainers", title: "Serverless Containers", icon: "☁️", svc: "serverless-containers", listPath: "/containers/v1/containers", listKey: "containers" },
-  { key: "vpc", title: "Virtual Private Cloud", icon: "🕸️", svc: "vpc", listPath: "/vpc/v1/networks", listKey: "networks" },
+  { key: "postbox", ru: "Почта", title: "Cloud Postbox", icon: "📮", svc: "postbox", listPath: "/v2/email/identities", listKey: "Identities", auth: "subject", query: "ses" },
+  { key: "containerRegistry", ru: "Реестр образов", title: "Container Registry", icon: "📦", svc: "container-registry", listPath: "/container-registry/v1/registries", listKey: "registries" },
+  { key: "iam", ru: "Сервисные аккаунты", title: "Identity and Access Management", icon: "🗝️", svc: "iam", listPath: "/iam/v1/serviceAccounts", listKey: "serviceAccounts" },
+  { key: "lockbox", ru: "Секреты", title: "Lockbox", icon: "🔒", svc: "lockbox", listPath: "/lockbox/v1/secrets", listKey: "secrets" },
+  { key: "ydb", ru: "База YDB", title: "Managed Service for YDB", icon: "🗄️", svc: "ydb", listPath: "/ydb/v1/databases", listKey: "databases" },
+  { key: "storage", ru: "Объектное хранилище", title: "Object Storage", icon: "🪣", svc: "storage-api", listPath: "/storage/v1/buckets", listKey: "buckets" },
+  { key: "serverlessContainers", ru: "Serverless-контейнеры", title: "Serverless Containers", icon: "☁️", svc: "serverless-containers", listPath: "/containers/v1/containers", listKey: "containers" },
+  { key: "cloudFunctions", ru: "Функции", title: "Cloud Functions", icon: "⚡", svc: "serverless-functions", listPath: "/functions/v1/functions", listKey: "functions" },
+  { key: "vpc", ru: "Сети VPC", title: "Virtual Private Cloud", icon: "🕸️", svc: "vpc", listPath: "/vpc/v1/networks", listKey: "networks" },
+  // Машины пришли на полку последними (часть 75). До этого они были только у
+  // агента: создание, питание, снимки и метрики — а в окне их не было видно
+  // даже списком, то есть человек не знал, что у него вообще есть машины.
+  { key: "compute", ru: "Виртуальные машины", title: "Compute Cloud", icon: "🖥️", svc: "compute", listPath: "/compute/v1/instances", listKey: "instances" },
 ];
 
 function serviceByKey(key) {
@@ -445,6 +481,14 @@ const CREATABLE = {
     body: (folderId, name) => ({ folderId, name }),
     hint: "Контейнер для запуска приложения (образ деплоится отдельно)",
   },
+  // У функции код живёт в ВЕРСИИ: создание функции — только «полка», поэтому в
+  // подсказке прямо сказано, что дальше нужна версия (панель зовёт ycFunctions).
+  cloudFunctions: {
+    path: "/functions/v1/functions",
+    body: (folderId, name) => ({ folderId, name }),
+    hint: "Функция Cloud Functions (код кладётся версией: ycFunctions { action: \"deploy\" })",
+  },
+
   vpc: {
     path: "/vpc/v1/networks",
     body: (folderId, name) => ({ folderId, name }),
@@ -1587,6 +1631,7 @@ async function setBucketPublicAccess(oauthToken, bucketName, publicOn) {
 module.exports = {
   SERVICES,
   _fetchJson: fetchJson,
+  _fetchText: fetchText,
   _testApiBase: testApiBase,
   CREATABLE,
   serviceByKey,

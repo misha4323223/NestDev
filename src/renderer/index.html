@@ -19,6 +19,11 @@
   <!-- Тема «Replit»: палитра и зачистка остатков неона. Подключается ПОСЛЕДНЕЙ,
        поэтому перекрывает styles.css, monochrome.css и панельные слои. -->
   <link rel="stylesheet" href="replit-theme.css" />
+  <!-- Панель облака: подключается последней, селекторы живут только в #sp-cloud -->
+  <link rel="stylesheet" href="yc-panel.css" />
+  <!-- Действия облака (машины, IAM, функции, сертификаты, деньги): тот же слой
+       панели, подключается после неё и живёт внутри #sp-cloud -->
+  <link rel="stylesheet" href="yc-actions.css" />
   <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="icon" href="/icon.svg" type="image/svg+xml" />
   <meta name="theme-color" content="#0d0d0f" />
@@ -435,15 +440,20 @@
         <div id="dp-body"></div>
       </div>
       <div id="sp-cloud" class="sp-body hidden">
-        <div class="yc-dash-top">
-          <div class="yc-dash-title">☁️ Yandex Cloud</div>
-          <span id="yc-dash-status" class="yc-dash-status">—</span>
+        <header class="yc-head">
+          <div class="yc-head-brand">
+            <span id="yc-brand-mark" class="yc-brand-mark" aria-hidden="true"></span>
+            <span class="yc-head-text">
+              <span class="yc-head-title">Yandex Cloud</span>
+              <span id="yc-dash-status" class="yc-dash-status">—</span>
+            </span>
+          </div>
           <div class="yc-dash-btns">
-            <button id="btn-yc-deploy" class="btn btn-primary btn-small" title="Задеплоить рабочую директорию в Serverless Containers (Docker обязателен)">🚀 Задеплоить проект</button>
-            <button id="btn-yc-dash-refresh" class="btn btn-ghost btn-small" title="Обновить счётчики ресурсов">↻</button>
+            <button id="btn-yc-deploy" class="btn btn-primary btn-small" title="Задеплоить рабочую директорию в Serverless Containers (Docker обязателен)">🚀 Задеплоить</button>
+            <button id="btn-yc-dash-refresh" class="btn btn-ghost btn-small" title="Обновить ресурсы, баланс и платные хвосты">↻</button>
             <button id="btn-yc-dash-settings" class="btn btn-ghost btn-small" title="Настройки Yandex Cloud (токен, каталог, разрешения)">⚙️</button>
           </div>
-        </div>
+        </header>
         <div id="yc-onboard" class="yc-onboard hidden">
           <div class="yc-onboard-ic">☁️</div>
           <div class="yc-onboard-title">Yandex Cloud не подключён</div>
@@ -467,7 +477,18 @@
             <button id="btn-yc-deploy-open" class="btn btn-primary btn-small">Открыть</button>
           </div>
         </div>
+        <div class="yc-tools">
+          <input id="yc-search" class="yc-search" placeholder="Поиск сервиса…" spellcheck="false" autocomplete="off" />
+          <div id="yc-filter" class="yc-filter" role="tablist" aria-label="Фильтр сервисов">
+            <button type="button" class="yc-filter-btn active" data-flt="all" title="Все сервисы каталога">Все</button>
+            <button type="button" class="yc-filter-btn" data-flt="used" title="Только сервисы, где уже есть ресурсы">С ресурсами</button>
+            <button type="button" class="yc-filter-btn" data-flt="err" title="Только те, что не ответили">Ошибки</button>
+          </div>
+        </div>
         <div id="yc-dash" class="yc-dash"></div>
+        <div class="yc-foot">
+          <div id="yc-credit" class="yc-credit"></div>
+        </div>
       </div>
     </div>
 
@@ -1302,25 +1323,25 @@
             </div>
             <div class="field yc-perms hidden" id="yc-perms">
               <label>Разрешения агента <span class="hint">(галочка = РАЗРЕШЕНО, пусто = запрещено; ИИ управляет облаком прямо из чата)</span></label>
-              <label class="check-row" title="Агент сможет вызывать ycCreate — создание баз, бакетов, контейнеров и т.д. Платные ресурсы — только по твоей явной просьбе.">
+              <label class="check-row" title="Агент сможет вызывать ycCreate, а также ycVpc (подсети, группы, статические адреса) ycCompute (создание машины), ycIam (сервисные аккаунты и ключи), ycFunctions (функция и её версия) и ycCdn (сертификат и CDN-ресурс) — создание баз, бакетов, контейнеров, сети, машин и HTTPS-сайтов. Платные ресурсы создаются только по твоей явной просьбе и с подтверждением цены.">
                 <input id="s-yc-allow-create" type="checkbox" />
                 <span class="check-row-text">
                   <b>Разрешить агенту создавать ресурсы</b>
-                  <small>YDB, Lockbox, реестр, бакет, DNS-зона, Serverless-контейнер, VPC — через чат. Выключено по умолчанию.</small>
+                  <small>YDB, Lockbox, реестр, бакет, DNS-зона, Serverless-контейнер, VPC и виртуальная машина — через чат. Выключено по умолчанию.</small>
                 </span>
               </label>
-              <label class="check-row" title="Агент сможет вызывать ycDelete. Удаление необратимо — включай, только если доверяешь.">
+              <label class="check-row" title="Агент сможет вызывать ycDelete, а также ycVpc (подсети, группы, адреса) и ycCompute (delete, delsnapshot, cleansnapshots), ycIam (delete, delkey), ycFunctions (delete, delversion), ycCdn (certdel, cdndel, origindel). Удаление необратимо: машину можно снести вместе с её дисками — включай, только если доверяешь.">
                 <input id="s-yc-allow-delete" type="checkbox" />
                 <span class="check-row-text">
                   <b>Разрешить агенту удалять ресурсы</b>
-                  <small>Необратимо, может стереть данные. Выключено по умолчанию.</small>
+                  <small>Необратимо, может стереть данные: диски машины, снимки, базы. Выключено по умолчанию.</small>
                 </span>
               </label>
-              <label class="check-row" title="Агент сможет вызывать ycContainer (deploy/rollback/update): создавать ревизии, откатывать их и менять имя, описание и метки контейнера. Новая ревизия сразу получает трафик и тарифицируется.">
+              <label class="check-row" title="Агент сможет вызывать ycContainer (deploy/rollback/update): создавать ревизии, откатывать их и менять имя, описание и метки контейнера. Новая ревизия сразу получает трафик и тарифицируется. Также разрешает менять правила групп безопасности сети (ycVpc: addrule/delrule) и включать, выключать и перезагружать машины (ycCompute: start/stop/restart), роли сервисных аккаунтов (ycIam: grant/revoke/update), теги и публичность функций (ycFunctions: tag/public), привязку сертификата к сайту, включение ресурса и очистку кэша (ycCdn: certupdate, cdnupdate, cdnpurge).">
                 <input id="s-yc-allow-update" type="checkbox" />
                 <span class="check-row-text">
                   <b>Разрешить агенту менять контейнеры</b>
-                  <small>Ревизии, откат, имя/описание/метки. Новая ревизия сразу идёт в бой. Выключено по умолчанию.</small>
+                  <small>Ревизии, откат, имя/описание/метки, правила сети, питание машин. Новая ревизия сразу идёт в бой. Выключено по умолчанию.</small>
                 </span>
               </label>
               <label class="check-row" title="Агент сможет включать и выключать публичный доступ к бакету (ycStorage: action public / private). После включения содержимое бакета читает кто угодно из интернета, кто знает ссылку, и оно становится видно поисковикам. Закрытым данным сюда не место — для них есть Lockbox.">
@@ -1533,7 +1554,10 @@
   <script src="bootstrap.js"></script>
   <script src="mobile-api.js"></script>
   <script src="yc-console.js"></script>
+  <script src="yc-logos.js"></script>
   <script src="yc-panel.js"></script>
+  <!-- Действия служб в интерфейсе: панель и консоль зовут их по window.YcActions -->
+  <script src="yc-actions.js"></script>
   <script src="deploy-panel.js"></script>
   <script src="dev-run.js"></script>
   <script src="highlight.js"></script>

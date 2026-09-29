@@ -55,6 +55,17 @@ const RELATIONS = {
     { key: "revisions", title: "Ревизии", icon: "🧱", listKey: "revisions",
       attempts: [{ path: (c) => "/containers/v1/revisions?containerId=" + enc(c.id) + "&pageSize=100" }] },
   ],
+  // Кода у функции нет: код живёт в версии, и вызывается всегда какая-то версия.
+  cloudFunctions: [
+    { key: "versions", title: "Версии", icon: "⚡", listKey: "versions",
+      attempts: [{ path: (c) => "/functions/v1/versions?functionId=" + enc(c.id) + "&pageSize=100" }] },
+  ],
+  // У машины связей НЕТ намеренно. Диски каталога фильтруются по ПОЛЮ, а у диска
+  // не `instanceId`, а массив `instanceIds`: фильтр по равенству вернул бы на
+  // карточку каждой машины ВСЕ диски каталога. Что действительно относится к
+  // машине (диски, снимки, подсети, группы, хвосты) показывает карточка действий
+  // полки — она спрашивает ycCompute, а тот считает связи сам.
+  compute: [],
   containerRegistry: [
     { key: "images", title: "Образы", icon: "🖼", listKey: "images",
       attempts: [{ path: (c) => "/container-registry/v1/images?registryId=" + enc(c.id) + "&pageSize=100" }] },
@@ -113,6 +124,8 @@ const DETAIL_PATHS = {
   containerRegistry: (c) => "/container-registry/v1/registries/" + enc(c.id),
   iam: (c) => "/iam/v1/serviceAccounts/" + enc(c.id),
   serverlessContainers: (c) => "/containers/v1/containers/" + enc(c.id),
+  cloudFunctions: (c) => "/functions/v1/functions/" + enc(c.id),
+  compute: (c) => "/compute/v1/instances/" + enc(c.id),
 };
 
 // Эндпоинт сервиса для запросов консоли. Совпадает с SERVICES из yandex-cloud.js.
@@ -127,7 +140,9 @@ const SERVICE_ENDPOINT = {
   lockbox: "lockbox",
   ydb: "ydb",
   serverlessContainers: "serverless-containers",
+  cloudFunctions: "serverless-functions",
   vpc: "vpc",
+  compute: "compute",
   storage: "storage-api",
   postbox: "postbox",
 };
@@ -664,6 +679,7 @@ const SERVICE_TITLES = {
   containerRegistry: "Container Registry",
   iam: "Identity and Access Management",
   serverlessContainers: "Serverless Containers",
+  cloudFunctions: "Cloud Functions",
   storage: "Object Storage",
   postbox: "Cloud Postbox",
 };

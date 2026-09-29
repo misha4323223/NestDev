@@ -171,8 +171,12 @@ const STATIC_FILES = new Set([
   // Панели Yandex Cloud и деплоя: они подключены в разметке, но телефон за ними
   // получал 404 — на телефоне эти разделы просто не работали.
   "yc-console.js",
+  "yc-logos.js",
   "yc-panel.js",
+  "yc-actions.js",
   "yc-console.css",
+  "yc-panel.css",
+  "yc-actions.css",
   "deploy-panel.js",
   "dev-run.js",
   "chat-actions.js",

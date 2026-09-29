@@ -15,3 +15,14 @@ ota/*
 # Фолбэк удалённого playwright (снимки, restore.js, описание) — В РЕПОЗИТОРИИ,
 # специально НЕ игнорируется: вернуть Playwright можно в любой момент,
 # из любого клона. См. backup-playwright/README.md.
+#
+# А вот ЛОКАЛЬНАЯ копия (архив пакетов и копии локов) в репозиторий не идёт:
+# это 3,9 МБ бинарного блоба, который остался бы в истории навсегда, к тому же
+# restore.js его не читает — он ставит пакет через `npm install`. Сам каталог
+# backup-playwright/ при этом НЕ игнорируется (там restore.js, снимки *.bak и
+# README), и это проверяет сторож repo-shape.
+backup-playwright/node_modules-playwright.tar.gz
+backup-playwright/package.json
+backup-playwright/package-lock.json
+backup-playwright/bun.lock
+backup-playwright/ВОССТАНОВЛЕНИЕ.md

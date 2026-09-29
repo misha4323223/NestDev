@@ -7,7 +7,8 @@
    задаче (routeTools из ядра). Здесь живёт всё, что делает эту экономию
    безопасной:
 
-     • состав ЛИПКИЙ: группа, однажды включённая, не исчезает на середине работы.
+     • состав ЛИПКИЙ: группа, однажды включённая, не исчезает на середине работы,
+       и её режет только окно, а не потолок схем (см. stickyMaxTokens в ядре);
        Иначе набор схем меняется на ходу, префикс запроса ломается и провайдер
        отвечает 503 cache_only_cold (это уже случалось, см. 1.5.46 и 1.5.63);
      • задача для роутера берётся из ИСТОРИИ работы, а не из последней фразы: в
@@ -85,7 +86,12 @@ function createRunTools(deps) {
       // от окна после системного промпта и минимальной истории. Сама формула живёт в
       // ядре (routerMaxTokens) — здесь только вызов.
       const maxTokens = routerMaxTokens(budget, systemWeight, baseWeight);
-      state.route = routeTools({ text: routerTask, sticky: [...state.sticky], roleGroups: role.groups, forceAll: forceAllTools, maxTokens: maxTokens });
+      // Предел для групп, включённых РАНЬШЕ (sticky): их режет только окно, а не
+      // политический потолок схем. Иначе подросшая группа (каталог облака yc*,
+      // десятки схем) молча выпадала бы на середине работы: инструменты исчезали
+      // из запроса, а «Консоль» об этом молчала.
+      const stickyMaxTokens = routerMaxTokens(budget, systemWeight, baseWeight, { windowOnly: true });
+      state.route = routeTools({ text: routerTask, sticky: [...state.sticky], roleGroups: role.groups, forceAll: forceAllTools, maxTokens: maxTokens, stickyMaxTokens: stickyMaxTokens });
       for (const id of state.route.groups) state.sticky.add(id);
       state.active = state.route.tools;
     }
