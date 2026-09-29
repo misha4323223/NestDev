@@ -1032,6 +1032,17 @@ const ycVpc = createYcVpc({
 // и метрики — своим модулем (чистый Node, как yc-vpc.js). Метрики живут в
 // отдельном сервисе Monitoring, поэтому модуль получает и его адрес через тот
 // же каталог эндпоинтов.
+// Модуль собирается ЗДЕСЬ, выше денег: ycBilling получает его готовым, а с
+// `const` чтение до объявления — это падение окна при загрузке, а не undefined.
+const { createYcCompute } = require("./yc-compute.js");
+const ycCompute = createYcCompute({
+  fetchJson: yandexCloud._fetchJson,
+  endpoint: yandexCloud.endpoint,
+  getIamToken: yandexCloud.getIamToken,
+  waitOperation: yandexCloud.waitOperation,
+  serviceError: yandexCloud.serviceError,
+  isNetworkError: yandexCloud.isNetworkError,
+});
 // IAM: сервисные аккаунты, их роли и ключи — своим модулем (чистый Node).
 // Cloud Functions: функции, версии, теги и вызов — своим модулем (чистый Node).
 // Чтение ответа ТЕКСТОМ (fetchText) нужно потому, что вызов возвращает то, что
@@ -1075,15 +1086,6 @@ const ycCdn = createYcCdn({
 });
 const { createYcIam } = require("./yc-iam.js");
 const ycIam = createYcIam({
-  fetchJson: yandexCloud._fetchJson,
-  endpoint: yandexCloud.endpoint,
-  getIamToken: yandexCloud.getIamToken,
-  waitOperation: yandexCloud.waitOperation,
-  serviceError: yandexCloud.serviceError,
-  isNetworkError: yandexCloud.isNetworkError,
-});
-const { createYcCompute } = require("./yc-compute.js");
-const ycCompute = createYcCompute({
   fetchJson: yandexCloud._fetchJson,
   endpoint: yandexCloud.endpoint,
   getIamToken: yandexCloud.getIamToken,

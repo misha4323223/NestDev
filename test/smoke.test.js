@@ -14978,6 +14978,48 @@ async function testFsGitIpc() {
     assert.deepStrictEqual(r.missing, [], "модули ссылаются на состояние main.js без внедрения: " + r.missing.join(", "));
   });
 
+  await test("порядок в main.js: значение не читается раньше объявления", () => {
+    // Третья ошибка разреза — и самая дорогая: у `const` чтение до объявления это
+    // не undefined, а падение всего окна при загрузке. Так упало приложение после
+    // части 75: модуль денег начал получать машины и сеть, а постройка машин
+    // осталась ниже по файлу («Cannot access 'ycCompute' before initialization»).
+    const { scanMainOrder } = require(path.join(__dirname, "backend-wiring.js"));
+    const found = scanMainOrder(fs.readFileSync(path.join(ROOT, "src", "main.js"), "utf8"));
+    assert.deepStrictEqual(found, [], "main.js читает объявленное ниже: " + found.join(", "));
+  });
+
+  await test("страж порядка: ловит чтение до объявления и не тревожит верную проводку", () => {
+    // Страж без негативного контроля бесполезен: он либо молчит, либо ругается на
+    // верную проводку. Отложенные стрелки и геттеры моста live законны — их тела
+    // исполняются в момент вызова, а не в строке объявления.
+    const { scanMainOrder } = require(path.join(__dirname, "backend-wiring.js"));
+    const broken = [
+      "const ycBilling = createYcBilling({ ycCompute, ycVpc });",
+      "const ycVpc = createYcVpc({ fetchJson });",
+      "const ycCompute = createYcCompute({ fetchJson });",
+    ].join("\n");
+    assert.deepStrictEqual(
+      scanMainOrder(broken),
+      ["ycCompute (строка 1, объявлено в 3)", "ycVpc (строка 1, объявлено в 2)"],
+      "чтение до объявления не поймано"
+    );
+    const fine = [
+      "const ycVpc = createYcVpc({ fetchJson });",
+      "const ycCompute = createYcCompute({ fetchJson });",
+      "const ycBilling = createYcBilling({ ycCompute, ycVpc });",
+      "const wiring = createWiring({ window: () => mainWindow, live: { get mainWindow() { return mainWindow; } } });",
+      "let mainWindow = null;",
+      "function later() { return ycCdn; }",
+      "const ycCdn = createYcCdn({});",
+    ].join("\n");
+    assert.deepStrictEqual(scanMainOrder(fine), [], "верная проводка принята за ошибку");
+    const props = [
+      "const a = f({ ycCompute: 1, ycVpc() { return 2; } });",
+      "const ycCompute = createYcCompute({});",
+    ].join("\n");
+    assert.deepStrictEqual(scanMainOrder(props), [], "ключ свойства принят за обращение к имени");
+  });
+
   await test("вынесенные модули: изменяемое значение меняется через сеттер, а не копией", () => {
     // Обратная ошибка разреза: инструмент присваивает имени, которое ему передали
     // значением. Копия «застынет» на null, и особенность работы приложения (журнал
