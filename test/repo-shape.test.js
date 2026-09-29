@@ -169,9 +169,58 @@ function walk(rel, out) {
     assert.ok(manifest.version && manifest.files > 0, "у манифеста нет версии/файлов");
   });
 
+  await test("документы живут в docs/: одно место правды и ни одного чтения со старого", () => {
+    // Документы съехали из корня в docs/ (часть 76): корень держит сборку и точку
+    // входа, а история работ — отдельная папка. Проверка стережёт две вещи: файл
+    // не вернулся в корень (иначе два места правды разъедутся) и никто не читает
+    // его по старому пути — такое чтение падало бы уже в прогоне.
+    const DOCS = ["AGENT-NOTES.md", "ARCHITECTURE.md", "HANDOFF.md"];
+    for (const f of DOCS) {
+      assert.ok(exists("docs/" + f), "нет docs/" + f);
+      assert.ok(!exists(f), f + " вернулся в корень — два места правды");
+    }
+
+    // Считаем только НАСТОЯЩИЕ чтения с диска: имя файла внутри read()/path.join().
+    // Простое упоминание в комментарии («ловушка 5 из HANDOFF») — не чтение.
+    const oldPlaceReads = (src) => {
+      const out = [];
+      for (const m of src.matchAll(/(?:read(?:FileSync)?|path\.join)\(([^)\n]{0,160})\)/g)) {
+        if (!/(AGENT-NOTES|ARCHITECTURE|HANDOFF)\.md/.test(m[1])) continue;
+        if (!/docs/.test(m[1])) out.push(m[1].replace(/\s+/g, " ").slice(0, 70));
+      }
+      return out;
+    };
+    const files = [];
+    for (const dir of ["test", "scripts", "src"]) {
+      for (const f of fs.readdirSync(path.join(ROOT, dir))) if (f.endsWith(".js")) files.push(dir + "/" + f);
+    }
+    const bad = [];
+    for (const rel of files) {
+      for (const call of oldPlaceReads(fs.readFileSync(path.join(ROOT, rel), "utf8"))) bad.push(rel + " → " + call);
+    }
+    assert.deepStrictEqual(bad, [], "документ читают со старого места: " + bad.join(" | "));
+
+    // Негативный контроль: страж обязан ловить старый путь и не трогать новый.
+    // Без него он мог бы молча ничего не находить (например, из-за жадной маски).
+    // Строку-пример собираем из кусков: иначе страж найдёт свой же пример прямо
+    // в этом файле и упадёт на собственном наборе (так и было на первой проверке).
+    const OLD = "ARCHITECTURE" + ".md";
+    assert.deepStrictEqual(oldPlaceReads('const d = read("' + OLD + '");'), ['"' + OLD + '"'], "старый путь не пойман");
+    assert.deepStrictEqual(
+      oldPlaceReads('const d = read("docs", "' + OLD + '");'),
+      [],
+      "новый путь принят за старый"
+    );
+    assert.deepStrictEqual(
+      oldPlaceReads('// ловушка 5 из HANDOFF: см. AGENT-NOTES.md\nconst x = 1;'),
+      [],
+      "упоминание в комментарии посчитано за чтение"
+    );
+  });
+
   await test("раскладка интерфейса: карта, разметка и список для телефона согласованы", () => {
-    const doc = fs.readFileSync(path.join(ROOT, "ARCHITECTURE.md"), "utf8");
-    assert.ok(doc.includes("<!-- UI-MAP:START -->"), "в ARCHITECTURE.md нет карты интерфейса");
+    const doc = fs.readFileSync(path.join(ROOT, "docs", "ARCHITECTURE.md"), "utf8");
+    assert.ok(doc.includes("<!-- UI-MAP:START -->"), "в docs/ARCHITECTURE.md нет карты интерфейса");
     const rows = doc
       .split("<!-- UI-MAP:START -->")[1]
       .split("<!-- UI-MAP:END -->")[0]

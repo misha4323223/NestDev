@@ -307,6 +307,30 @@
     return grid;
   }
 
+  // Какой счёт показать одной цифрой, когда их НЕСКОЛЬКО: сначала тот, у которого
+  // баланс в минусе (облако остановит ресурсы), затем выключенный, затем первый
+  // по списку. Складывать балансы разных счетов нельзя — это разные деньги.
+  function ycWorstAccount(list) {
+    const rank = (a) => (Number(a.balance) < 0 ? 0 : a.active ? 2 : 1);
+    return (
+      (list || [])
+        .slice()
+        .sort((a, b) => rank(a) - rank(b) || (Number(a.balance) || 0) - (Number(b.balance) || 0))[0] || null
+    );
+  }
+
+  // Строка про один платёжный аккаунт для подсказки чипа: имя, баланс, состояние.
+  // Минус и «ВЫКЛЮЧЕН» называем прямо — именно из-за них облако останавливает
+  // ресурсы, и человеку это нужно видеть без открытия «Денег».
+  function ycAccountLine(a) {
+    const negative = Number(a.balance) < 0;
+    return (
+      "Платёжный аккаунт «" + (a.name || a.id) + "» · " + (a.balanceHuman || ycMoney(a.balance)) +
+      " · " + (a.active ? "активен" : "ВЫКЛЮЧЕН") +
+      (negative ? " · баланс в минусе: новые ресурсы не создадутся, пока он не станет положительным" : "")
+    );
+  }
+
   // Строка здоровья: сколько ресурсов, что не ответило, баланс и — главное —
   // платные хвосты в рублях. Деньги берём у биллинга (он один знает баланс и
   // правило «что такое хвост»), но ждать его полка не обязана.
@@ -358,19 +382,33 @@
           title: "Биллинг недоступен: " + ycHealthErr + "\nЧастая причина — нет роли billing.viewer: без неё облако не отдаёт платёжные аккаунты.",
         })
       );
-    } else if (h && h.account) {
-      const negative = Number(h.account.balance) < 0;
+    } else if (h && (h.account || (h.accounts || []).length)) {
+      // Счетов может быть НЕСКОЛЬКО, и биллинг намеренно не выбирает за человека
+      // (в yc-billing.js это закреплено тестом «аккаунт угадан при двух
+      // доступных»). Но чип обязан назвать деньги: раньше в этой ветке стояло
+      // «аккаунта нет», и человек читал «счёта нет вовсе», хотя счета и балансы
+      // были видны в «Деньгах». Теперь чип берёт САМЫЙ ТРЕВОЖНЫЙ счёт (минус →
+      // выключенный → первый), а все остальные показываются в подсказке.
+      const list = (h.accounts && h.accounts.length ? h.accounts : [h.account]).filter(Boolean);
+      const acc = h.account || ycWorstAccount(list);
+      const negative = Number(acc.balance) < 0;
+      const many = list.length > 1;
       row.appendChild(
-        chip("Баланс", h.account.balanceHuman || ycMoney(h.account.balance), {
-          cls: negative ? "err" : "ok",
+        chip("Баланс", (acc.balanceHuman || ycMoney(acc.balance)) + (many ? " · счётов: " + list.length : ""), {
+          cls: negative ? "err" : list.some((a) => a.active === false) ? "warn" : "ok",
           title:
-            (h.account.name ? "Платёжный аккаунт «" + h.account.name + "» · " : "") +
-            (h.account.active ? "активен" : "ВЫКЛЮЧЕН") +
-            (negative ? " · баланс в минусе: новые ресурсы не создадутся" : ""),
+            list.map((a) => ycAccountLine(a)).join("\n") +
+            (many ? "\nПоказан самый тревожный счёт. Остальные — в «Деньги · подробнее» и в списке аккаунтов." : ""),
+          onClick: many ? () => ycOpenActions("billing", "", "Биллинг") : undefined,
         })
       );
     } else if (h) {
-      row.appendChild(chip("Баланс", "аккаунта нет", { cls: "warn", title: "Платёжный аккаунт не найден: облако не привязано к счёту." }));
+      row.appendChild(
+        chip("Баланс", "нет счёта", {
+          cls: "warn",
+          title: "Платёжных аккаунтов нет: облако не привязано к счёту — платные ресурсы создавать некуда.",
+        })
+      );
     }
     if (h && h.leaks) {
       const leaks = h.leaks;
@@ -475,7 +513,14 @@
     const list = document.createElement("div");
     list.className = "yc-tile-list";
     if (!s.ok) {
-      list.textContent = "Ошибка API: " + (s.error || "недоступно");
+      // В СВЁРНУТОЙ плитке полный отказ не печатаем: длинный текст заслонял
+      // полку, а та же ошибка читалась дважды (сверху и здесь). Свёрнутая плитка
+      // говорит только «⚠ ошибка API», причина — в подсказке при наведении, а
+      // развёрнутая показывает текст целиком и без обрезки.
+      const err = document.createElement("div");
+      err.className = "yc-card-err";
+      err.textContent = "Ошибка API: " + (s.error || "недоступно");
+      list.appendChild(err);
       return list;
     }
     if (!s.items || !s.items.length) {
@@ -634,12 +679,6 @@
       dot.className = "yc-tile-dot" + (s.ok ? (s.count > 0 ? " on" : "") : " err");
       top.appendChild(dot);
       card.appendChild(top);
-      if (!s.ok) {
-        const err = document.createElement("div");
-        err.className = "yc-card-err";
-        err.textContent = String(s.error || "API недоступно").slice(0, 200);
-        card.appendChild(err);
-      }
       const canCreate = s.ok && YC_CREATABLE.includes(s.key);
       const canAct = !!(window.YcActions && window.YcActions.forService(s.key).length);
       if (canCreate || canAct) {

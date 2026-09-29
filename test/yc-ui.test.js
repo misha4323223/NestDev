@@ -30,7 +30,11 @@
        ② биллинг отказал — ресурсы всё равно видны, а вместо суммы честное
           «Баланс не видно» с причиной (частая — нет роли billing.viewer);
        ③ SVG со скриптом внутри не рисуется: панель показывает наш нейтральный
-          знак, а не чужой код.
+          знак, а не чужой код;
+       ④ при ДВУХ платёжных счетах чип показывает самый тревожный (минус → выклю-
+          ченный), а не «аккаунта нет»; при нуле счетов — честное «нет счёта»;
+       ⑤ свёрнутая плитка с ошибкой API не печатает длинный отказ — он ждёт
+          раскрытия (иначе текст заслонял полку и читался дважды).
 
    Заглушка `$` строгая: id, которого нет в настоящей разметке, — ошибка теста. */
 
@@ -215,6 +219,9 @@ function buildEnv(o) {
       calls.billing++;
       calls.billingOp = args && args.op;
       if (opts.billingFails) return { ok: false, error: opts.billingFails };
+      // Свой ответ биллинга — для случаев, которых нет в базовой заглушке:
+      // несколько платёжных счетов и полное их отсутствие.
+      if (opts.billing) return opts.billing;
       return {
         ok: true,
         account: { id: "acc-1", name: "Облако", currency: "RUB", balance: 1234.56, balanceHuman: "1 234,56 ₽", active: true },
@@ -383,7 +390,7 @@ function tileByName(env, name) {
 
   console.log("\n[3] Панель работает: полка, фильтр, деньги");
 
-  await test("полка: плитки с иконками, русские имена, ошибка текстом, «Создать» только где можно", async () => {
+  await test("полка: плитки с иконками, русские имена, пометка ошибки, «Создать» только где можно", async () => {
     const env = buildEnv();
     assert.deepStrictEqual(Object.keys(env.built).sort(), ["loadDashboard", "refreshSettingsUI"], "наружу торчит лишнее");
     await env.built.loadDashboard(true);
@@ -398,7 +405,12 @@ function tileByName(env, name) {
       assert.ok(logo && /<svg/.test(logo.innerHTML), "у плитки нет официальной иконки: " + t.textContent);
     }
     const failed = tileByName(env, "DNS-зоны");
-    assert.ok(/нет роли dns\.viewer/.test(failed.textContent), "ошибка сервиса не показана текстом");
+    assert.ok(/⚠ ошибка API/.test(failed.textContent), "ошибка сервиса не помечена словами: " + failed.textContent);
+    // Свёрнутая плитка полный отказ НЕ печатает: длинный текст заслонял полку,
+    // а при раскрытии та же ошибка читалась дважды. Причина — в подсказке,
+    // полный текст — при раскрытии (отдельная проверка в негативных контролях).
+    assert.ok(!/нет роли dns\.viewer/.test(failed.textContent), "свёрнутая плитка печатает полный отказ");
+    assert.ok(/нет роли dns\.viewer/.test(failed.title), "причина отказа не видна в подсказке: " + failed.title);
     assert.ok(tileByName(env, "Объектное хранилище").querySelectorAll(".yc-tile-add").length === 1, "у хранилища нет кнопки «Создать»");
     assert.ok(tileByName(env, "CDN и сайты").querySelectorAll(".yc-tile-add").length === 0, "CDN не создаётся агентом — кнопки быть не должно");
   });
@@ -483,6 +495,40 @@ function tileByName(env, name) {
     assert.ok(/удали диск/.test(leaks[0].textContent), "у хвоста нет ответа «что делать»");
   });
 
+  await test("два платёжных счёта: чип берёт тот, на котором тревога, а не «аккаунта нет»", async () => {
+    // Жизнь: у человека два платёжных аккаунта — «Misha» (баланс в минусе,
+    // ВЫКЛЮЧЕН) и «account-onyx-6968» (активен, в плюсе). Биллинг в такой
+    // ситуации намеренно не выбирает счёт сам (это закреплено тестом в
+    // yc-billing), и панель говорила «Баланс аккаунта нет» — то есть «счёта нет
+    // вовсе», хотя деньги и балансы были видны в «Деньгах».
+    const env = buildEnv({
+      billing: {
+        ok: true,
+        account: null,
+        accounts: [
+          { id: "a2", name: "account-onyx-6968", currency: "RUB", balance: 478.03, balanceHuman: "478,03 ₽", active: true },
+          { id: "a1", name: "Misha", currency: "RUB", balance: -2.91, balanceHuman: "−2,91 ₽", active: false },
+        ],
+        budgets: [],
+        leaks: null,
+        lines: [],
+        message: "",
+      },
+    });
+    await env.built.loadDashboard(true);
+    await tick();
+    const text = env.$("yc-summary").textContent;
+    assert.ok(!/аккаунта нет/.test(text), "при двух счетах строка сказала «аккаунта нет»: " + text);
+    const chip = env.$("yc-summary").querySelectorAll(".yc-chip").find((c) => /Баланс/.test(c.textContent));
+    assert.ok(chip, "чипа баланса нет вовсе");
+    assert.ok(/−2,91 ₽/.test(chip.textContent), "в чипе не баланс тревожного счёта: " + chip.textContent);
+    assert.ok(/счётов: 2/.test(chip.textContent), "не сказано, что счетов несколько: " + chip.textContent);
+    assert.ok(/Misha/.test(chip.title) && /account-onyx-6968/.test(chip.title), "в подсказке не все счета: " + chip.title);
+    assert.ok(/ВЫКЛЮЧЕН/.test(chip.title) && /478,03 ₽/.test(chip.title), "состояние и баланс второго счёта не названы");
+    assert.ok(chip.classList.contains("err"), "минус на балансе не выделен");
+    assert.ok(chip.classList.contains("yc-chip-link"), "на несколько счетов нельзя кликнуть");
+  });
+
   await test("повторный заход берёт данные из памяти, а ↻ перечитывает деньги", async () => {
     const env = buildEnv();
     await env.built.loadDashboard(true);
@@ -532,6 +578,33 @@ function tileByName(env, name) {
     assert.ok(/Хвосты/.test(text) === false, "хвосты показаны, хотя биллинг не ответил");
   });
 
+  await test("ни одного платёжного счёта — сказано именно это, без выдуманных цифр", async () => {
+    const env = buildEnv({ billing: { ok: true, account: null, accounts: [], budgets: [], leaks: null, lines: [], message: "" } });
+    await env.built.loadDashboard(true);
+    await tick();
+    const text = env.$("yc-summary").textContent;
+    assert.ok(/Баланс нет счёта/.test(text), "нет честного «нет счёта»: " + text);
+    const chip = env.$("yc-summary").querySelectorAll(".yc-chip").find((c) => /Баланс/.test(c.textContent));
+    assert.ok(/Платёжных аккаунтов нет/.test(chip.title), "причина не названа: " + chip.title);
+    assert.ok(!/₽/.test(chip.textContent), "при отсутствии счёта показана сумма: " + chip.textContent);
+  });
+
+  await test("свёрнутая плитка с ошибкой API не печатает отказ, развёрнутая — печатает", async () => {
+    // Жизнь: длинный отказ Postbox (403 и что делать) заслонял полку, а при
+    // раскрытии та же ошибка читалась второй раз — сверху и в теле плитки.
+    const env = buildEnv();
+    await env.built.loadDashboard(true);
+    await tick();
+    const tile = tileByName(env, "DNS-зоны");
+    assert.ok(tile, "плитка «DNS-зоны» не собралась");
+    assert.ok(/⚠ ошибка API/.test(tile.textContent), "в свёрнутой плитке нет пометки об ошибке: " + tile.textContent);
+    assert.ok(!/403: нет роли dns\.viewer/.test(tile.textContent), "свёрнутая плитка печатает полный отказ: " + tile.textContent);
+    assert.ok(/403: нет роли dns\.viewer/.test(tile.title), "причина не видна в подсказке при наведении: " + tile.title);
+    tile.onclick();
+    const open = tileByName(env, "DNS-зоны");
+    assert.ok(/Ошибка API: 403: нет роли dns\.viewer/.test(open.textContent), "развёрнутая плитка не показала отказ: " + open.textContent);
+  });
+
   await test("список ресурсов не загрузился — панель объясняет причину и не молчит", async () => {
     const env = buildEnv({ resourcesError: "Сеть: облако не ответило" });
     env.$("yc-search").oninput();
@@ -548,6 +621,11 @@ function tileByName(env, name) {
     const smoke = read("test", "smoke.test.js");
     assert.ok(smoke.indexOf('chip("Ошибки API", failed.length') > 0, "сторож не следит за строкой здоровья");
     assert.ok(smoke.indexOf('err.className = "yc-card-err"') > 0, "сторож перестал требовать текст ошибки сервиса");
+    // Сам сторож тоже проверяем: он обязан ЗАПРЕЩАТЬ текст отказа в свёрнутой
+    // плитке, а сама панель — его не печатать. (Строка ищется в тексте сторожа,
+    // поэтому знак обратный тому, что в панели.)
+    assert.ok(smoke.indexOf("card.appendChild(err)") > 0, "сторож не проверяет текст отказа в свёрнутой плитке");
+    assert.ok(PANEL_SRC.indexOf("card.appendChild(err)") < 0, "свёрнутая плитка печатает полный текст отказа");
   });
 
   console.log("\nИтог: " + passed + " прошло, " + failed + " упало\n");

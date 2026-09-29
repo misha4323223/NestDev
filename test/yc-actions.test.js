@@ -72,7 +72,7 @@ const PRELOAD = read("src", "preload.js");
 const BRIDGE = read("src", "mobile-bridge.js");
 const IPC = read("src", "yc-ipc.js");
 const YANDEX = read("src", "yandex-cloud.js");
-const DOC = read("ARCHITECTURE.md");
+const DOC = read("docs", "ARCHITECTURE.md"); // документы переехали из корня в docs/ (часть 76)
 const PKG = JSON.parse(read("package.json"));
 
 // Набор действий читаем ИЗ МОДУЛЯ, а не из своей копии таблицы: копия проверяла
