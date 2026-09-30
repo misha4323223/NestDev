@@ -112,11 +112,11 @@
   в консоли. Разрешения: `create` — «создавать ресурсы», `start`/`stop` — «менять контейнеры и
   правила сети», `delete` — «удалять ресурсы». Это НЕ `ycCompute`: там одна машина, здесь парк
   одинаковых машин под одним шаблоном.
-- `ycAlb { action, lb, group, router, name, kind, ips, subnet, listener, port, certificate, targetGroup, backendGroup, healthPath, host, pathPrefix, pathExact, address, securityGroups, confirm }` —
+- `ycAlb { action, lb, listenerName, newName, group, router, name, kind, ips, subnet, listener, port, certificate, backendGroup, targetGroup, healthPath, host, pathPrefix, pathExact, address, sni, securityGroups, confirm }` —
   ВХОД В ПРИЛОЖЕНИЕ С УЛИЦЫ (Application Load Balancer). Это ЧЕТЫРЕ разных ресурса одной семьи, и путать их нельзя:
   **группа целей** (`targets`, `targetnew`, `targetadd`, `targetremove`, `targetdel`) — список АДРЕСОВ машин,
   знает только адрес и подсеть; **HTTP-роутер** (`routers`, `routernew`, `routerdel`) — правила «домен и путь →
-  группа бэкендов»; **балансировщик** (`list`, `card`, `lbnew`, `lbstart`, `lbstop`, `lbdel`) — адреса, зоны и
+  группа бэкендов»; **балансировщик** (`list`, `card`, `lbnew`, `lbupdate`, `listeneradd`, `listenerupd`, `listenerdel`, `lbstart`, `lbstop`, `lbdel`) — адреса, зоны и
   СЛУШАТЕЛИ; **группа бэкендов** (`backends`, `backnew`, `backdel`) — куда ведут маршруты: здесь живут ПОРТ целей
   и проверки здоровья.
   **Порядок такой:** `targetnew` (адреса машин) → `backnew` (группа бэкендов: `kind` — http/grpc/stream,
@@ -124,6 +124,27 @@
   `backends`; пустой список значит «роутер создавать некуда», и это надо сказать человеку, а не выдумывать id) →
   `lbnew` (слушатель: `http` — через роутер, `https` — роутер и сертификат Certificate Manager со статусом
   `Issued`, `stream` — поток TCP на группу бэкендов). Смешивать HTTP и TCP в одном TLS-слушателе нельзя.
+  **Состав слушателей меняют точечно:** `listeneradd` (имя `listenerName`, вид `listener`, `port`, а дальше
+  роутер, сертификат или группа бэкендов) и `listenerdel` (`listenerName`; необратимо для входа — спрашивает
+  `confirm: true`). Перезаписи всего списка (`listenerSpecs[]`) при правке нет: она стёрла бы слушателей, которых
+  в теле нет. `lbupdate` правит только имя (`newName`), описание и `securityGroups` — и список групп
+  **ЗАМЕНЯЕТСЯ целиком**: перечисли все нужные, иначе вход закроется снаружи. Карточка HTTPS-слушателя (`card`)
+  показывает сертификат, его домены и срок: «сайт не открывается» часто значит «сертификат просрочен или ещё не
+  выпущен», а не «балансировщик сломался».
+  **Правка слушателя — `listenerupd`, и он НЕ пересобирает слушателя заново:** называй только то, что меняешь
+  (`listenerName` обязателен, дальше `listener`, `port`, `router`, `certificate`, `backendGroup`, `address`,
+  `sni`), остальное остаётся прежним. Поэтому продление HTTPS — это `listenerupd { listenerName: "web",
+  certificate: "<новый>" }`, а перевод сайта на HTTPS — `listenerupd { listenerName: "web", listener: "https",
+  certificate: "…" }`. Переименовать слушателя НЕЛЬЗЯ: имя и есть его адрес внутри балансировщика — облако
+  опознаёт слушателя по имени. Адрес при правке оставляй: домены смотрят на адрес слушателя, а новый адрес
+  пришлось бы переводить в DNS заново. Смена вида заменяет обработчик целиком, и настройки, которых ты не
+  называл (HTTP/2, перенаправление), вернутся к значениям по умолчанию.
+  **Несколько доменов на одном HTTPS-слушателе — это SNI** (`sni` у `lbnew`, `listeneradd` и `listenerupd`):
+  у КАЖДОГО домена СВОЙ сертификат — `[{ serverNames: ["shop.example.com"], certificate: "shop-cert" }]`,
+  строкой — `"shop.example.com=shop-cert"` (по строке на домен, домены через запятую). Домен обязан быть РОВНО
+  у одного обработчика, сертификат — выпущенный (`Issued`), а остальным доменам достаётся основной сертификат
+  слушателя. В `listenerupd` список ЗАМЕНЯЕТСЯ целиком: доменов, которых нет, больше не будет (пустой список
+  убирает все). Так один слушатель на 443 держит и сайт, и магазин — без второго адреса и второго порта.
   **Деньги:** платит БАЛАНСИРОВЩИК — ресурсные единицы и сам ресурс за час, даже когда трафика нет, поэтому
   `lbnew` только с `confirm: true` после согласия, а ориентир даёт `ycBilling { action: "price", query: "Application
   Load Balancer" }`. Группа целей и роутер бесплатны. `lbdel` уносит слушатели и адреса — домен перестанет

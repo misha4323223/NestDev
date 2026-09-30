@@ -589,7 +589,7 @@ function createCloudTools(deps) {
         if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
         if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud — балансировщик и его группы целей живут в каталоге.";
         const action = String(args.action || "list").trim().toLowerCase();
-        const ALL = ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "lbnew", "lbstart", "lbstop", "lbdel"];
+        const ALL = ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"];
         if (ALL.indexOf(action) === -1) return "Ошибка: неизвестное действие ycAlb «" + action + "». Доступно: " + ALL.join(", ") + ".";
         const ref = String(args.lb || args.id || args.name || "").trim();
         try {
@@ -644,6 +644,12 @@ function createCloudTools(deps) {
                 }
               }
             }
+            // HTTPS-слушатели: сертификат, его состояние и срок — по ним видно,
+            // будет ли вход отвечать, не залезая в Certificate Manager.
+            if ((c.certificates || []).length) {
+              lines.push("Сертификаты HTTPS-слушателей:");
+              for (const x of c.certificates) lines.push("  " + ycAlb.certLine(x));
+            }
             if (c.backendGroups.length) lines.push("Группы бэкендов: " + c.backendGroups.map((b) => b.name).join(", "));
             if (c.targetGroups.length) {
               lines.push("Группы целей (" + c.targetGroups.length + "):");
@@ -655,6 +661,7 @@ function createCloudTools(deps) {
             lines.push(!c.targetGroupsResolved && c.targetGroups.length
               ? "Связь с группами целей не подтвердилась (нет групп бэкендов или маршрутов): показаны все группы целей каталога."
               : "Здоровье целей (здорова/не отвечает) — действие health: ycAlb { action: \"health\", lb: \"<балансировщик>\", targetGroup: \"<группа целей>\" }.");
+            for (const w of c.warnings || []) lines.push(w);
             return lines.join("\n");
           }
           if (action === "targetnew") {
@@ -733,6 +740,67 @@ function createCloudTools(deps) {
             const r = await ycAlb.removeBackendGroup(cfg.oauth, { folderId: cfg.folderId, group: g });
             return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "");
           }
+          if (action === "listeneradd") {
+            const r = await ycAlb.addListener(cfg.oauth, {
+              folderId: cfg.folderId,
+              lb: String(args.lb || args.id || "").trim(),
+              listenerName: args.listenerName || (String(args.lb || args.id || "").trim() ? args.name : ""),
+              listener: args.listener || args.kind,
+              port: args.port,
+              router: args.router || args.httpRouter || args.httpRouterId,
+              certificate: args.certificate || args.certificateId,
+              backendGroup: args.backendGroup || args.backendGroupId,
+              address: args.address || args.staticAddress,
+              httpToHttps: args.httpToHttps,
+              sni: args.sni || args.sniHandlers,
+            });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "") +
+              "\nСлушатель добавлен отдельным методом (:addListener): состав слушателей НЕ переписывается целиком, остальные остаются на месте.";
+          }
+          if (action === "listenerupd") {
+            // Правка слушателя: чего не назвали — остаётся прежним. Переименовать
+            // слушателя нельзя — :updateListener опознаёт его по имени.
+            const r = await ycAlb.updateListener(cfg.oauth, {
+              folderId: cfg.folderId,
+              lb: String(args.lb || args.id || "").trim(),
+              listenerName: args.listenerName || args.listenerToUpdate,
+              listener: args.listener || args.kind,
+              port: args.port,
+              router: args.router || args.httpRouter || args.httpRouterId,
+              certificate: args.certificate || args.certificateId,
+              backendGroup: args.backendGroup || args.backendGroupId,
+              address: args.address || args.staticAddress,
+              httpToHttps: args.httpToHttps,
+              sni: args.sni != null || args.sniHandlers != null ? (args.sni != null ? args.sni : args.sniHandlers) : null,
+            });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "") +
+              "\nПравка ушла отдельным методом (:updateListener) с маской полей: чужие слушатели и то, чего мы не назвали, остаются прежними. Новый сертификат сюда же: listenerupd { listenerName: \"web\", certificate: \"new-cert\" } — так продлевают HTTPS.";
+          }
+          if (action === "listenerdel") {
+            const lb0 = await ycAlb.findLoadBalancer(cfg.oauth, cfg.folderId, ref);
+            if (!lb0) return "Ошибка: не нашёл балансировщик «" + ref + "» в каталоге. Список — ycAlb { action: \"list\" }.";
+            const lname = String(args.listenerName || args.listener || "").trim();
+            const found = lb0.listeners.find((l) => l.name === lname) || null;
+            if (!found) {
+              return "Ошибка: у балансировщика «" + lb0.name + "» нет слушателя «" + lname + "»." + (lb0.listeners.length ? " Слушатели: " + lb0.listeners.map((l) => l.name).join(", ") + "." : " Слушателей нет вовсе.");
+            }
+            if (args.confirm !== true) {
+              return "Слушатель «" + found.name + "» убирается с балансировщика «" + lb0.name + "»: вход по нему закроется" + (found.addresses.length ? ", адрес " + found.addresses.join(", ") + " освободится" : "") + ", а домен, который на него смотрел, перестанет открываться. Вызови снова с confirm: true после согласия человека.";
+            }
+            const r = await ycAlb.removeListener(cfg.oauth, { folderId: cfg.folderId, lb: lb0, listenerName: found.name });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "");
+          }
+          if (action === "lbupdate") {
+            const r = await ycAlb.updateLoadBalancer(cfg.oauth, {
+              folderId: cfg.folderId,
+              lb: ref,
+              newName: args.newName || args.rename,
+              description: args.description != null && String(args.description).trim() !== "" ? String(args.description).trim() : undefined,
+              securityGroups: args.securityGroups || args.securityGroupIds,
+            });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "") +
+              "\nПравка ушла С МАСКОЙ полей: облако меняет только названное, а слушателей трогают отдельные действия listeneradd и listenerdel.";
+          }
           if (action === "lbnew") {
             if (args.confirm !== true) {
               return "Создание балансировщика — решение с ценой: ресурсные единицы и сам ресурс тарифицируются за час, даже когда трафика нет. Проверь имя, подсеть, слушателя и вызови снова с confirm: true.\n" +
@@ -753,6 +821,7 @@ function createCloudTools(deps) {
               address: args.address || args.staticAddress,
               securityGroups: args.securityGroups || args.securityGroupIds,
               httpToHttps: args.httpToHttps,
+              sni: args.sni || args.sniHandlers,
               minZoneSize: args.minZoneSize,
               maxSize: args.maxSize,
               description: args.description,

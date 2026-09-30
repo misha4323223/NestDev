@@ -75,7 +75,13 @@
          облако удалять откажется, а здоровье цели спрашивают у ПАРЫ
          «бэкенды + цели» и приходит оно ПО ЗОНАМ;
      [24] yc:alb: канал ОКНА — тот же модуль через настоящий main.js: строки,
-         цена до согласия, согласие на необратимое и здоровье числом.
+         цена до согласия, согласие на необратимое и здоровье числом; состав
+         слушателей меняют ТОЧЕЧНО (:addListener, :updateListener,
+         :removeListener — без списка целиком), HTTPS берёт только выпущенный
+         сертификат, правка уходит МАСКОЙ полей, а карточка отдаёт сертификаты
+         окну объектами; правка слушателя НЕ перебирает его заново (что не
+         назвали — то и осталось, адрес в том числе), а несколько доменов на
+         одном слушателе живут в SNI — у каждого свой сертификат.
 
    Ничего в репозитории приложения не пишется: всё в temp-папках. */
 
@@ -155,12 +161,50 @@ const igState = { created: [], deleted: new Set(), status: "ACTIVE" };// Зап�
 // (endpointSpecs/addressSpecs) — только запасная. Как и у групп машин, стенд
 // помнит созданное и удалённое: по этому видно, что действие правда дошло.
 const albCalls = [];
-const albState = { lbCreated: [], lbDeleted: new Set(), tgCreated: [], tgDeleted: new Set(), bgCreated: [], bgDeleted: new Set(), routerCreated: [], targets: ["10.10.0.5", "10.10.0.6"], status: "ACTIVE" };
+// Облако выдаёт адрес слушателю САМО, если его не назвали, и отдаёт слушателя в
+// форме ОТВЕТА — тут так же: иначе «адрес сохраняется при правке» проверить
+// было бы нечем (домены смотрят именно на адрес).
+let albAddrSeq = 0;
+const albState = { lbCreated: [], lbDeleted: new Set(), tgCreated: [], tgDeleted: new Set(), bgCreated: [], bgDeleted: new Set(), routerCreated: [], targets: ["10.10.0.5", "10.10.0.6"], status: "ACTIVE",
+  // Часть 91, заход 4: имя, описание, группы безопасности и СОСТАВ СЛУШАТЕЛЕЙ
+  // здесь меняются — иначе правку (:addListener, :removeListener, PATCH) нечем
+  // было бы проверить: стенд должен перечитываться как настоящее облако.
+  name: "web-lb", description: "", securityGroupIds: ["sg-web"],
+  listeners: [{ name: "web", endpoints: [{ addresses: [{ externalIpv4Address: { address: "203.0.113.10" } }], ports: ["80"] }], http: { handler: { httpRouterId: "rt-web" } } }] };
+// Правка слушателя (:updateListener): тело — updateMask + listenerSpec, а сам
+// слушатель опознаётся ПО ИМЕНИ (переименовать его нельзя). Стенд повторяет
+// поведение облака: названное в маске берётся из тела, НЕназванное остаётся
+// прежним, а названное без значения сбрасывается — так и работает смена вида
+// http → https (в маске оказывается и СТАРЫЙ вид).
+const albMaskField = { name: "name", endpoints: "endpoint_specs", http: "http", tls: "tls", stream: "stream" };
+const albEndpointFromSpec = (e) => {
+  const a = (e && (e.addressSpecs || [])[0]) || {};
+  const ext = a.externalIpv4AddressSpec || a.externalIpv6AddressSpec || a.internalIpv4AddressSpec || {};
+  return { addresses: [ext.address ? { externalIpv4Address: { address: ext.address } } : {}], ports: ((e && e.ports) || []).map(String) };
+};
+const albApplyListener = (sent) => {
+  const spec = sent.listenerSpec || {};
+  const fields = String(sent.updateMask || "").split(",").map((s) => s.trim());
+  const at = albState.listeners.findIndex((x) => x.name === spec.name);
+  if (at < 0) return;
+  const before = albState.listeners[at];
+  const next = {};
+  for (const key of ["name", "endpoints", "http", "tls", "stream"]) {
+    if (fields.indexOf(albMaskField[key]) < 0) {
+      if (before[key] !== undefined) next[key] = before[key];
+      continue;
+    }
+    const given = key === "endpoints" ? spec.endpointSpecs : spec[key];
+    if (given === undefined) continue;
+    next[key] = key === "endpoints" ? (spec.endpointSpecs || []).map(albEndpointFromSpec) : given;
+  }
+  albState.listeners[at] = next;
+};
 const albLbBody = () => ({
-  id: "lb-web", name: "web-lb", folderId: "f1", createdAt: "2026-08-03T10:00:00Z", status: albState.status,
-  regionId: "ru-central1", networkId: "net-1", securityGroupIds: ["sg-web"],
+  id: "lb-web", name: albState.name, folderId: "f1", description: albState.description, createdAt: "2026-08-03T10:00:00Z", status: albState.status,
+  regionId: "ru-central1", networkId: "net-1", securityGroupIds: albState.securityGroupIds,
   allocationPolicy: { locations: [{ zoneId: "ru-central1-a", subnetId: "sub-a" }] },
-  listeners: [{ name: "web", endpoints: [{ addresses: [{ externalIpv4Address: { address: "203.0.113.10" } }], ports: ["80"] }], http: { handler: { httpRouterId: "rt-web" } } }],
+  listeners: albState.listeners,
 });
 const albTgBody = (id, name, targets) => ({
   id: id || "tg-web", name: name || "web-targets", folderId: "f1", createdAt: "2026-08-02T10:00:00Z",
@@ -560,7 +604,22 @@ function startFakeYc() {
         });
       }
 
-      // ── Application Load Balancer (часть 91, заход 2) ─────────────────────
+      // Сертификаты Certificate Manager: HTTPS-слушателю годится только
+      // ВЫПУЩЕННЫЙ (Issued) сертификат того же каталога — стенд даёт оба случая.
+      if (p.indexOf("/certificate-manager/v1/certificates") === 0) {
+        return json({
+          certificates: [
+            { id: "cert-1", name: "site-cert", status: "ISSUED", domains: ["site.example.com"], notAfter: new Date(Date.now() + 200 * 86400000).toISOString() },
+            { id: "cert-2", name: "old-cert", status: "VALIDATING" },
+            // Два сертификата на один слушатель — это SNI, и продление HTTPS:
+            // у каждого домена свой, а «fresh» нужен правке слушателя.
+            { id: "cert-3", name: "fresh-cert", status: "ISSUED", domains: ["site.example.com"], notAfter: new Date(Date.now() + 360 * 86400000).toISOString() },
+            { id: "cert-4", name: "shop-cert", status: "ISSUED", domains: ["shop.example.com"], notAfter: new Date(Date.now() + 150 * 86400000).toISOString() },
+          ],
+        });
+      }
+
+      // ── Application Load Balancer (часть 91, заходы 2–4) ─────────────────
       // Вход в приложение: балансировщик, слушатели, группы целей, роутеры и
       // группы бэкендов. Слушатели отдаются в форме ОТВЕТА облака; группа
       // целей достижима только через группу бэкендов — стенд держит цепочку.
@@ -584,6 +643,37 @@ function startFakeYc() {
         if (req.method === "POST" && /:removeTargets$/.test(p)) {
           albState.targets = albState.targets.filter((ip) => !(albSent.targets || []).some((t) => t.ipAddress === ip));
           return json({ id: "op-alb-trem", done: false });
+        }
+        // Слушателей меняют ТОЧЕЧНО: один добавляется, один убирается — списка
+        // целиком в этих запросах нет вовсе (иначе остальные были бы стёрты).
+        if (req.method === "POST" && /:addListener$/.test(p)) {
+          const spec = albSent.listenerSpec || {};
+          const eps = (spec.endpointSpecs || []).map(albEndpointFromSpec);
+          if (eps.length && !(eps[0].addresses[0] || {}).externalIpv4Address) {
+            albAddrSeq++;
+            eps[0] = { addresses: [{ externalIpv4Address: { address: "203.0.113." + (20 + albAddrSeq) } }], ports: eps[0].ports };
+          }
+          const next = { name: spec.name, endpoints: eps };
+          for (const k of ["http", "tls", "stream"]) if (spec[k] !== undefined) next[k] = spec[k];
+          albState.listeners.push(next);
+          return json({ id: "op-alb-ladd", done: false });
+        }
+        if (req.method === "POST" && /:updateListener$/.test(p)) {
+          albApplyListener(albSent);
+          return json({ id: "op-alb-lupd", done: false });
+        }
+        if (req.method === "POST" && /:removeListener$/.test(p)) {
+          albState.listeners = albState.listeners.filter((x) => x.name !== albSent.name);
+          return json({ id: "op-alb-ldel", done: false });
+        }
+        // Правка самого балансировщика приходит МАСКОЙ полей: без маски облако
+        // сбросило бы всё, чего нет в теле (включая слушателей).
+        if (req.method === "PATCH" && /\/loadBalancers\/lb-web$/.test(p)) {
+          const fields = String(albSent.updateMask || "").split(",").map((s) => s.trim());
+          if (fields.indexOf("name") >= 0) albState.name = albSent.name;
+          if (fields.indexOf("description") >= 0) albState.description = albSent.description || "";
+          if (fields.indexOf("security_group_ids") >= 0) albState.securityGroupIds = albSent.securityGroupIds || [];
+          return json({ id: "op-alb-patch", done: false });
         }
         if (req.method === "DELETE") {
           if (/\/loadBalancers\//.test(p)) { albState.lbDeleted.add("lb-web"); return json({ id: "op-alb-lbdel", done: false }); }
@@ -1378,13 +1468,14 @@ watchdog.unref();
   const uiIgNoAuth = await callIg({ op: "nope" });
   ok(uiIgNoAuth.ok === true || uiIgNoAuth.ok === false, "чужое действие не сломало канал");
 
-  // ── Application Load Balancer: вход в приложение (часть 91, заходы 2–3) ──
+  // ── Application Load Balancer: вход в приложение (часть 91, заходы 2–4) ──
   // Балансировщик — не «ещё один ресурс»: за одним адресом стоят слушатели,
   // группы целей, роутеры и группы бэкендов. Стенд отдаёт слушателей в форме
   // ОТВЕТА облака, поэтому раздел проверяет и чтение адреса, и весь путь
   // слушатель → роутер → маршрут → группа бэкендов → группа целей. Группа
   // бэкендов здесь же задаёт ПОРТ целей и проверку здоровья, а здоровье цели
-  // облако отдаёт ПО ЗОНАМ.
+  // облако отдаёт ПО ЗОНАМ. В заходе 4 стенд научился МЕНЯТЬ состояние:
+  // :addListener, :removeListener и PATCH — правка обязана перечитываться.
   console.log("\n[23] ycAlb: вход в приложение — слушатели, роутер, группы бэкендов и здоровье целей");
   const albList = plain(await call("ycAlb", { action: "list" }));
   ok(/Балансировщики/.test(albList) && /web-lb/.test(albList), "балансировщик каталога показан: " + lineN(albList, 1));
@@ -1547,6 +1638,100 @@ watchdog.unref();
   ok(albCalls.length > uiAlbRef, "и действительно ушло в облако");
   const uiAlbNoAuth = await callAlb({ op: "nope" });
   ok(uiAlbNoAuth.ok === false && /Неизвестное действие/.test(uiAlbNoAuth.error || ""), "чужое действие отбито словами");
+
+  // ── Правка слушателей и самого балансировщика (часть 91, заход 4) ───────
+  // Слушателей меняют ТОЧЕЧНО: добавление уходит одним listenerSpec (целого
+  // списка в запросе нет — иначе остальные были бы стёрты), HTTPS берёт только
+  // выпущенный сертификат ТОГО ЖЕ каталога, а удаление — именем и с согласием.
+  const uiListenerAdd = await callAlb({ op: "listeneradd", lb: "web-lb", listenerName: "api", port: 8080, router: "web-router" });
+  ok(uiListenerAdd.ok === true && /получает слушателя «api»/.test(uiListenerAdd.message || ""), "слушатель добавлен из окна: " + String(uiListenerAdd.message || "").slice(0, 90));
+  const addListenerCall = albCalls.filter((c) => /:addListener$/.test(c.path)).pop() || {};
+  const addListenerBody = JSON.parse(addListenerCall.body || "{}");
+  ok(addListenerBody.listenerSpec && addListenerBody.listenerSpec.name === "api" && addListenerBody.listenerSpecs === undefined, "добавление ушло ОДНИМ слушателем (listenerSpec), а не списком целиком");
+  ok((uiListenerAdd.warnings || []).join(" ").includes("Адрес слушателя"), "окно предупреждено, что адрес выдаёт облако: " + (uiListenerAdd.warnings || []).join(" | "));
+  const uiAlbCardAdd = await callAlb({ op: "card", lb: "web-lb" });
+  ok((uiAlbCardAdd.lines || []).some((l) => /Слушатели \(2\)/.test(l)) && (uiAlbCardAdd.lines || []).some((l) => /• api —/.test(l)), "карточка перечитала состав слушателей: " + (uiAlbCardAdd.lines || []).join(" | "));
+  const uiListenerSame = await callAlb({ op: "listeneradd", lb: "web-lb", listenerName: "api", port: 8080, router: "web-router" });
+  ok(uiListenerSame.ok === false && /уже есть слушатель/.test(uiListenerSame.error || ""), "дубль имени слушателя отбит до сети: " + String(uiListenerSame.error || "").slice(0, 90));
+  const uiListenerTlsNo = await callAlb({ op: "listeneradd", lb: "web-lb", listenerName: "secure", listener: "https", router: "web-router", certificate: "old-cert" });
+  ok(uiListenerTlsNo.ok === false && /ещё не выпущен/.test(uiListenerTlsNo.error || ""), "HTTPS без выпущенного сертификата отбит до сети: " + String(uiListenerTlsNo.error || "").slice(0, 90));
+  const uiListenerTls = await callAlb({ op: "listeneradd", lb: "web-lb", listenerName: "secure", listener: "https", router: "web-router", certificate: "site-cert" });
+  ok(uiListenerTls.ok === true && /HTTPS\/TLS/.test(uiListenerTls.message || "") && /порт 443/.test(uiListenerTls.message || ""), "HTTPS-слушатель добавлен с выпущенным сертификатом: " + String(uiListenerTls.message || "").slice(0, 90));
+  const tlsListenerCall = albCalls.filter((c) => /:addListener$/.test(c.path)).pop() || {};
+  const tlsListenerBody = JSON.parse(tlsListenerCall.body || "{}");
+  ok((((tlsListenerBody.listenerSpec || {}).tls || {}).defaultHandler || {}).certificateIds[0] === "cert-1", "в HTTPS-слушатель ушёл найденный сертификат (id, а не имя): " + tlsListenerCall.body);
+  ok((tlsListenerBody.listenerSpec || {}).http === undefined, "у TLS-слушателя не появилось второго вида");
+  const uiAlbTlsCard = await callAlb({ op: "card", lb: "web-lb" });
+  ok((uiAlbTlsCard.lines || []).some((l) => /🔒 Слушатель «secure»/.test(l) && /site-cert/.test(l) && /выпущен/.test(l)), "карточка показала сертификат HTTPS-слушателя: " + (uiAlbTlsCard.lines || []).join(" | "));
+  ok((uiAlbTlsCard.certificates || []).length === 1 && (uiAlbTlsCard.certificates || [])[0].cert.name === "site-cert", "окно получило сертификаты объектами: " + JSON.stringify(uiAlbTlsCard.certificates || []));
+  const uiStreamBad = await callAlb({ op: "listeneradd", lb: "web-lb", listenerName: "tcp", listener: "stream", port: 5432, backendGroup: "web-backends" });
+  ok(uiStreamBad.ok === false && /группа вида stream/.test(uiStreamBad.error || ""), "потоку не отдали HTTP-группу бэкендов: " + String(uiStreamBad.error || "").slice(0, 90));
+  const uiListenerDelNo = await callAlb({ op: "listenerdel", lb: "web-lb", listenerName: "api" });
+  ok(uiListenerDelNo.ok === false && uiListenerDelNo.needsConfirm === true && /вход по нему закроется/.test(uiListenerDelNo.error || ""), "удаление слушателя из окна ждёт согласия человека");
+  const uiListenerDel = await callAlb({ op: "listenerdel", lb: "web-lb", listenerName: "api", confirm: true });
+  ok(uiListenerDel.ok === true && /убирается у балансировщика/.test(uiListenerDel.message || ""), "с согласием слушатель убран: " + String(uiListenerDel.message || "").slice(0, 90));
+  const removeListenerCall = albCalls.filter((c) => /:removeListener$/.test(c.path)).pop() || {};
+  ok(JSON.parse(removeListenerCall.body || "{}").name === "api", "удаление ушло ИМЕНЕМ слушателя: " + String(removeListenerCall.body || ""));
+  const uiAlbCardDel = await callAlb({ op: "card", lb: "web-lb" });
+  ok((uiAlbCardDel.lines || []).some((l) => /Слушатели \(2\)/.test(l)) && !(uiAlbCardDel.lines || []).some((l) => /^• api —/.test(l)), "карточка перечитала состав после удаления: " + (uiAlbCardDel.lines || []).join(" | "));
+  const uiAlbUpdNo = await callAlb({ op: "lbupdate", lb: "web-lb" });
+  ok(uiAlbUpdNo.ok === false && /Нечего менять/.test(uiAlbUpdNo.error || ""), "правка без полей отбита словами: " + String(uiAlbUpdNo.error || "").slice(0, 90));
+  const uiAlbUpd = await callAlb({ op: "lbupdate", lb: "web-lb", newName: "web-lb-edge", description: "витрина", securityGroups: "web" });
+  ok(uiAlbUpd.ok === true && /обновляется: имя, описание, группы безопасности/.test(uiAlbUpd.message || ""), "правка балансировщика из окна: " + String(uiAlbUpd.message || "").slice(0, 90));
+  const patchCall = albCalls.filter((c) => c.method === "PATCH").pop() || {};
+  const patchBody = JSON.parse(patchCall.body || "{}");
+  ok(patchBody.updateMask === "name,description,security_group_ids", "правка ушла МАСКОЙ полей: " + patchBody.updateMask);
+  ok(patchBody.listenerSpecs === undefined, "правка не понесла список слушателей");
+  ok((uiAlbUpd.warnings || []).join(" ").includes("ЗАМЕНЁН целиком"), "окно предупреждено: группы безопасности ЗАМЕНЯЮТСЯ целиком");
+  const uiAlbUpdCard = await callAlb({ op: "card", lb: "web-lb-edge" });
+  ok(uiAlbUpdCard.ok === true && (uiAlbUpdCard.lines || []).some((l) => /web-lb-edge/.test(l)), "карточка нашла балансировщик по НОВОМУ имени: " + (uiAlbUpdCard.lines || [])[0]);
+
+  // ── Правка слушателя и SNI (часть 91, заход 5) ────────────────────────
+  // Правка — своё действие (:updateListener), а не «убрать и создать заново»:
+  // чего не назвали — то остаётся прежним (порт, адрес, роутер), поэтому
+  // продление HTTPS — это одно поле. Несколько доменов на одном слушателе —
+  // это SNI: у КАЖДОГО домена свой сертификат, а не второй адрес и порт.
+  const uiSniName = "shop";
+  const uiSni = await callAlb({ op: "listeneradd", lb: "web-lb-edge", listenerName: uiSniName, listener: "https", router: "web-router", certificate: "site-cert", sni: "shop.example.com=shop-cert\nwww.example.com,example.com=site-cert" });
+  ok(uiSni.ok === true && /домены SNI: shop\.example\.com/.test(uiSni.message || ""), "слушатель с доменами добавлен: " + String(uiSni.message || "").slice(0, 120));
+  const sniListenerCall = albCalls.filter((c) => /:addListener$/.test(c.path)).pop() || {};
+  const sniSpec = (JSON.parse(sniListenerCall.body || "{}").listenerSpec || {}).tls || {};
+  ok((sniSpec.sniHandlers || []).length === 2, "SNI-обработчиков ушло два: " + JSON.stringify(sniSpec.sniHandlers || []).slice(0, 120));
+  ok(((sniSpec.sniHandlers || [])[0] || {}).handler && ((sniSpec.sniHandlers || [])[0] || {}).handler.certificateIds[0] === "cert-4", "у домена SNI свой сертификат (id, а не имя): " + JSON.stringify(sniSpec.sniHandlers || []).slice(0, 160));
+  ok(((sniSpec.sniHandlers || [])[1] || {}).serverNames.length === 2 && ((sniSpec.sniHandlers || [])[1] || {}).handler.certificateIds[0] === "cert-1", "домены одной строки разобраны все: " + JSON.stringify((sniSpec.sniHandlers || [])[1] || {}).slice(0, 160));
+  const uiSniBad = await callAlb({ op: "listeneradd", lb: "web-lb-edge", listenerName: "sni-http", listener: "http", port: 80, router: "web-router", sni: "shop.example.com=shop-cert" });
+  ok(uiSniBad.ok === false && /только у HTTPS-слушателя/.test(uiSniBad.error || ""), "SNI у HTTP-слушателя отбит до сети: " + String(uiSniBad.error || "").slice(0, 90));
+  const uiSniOld = await callAlb({ op: "listeneradd", lb: "web-lb-edge", listenerName: "sni-old", listener: "https", router: "web-router", certificate: "site-cert", sni: "shop.example.com=old-cert" });
+  ok(uiSniOld.ok === false && /ещё не выпущен/.test(uiSniOld.error || ""), "SNI с невыпущенным сертификатом отбит до сети: " + String(uiSniOld.error || "").slice(0, 90));
+  const uiSniCard = await callAlb({ op: "card", lb: "web-lb-edge" });
+  ok((uiSniCard.lines || []).some((l) => /SNI: shop\.example\.com/.test(l)), "карточка показала домены SNI: " + (uiSniCard.lines || []).join(" | "));
+  ok((uiSniCard.certificates || []).some((x) => /SNI: shop\.example\.com/.test(x.listenerName || "") && x.cert.name === "shop-cert"), "карточка прочитала СВОЙ сертификат SNI-домена: " + JSON.stringify((uiSniCard.certificates || []).map((x) => x.listenerName)));
+
+  const shopAddr = ((((uiSniCard.listeners || []).find((x) => x.listener && x.listener.name === uiSniName) || {}).listener || {}).addresses || [])[0] || "";
+  ok(!!shopAddr, "адрес слушателя виден в карточке (его выдало облако): " + shopAddr);
+  const uiLupdPort = await callAlb({ op: "listenerupd", lb: "web-lb-edge", listenerName: uiSniName, port: 8443 });
+  ok(uiLupdPort.ok === true && /обновляется: порт 8443/.test(uiLupdPort.message || ""), "слушатель поправлен по порту: " + String(uiLupdPort.message || "").slice(0, 120));
+  const lupdCall = albCalls.filter((c) => /:updateListener$/.test(c.path)).pop() || {};
+  const lupdBody = JSON.parse(lupdCall.body || "{}");
+  ok(lupdBody.updateMask === "name,endpoint_specs,tls", "правка слушателя ушла МАСКОЙ полей: " + lupdBody.updateMask);
+  ok(lupdBody.listenerSpec && lupdBody.listenerSpec.name === uiSniName, "слушателя опознают по имени: " + String((lupdBody.listenerSpec || {}).name));
+  ok(lupdBody.listenerSpecs === undefined, "правка не понесла список слушателей — остальные были бы стёрты");
+  ok(((lupdBody.listenerSpec || {}).endpointSpecs || [])[0].ports.join(",") === "8443", "новый порт ушёл: " + JSON.stringify((lupdBody.listenerSpec || {}).endpointSpecs || []).slice(0, 120));
+  ok((((lupdBody.listenerSpec || {}).tls || {}).sniHandlers || []).length === 2, "домены SNI потерялись при правке порта: " + JSON.stringify(((lupdBody.listenerSpec || {}).tls || {}).sniHandlers || []).slice(0, 120));
+  const lupdAddr = ((((lupdBody.listenerSpec || {}).endpointSpecs || [])[0] || {}).addressSpecs || [])[0] || {};
+  ok((lupdAddr.externalIpv4AddressSpec || {}).address === shopAddr, "адрес слушателя не сохранён — домены смотрели бы в новый адрес: " + JSON.stringify(lupdAddr));
+  const uiLupdCard = await callAlb({ op: "card", lb: "web-lb-edge" });
+  ok((uiLupdCard.lines || []).some((l) => /8443/.test(l)), "карточка перечитала порт: " + (uiLupdCard.lines || []).join(" | "));
+  const uiLupdCert = await callAlb({ op: "listenerupd", lb: "web-lb-edge", listenerName: uiSniName, certificate: "fresh-cert" });
+  ok(uiLupdCert.ok === true && /обновляется: сертификат cert-3/.test(uiLupdCert.message || ""), "HTTPS продлён правкой одного поля: " + String(uiLupdCert.message || "").slice(0, 120));
+  const uiLupdGone = await callAlb({ op: "listenerupd", lb: "web-lb-edge", listenerName: uiSniName, sni: [] });
+  ok(uiLupdGone.ok === true && /домены SNI: убраны/.test(uiLupdGone.message || ""), "пустой список доменов убрал их: " + String(uiLupdGone.message || "").slice(0, 120));
+  const uiLupdBad = await callAlb({ op: "listenerupd", lb: "web-lb-edge", listenerName: "нет-такого", port: 8443 });
+  ok(uiLupdBad.ok === false && /нет слушателя/.test(uiLupdBad.error || "") && /Переименовать слушателя нельзя/.test(uiLupdBad.error || ""), "правка чужого имени отбита словами: " + String(uiLupdBad.error || "").slice(0, 120));
+  const uiAlbNoLupd = await callAlb({ op: "nope" });
+  ok(/listenerupd/.test(uiAlbNoLupd.error || ""), "список действий канала знает правку слушателя: " + String(uiAlbNoLupd.error || "").slice(0, 160));
+  const uiLupdTool = plain(await call("ycAlb", { action: "listenerupd", lb: "web-lb-edge", listenerName: uiSniName, port: 9443 }));
+  ok(/:updateListener/.test(uiLupdTool) && /маской полей/.test(uiLupdTool), "инструмент правит слушателя тем же методом: " + uiLupdTool.slice(0, 160));
 
   srv.close();
   clearTimeout(watchdog);

@@ -26,6 +26,10 @@
      GET    /loadBalancers/{id}                         карточка
      POST   /loadBalancers                              создание
      POST   /loadBalancers/{id}:start | :stop           питание
+     PATCH  /loadBalancers/{id}                         правка (имя, описание, группы безопасности)
+     POST   /loadBalancers/{id}:addListener             добавить слушателя
+     POST   /loadBalancers/{id}:updateListener          правка слушателя (updateMask + listenerSpec)
+     POST   /loadBalancers/{id}:removeListener          убрать слушателя (по имени)
      DELETE /loadBalancers/{id}                         удаление
      GET    /targetGroups?folderId=…                    группы целей
      POST   /targetGroups                               создание
@@ -57,6 +61,31 @@
      • СЛУШАТЕЛЬ РОВНО ОДНОГО ВИДА: stream, http или tls (одно из трёх). HTTP —
        это http.handler.httpRouterId; HTTPS — tls.defaultHandler с httpHandler и
        certificateIds. Смешивать HTTP и TCP в одном TLS-слушателе нельзя.
+     • СПИСОК СЛУШАТЕЛЕЙ ЗАМЕНЯЕТСЯ ЦЕЛИКОМ, и это ловушка: PATCH с
+       listenerSpecs[] стирает всех слушателей, которых нет в присланном списке,
+       а PATCH БЕЗ updateMask сбрасывает в значение по умолчанию всё, чего нет в
+       теле. Поэтому состав слушателей меняют ТОЧЕЧНЫМИ методами (:addListener,
+       :updateListener, :removeListener), а правка самого балансировщика уходит
+       С МАСКОЙ полей — в маске только то, что действительно меняем.
+     • ГРУППЫ БЕЗОПАСНОСТИ ЗАМЕНЯЮТСЯ ЦЕЛИКОМ: список в теле — это НОВЫЙ список,
+       а не добавка к прежнему. Пока порт слушателя не открыт в новых группах,
+       вход закроется снаружи.
+     • У HTTPS-СЛУШАТЕЛЯ РОВНО ОДИН СЕРТИФИКАТ (tls.defaultHandler.
+       certificateIds, максимум 1): годится только ВЫПУЩЕННЫЙ (ISSUED) и лежать
+       он обязан в ТОМ ЖЕ каталоге, что балансировщик.
+     • ПРАВКА СЛУШАТЕЛЯ — ЭТО НОВЫЙ СЛУШАТЕЛЬ ЦЕЛИКОМ: :updateListener
+       принимает updateMask и listenerSpec, а САМ слушатель опознаётся ПО ИМЕНИ
+       (переименовать его нельзя — такого поля у метода нет). В маске
+       перечисляем только то, что задаём: name, endpoint_specs и вид
+       (http/tls/stream); если вид МЕНЯЕТСЯ, в маску попадает и СТАРЫЙ вид —
+       иначе облако оставило бы оба, а у слушателя вид ровно один из трёх.
+     • АДРЕС ПРИ ПРАВКЕ ОСТАВЛЯЮТ: адрес принадлежит СЛУШАТЕЛЮ, и правка без
+       адреса может выдать НОВЫЙ адрес — тогда домены придётся переводить
+       заново. Модуль по умолчанию берёт адрес из самого слушателя.
+     • SNI — НЕСКОЛЬКО ДОМЕНОВ НА ОДНОМ СЛУШАТЕЛЕ: tls.sniHandlers[] — это
+       список { name, serverNames[], handler } со СВОИМ сертификатом у каждого
+       (у TLS-обработчика максимум ОДИН сертификат). Все обработчики одного
+       слушателя обязаны быть ОДНОГО типа (HTTP или поток): смешивать нельзя.
      • РОУТЕР БЕЗ ГРУППЫ БЭКЕНДОВ НЕ ИМЕЕТ СМЫСЛА: маршрут ведёт в
        backendGroupId. Модуль проверяет группу бэкендов ДО запроса — иначе
        человек получил бы роутер, который ничего не отдаёт.
@@ -77,6 +106,7 @@
 
 const ALB_HOST = "https://alb.api.cloud.yandex.net";
 const ALB_BASE = "/apploadbalancer/v1";
+const CERT_FALLBACK = "https://certificatemanager.api.cloud.yandex.net";
 
 const PORT_DEFAULT = 80;
 const BACKEND_NAME_DEFAULT = "main";
@@ -106,6 +136,55 @@ const TARGET_STATUS_RU = {
   DRAINING: "выводится из работы",
   TIMEOUT: "проверка не успела ответить",
 };
+
+// Состояния сертификата Certificate Manager — из перечисления Status. HTTPS-
+// слушателю годится только ВЫПУЩЕННЫЙ: остальные состояния — это «ещё не
+// готов» или «уже не годится», и в обоих случаях вход не отвечает.
+const CERT_STATUS_RU = {
+  VALIDATING: "проверяется (запись подтверждения не готова)",
+  PROVISIONING: "выпускается",
+  ISSUED: "выпущен",
+  INVALID: "недействителен",
+  REVOKED: "отозван",
+  RENEWAL_FAILED: "не удалось продлить",
+};
+
+function certStatusHuman(status) {
+  return CERT_STATUS_RU[one(status).toUpperCase()] || one(status);
+}
+
+// Вид слушателя в ОТВЕТЕ облака называется tls, а в запросе — https: сравнивать
+// их надо приведёнными, иначе слушатель «менял бы вид» на каждом чтении.
+function kindInput(kind) {
+  const k = one(kind).toLowerCase();
+  return k === "tls" ? "https" : k;
+}
+
+// Поля балансировщика, которые правит updateLoadBalancer, — словами для ответа
+// (в теле и в маске они идут именами из справочника).
+const LB_FIELD_RU = {
+  name: "имя",
+  description: "описание",
+  security_group_ids: "группы безопасности",
+  endpoint_specs: "адрес и порт",
+  http: "вид HTTP",
+  tls: "вид HTTPS/TLS",
+  stream: "вид поток TCP",
+};
+
+// Поле вида в listenerSpec и в маске правки: у слушателя вид ровно один.
+const KIND_FIELD = { http: "http", https: "tls", stream: "stream" };
+
+// Имя домена для SNI: только строчные латинские буквы, цифры, дефис и точка,
+// звёздочка — только в начале (*.example.com).
+const SNI_SERVER_RE = /^(\*\.)?[-.a-z0-9]+$/;
+
+// Сколько дней осталось до даты (для сертификата): отрицательное — просрочен.
+function daysTo(iso) {
+  const t = Date.parse(one(iso));
+  if (!t) return null;
+  return Math.floor((t - Date.now()) / 86400000);
+}
 
 const NAME_RE = /^[a-z][-a-z0-9_]{0,61}[a-z0-9]$/;
 const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/;
@@ -214,6 +293,13 @@ function listenerInfo(l) {
     backendGroupId: one(handler.backendGroupId),
     certificateIds: certs.map(one),
     sniNames: sni.map((h) => one(h && h.name)),
+    // SNI-обработчики: у КАЖДОГО свои домены и СВОЙ сертификат — без этого
+    // карточка не назовёт, какой именно домен отвечает и каким сертификатом.
+    sni: sni.map((h) => ({
+      name: one(h && h.name),
+      serverNames: ((h && h.serverNames) || []).map(one),
+      certificateIds: (((h && h.handler) || {}).certificateIds || []).map(one),
+    })),
     httpToHttps: !!(o.http && o.http.redirects && o.http.redirects.httpToHttps),
     endpoints: endpoints,
     ports: endpoints.reduce((acc, e) => acc.concat(e.ports), []),
@@ -389,7 +475,13 @@ function listenerLine(l) {
   const target = l.routerId ? "роутер " + l.routerId : l.backendGroupId ? "группа бэкендов " + l.backendGroupId : "цель не названа";
   const certs = l.certificateIds.length ? " · сертификатов: " + l.certificateIds.length : "";
   const redirect = l.httpToHttps ? " · перенаправляет на HTTPS" : "";
-  return "• " + (l.name || "слушатель") + " — " + l.kindHuman + " " + where + ports + " → " + target + certs + redirect;
+  // Домены SNI — это то, зачем слушатель вообще сделан: один слушатель
+  // отвечает на несколько доменов, каждому — свой сертификат.
+  const sni = (l.sni || [])
+    .map((h) => (h.serverNames.length ? h.serverNames.join(", ") : h.name))
+    .filter(Boolean);
+  return "• " + (l.name || "слушатель") + " — " + l.kindHuman + " " + where + ports + " → " + target + certs + redirect +
+    (sni.length ? " · SNI: " + sni.join(" | ") : "");
 }
 
 function targetLine(t) {
@@ -422,6 +514,78 @@ function targetStateLine(s) {
         .join(" · ")
     : "состояний нет: у группы бэкендов не заданы проверки здоровья или облако ещё не ответило";
   return "• " + s.ipAddress + (s.subnetId ? " (подсеть " + s.subnetId + ")" : "") + " — " + where;
+}
+
+// Строка сертификата HTTPS-слушателя: имя, состояние, домены и срок — по ним
+// видно, будет ли вход отвечать, не залезая в консоль Certificate Manager.
+function certLine(entry) {
+  const e = entry || {};
+  const c = e.cert || {};
+  const head = "🔒 Слушатель «" + (e.listenerName || "?") + "» — " + (c.name || c.id || "сертификат не назван") +
+    (e.certId && e.certId !== c.name ? " (" + e.certId + ")" : "") + " · " + (c.statusHuman || "состояние неизвестно");
+  const bits = [];
+  if (c.domains && c.domains.length) bits.push("домены: " + c.domains.join(", "));
+  if (c.notAfter) {
+    bits.push("действует до " + c.notAfter.slice(0, 10) +
+      (c.daysLeft != null ? c.daysLeft < 0 ? " (просрочен " + Math.abs(c.daysLeft) + " дн. назад)" : " (осталось " + c.daysLeft + " дн.)" : ""));
+  }
+  return head + (bits.length ? " · " + bits.join(" · ") : "");
+}
+
+// Имя SNI-обработчика по имени домена: у списка доменов своего имени нет, а
+// облако требует его у каждого обработчика. «*.example.com» → «sni-wildcard-…».
+function sniNameFor(serverName) {
+  const base = one(serverName)
+    .replace(/^\*\./, "wildcard-")
+    .replace(/[^a-z0-9]+/gi, "-")
+    .toLowerCase()
+    .replace(/^-+|-+$/g, "");
+  const name = "sni-" + (base || "handler");
+  return name.length > 63 ? name.slice(0, 63).replace(/-+$/, "") : name;
+}
+
+// SNI-обработчики приходят ДВУМЯ формами: окно шлёт строкой «домен=сертификат»
+// (по строке на обработчик, домены через запятую), агент — списком объектов.
+// Разбор один, и «сертификата нет» отбивается словами ДО сети: без него
+// обработчик не поднимется.
+function parseSniHandlers(raw) {
+  if (raw == null || raw === "") return [];
+  // «нет» — это не домен, а просьба убрать домены: из окна пустое поле означает
+  // «не менять», а список заменяется ЦЕЛИКОМ.
+  if (typeof raw === "string" && ["нет", "нет.", "-"].indexOf(one(raw).toLowerCase()) >= 0) return [];
+  const out = [];
+  const push = (entry) => {
+    if (!entry) return;
+    if (typeof entry === "string") {
+      const line = one(entry);
+      if (!line) return;
+      const cut = line.indexOf("=") >= 0 ? line.indexOf("=") : line.indexOf(":");
+      if (cut < 0) {
+        throw new Error("SNI: в строке «" + line + "» нет сертификата — пиши «домен=сертификат», а несколько доменов — через запятую.");
+      }
+      out.push({
+        name: "",
+        serverNames: line.slice(0, cut).split(/[,\s]+/).map(one).filter(Boolean),
+        certificate: one(line.slice(cut + 1)),
+      });
+      return;
+    }
+    const o = entry || {};
+    const names = [];
+    [].concat(o.serverNames != null ? o.serverNames : o.names != null ? o.names : o.domains || [])
+      .map(one)
+      .forEach((s) => s.split(/[,\s]+/).map(one).filter(Boolean).forEach((x) => names.push(x)));
+    out.push({
+      name: one(o.name || o.handlerName),
+      serverNames: names,
+      certificate: one(o.certificate || o.certificateId || o.cert),
+    });
+  };
+  if (Array.isArray(raw)) raw.forEach(push);
+  else if (typeof raw === "string") raw.split(/[\n;]+/).forEach(push);
+  else if (typeof raw === "object") Object.keys(raw).forEach((k) => push({ serverNames: k, certificate: raw[k] }));
+  else throw new Error("SNI: не понял список доменов — передай строкой «домен=сертификат» или списком.");
+  return out;
 }
 
 function routerLine(r) {
@@ -584,6 +748,34 @@ function createYcAlb(deps) {
     return null;
   }
 
+  // ── Сертификаты (Certificate Manager) ─────────────────────────────────────
+  // HTTPS-слушателю годится только ВЫПУЩЕННЫЙ сертификат, и лежать он обязан в
+  // ТОМ ЖЕ каталоге, что балансировщик: чужой каталог облако отклонит.
+  async function certificates(oauthToken, folderId) {
+    const folder = checkFolder(folderId);
+    const j = await call(oauthToken, "certificate-manager", CERT_FALLBACK, "GET",
+      "/certificate-manager/v1/certificates?folderId=" + encodeURIComponent(folder) + "&pageSize=1000", undefined, 25000);
+    return (Array.isArray(j && j.certificates) ? j.certificates : []).map((c) => ({
+      id: one(c.id),
+      name: one(c.name),
+      status: one(c.status).toUpperCase(),
+      statusHuman: certStatusHuman(c.status),
+      issued: one(c.status).toUpperCase() === "ISSUED",
+      domains: (c.domains || []).map(one).filter(Boolean),
+      notAfter: one(c.notAfter),
+      daysLeft: daysTo(c.notAfter),
+    }));
+  }
+
+  async function findCertificate(oauthToken, folderId, ref) {
+    const list = await certificates(oauthToken, folderId);
+    const q = one(ref);
+    const got = list.find((c) => c.id === q) || list.find((c) => c.name === q) || null;
+    if (got) return got;
+    if (!q && list.length === 1) return list[0];
+    return null;
+  }
+
   // Карточка: балансировщик и его связи — роутеры слушателей, группы бэкендов
   // (из слушателей-потоков и маршрутов) и группы целей. У балансировщика и
   // роутера ссылки на группу целей НЕТ: путь к ней один — через группу бэкендов,
@@ -619,6 +811,57 @@ function createYcAlb(deps) {
       const r = boundRouters.find((x) => x.id === l.routerId);
       if (r) listeners.push({ listener: l, router: r });
     }
+    // HTTPS-слушателю нужен ВЫПУЩЕННЫЙ сертификат из ТОГО ЖЕ каталога. Карточка
+    // читает его состояние, домены и срок: иначе «сайт не открывается» ищут
+    // вслепую, а причина — в сертификате.
+    const certWanted = [];
+    lb.listeners.forEach((l) => {
+      if (l.kind !== "tls") return;
+      if (!l.certificateIds.length) certWanted.push({ listenerName: l.name, certId: "" });
+      else l.certificateIds.forEach((id) => certWanted.push({ listenerName: l.name, certId: id }));
+      // У SNI-обработчиков сертификаты СВОИ: без них домен отвечал бы не тем
+      // сертификатом (или не отвечал вовсе), а по карточке это не видно.
+      (l.sni || []).forEach((h) => {
+        const label = l.name + " (SNI: " + (h.serverNames.join(", ") || h.name || "домены не названы") + ")";
+        if (!h.certificateIds.length) certWanted.push({ listenerName: label, certId: "" });
+        else h.certificateIds.forEach((id) => certWanted.push({ listenerName: label, certId: id }));
+      });
+    });
+    let known = [];
+    if (certWanted.length) known = await certificates(oauthToken, folderId).catch(() => []);
+    const certificates_ = certWanted.map((x) => {
+      const c = x.certId ? known.find((y) => y.id === x.certId) || null : null;
+      return {
+        listenerName: x.listenerName,
+        certId: x.certId,
+        cert: c || {
+          id: x.certId,
+          name: "",
+          status: "",
+          statusHuman: x.certId ? "в каталоге не найден" : "не назван",
+          issued: false,
+          domains: [],
+          notAfter: "",
+          daysLeft: null,
+          unknown: !!x.certId,
+        },
+      };
+    });
+    const warnings = [];
+    certificates_.forEach((x) => {
+      const c = x.cert;
+      if (!x.certId) {
+        warnings.push("У HTTPS-слушателя «" + x.listenerName + "» не назван сертификат: HTTPS без сертификата не поднимется. Сертификат выпускают в Certificate Manager (ycCdn certnew), а слушателю его задают при создании (lbnew, certificate).");
+      } else if (c.unknown) {
+        warnings.push("Сертификат «" + x.certId + "» не найден в каталоге: сертификат обязан лежать в ТОМ ЖЕ каталоге, что балансировщик, иначе облако его не подставит.");
+      } else if (!c.issued) {
+        warnings.push("Сертификат «" + (c.name || x.certId) + "» в состоянии «" + c.statusHuman + "»: пока он не выпущен, HTTPS-слушатель «" + x.listenerName + "» может не отвечать.");
+      } else if (c.daysLeft != null && c.daysLeft < 30) {
+        warnings.push(c.daysLeft < 0
+          ? "Сертификат «" + c.name + "» просрочен (" + c.notAfter.slice(0, 10) + "): HTTPS не отвечает — выпусти новый и задай его слушателю."
+          : "Сертификат «" + c.name + "» истекает " + c.notAfter.slice(0, 10) + " (осталось " + c.daysLeft + " дн.): продли его или выпусти новый заранее.");
+      }
+    });
     return {
       lb: lb,
       listeners: listeners,
@@ -626,6 +869,8 @@ function createYcAlb(deps) {
       backendGroups: boundBackends,
       targetGroups: used.length ? used : tgs,
       targetGroupsResolved: used.length > 0,
+      certificates: certificates_,
+      warnings: warnings,
     };
   }
 
@@ -993,6 +1238,198 @@ function createYcAlb(deps) {
     };
   }
 
+  // ── Сборка слушателя и групп безопасности ────────────────────────────────
+  // Слушатель собирает ОДНА функция: создание балансировщика, добавление и
+  // правка слушателя — три копии одного разбора разъехались бы. HTTP — это
+  // роутер, HTTPS — роутер и ВЫПУЩЕННЫЙ сертификат, поток — группа бэкендов.
+  async function listenerSpecOf(oauthToken, folderId, o) {
+    const kind = one(o.listener || o.kind || "http").toLowerCase();
+    if (["http", "https", "stream"].indexOf(kind) < 0) {
+      throw new Error("Слушатель бывает http, https или stream (дано: " + o.listener + ").");
+    }
+    const port = checkPort(kind === "https" ? (o.port || 443) : o.port);
+    const givenName = one(o.listenerName);
+    if (givenName) checkName(givenName, "слушателя");
+    const name = givenName || LISTENER_NAME_DEFAULT;
+
+    // Домены сверх первого живут в SNI-обработчиках — но только у HTTPS: у HTTP и
+    // потока сертификата (а значит и домена) нет вовсе. Это отказ ДО сети.
+    const sniRaw = o.sni != null ? o.sni : o.sniHandlers != null ? o.sniHandlers : null;
+    if (kind !== "https" && parseSniHandlers(sniRaw).length) {
+      throw new Error(
+        "SNI-обработчики (несколько доменов на одном слушателе) бывают только у HTTPS-слушателя: у HTTP и потока домена в сертификате нет. Смени вид слушателя на https."
+      );
+    }
+
+    let handler = {};
+    let tls = null;
+    let sniSummary = [];
+    if (kind === "stream") {
+      const bgRef = one(o.backendGroup || o.backendGroupId);
+      const bg = await findBackendGroup(oauthToken, folderId, bgRef);
+      if (!bg) {
+        throw new Error(
+          "Потоковому слушателю нужна группа бэкендов («backendGroup»): " +
+            (bgRef ? "«" + bgRef + "» не нашёл" : "не указана") + "."
+        );
+      }
+      if (bg.kind && bg.kind !== "stream") {
+        throw new Error(
+          "Группа бэкендов «" + bg.name + "» — " + bg.kindHuman + ", а потоковому слушателю нужна группа вида stream: облако такой слушатель не примет."
+        );
+      }
+      handler = { backendGroupId: bg.id, idleTimeout: "60s" };
+    } else {
+      const rRef = one(o.router || o.httpRouter || o.httpRouterId);
+      let router = null;
+      if (rRef) {
+        router = await findHttpRouter(oauthToken, folderId, rRef);
+        if (!router) {
+          const rs = await httpRouters(oauthToken, folderId);
+          throw new Error(
+            "Не нашёл HTTP-роутер «" + rRef + "»." +
+              (rs.length ? " В каталоге: " + rs.map((x) => x.name).join(", ") + "." : " Роутеров нет — создай: действие «Создать HTTP-роутер».")
+          );
+        }
+      } else {
+        const rs = await httpRouters(oauthToken, folderId);
+        if (rs.length === 1) router = rs[0];
+        else {
+          throw new Error(
+            "Слушателю нужен HTTP-роутер — он решает, куда идёт запрос: укажи router." +
+              (rs.length ? " В каталоге: " + rs.map((x) => x.name).join(", ") + "." : " Роутеров нет — сначала создай роутер (действие «Создать HTTP-роутер»).")
+          );
+        }
+      }
+      handler = { httpRouterId: router.id };
+      if (kind === "https") {
+        const cRef = one(o.certificate || o.certificateId);
+        if (!cRef) {
+          throw new Error(
+            "HTTPS-слушателю нужен сертификат (поле certificate): он берётся в Certificate Manager. Выпустить: ycCdn { action: \"certnew\", domain: \"…\" } и дождаться статуса Issued."
+          );
+        }
+        const cert = await findCertificate(oauthToken, folderId, cRef);
+        if (!cert) {
+          const cl = await certificates(oauthToken, folderId).catch(() => []);
+          throw new Error(
+            "Не нашёл сертификат «" + cRef + "» в каталоге." +
+              (cl.length ? " В каталоге: " + cl.map((c) => c.name + " (" + c.status + ")").join(", ") + "." : " Сертификатов нет — выпусти: ycCdn { action: \"certnew\", domain: \"…\" }.")
+          );
+        }
+        if (cert.status && !cert.issued) {
+          throw new Error(
+            "Сертификат «" + (cert.name || cert.id) + "» ещё не выпущен (состояние " + cert.status + "): HTTPS-слушатель с таким сертификатом не поднимется. Дождись статуса Issued."
+          );
+        }
+        tls = { defaultHandler: { httpHandler: { httpRouterId: router.id }, certificateIds: [cert.id] } };
+
+        // SNI: один TLS-слушатель отвечает на НЕСКОЛЬКО доменов, и у каждого
+        // домена свой сертификат. Обработчик обязан быть того же типа, что
+        // defaultHandler (оба — HTTP), иначе облако слушатель не примет.
+        const snis = parseSniHandlers(sniRaw);
+        if (snis.length) {
+          const handlers = [];
+          const seen = [];
+          const handlerNames = [];
+          for (const h of snis) {
+            if (!h.serverNames.length) {
+              throw new Error("SNI: у обработчика не назван ни один домен — пиши «домен=сертификат» (несколько доменов — через запятую).");
+            }
+            h.serverNames.forEach((n) => {
+              if (n.length > 255 || !SNI_SERVER_RE.test(n)) {
+                throw new Error(
+                  "SNI: домен «" + n + "» облако не примет — только строчные латинские буквы, цифры, дефис и точка; звёздочка — только в начале (*.example.com)."
+                );
+              }
+              if (seen.indexOf(n) >= 0) {
+                throw new Error("SNI: домен «" + n + "» назван дважды — домен принадлежит РОВНО одному обработчику, иначе облако не поймёт, какой сертификат отдавать.");
+              }
+              seen.push(n);
+            });
+            if (!h.certificate) {
+              throw new Error("SNI: у доменов «" + h.serverNames.join(", ") + "» не назван сертификат — у каждого SNI-обработчика СВОЙ сертификат (пиши «домен=сертификат»).");
+            }
+            const scert = await findCertificate(oauthToken, folderId, h.certificate);
+            if (!scert) {
+              const cl = await certificates(oauthToken, folderId).catch(() => []);
+              throw new Error(
+                "SNI: не нашёл сертификат «" + h.certificate + "» для домена «" + h.serverNames[0] + "» в каталоге." +
+                  (cl.length ? " В каталоге: " + cl.map((c) => c.name + " (" + c.status + ")").join(", ") + "." : " Сертификатов нет — выпусти: ycCdn { action: \"certnew\", domain: \"…\" }.")
+              );
+            }
+            if (scert.status && !scert.issued) {
+              throw new Error(
+                "SNI: сертификат «" + (scert.name || scert.id) + "» ещё не выпущен (состояние " + scert.status + "): обработчик для домена «" + h.serverNames[0] + "» с ним не поднимется. Дождись статуса Issued."
+              );
+            }
+            const hname = h.name || sniNameFor(h.serverNames[0]);
+            checkName(hname, "SNI-обработчика");
+            if (handlerNames.indexOf(hname) >= 0) {
+              throw new Error("SNI: два обработчика с одним именем «" + hname + "» — назови их (sni: имя | домены | сертификат) или разведи домены по разным обработчикам.");
+            }
+            handlerNames.push(hname);
+            handlers.push({
+              name: hname,
+              serverNames: h.serverNames,
+              handler: { httpHandler: { httpRouterId: router.id }, certificateIds: [scert.id] },
+            });
+          }
+          tls.sniHandlers = handlers;
+          sniSummary = handlers.map((h) => ({ name: h.name, serverNames: h.serverNames, certificateId: h.handler.certificateIds[0] }));
+        }
+      }
+    }
+
+    const addressSpecs = [{ externalIpv4AddressSpec: {} }];
+    const staticIp = one(o.address || o.staticAddress);
+    if (staticIp) addressSpecs[0].externalIpv4AddressSpec.address = staticIp;
+    const listenerSpec = {
+      name: name,
+      endpointSpecs: [{ addressSpecs: addressSpecs, ports: [String(port)] }],
+      [kind === "stream" ? "stream" : kind === "https" ? "tls" : "http"]:
+        kind === "stream" ? { handler: handler } : kind === "https" ? tls : { handler: handler },
+    };
+    if (kind === "http" && o.httpToHttps === true) listenerSpec.http.redirects = { httpToHttps: true };
+    return {
+      kind: kind,
+      kindHuman: kind === "stream" ? "поток TCP" : kind === "https" ? "HTTPS/TLS" : "HTTP",
+      port: port,
+      name: name,
+      routerId: one(handler.httpRouterId),
+      backendGroupId: one(handler.backendGroupId),
+      certificateId: one(tls && tls.defaultHandler && tls.defaultHandler.certificateIds[0]),
+      sni: sniSummary,
+      staticAddress: staticIp,
+      listenerSpec: listenerSpec,
+    };
+  }
+
+  // Группы безопасности: имена разрешаются в id, а список ЗАМЕНЯЕТСЯ целиком —
+  // поэтому сборка одна на создание балансировщика и на его правку.
+  async function securityGroupIdsOf(oauthToken, folderId, wanted) {
+    const ids = [];
+    // Форма в окне и агент зовут этот разбор по-разному: окно шлёт строку
+    // «sg-1, sg-2» (поле «через запятую»), агент — массив имён. Разбираем оба.
+    const list = [];
+    [].concat(wanted || []).map(one).filter(Boolean).forEach((w) => {
+      w.split(/[,\n;]+/).forEach((s) => {
+        const t = one(s);
+        if (t) list.push(t);
+      });
+    });
+    if (!list.length) return ids;
+    const groupsRes = await call(oauthToken, "vpc", "https://vpc.api.cloud.yandex.net", "GET",
+      "/vpc/v1/securityGroups?folderId=" + encodeURIComponent(folderId) + "&pageSize=1000", undefined, 25000);
+    const sgs = Array.isArray(groupsRes && groupsRes.securityGroups) ? groupsRes.securityGroups : [];
+    for (const w of list) {
+      const g = sgs.find((x) => x.id === w) || sgs.find((x) => x.name === w);
+      if (!g) throw new Error("Не нашёл группу безопасности «" + w + "»." + (sgs.length ? " В каталоге: " + sgs.map((x) => x.name).join(", ") + "." : ""));
+      ids.push(g.id);
+    }
+    return ids;
+  }
+
   // ── Создание балансировщика ───────────────────────────────────────────────
   async function createLoadBalancer(oauthToken, opts) {
     const o = opts || {};
@@ -1031,97 +1468,13 @@ function createYcAlb(deps) {
       throw new Error("У подсети «" + subnet.name + "» не названа сеть — без сети балансировщик не создать.");
     }
 
-    // Слушатель: HTTP — роутер, HTTPS — роутер и сертификат, поток — группа
-    // бэкендов. Смешивать виды нельзя, поэтому вид выбирается одним полем.
-    const kind = one(o.listener || o.kind || "http").toLowerCase();
-    if (["http", "https", "stream"].indexOf(kind) < 0) {
-      throw new Error("Слушатель бывает http, https или stream (дано: " + o.listener + ").");
-    }
-    const port = checkPort(kind === "https" ? (o.port || 443) : o.port);
-    let handler = {};
-    let tls = null;
-    if (kind === "stream") {
-      const bgRef = one(o.backendGroup || o.backendGroupId);
-      const bg = await findBackendGroup(oauthToken, folderId, bgRef);
-      if (!bg) {
-        throw new Error(
-          "Потоковому слушателю нужна группа бэкендов («backendGroup»): " +
-            (bgRef ? "«" + bgRef + "» не нашёл" : "не указана") + "."
-        );
-      }
-      handler = { backendGroupId: bg.id, idleTimeout: "60s" };
-    } else {
-      const rRef = one(o.router || o.httpRouter || o.httpRouterId);
-      let router = null;
-      if (rRef) {
-        router = await findHttpRouter(oauthToken, folderId, rRef);
-        if (!router) {
-          const rs = await httpRouters(oauthToken, folderId);
-          throw new Error(
-            "Не нашёл HTTP-роутер «" + rRef + "»." +
-              (rs.length ? " В каталоге: " + rs.map((x) => x.name).join(", ") + "." : " Роутеров нет — создай: действие «Создать HTTP-роутер».")
-          );
-        }
-      } else {
-        const rs = await httpRouters(oauthToken, folderId);
-        if (rs.length === 1) router = rs[0];
-        else {
-          throw new Error(
-            "Слушателю нужен HTTP-роутер — он решает, куда идёт запрос: укажи router." +
-              (rs.length ? " В каталоге: " + rs.map((x) => x.name).join(", ") + "." : " Роутеров нет — сначала создай роутер (действие «Создать HTTP-роутер»).")
-          );
-        }
-      }
-      handler = { httpRouterId: router.id };
-      if (kind === "https") {
-        const cRef = one(o.certificate || o.certificateId);
-        if (!cRef) {
-          throw new Error(
-            "HTTPS-слушателю нужен сертификат (поле certificate): он берётся в Certificate Manager. Выпустить: ycCdn { action: \"certnew\", domain: \"…\" } и дождаться статуса Issued."
-          );
-        }
-        const certs = await call(oauthToken, "certificate-manager", "https://certificatemanager.api.cloud.yandex.net", "GET",
-          "/certificate-manager/v1/certificates?folderId=" + encodeURIComponent(folderId) + "&pageSize=1000", undefined, 25000);
-        const cl = Array.isArray(certs && certs.certificates) ? certs.certificates : [];
-        const cert = cl.find((c) => c.id === cRef) || cl.find((c) => c.name === cRef);
-        if (!cert) {
-          throw new Error(
-            "Не нашёл сертификат «" + cRef + "» в каталоге." +
-              (cl.length ? " В каталоге: " + cl.map((c) => c.name + " (" + one(c.status) + ")").join(", ") + "." : " Сертификатов нет — выпусти: ycCdn { action: \"certnew\", domain: \"…\" }.")
-          );
-        }
-        if (one(cert.status) && one(cert.status).toUpperCase() !== "ISSUED") {
-          throw new Error(
-            "Сертификат «" + (cert.name || cert.id) + "» ещё не выпущен (состояние " + one(cert.status) + "): HTTPS-слушатель с таким сертификатом не поднимется. Дождись статуса Issued."
-          );
-        }
-        tls = { defaultHandler: { httpHandler: { httpRouterId: router.id }, certificateIds: [one(cert.id)] } };
-      }
-    }
-
-    const wanted = [].concat(o.securityGroupIds || o.securityGroups || []).map(one).filter(Boolean);
-    let securityGroupIds = [];
-    if (wanted.length) {
-      const groupsRes = await call(oauthToken, "vpc", "https://vpc.api.cloud.yandex.net", "GET",
-        "/vpc/v1/securityGroups?folderId=" + encodeURIComponent(folderId) + "&pageSize=1000", undefined, 25000);
-      const sgs = Array.isArray(groupsRes && groupsRes.securityGroups) ? groupsRes.securityGroups : [];
-      for (const w of wanted) {
-        const g = sgs.find((x) => x.id === w) || sgs.find((x) => x.name === w);
-        if (!g) throw new Error("Не нашёл группу безопасности «" + w + "»." + (sgs.length ? " В каталоге: " + sgs.map((x) => x.name).join(", ") + "." : ""));
-        securityGroupIds.push(g.id);
-      }
-    }
-
-    const addressSpecs = [{ externalIpv4AddressSpec: {} }];
-    const staticIp = one(o.address || o.staticAddress);
-    if (staticIp) addressSpecs[0].externalIpv4AddressSpec.address = staticIp;
-    const listenerSpec = {
-      name: one(o.listenerName) || LISTENER_NAME_DEFAULT,
-      endpointSpecs: [{ addressSpecs: addressSpecs, ports: [String(port)] }],
-      [kind === "stream" ? "stream" : kind === "https" ? "tls" : "http"]:
-        kind === "stream" ? { handler: handler } : kind === "https" ? tls : { handler: handler },
-    };
-    if (kind === "http" && o.httpToHttps === true) listenerSpec.http.redirects = { httpToHttps: true };
+    // Слушатель собирает ОДНА сборка (listenerSpecOf): она же нужна добавлению
+    // и правке слушателя — три копии одного разбора разъехались бы.
+    const L = await listenerSpecOf(oauthToken, folderId, o);
+    const kind = L.kind;
+    const port = L.port;
+    const listenerSpec = L.listenerSpec;
+    const securityGroupIds = await securityGroupIdsOf(oauthToken, folderId, o.securityGroupIds || o.securityGroups);
 
     const body = {
       folderId: folderId,
@@ -1156,14 +1509,21 @@ function createYcAlb(deps) {
     if (!securityGroupIds.length) {
       warnings.push("Группы безопасности не заданы: правила приёма трафика на порт " + port + " останутся за группой по умолчанию сети, а она обычно закрыта снаружи (ycVpc: addrule).");
     }
+    if (L.sni.length) {
+      warnings.push(
+        "Домены SNI у слушателя «" + L.name + "»: " + L.sni.map((h) => h.serverNames.join(", ")).join(" | ") +
+          " — каждый со СВОИМ сертификатом; остальным доменам достаётся основной сертификат слушателя."
+      );
+    }
     return {
       lb: created,
       lbId: (created && created.id) || id,
+      sni: L.sni,
       operationId: one(j && j.id),
       message:
         "Балансировщик «" + name + "» создаётся: слушатель " +
         (kind === "stream" ? "поток TCP" : kind === "https" ? "HTTPS/TLS" : "HTTP") +
-        ", порт " + port + ", зона " + zoneId + ".",
+        ", порт " + port + ", зона " + zoneId + (L.sni.length ? ", домены SNI: " + L.sni.map((h) => h.serverNames.join(", ")).join(" | ") : "") + ".",
       warnings: warnings,
     };
   }
@@ -1251,6 +1611,305 @@ function createYcAlb(deps) {
     };
   }
 
+  // ── Правка слушателей и самого балансировщика ────────────────────────────
+  // Состав слушателей меняют ТОЧЕЧНЫМИ методами: PATCH с listenerSpecs[] стёр
+  // бы всех, кого нет в списке, а PATCH без маски — всё, чего нет в теле.
+  async function requireLoadBalancer(oauthToken, folderId, ref) {
+    const lb = ref && ref.id ? ref : await findLoadBalancer(oauthToken, folderId, ref);
+    if (!lb) throw new Error("Не нашёл балансировщик «" + one(ref) + "» в каталоге. Список — действие list.");
+    if (lb.busy) {
+      throw new Error(
+        "Балансировщик «" + lb.name + "» сейчас занят: " + lb.statusHuman + ". Слушатели меняют только у работающего (или остановленного) балансировщика — дождись окончания и повтори."
+      );
+    }
+    return lb;
+  }
+
+  // Добавление слушателя: имя уникально ВНУТРИ балансировщика, вид — http,
+  // https (с выпущенным сертификатом) или поток TCP (с группой вида stream).
+  async function addListener(oauthToken, opts) {
+    const o = opts || {};
+    const folderId = checkFolder(o.folderId);
+    const lb = await requireLoadBalancer(oauthToken, folderId, o.lb || o.loadBalancer || o.id || o.name);
+    const L = await listenerSpecOf(oauthToken, folderId, o);
+    if (lb.listeners.some((x) => x.name === L.name)) {
+      throw new Error(
+        "У балансировщика «" + lb.name + "» уже есть слушатель «" + L.name + "»: имя слушателя уникально внутри балансировщика, а второй слушатель с тем же именем облако не примет. Выбери другое имя."
+      );
+    }
+    const j = await alb(oauthToken, "POST", ALB_BASE + "/loadBalancers/" + encodeURIComponent(lb.id) + ":addListener", { listenerSpec: L.listenerSpec }, 40000);
+    await run(oauthToken, j, 240000);
+    const after = await loadBalancer(oauthToken, lb.id).catch(() => null);
+    const now = after || lb;
+    const added = (now.listeners || []).find((x) => x.name === L.name) || null;
+    if (after && !added) {
+      throw new Error(
+        "Слушатель «" + L.name + "» не появился у балансировщика «" + now.name + "»: облако приняло запрос, но в ответе его нет. Нужна роль alb.editor (или admin) — проверь права и повтори."
+      );
+    }
+    const warnings = [
+      "Адрес слушателя выдаёт облако и он же адрес других слушателей: домен вешай на адрес ТОЛЬКО после того, как он появился в карточке (ycDns).",
+    ];
+    if (L.kind === "https") warnings.push("Сертификат должен оставаться выпущенным: когда он истечёт, HTTPS перестанет отвечать — карточка показывает срок, и новый сертификат выпускают заранее.");
+    if (L.sni.length) warnings.push("SNI-обработчики обслуживают свои домены СВОИМ сертификатом: у каждого обработчика максимум один сертификат, а домен, которого нет ни в одном обработчике, отдаётся основным сертификатом слушателя.");
+    if (L.kind === "stream") warnings.push("Потоковый слушатель ведёт трафик в группу бэкендов вида stream, и порт слушателя должен совпадать с портом целей в той группе — иначе цели не ответят.");
+    if (L.port === 80 || L.port === 443) warnings.push("Порт " + L.port + " обязан быть открыт в группах безопасности балансировщика: без них снаружи порт закрыт (ycVpc: addrule).");
+    return {
+      changed: true,
+      lb: now,
+      listener: added,
+      listenerName: L.name,
+      listenerSpec: L.listenerSpec,
+      sni: L.sni,
+      operationId: one(j && j.id),
+      message:
+        "Балансировщик «" + now.name + "» получает слушателя «" + L.name + "»: " + L.kindHuman + ", порт " + L.port +
+        (L.staticAddress ? ", адрес " + L.staticAddress : "") +
+        (L.sni.length ? ", домены SNI: " + L.sni.map((h) => h.serverNames.join(", ")).join(" | ") : "") + ".",
+      warnings: warnings,
+    };
+  }
+
+  // Удаление слушателя: адрес и порт закрываются вместе с ним, поэтому модуль
+  // говорит об этом ДО запроса и предупреждает, если слушатель остался один.
+  async function removeListener(oauthToken, opts) {
+    const o = opts || {};
+    const folderId = checkFolder(o.folderId);
+    const lb = await requireLoadBalancer(oauthToken, folderId, o.lb || o.loadBalancer || o.id || o.name);
+    const ref = one(o.listenerName || o.listener);
+    const names = lb.listeners.map((l) => l.name).filter(Boolean);
+    if (!ref) {
+      throw new Error(
+        "Не указано имя слушателя (listenerName). У балансировщика «" + lb.name + "» " + (names.length ? "слушатели: " + names.join(", ") : "слушателей нет") + "."
+      );
+    }
+    const found = lb.listeners.find((l) => l.name === ref) || null;
+    if (!found) {
+      throw new Error(
+        "У балансировщика «" + lb.name + "» нет слушателя «" + ref + "»." + (names.length ? " Слушатели: " + names.join(", ") + "." : " Слушателей нет вовсе.")
+      );
+    }
+    const j = await alb(oauthToken, "POST", ALB_BASE + "/loadBalancers/" + encodeURIComponent(lb.id) + ":removeListener", { name: found.name }, 40000);
+    await run(oauthToken, j, 120000);
+    const after = await loadBalancer(oauthToken, lb.id).catch(() => null);
+    const now = after || lb;
+    if (after && (after.listeners || []).some((x) => x.name === found.name)) {
+      throw new Error(
+        "Слушатель «" + found.name + "» остался у балансировщика «" + now.name + "»: облако приняло запрос, но состав не изменился. Нужна роль alb.editor (или admin) — проверь права и повтори."
+      );
+    }
+    const warnings = [
+      found.addresses.length
+        ? "Адрес " + found.addresses.join(", ") + " освободится, если его не слушает другой слушатель: домен, который на него смотрел, перестанет открываться — сначала поставь запись на новый адрес."
+        : "Порт " + (found.ports.join(",") || "слушателя") + " закроется снаружи: домен, который на него смотрел, перестанет открываться.",
+    ];
+    if (!(now.listeners || []).length) {
+      warnings.push("У балансировщика не осталось слушателей: он работает, но ни на одном порту не отвечает — а тарифицируется по-прежнему за час.");
+    }
+    return {
+      changed: true,
+      lb: now,
+      listener: found,
+      listenerName: found.name,
+      operationId: one(j && j.id),
+      message:
+        "Слушатель «" + found.name + "» (" + found.kindHuman +
+        (found.addresses.length ? " " + found.addresses.join(", ") : "") +
+        (found.ports.length ? ":" + found.ports.join(",") : "") + ") убирается у балансировщика «" + now.name + "» — вход по нему закроется.",
+      warnings: warnings,
+    };
+  }
+
+  // Правка самого балансировщика: имя, описание и группы безопасности. Уходит
+  // С МАСКОЙ полей: без маски облако сбросило бы всё, чего нет в теле (включая
+  // слушателей), а с маской меняет только названное.
+  async function updateLoadBalancer(oauthToken, opts) {
+    const o = opts || {};
+    const folderId = checkFolder(o.folderId);
+    const lb = await requireLoadBalancer(oauthToken, folderId, o.lb || o.loadBalancer || o.id);
+    const body = {};
+    const mask = [];
+    const newName = one(o.newName || o.rename);
+    if (newName) {
+      checkName(newName, "балансировщика");
+      if (newName === lb.name) throw new Error("Балансировщик уже называется «" + newName + "»: назови другое имя или убери newName.");
+      body.name = newName;
+      mask.push("name");
+    }
+    if (o.description != null) {
+      body.description = one(o.description);
+      mask.push("description");
+    }
+    if (o.securityGroupIds != null || o.securityGroups != null) {
+      body.securityGroupIds = await securityGroupIdsOf(oauthToken, folderId, o.securityGroupIds != null ? o.securityGroupIds : o.securityGroups);
+      mask.push("security_group_ids");
+    }
+    if (!mask.length) {
+      throw new Error(
+        "Нечего менять: назови новое имя (newName), описание (description) или группы безопасности (securityGroups). Состав слушателей правят отдельными действиями — добавление, правка и удаление слушателя (listeneradd, listenerupd, listenerdel)."
+      );
+    }
+    body.updateMask = mask.join(",");
+    const j = await alb(oauthToken, "PATCH", ALB_BASE + "/loadBalancers/" + encodeURIComponent(lb.id), body, 40000);
+    await run(oauthToken, j, 240000);
+    const after = await loadBalancer(oauthToken, lb.id).catch(() => null);
+    const now = after || lb;
+    // Правка обязана подтвердиться ПЕРЕЧИТЫВАНИЕМ: облако может ответить
+    // «сделано» и ничего не сделать (права, чужое поле, отброшенное значение).
+    const bad = [];
+    if (mask.indexOf("name") >= 0 && now.name !== body.name) bad.push("имя («" + now.name + "»)");
+    if (mask.indexOf("description") >= 0 && one(now.description) !== one(body.description)) bad.push("описание («" + one(now.description) + "»)");
+    if (mask.indexOf("security_group_ids") >= 0 && now.securityGroupIds.slice().sort().join(",") !== body.securityGroupIds.slice().sort().join(",")) {
+      bad.push("группы безопасности (" + (now.securityGroupIds.join(", ") || "их нет") + ")");
+    }
+    if (bad.length) {
+      throw new Error("Правка балансировщика «" + lb.name + "» не применилась: " + bad.join(", ") + ". Нужна роль alb.editor (или admin).");
+    }
+    const warnings = [];
+    if (mask.indexOf("security_group_ids") >= 0) {
+      warnings.push(
+        "Список групп безопасности ЗАМЕНЁН целиком, а не дополнен: правила приёма трафика на порты " + (now.ports.join(", ") || "слушателей") +
+          " должны быть открыты в НОВЫХ группах — иначе вход закроется снаружи. Группа по умолчанию открывает трафик только внутри сети."
+      );
+    }
+    if (mask.indexOf("name") >= 0) {
+      warnings.push("Имя — это подпись, а не адрес: домены смотрят на адреса слушателей, поэтому переименование их не трогает.");
+    }
+    return {
+      changed: true,
+      lb: now,
+      fields: mask,
+      operationId: one(j && j.id),
+      message: "Балансировщик «" + lb.name + "» обновляется: " + mask.map((f) => LB_FIELD_RU[f] || f).join(", ") + ".",
+      warnings: warnings,
+    };
+  }
+
+  // ── Правка слушателя ─────────────────────────────────────────────────────
+  // Переименовать слушателя нельзя: :updateListener опознаёт его ПО ИМЕНИ, а
+  // поля «новое имя» у метода нет. Поэтому правка — это тот же слушатель с
+  // новыми настройками, а маска перечисляет то, что задали (и СТАРЫЙ вид, если
+  // вид меняется: иначе у слушателя оказалось бы два вида, а облако такого не
+  // принимает). Чего не назвали — остаётся прежним: так «продлить сертификат»
+  // — это одно поле, а не пересборка слушателя.
+  async function updateListener(oauthToken, opts) {
+    const o = opts || {};
+    const folderId = checkFolder(o.folderId);
+    const lb = await requireLoadBalancer(oauthToken, folderId, o.lb || o.loadBalancer || o.id || o.name);
+    const ref = one(o.listenerName || o.listener);
+    const names = lb.listeners.map((x) => x.name).filter(Boolean);
+    if (!ref) {
+      throw new Error(
+        "Не указано имя слушателя (listenerName). У балансировщика «" + lb.name + "» " + (names.length ? "слушатели: " + names.join(", ") : "слушателей нет") + "."
+      );
+    }
+    const before = lb.listeners.find((x) => x.name === ref) || null;
+    if (!before) {
+      throw new Error(
+        "У балансировщика «" + lb.name + "» нет слушателя «" + ref + "»." +
+          (names.length ? " Слушатели: " + names.join(", ") + "." : " Слушателей нет — сначала добавь (действие listeneradd).") +
+          " Переименовать слушателя нельзя: правка — это тот же слушатель с новыми настройками."
+      );
+    }
+
+    // Вид, порт, адрес, роутер, сертификат, группа бэкендов и перенаправление —
+    // из самого слушателя, если человек их не назвал.
+    const keepSni = (before.sni || []).map((h) => ({ name: h.name, serverNames: h.serverNames, certificate: h.certificateIds[0] }));
+    const givenSni = o.sni != null ? o.sni : o.sniHandlers != null ? o.sniHandlers : null;
+    const wantKind = one(o.listener || o.kind) || kindInput(before.kind);
+    const L = await listenerSpecOf(oauthToken, folderId, {
+      folderId: folderId,
+      listener: wantKind,
+      port: o.port != null ? o.port : before.ports[0],
+      listenerName: before.name,
+      router: one(o.router || o.httpRouter || o.httpRouterId) || before.routerId,
+      certificate: one(o.certificate || o.certificateId) || before.certificateIds[0],
+      backendGroup: one(o.backendGroup || o.backendGroupId) || before.backendGroupId,
+      address: one(o.address || o.staticAddress) || before.addresses[0],
+      httpToHttps: o.httpToHttps != null ? o.httpToHttps === true : before.httpToHttps,
+      sni: givenSni != null ? givenSni : keepSni.length ? keepSni : null,
+    });
+
+    const mask = ["name", "endpoint_specs", KIND_FIELD[L.kind]];
+    if (kindInput(before.kind) && kindInput(before.kind) !== L.kind) mask.push(KIND_FIELD[kindInput(before.kind)]);
+    const body = { updateMask: mask.join(","), listenerSpec: L.listenerSpec };
+    const j = await alb(oauthToken, "POST", ALB_BASE + "/loadBalancers/" + encodeURIComponent(lb.id) + ":updateListener", body, 40000);
+    await run(oauthToken, j, 240000);
+
+    // Правка обязана подтвердиться ПЕРЕЧИТЫВАНИЕМ: облако может ответить
+    // «сделано» и ничего не сделать (права, отброшенное значение).
+    const after = await loadBalancer(oauthToken, lb.id).catch(() => null);
+    const now = after || lb;
+    const got = (now.listeners || []).find((x) => x.name === before.name) || null;
+    const wantSni = L.sni.map((h) => h.serverNames.join(",")).sort().join("|");
+    const bad = [];
+    if (!got) bad.push("слушателя «" + before.name + "» у балансировщика больше нет");
+    else {
+      if (got.kind !== KIND_FIELD[L.kind]) bad.push("вид (" + got.kindHuman + ")");
+      if (one(got.ports.join(",")) !== one(String(L.port))) bad.push("порт (" + (got.ports.join(",") || "не назван") + ")");
+      if (L.routerId && got.routerId !== L.routerId) bad.push("роутер (" + (got.routerId || "не назван") + ")");
+      if (L.backendGroupId && got.backendGroupId !== L.backendGroupId) bad.push("группа бэкендов (" + (got.backendGroupId || "не названа") + ")");
+      if (L.certificateId && got.certificateIds.indexOf(L.certificateId) < 0) bad.push("сертификат (" + (got.certificateIds.join(", ") || "не назван") + ")");
+      const gotSni = (got.sni || []).map((h) => h.serverNames.join(",")).sort().join("|");
+      if (wantSni !== gotSni) bad.push("SNI-домены (" + (gotSni || "их нет") + ")");
+    }
+    if (bad.length) {
+      throw new Error("Правка слушателя «" + before.name + "» не применилась: " + bad.join(", ") + ". Нужна роль alb.editor (или admin) — проверь права и повтори.");
+    }
+
+    const warnings = [];
+    const newAddress = (got && got.addresses[0]) || "";
+    if (before.addresses[0] && newAddress && before.addresses[0] !== newAddress) {
+      warnings.push(
+        "Адрес слушателя изменился: " + before.addresses[0] + " → " + newAddress + ". Домены, которые смотрели на прежний адрес, надо перевести на новый (ycDns) — иначе вход открывается по старому адресу."
+      );
+    }
+    if (kindInput(before.kind) && kindInput(before.kind) !== L.kind) {
+      warnings.push(
+        "Вид слушателя заменён целиком (" + before.kindHuman + " → " + L.kindHuman + "): настройки, которых мы не задаём (HTTP/2, перенаправление, проверка клиентских сертификатов), вернулись к значениям по умолчанию."
+      );
+    }
+    if (one(before.ports.join(",")) !== one(String(L.port))) {
+      warnings.push("Порт слушателя: " + (before.ports.join(",") || "—") + " → " + L.port + ". Новый порт должен быть открыт в группах безопасности балансировщика, а старый — закрыт (ycVpc).");
+    }
+    if (L.kind === "https") {
+      warnings.push("Сертификат должен оставаться выпущенным: когда он истечёт, HTTPS перестанет отвечать — карточка показывает срок, а новый сертификат выпускают заранее.");
+    }
+    const beforeSni = (before.sni || []).map((h) => h.serverNames.join(",")).sort().join("|");
+    // О доменах говорим ТОЛЬКО когда они меняются: иначе предупреждение стояло бы
+    // и у правки одного порта, где домены никто не трогал.
+    if (wantSni !== beforeSni) {
+      if (L.sni.length) {
+        warnings.push("SNI-обработчики заменяются ЦЕЛИКОМ: домены, которых нет в списке, убираются вместе со своими сертификатами; у каждого обработчика максимум ОДИН сертификат.");
+      } else {
+        warnings.push("Домены SNI убраны: " + before.sni.map((h) => h.serverNames.join(", ")).filter(Boolean).join(" | ") + " — эти домены слушатель больше не обслуживает, им достанется основной сертификат.");
+      }
+    }
+
+    const what = [];
+    if (one(before.ports.join(",")) !== one(String(L.port))) what.push("порт " + L.port);
+    if (kindInput(before.kind) !== L.kind) what.push("вид " + L.kindHuman);
+    if (L.routerId && L.routerId !== before.routerId) what.push("роутер " + L.routerId);
+    if (L.backendGroupId && L.backendGroupId !== before.backendGroupId) what.push("группа бэкендов " + L.backendGroupId);
+    if (L.certificateId && before.certificateIds.indexOf(L.certificateId) < 0) what.push("сертификат " + L.certificateId);
+    if (wantSni !== beforeSni) what.push("домены SNI: " + (L.sni.map((h) => h.serverNames.join(", ")).join(" | ") || "убраны"));
+
+    return {
+      changed: true,
+      lb: now,
+      listener: got,
+      listenerName: before.name,
+      listenerSpec: L.listenerSpec,
+      fields: mask,
+      sni: L.sni,
+      operationId: one(j && j.id),
+      message:
+        "Слушатель «" + before.name + "» балансировщика «" + now.name + "» обновляется" +
+        (what.length ? ": " + what.join(", ") : " (настройки применены заново)") + ".",
+      warnings: warnings,
+    };
+  }
+
   return {
     loadBalancers: loadBalancers,
     loadBalancer: loadBalancer,
@@ -1268,6 +1927,12 @@ function createYcAlb(deps) {
     removeBackendGroup: removeBackendGroup,
     targetStates: targetStates,
     createLoadBalancer: createLoadBalancer,
+    addListener: addListener,
+    removeListener: removeListener,
+    updateListener: updateListener,
+    updateLoadBalancer: updateLoadBalancer,
+    certificates: certificates,
+    findCertificate: findCertificate,
     createTargetGroup: createTargetGroup,
     changeTargets: changeTargets,
     createHttpRouter: createHttpRouter,
@@ -1284,6 +1949,8 @@ function createYcAlb(deps) {
     targetStateLine: targetStateLine,
     statusHuman: statusHuman,
     targetStatusHuman: targetStatusHuman,
+    certStatusHuman: certStatusHuman,
+    certLine: certLine,
   };
 }
 
@@ -1294,6 +1961,9 @@ module.exports = {
   PORT_DEFAULT: PORT_DEFAULT,
   statusHuman: statusHuman,
   targetStatusHuman: targetStatusHuman,
+  certStatusHuman: certStatusHuman,
+  certLine: certLine,
+  kindInput: kindInput,
   lbInfo: lbInfo,
   tgInfo: tgInfo,
   routerInfo: routerInfo,
@@ -1306,4 +1976,7 @@ module.exports = {
   backendGroupLine: backendGroupLine,
   targetStateInfo: targetStateInfo,
   targetStateLine: targetStateLine,
+  sniNameFor: sniNameFor,
+  parseSniHandlers: parseSniHandlers,
+  LB_FIELD_RU: LB_FIELD_RU,
 };

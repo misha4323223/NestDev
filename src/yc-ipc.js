@@ -2085,7 +2085,7 @@ ipcMain.handle("yc:alb", async (_e, args) => {
   if (!ycAlb) return { ok: false, error: "Модуль Application Load Balancer не подключён к приложению (src/yc-alb.js)." };
   if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках (Настройки → «☁️ Yandex Cloud»)." };
   if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
-  const ALL = ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "lbnew", "lbstart", "lbstop", "lbdel"];
+  const ALL = ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"];
   if (ALL.indexOf(op) === -1) return { ok: false, error: "Неизвестное действие Application Load Balancer: " + op + ". Доступно: " + ALL.join(", ") + "." };
   const ref = String(a.lb || a.id || a.name || "").trim();
   const missingLb = { ok: false, error: "Не нашёл балансировщик «" + ref + "» в каталоге. Список — действие list." };
@@ -2173,6 +2173,12 @@ ipcMain.handle("yc:alb", async (_e, args) => {
           }
         }
       }
+      // HTTPS-слушатели: сертификат, его состояние и срок. Без этого «сайт не
+      // открывается» ищут в роутере, а причина — в истёкшем сертификате.
+      if ((c.certificates || []).length) {
+        lines.push("Сертификаты HTTPS-слушателей:");
+        for (const x of c.certificates) lines.push("  " + ycAlb.certLine(x));
+      }
       if (c.backendGroups.length) lines.push("Группы бэкендов: " + c.backendGroups.map((b) => b.name).join(", "));
       if (c.targetGroups.length) {
         lines.push("Группы целей (" + c.targetGroups.length + "):");
@@ -2185,13 +2191,17 @@ ipcMain.handle("yc:alb", async (_e, args) => {
         ok: true,
         lb: c.lb,
         listeners: c.listeners,
+        certificates: c.certificates || [],
         targetGroups: c.targetGroups,
         backendGroups: c.backendGroups,
         lines: lines,
         message: "Балансировщик «" + c.lb.name + "»: " + c.lb.statusHuman + ".",
-        warnings: !c.targetGroupsResolved && c.targetGroups.length
-          ? ["Связь с группами целей не подтвердилась (нет групп бэкендов или маршрутов): показаны все группы целей каталога."]
-          : [],
+        warnings: [].concat(
+          c.warnings || [],
+          !c.targetGroupsResolved && c.targetGroups.length
+            ? ["Связь с группами целей не подтвердилась (нет групп бэкендов или маршрутов): показаны все группы целей каталога."]
+            : []
+        ),
       };
     }
     if (op === "targetnew") {
@@ -2282,6 +2292,78 @@ ipcMain.handle("yc:alb", async (_e, args) => {
       const r = await ycAlb.removeBackendGroup(cfg.oauth, { folderId: cfg.folderId, group: g });
       return { ok: true, changed: true, groupId: r.groupId, lines: [r.message], warnings: r.warnings || [], message: r.message };
     }
+    if (op === "listeneradd") {
+      const r = await ycAlb.addListener(cfg.oauth, {
+        folderId: cfg.folderId,
+        lb: ref,
+        listenerName: a.listenerName,
+        listener: a.listener || a.kind,
+        port: a.port,
+        router: a.router || a.httpRouter || a.httpRouterId,
+        certificate: a.certificate || a.certificateId,
+        backendGroup: a.backendGroup || a.backendGroupId,
+        address: a.address || a.staticAddress,
+        httpToHttps: a.httpToHttps,
+        sni: a.sni || a.sniHandlers,
+      });
+      return { ok: true, changed: true, listener: r.listener, listenerName: r.listenerName, sni: r.sni || [], lb: r.lb, operationId: r.operationId, lines: [r.message], warnings: r.warnings || [], message: r.message };
+    }
+    if (op === "listenerupd") {
+      // Правка слушателя точечная: чего не назвали — остаётся прежним (вид,
+      // порт, адрес, роутер, сертификат, домены SNI). Переименовать слушателя
+      // нельзя — :updateListener опознаёт его по имени.
+      const r = await ycAlb.updateListener(cfg.oauth, {
+        folderId: cfg.folderId,
+        lb: ref,
+        listenerName: a.listenerName || a.listenerToUpdate,
+        listener: a.listener || a.kind,
+        port: a.port,
+        router: a.router || a.httpRouter || a.httpRouterId,
+        certificate: a.certificate || a.certificateId,
+        backendGroup: a.backendGroup || a.backendGroupId,
+        address: a.address || a.staticAddress,
+        httpToHttps: a.httpToHttps,
+        sni: a.sni != null || a.sniHandlers != null ? a.sni != null ? a.sni : a.sniHandlers : null,
+      });
+      return { ok: true, changed: true, listener: r.listener, listenerName: r.listenerName, sni: r.sni || [], fields: r.fields, lb: r.lb, operationId: r.operationId, lines: [r.message], warnings: r.warnings || [], message: r.message };
+    }
+    if (op === "listenerdel") {
+      // Необратимое для входа: адрес и порт закрываются вместе со слушателем,
+      // поэтому человека спрашивают ДО запроса.
+      const lb0 = await ycAlb.findLoadBalancer(cfg.oauth, cfg.folderId, ref);
+      if (!lb0) return missingLb;
+      const name = String(a.listenerName || a.listener || "").trim();
+      const found = lb0.listeners.find((l) => l.name === name) || null;
+      if (!found) {
+        return {
+          ok: false,
+          error: "У балансировщика «" + lb0.name + "» нет слушателя «" + name + "»." + (lb0.listeners.length ? " Слушатели: " + lb0.listeners.map((l) => l.name).join(", ") + "." : " Слушателей нет вовсе."),
+        };
+      }
+      if (a.confirm !== true) {
+        return {
+          ok: false,
+          needsConfirm: true,
+          error: "Слушатель «" + found.name + "» убирается с балансировщика «" + lb0.name + "»: вход по нему закроется" + (found.addresses.length ? ", адрес " + found.addresses.join(", ") + " освободится" : "") + ", а домен, который на него смотрел, перестанет открываться. Подтверди удаление.",
+          lines: ["  " + ycAlb.listenerLine(found)],
+        };
+      }
+      const r = await ycAlb.removeListener(cfg.oauth, { folderId: cfg.folderId, lb: lb0, listenerName: found.name });
+      return { ok: true, changed: true, listenerName: r.listenerName, lb: r.lb, lines: [r.message], warnings: r.warnings || [], message: r.message };
+    }
+    if (op === "lbupdate") {
+      // Правка самого балансировщика: имя, описание и группы безопасности.
+      // Состав слушателей меняют отдельными действиями — PATCH с listenerSpecs[]
+      // стёр бы всех, кого нет в списке.
+      const r = await ycAlb.updateLoadBalancer(cfg.oauth, {
+        folderId: cfg.folderId,
+        lb: ref,
+        newName: a.newName || a.rename,
+        description: a.description != null && String(a.description).trim() !== "" ? String(a.description).trim() : undefined,
+        securityGroups: a.securityGroups || a.securityGroupIds,
+      });
+      return { ok: true, changed: true, lb: r.lb, fields: r.fields, operationId: r.operationId, lines: [r.message], warnings: r.warnings || [], message: r.message };
+    }
     if (op === "lbnew") {
       if (a.confirm !== true) {
         return {
@@ -2309,11 +2391,12 @@ ipcMain.handle("yc:alb", async (_e, args) => {
         address: a.address || a.staticAddress,
         securityGroups: a.securityGroups || a.securityGroupIds,
         httpToHttps: a.httpToHttps,
+        sni: a.sni || a.sniHandlers,
         minZoneSize: a.minZoneSize,
         maxSize: a.maxSize,
         description: a.description,
       });
-      return { ok: true, changed: true, lb: r.lb, lbId: r.lbId, operationId: r.operationId, lines: [r.message], warnings: r.warnings || [], message: r.message };
+      return { ok: true, changed: true, lb: r.lb, lbId: r.lbId, sni: r.sni || [], operationId: r.operationId, lines: [r.message], warnings: r.warnings || [], message: r.message };
     }
     if (op === "lbstart" || op === "lbstop") {
       const lb = await ycAlb.findLoadBalancer(cfg.oauth, cfg.folderId, ref);

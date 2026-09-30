@@ -49,13 +49,18 @@
      [13] ГРУППЫ МАШИН: у плитки «Группы машин» свои восемь действий — список,
          карточка с шаблоном и машинами, создание (сначала цена и размер,
          потом согласие) и удаление, которое забирает машины вместе с дисками.
-     [14] БАЛАНСИРОВЩИКИ: у плитки «Балансировщики» восемнадцать действий —
+     [14] БАЛАНСИРОВЩИКИ: у плитки «Балансировщики» двадцать одно действие —
          карточка проходит путь слушатель → роутер → группа бэкендов → группа
          целей, создание сначала показывает цену и порт, а удаление называет
          адреса слушателей и спрашивает человека; группа бэкендов собирается из
          формы (вид, порт целей, путь проверки), здоровье спрашивают у пары
          «бэкенды + цели» и показывают ПО ЗОНАМ, а удаление группы сначала
-         спрашивает человека.
+         спрашивает человека; состав слушателей меняется ТОЧЕЧНО (добавить,
+         ПОПРАВИТЬ и убрать — с согласием на закрытие входа), правка слушателя
+         называет только то, что меняем (пустое остаётся прежним), несколько
+         доменов на одном слушателе живут в SNI со своими сертификатами, а
+         правка балансировщика уходит МАСКОЙ полей — группы безопасности
+         заменяются целиком.
 
    Этот прогон уже нашёл настоящую ошибку: поиск по «функц» не находил плитку
    «Функции» — строка поиска не включала русское имя, а человек ищет по тому, что
@@ -152,10 +157,10 @@ ${STUBS}
     // другой — группа сама создаёт машины по шаблону. Своя плитка и своё
     // семейство действий (канал yc:ig).
     { key: "instanceGroups", ru: "Группы машин", title: "Instance Groups", ok: true, count: 1, items: [{ id: "ig1", name: "web" }] },    // Балансировщики: вход в приложение — слушатели, группы целей, HTTP-роутеры
-    // и группы бэкендов. У плитки своё семейство из восемнадцати действий (канал
-    // ycAlb): создание балансировщика платное — цена спрашивается до согласия, а
-    // группа бэкендов задаёт порт целей и проверку здоровья, поэтому её создание
-    // и здоровье целей — отдельные действия.
+    // и группы бэкендов. У плитки своё семейство из двадцати одного действия (канал
+    // ycAlb): создание балансировщика платное — цена спрашивается до согласия, — а
+    // состав слушателей меняют ТОЧЕЧНО (listeneradd/listenerdel) и правят маской
+    // полей (lbupdate).
     { key: "alb", ru: "Балансировщики", title: "Application Load Balancer", ok: true, count: 1, items: [{ id: "lb1", name: "web-lb" }] },
 
     // Managed-базы: три плитки у одного канала (yc:mdb). Какая это база, видно
@@ -277,6 +282,18 @@ ${STUBS}
           message: "Балансировщиков: 1." };
       }
       if (a.op === "card") {
+        // HTTPS-карточка отдаёт сертификат отдельной строкой (заход 4): срок
+        // сертификата — первое, что объясняет «сайт не открывается».
+        if (a.lb === "https-lb") {
+          return { ok: true, lb: { id: "lb2", name: "https-lb" },
+            lines: ["● https-lb — работает · HTTPS/TLS 443 203.0.113.11", "Слушатели (1):", "  • secure — HTTPS/TLS 203.0.113.11:443 → роутер rt-web · сертификатов: 1",
+              "Сертификаты HTTPS-слушателей:",
+              "  🔒 Слушатель «secure» — site-cert (cert-1) · выпущен · домены: site.example.com · действует до 2027-04-18 (осталось 199 дн.)",
+              "  🔒 Слушатель «shop (SNI: shop.example.com)» — shop-cert (cert-4) · выпущен · домены: shop.example.com · действует до 2027-02-27 (осталось 149 дн.)"],
+            certificates: [{ listenerName: "secure", certId: "cert-1", cert: { name: "site-cert", statusHuman: "выпущен", domains: ["site.example.com"], daysLeft: 199 } },
+              { listenerName: "shop (SNI: shop.example.com)", certId: "cert-4", cert: { name: "shop-cert", statusHuman: "выпущен", domains: ["shop.example.com"], daysLeft: 149 } }],
+            message: "Балансировщик «https-lb»: работает." };
+        }
         return { ok: true, lb: { id: "lb1", name: a.lb },
           lines: ["● web-lb — работает · HTTP 80 203.0.113.10", "Слушатели (1):", "  • web — HTTP 203.0.113.10:80 → роутер rt-web",
             "Роутер «web-router»:", "  домены: site.example.com · путь /* → группа бэкендов bg-web",
@@ -303,6 +320,48 @@ ${STUBS}
         return { ok: true, changed: true, lbId: "lb1",
           lines: ["Балансировщик «web-lb» удаляется вместе со слушателями и адресами (203.0.113.10) — отменить нельзя."],
           warnings: ["Домен, который смотрел на этот адрес, перестанет открываться."], message: "Балансировщик удаляется." };
+      }
+      // Состав слушателей и правка самого балансировщика (часть 91, заход 4):
+      // добавление уходит ОДНИМ listenerSpec, удаление — именем и только после
+      // согласия (канал отвечает needsConfirm), а lbupdate — маской полей.
+      if (a.op === "listeneradd") {
+        return { ok: true, changed: true, listenerName: a.listenerName, lb: { id: "lb1", name: a.lb },
+          lines: ["Балансировщик «" + a.lb + "» получает слушателя «" + a.listenerName + "»: " + (a.listener === "https" ? "HTTPS/TLS" : a.listener === "stream" ? "поток TCP" : "HTTP") + ", порт " + a.port + "."],
+          warnings: ["Адрес слушателя выдаёт облако и он же адрес других слушателей: домен вешай на адрес ТОЛЬКО после того, как он появился в карточке (ycDns)."],
+          message: "Слушатель добавлен." };
+      }
+      // Правка слушателя (заход 5): одно действие :updateListener — что не
+      // назвали, то осталось прежним, а домены живут в SNI со своими
+      // сертификатами.
+      if (a.op === "listenerupd") {
+        const what = [];
+        if (a.port) what.push("порт " + a.port);
+        if (a.certificate) what.push("сертификат cert-3");
+        if (a.sni === "нет") what.push("домены SNI: убраны");
+        else if (a.sni) what.push("домены SNI: shop.example.com");
+        return { ok: true, changed: true, listenerName: a.listenerName, fields: ["name", "endpoint_specs", "tls"],
+          sni: a.sni && a.sni !== "нет" ? [{ name: "sni-shop-example-com", serverNames: ["shop.example.com"], certificateId: "cert-4" }] : [],
+          lines: ["Слушатель «" + a.listenerName + "» балансировщика «" + a.lb + "» обновляется" + (what.length ? ": " + what.join(", ") : " (настройки применены заново)") + "."],
+          warnings: ["Сертификат должен оставаться выпущенным: когда он истечёт, HTTPS перестанет отвечать — карточка показывает срок.",
+            "SNI-обработчики заменяются ЦЕЛИКОМ: домены, которых нет в списке, убираются вместе со своими сертификатами."],
+          message: "Слушатель обновляется." };
+      }
+      if (a.op === "listenerdel" && a.confirm !== true) {
+        return { ok: false, needsConfirm: true,
+          error: "Слушатель «" + a.listenerName + "» убирается с балансировщика «" + a.lb + "»: вход по нему закроется, а домен, который на него смотрел, перестанет открываться. Подтверди удаление.",
+          lines: ["  • " + a.listenerName + " — HTTP 203.0.113.10:80 → роутер rt-web"] };
+      }
+      if (a.op === "listenerdel") {
+        return { ok: true, changed: true, listenerName: a.listenerName,
+          lines: ["Слушатель «" + a.listenerName + "» (HTTP 203.0.113.10:80) убирается у балансировщика «" + a.lb + "» — вход по нему закроется."],
+          warnings: ["Адрес 203.0.113.10 освободится, если его не слушает другой слушатель: домен, который на него смотрел, перестанет открываться — сначала поставь запись на новый адрес."],
+          message: "Слушатель убран." };
+      }
+      if (a.op === "lbupdate") {
+        return { ok: true, changed: true, lb: { id: "lb1", name: a.newName || a.lb }, fields: ["name", "description", "security_group_ids"],
+          lines: ["Балансировщик «" + a.lb + "» обновляется: имя, описание, группы безопасности."],
+          warnings: ["Список групп безопасности ЗАМЕНЁН целиком, а не дополнен: правила приёма трафика на порты слушателей должны быть открыты в НОВЫХ группах — иначе вход закроется снаружи."],
+          message: "Балансировщик обновляется." };
       }
       // Группа бэкендов (часть 91, заход 3): порт целей и проверки здоровья
       // живут ЗДЕСЬ, здоровье приходит ПО ЗОНАМ, а удаление необратимо.
@@ -1168,12 +1227,14 @@ fs.writeFileSync(SHOT, PAGE, "utf8");
     });
     ok(igDelRun.askedHuman && /ВМЕСТЕ с машинами/.test(igDelRun.warnText) && /дисками/.test(igDelRun.warnText), "удаление объяснило последствия до запроса", igDelRun.warnText.slice(0, 220));
     ok(igDelRun.group === "web" && igDelRun.firstConfirm !== true, "первый запрос ушёл без согласия, но с именем группы", JSON.stringify(igDelRun));
-    // ── Балансировщики в панели (часть 91, заходы 2–3) ─────────────────────
-    // Балансировщик — вход в приложение: у плитки своё семейство из восемнадцати
-    // действий, карточка проходит путь слушатель → роутер → группа бэкендов →
-    // группа целей, платное создание сначала показывает цену и порт и только
-    // потом уходит облаку с согласием, а группа бэкендов собирается из формы и
-    // её здоровье панель спрашивает у пары «бэкенды + цели».
+    // ── Балансировщики в панели (часть 91, заходы 2–4) ─────────────────────
+    // Балансировщик — вход в приложение: у плитки своё семейство из двадцати
+    // одного действия, карточка проходит путь слушатель → роутер → группа
+    // бэкендов → группа целей, платное создание сначала показывает цену и порт и
+    // только потом уходит облаку с согласием, а группа бэкендов собирается из
+    // формы и её здоровье панель спрашивает у пары «бэкенды + цели». Состав
+    // слушателей меняется ТОЧЕЧНО (добавление — одним слушателем, удаление —
+    // именем и после согласия), а правка уходит маской полей.
     section("[14] Балансировщики: плитка действий, карточка с цепочкой, группа бэкендов и здоровье");
     const albTile = await page.evaluate(async () => {
       const tile = [...document.querySelectorAll("#yc-dash .yc-tile")].find((t) => /Балансировщики/.test(t.textContent));
@@ -1190,7 +1251,11 @@ fs.writeFileSync(SHOT, PAGE, "utf8");
       return { btn: !!btn, title: title, listed: listed, called: !!sent, text: document.getElementById("yc-act-out").textContent };
     });
     ok(albTile.btn && /Application Load Balancer/.test(albTile.title || ""), "у плитки «Балансировщики» есть кнопка действий", JSON.stringify({ btn: albTile.btn, title: albTile.title }));
-    ok(albTile.listed.length === 18, "в семействе восемнадцать действий: " + albTile.listed.length);
+    ok(albTile.listed.length === 22, "в семействе двадцать два действия: " + albTile.listed.length);
+    ok(
+      albTile.listed.some((t) => /Добавить слушателя/.test(t)) && albTile.listed.some((t) => /Править слушателя/.test(t)) && albTile.listed.some((t) => /Убрать слушателя/.test(t)) && albTile.listed.some((t) => /Правка балансировщика/.test(t)),
+      "список называет правку слушателей и балансировщика: " + albTile.listed.join(", ")
+    );
     ok(
       albTile.listed.some((t) => /Создать группу бэкендов/.test(t)) && albTile.listed.some((t) => /Здоровье целей/.test(t)) && albTile.listed.some((t) => /Удалить группу бэкендов/.test(t)),
       "список называет группу бэкендов и здоровье: " + albTile.listed.join(", ")
@@ -1357,6 +1422,153 @@ fs.writeFileSync(SHOT, PAGE, "utf8");
     });
     ok(albBackDelRun.askedHuman && /необратимо/.test(albBackDelRun.warnText) && /настройки балансировки/.test(albBackDelRun.warnText), "удаление группы объяснило последствия до запроса", albBackDelRun.warnText.slice(0, 260));
     ok(albBackDelRun.args && albBackDelRun.args.group === "free-backends" && albBackDelRun.args.confirm !== true, "первый запрос ушёл без согласия, но с именем группы", JSON.stringify(albBackDelRun.args));
+
+    // Правка состава слушателей и самого балансировщика — из панели (заход 4):
+    // добавление собирается формой и уходит точечно, удаление спрашивает
+    // человека (и только второе нажатие уносит согласие в облако), а HTTPS-
+    // карточка показывает сертификат и его срок.
+    const albListenerAddRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Добавить слушателя/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Балансировщик/.test(label)) input.value = "web-lb";
+        if (/^Имя слушателя/.test(label)) input.value = "api";
+        if (/^Порт/.test(label)) input.value = "8080";
+        if (/^HTTP-роутер/.test(label)) input.value = "web-router";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "listeneradd").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(albListenerAddRun.args && albListenerAddRun.args.listenerName === "api" && albListenerAddRun.args.port === 8080, "форма добавления слушателя собрала имя и порт", JSON.stringify(albListenerAddRun.args));
+    ok(/получает слушателя «api»/.test(albListenerAddRun.text) && /Адрес слушателя/.test(albListenerAddRun.text), "ответ назвал слушателя и предупредил про адрес", albListenerAddRun.text.slice(0, 220));
+
+    const albListenerDelRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Убрать слушателя/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const before = window.__confirmCalls;
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Балансировщик/.test(label)) input.value = "web-lb";
+        if (/^Имя слушателя/.test(label)) input.value = "web";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const askedHuman = window.__confirmCalls > before;
+      const first = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "listenerdel").slice(-1)[0] || null;
+      const warnText = document.getElementById("yc-act-out").textContent;
+      const confirmBtn = [...document.querySelectorAll("#yc-act-out button")].find((b) => /Подтвердить/.test(b.textContent));
+      if (confirmBtn) confirmBtn.click();
+      await new Promise((r) => setTimeout(r, 90));
+      const last = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "listenerdel").slice(-1)[0] || null;
+      return { askedHuman: askedHuman, firstConfirm: first ? first[1].confirm : null, confirmSent: last ? last[1].confirm === true : false, name: first ? first[1].listenerName : "", warnText: warnText, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(albListenerDelRun.askedHuman && /вход по нему закроется/.test(albListenerDelRun.warnText), "удаление слушателя спросило человека и объяснило последствия", albListenerDelRun.warnText.slice(0, 220));
+    ok(albListenerDelRun.name === "web" && albListenerDelRun.firstConfirm !== true && albListenerDelRun.confirmSent, "первый запрос удаления ушёл без согласия, а согласие — только вторым нажатием", JSON.stringify(albListenerDelRun));
+    ok(/убирается у балансировщика/.test(albListenerDelRun.text), "ответ показал удаление слушателя словами", albListenerDelRun.text.slice(0, 200));
+
+    const albUpdateRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Правка балансировщика/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Балансировщик/.test(label)) input.value = "web-lb";
+        if (/^Новое имя/.test(label)) input.value = "web-lb-edge";
+        if (/^Группы безопасности/.test(label)) input.value = "web, ssh";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "lbupdate").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(albUpdateRun.args && albUpdateRun.args.newName === "web-lb-edge" && albUpdateRun.args.securityGroups === "web, ssh", "форма правки собрала имя и группы безопасности", JSON.stringify(albUpdateRun.args));
+    ok(/обновляется: имя, описание, группы безопасности/.test(albUpdateRun.text) && /ЗАМЕНЁН целиком/.test(albUpdateRun.text), "правка объяснила, что группы безопасности ЗАМЕНЯЮТСЯ целиком", albUpdateRun.text.slice(0, 260));
+
+    const albTlsCardRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Карточка: слушатели/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /Балансировщик/.test(label)) input.value = "https-lb";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      return { text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(/🔒 Слушатель «secure» — site-cert/.test(albTlsCardRun.text) && /осталось \d+ дн\./.test(albTlsCardRun.text), "HTTPS-карточка показала сертификат и его срок", albTlsCardRun.text.slice(0, 260));
+    ok(/SNI: shop\.example\.com/.test(albTlsCardRun.text) && /shop-cert/.test(albTlsCardRun.text), "карточка показала СВОЙ сертификат домена SNI", albTlsCardRun.text.slice(0, 320));
+
+    // Правка слушателя (заход 5): форма называет только то, что меняем, а
+    // пустые поля не уходят вовсе — иначе модуль счёл бы это сменой настройки.
+    const albListenerUpdRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Править слушателя/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Балансировщик/.test(label)) input.value = "web-lb";
+        if (/^Какой слушатель/.test(label)) input.value = "shop";
+        if (/^Порт/.test(label)) input.value = "8443";
+        if (/^Домены SNI/.test(label)) input.value = "shop.example.com=shop-cert";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "listenerupd").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(albListenerUpdRun.args && albListenerUpdRun.args.listenerName === "shop" && albListenerUpdRun.args.port === 8443, "форма правки слушателя собрала имя и порт", JSON.stringify(albListenerUpdRun.args));
+    ok(albListenerUpdRun.args && albListenerUpdRun.args.certificate === undefined && albListenerUpdRun.args.listener === undefined, "пустые поля правки в запрос не ушли", JSON.stringify(albListenerUpdRun.args));
+    ok(albListenerUpdRun.args && albListenerUpdRun.args.sni === "shop.example.com=shop-cert", "домены SNI ушли строкой", JSON.stringify(albListenerUpdRun.args));
+    ok(/обновляется: порт 8443, домены SNI/.test(albListenerUpdRun.text) && /SNI-обработчики заменяются ЦЕЛИКОМ/.test(albListenerUpdRun.text), "ответ назвал правку и предупредил про замену доменов", albListenerUpdRun.text.slice(0, 300));
+    // Имя слушателя — обязательное поле: без него модуль не знает, кого править
+    // (переименовать слушателя нельзя), и форма говорит об этом звёздочкой.
+    const albListenerUpdLabels = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Править слушателя/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      return { labels: [...form.querySelectorAll(".yc-act-label")].map((x) => x.textContent) };
+    });
+    ok(albListenerUpdLabels.labels.some((l) => /^Какой слушатель правим \*/.test(l)), "имя слушателя в форме правки помечено обязательным: " + albListenerUpdLabels.labels.join(" | "));
+    ok(albListenerUpdLabels.labels.some((l) => /оставить прежний/.test(l)) && albListenerUpdLabels.labels.some((l) => /пусто — прежний/.test(l)), "форма правки говорит, что пустое значит «оставить прежнее»: " + albListenerUpdLabels.labels.join(" | "));
 
   } finally {
     await browser.close();

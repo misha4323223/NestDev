@@ -81,7 +81,7 @@
     clickhouse: ["list", "presets", "card", "create", "hosts", "databases", "users", "logs", "operations", "start", "stop", "delete"],
     dns: ["zones", "card", "records", "add", "delete"],
     instanceGroups: ["list", "card", "instances", "operations", "create", "start", "stop", "delete"],
-    alb: ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "lbnew", "lbstart", "lbstop", "lbdel"],
+    alb: ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"],
   };
 
   const FAMILIES = {
@@ -534,6 +534,41 @@
           fld("healthPath", "Путь проверки здоровья (http)", { placeholder: "/health", hint: "Без проверок облако считает цель здоровой всегда — упавшая машина останется в ротации." }),
         ] },
       { id: "backdel", ru: "🗑 Удалить группу бэкендов", op: "backdel", view: "lines", danger: true, confirmArg: "confirm", target: target("Группа бэкендов (имя или id)", "group") },
+      // Слушателей правят ТОЧЕЧНЫМИ действиями: создание балансировщика задаёт
+      // одного слушателя, а PATCH с listenerSpecs[] стёр бы всех, кого нет в
+      // списке, — поэтому добавление и удаление идут по одному.
+      { id: "listeneradd", ru: "＋ Добавить слушателя", op: "listeneradd", view: "lines", target: target("Балансировщик (имя или id)", "lb"),
+        fields: [
+          fld("listenerName", "Имя слушателя", { required: true, placeholder: "web", hint: "Имя уникально ВНУТРИ балансировщика: строчные латинские буквы, цифры и дефис." }),
+          fld("listener", "Вид слушателя", { type: "select", options: ["http", "https", "stream"], value: "http", hint: "http и https — через роутер; stream — поток TCP на группу бэкендов вида stream." }),
+          fld("port", "Порт", { type: "number", value: "80" }),
+          fld("router", "HTTP-роутер (имя или id)", { placeholder: "нужен для http и https" }),
+          fld("certificate", "Сертификат (имя или id)", { placeholder: "нужен для https; сертификат обязан быть выпущен" }),
+          fld("backendGroup", "Группа бэкендов (для stream)", { placeholder: "нужна группа вида stream" }),
+          fld("address", "Статический адрес", { placeholder: "пусто — облако выдаст само" }),
+          fld("sni", "Доп. домены (SNI), по строке", { type: "textarea", placeholder: "shop.example.com=shop-cert\nwww.example.com,example.com=main-cert", hint: "Одна строка — один домен (или несколько через запятую) и его сертификат через «=». Каждый домен отвечает СВОИМ сертификатом, а остальным достаётся основной." }),
+        ] },
+      { id: "listenerupd", ru: "✎ Править слушателя: порт, сертификат, домены", op: "listenerupd", view: "lines", target: target("Балансировщик (имя или id)", "lb"),
+        fields: [
+          fld("listenerName", "Какой слушатель правим", { required: true, hint: "Переименовать слушателя нельзя: это тот же слушатель с новыми настройками. Имена слушателей — в карточке." }),
+          fld("listener", "Вид (пусто — оставить прежний)", { type: "select", options: ["http", "https", "stream"], hint: "Смена вида заменяет обработчик целиком: HTTP → HTTPS — обычный шаг, когда сертификат уже выпущен." }),
+          fld("port", "Порт (пусто — прежний)", { type: "number" }),
+          fld("router", "HTTP-роутер (имя или id)", { placeholder: "пусто — прежний" }),
+          fld("certificate", "Сертификат (имя или id)", { placeholder: "пусто — прежний; так продлевают HTTPS" }),
+          fld("backendGroup", "Группа бэкендов (для потока)", { placeholder: "пусто — прежняя" }),
+          fld("address", "Адрес", { placeholder: "пусто — прежний (его и надо оставлять)", hint: "Домены смотрят на АДРЕС слушателя: новый адрес придётся переводить в DNS заново." }),
+          fld("sni", "Домены SNI (пусто — прежние, «нет» — убрать)", { type: "textarea", placeholder: "shop.example.com=shop-cert", hint: "Одна строка — один домен (или несколько через запятую) и его сертификат через «=». Список ЗАМЕНЯЕТСЯ целиком: домены, которых нет, убираются вместе со своими сертификатами. Впиши «нет», чтобы убрать все." }),
+        ] },
+      { id: "listenerdel", ru: "🗑 Убрать слушателя (вход закроется)", op: "listenerdel", view: "lines", danger: true, confirmArg: "confirm", target: target("Балансировщик (имя или id)", "lb"),
+        fields: [
+          fld("listenerName", "Имя слушателя", { required: true, hint: "Вместе со слушателем закрываются его порт и адрес — состав показывает карточка." }),
+        ] },
+      { id: "lbupdate", ru: "✎ Правка балансировщика: имя, описание, группы безопасности", op: "lbupdate", view: "lines", target: target("Балансировщик (имя или id)", "lb"),
+        fields: [
+          fld("newName", "Новое имя", { placeholder: "пусто — имя не меняется" }),
+          fld("description", "Описание", { placeholder: "короткая подпись, что это за вход" }),
+          fld("securityGroups", "Группы безопасности (через запятую)", { hint: "Список ЗАМЕНЯЕТСЯ целиком: перечисли ВСЕ нужные группы, иначе вход закроется снаружи." }),
+        ] },
       { id: "targetnew", ru: "＋ Создать группу целей", op: "targetnew", view: "lines",
         fields: [
           fld("name", "Имя группы целей", { required: true, placeholder: "web-targets" }),
@@ -569,6 +604,7 @@
           fld("backendGroup", "Группа бэкендов (для stream)", { placeholder: "нужна для потока TCP" }),
           fld("address", "Статический адрес", { placeholder: "пусто — облако выдаст само" }),
           fld("securityGroups", "Группы безопасности (через запятую)", { placeholder: "без них порт закрыт снаружи" }),
+          fld("sni", "Доп. домены (SNI), по строке", { type: "textarea", placeholder: "shop.example.com=shop-cert", hint: "Только для HTTPS: один слушатель отвечает на несколько доменов, у каждого — свой сертификат." }),
         ] },
       { id: "lbstart", ru: "▶ Запустить", op: "lbstart", view: "lines", target: target("Балансировщик (имя или id)", "lb") },
       { id: "lbstop", ru: "■ Остановить (платится всё равно)", op: "lbstop", view: "lines", target: target("Балансировщик (имя или id)", "lb") },

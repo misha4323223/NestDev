@@ -34,7 +34,25 @@
        запроса; удаление необратимо и забирает слушатели с адресами;
      • HTTPS-СЛУШАТЕЛЬ БЕЗ ВЫПУЩЕННОГО СЕРТИФИКАТА НЕ ВСТАНЕТ: сертификат
        ищется в Certificate Manager и обязан быть в состоянии Issued — иначе
-       отказ ДО сети;
+       отказ ДО сети; а карточка читает сертификат дальше: домены и СРОК —
+       «сайт не открывается» часто значит «сертификат истекает»;
+     • СОСТАВ СЛУШАТЕЛЕЙ МЕНЯЮТ ТОЧЕЧНО (addListener / updateListener /
+       removeListener): PATCH с listenerSpecs[] стёр бы всех, кого нет в списке,
+       поэтому добавление, правка и удаление идут по одному, а перечитывание
+       подтверждает, что облако правда изменило состав (иначе «принял, но не
+       сделал» выглядело бы успехом);
+     • ПРАВКА СЛУШАТЕЛЯ НЕ ПЕРЕБИРАЕТ ЕГО ЗАНОВО: updateListener опознаёт
+       слушателя ПО ИМЕНИ (переименовать нельзя), в маске перечислено только
+       то, что задают (плюс СТАРЫЙ вид — иначе у слушателя оказалось бы два
+       вида), а адрес, порт и роутер без просьбы берутся у самого слушателя:
+       домены смотрят на адрес, и «продлить сертификат» — это одно поле;
+     • SNI — ЭТО НЕСКОЛЬКО ДОМЕНОВ НА ОДНОМ СЛУШАТЕЛЕ: tls.sniHandlers[] со
+       СВОИМ сертификатом у каждого домена (у TLS-обработчика максимум один);
+       домен обязан быть у РОВНО одного обработчика, только строчными буквами,
+       а карточка читает и эти сертификаты — иначе домен отвечал бы чужим;
+     • ГРУППЫ БЕЗОПАСНОСТИ ЗАМЕНЯЮТСЯ ЦЕЛИКОМ: правка балансировщика (lbupdate)
+       уходит с МАСКОЙ полей — без маски облако сбросило бы всё, чего нет в теле;
+       имя и описание меняются, а состав слушателей — отдельными действиями;
      • РОУТЕР БЕЗ ГРУППЫ БЭКЕНДОВ НЕ ИМЕЕТ СМЫСЛА: маршрут ведёт в
        backendGroupId, поэтому группа проверяется до запроса, а пустой список
        групп бэкендов объясняется словами, а не выдуманным id;
@@ -103,15 +121,29 @@ const LOGOS = require(path.join(ROOT, "src", "renderer", "yc-logos.js"));
 const ycConsole = require(path.join(ROOT, "src", "yc-console.js"));
 
 // ── Подменённое облако: балансировщики, группы целей, роутеры, бэкенды ──────
-// Три балансировщика — и каждый здесь не для красоты: работающий с HTTP-
+// Четыре балансировщика — и каждый здесь не для красоты: работающий с HTTP-
 // слушателем и адресом (alb-web), остановленный с HTTPS-слушателем и
-// сертификатом (alb-https) и занятый переходом (alb-busy, у него ещё и
-// слушателей нет). На них видно и разбор ответа, и отказы до сети.
+// сертификатом (alb-https), занятый переходом (alb-busy, у него ещё и
+// слушателей нет) и работающий с потоком TCP (alb-stream). На них видно и
+// разбор ответа, и отказы до сети, а состав слушателей, имя, описание и группы
+// безопасности здесь МЕНЯЮТСЯ (:addListener, :removeListener, PATCH) — как в
+// облаке, чтобы проверять правку настоящими запросами.
 function startAlbStub() {
   const calls = [];
-  const created = { lb: [], tg: [], router: [], targets: [], bg: [] };
+  const created = { lb: [], tg: [], router: [], targets: [], bg: [], listenerOps: [], lbPatches: [] };
   const deleted = new Set();
+  // «Облако приняло, но не сделало» — так бывает при нехватке прав (alb.editor):
+  // модуль обязан заметить это перечитыванием, а не показать успех.
+  const flags = { dropAdd: false, dropRemove: false, dropUpdate: false, dropPatch: false };
   const status = { "alb-web": "ACTIVE", "alb-https": "STOPPED", "alb-busy": "CREATING", "alb-stream": "ACTIVE" };
+  // Имя, описание и группы безопасности — изменяемые: правка (lbupdate) обязана
+  // быть видна следующему чтению, иначе проверка «применилось ли» ничего не значит.
+  const meta = {
+    "alb-web": { name: "web-lb", description: "витрина", securityGroupIds: ["sg-1"] },
+    "alb-https": { name: "https-lb", description: "", securityGroupIds: ["sg-1"] },
+    "alb-busy": { name: "busy-lb", description: "", securityGroupIds: ["sg-1"] },
+    "alb-stream": { name: "stream-lb", description: "", securityGroupIds: ["sg-1"] },
+  };
   const listeners = {
     "alb-web": [
       {
@@ -136,21 +168,44 @@ function startAlbStub() {
         endpoints: [{ addresses: [{ externalIpv4Address: { address: "203.0.113.12" } }], ports: ["5432"] }],
         stream: { handler: { backendGroupId: "bg-free" } },
       },
+      {
+        // Сертификата «cert-gone» в каталоге нет: карточка обязана сказать об
+        // этом словами — иначе «сайт не открывается» ищут вслепую. Роутер здесь
+        // без маршрутов (router-2): иначе через этот слушатель нашлась бы ещё
+        // одна группа бэкендов, и поиск пары «слушатель + группа» стал бы
+        // неоднозначным — а это уже другой урок.
+        name: "ghost",
+        endpoints: [{ addresses: [{ externalIpv4Address: { address: "203.0.113.13" } }], ports: ["444"] }],
+        tls: { defaultHandler: { httpHandler: { httpRouterId: "router-2" }, certificateIds: ["cert-gone"] } },
+      },
     ],
   };
   const lbBase = (id) => ({
     id: id,
-    name: id === "alb-web" ? "web-lb" : id === "alb-https" ? "https-lb" : id === "alb-stream" ? "stream-lb" : "busy-lb",
+    name: meta[id].name,
     folderId: "folder-1",
-    description: id === "alb-web" ? "витрина" : "",
+    description: meta[id].description,
     createdAt: "2026-08-02T10:00:00Z",
     status: status[id],
     listeners: listeners[id],
     allocationPolicy: { locations: [{ zoneId: "ru-central1-a", subnetId: "sub-1" }] },
     networkId: "net-1",
     regionId: "ru-central1",
-    securityGroupIds: ["sg-1"],
+    securityGroupIds: meta[id].securityGroupIds,
   });
+  // Правка слушателя в облаке — это НОВЫЙ слушатель с тем же именем: в теле
+  // приходит форма ЗАПРОСА (endpointSpecs/addressSpecs), а читается она потом в
+  // форме ОТВЕТА (endpoints/addresses), как у настоящего облака.
+  const endpointFromSpec = (e) => {
+    const a = (e && (e.addressSpecs || [])[0]) || {};
+    const ext = a.externalIpv4AddressSpec || a.internalIpv4AddressSpec || a.externalIpv6AddressSpec || {};
+    return {
+      addresses: [ext.address ? { externalIpv4Address: { address: ext.address } } : {}],
+      ports: ((e && e.ports) || []).map(String),
+    };
+  };
+  // Имена полей в маске и в ответе облака разные: endpoint_specs → endpoints.
+  const MASK_FIELD = { name: "name", endpoints: "endpoint_specs", http: "http", tls: "tls", stream: "stream" };
   const groups = {
     "tg-web": {
       id: "tg-web",
@@ -217,7 +272,18 @@ function startAlbStub() {
         return json({ securityGroups: [{ id: "sg-1", name: "web" }, { id: "sg-2", name: "ssh" }] });
       }
       if (url.indexOf("/certificate-manager/v1/certificates") >= 0) {
-        return json({ certificates: [{ id: "cert-1", name: "site-cert", status: "ISSUED" }, { id: "cert-2", name: "old-cert", status: "VALIDATING" }] });
+        // Сроки считаются ОТ СЕГОДНЯШНЕГО дня: у одного сертификата запас
+        // большой, у другого — меньше месяца (карточка обязана предупредить).
+        return json({
+          certificates: [
+            { id: "cert-1", name: "site-cert", status: "ISSUED", domains: ["site.example"], notAfter: new Date(Date.now() + 200 * 86400000).toISOString() },
+            { id: "cert-2", name: "old-cert", status: "VALIDATING" },
+            { id: "cert-3", name: "soon-cert", status: "ISSUED", domains: ["soon.example"], notAfter: new Date(Date.now() + 20 * 86400000).toISOString() },
+            // Два сертификата на один слушатель — это SNI: у каждого домена свой.
+            { id: "cert-4", name: "shop-cert", status: "ISSUED", domains: ["shop.example.com"], notAfter: new Date(Date.now() + 150 * 86400000).toISOString() },
+            { id: "cert-5", name: "fresh-cert", status: "ISSUED", domains: ["site.example"], notAfter: new Date(Date.now() + 360 * 86400000).toISOString() },
+          ],
+        });
       }
 
       // Здоровье целей: у пути свой обработчик, и он стоит ДО балансировщиков —
@@ -241,6 +307,52 @@ function startAlbStub() {
         if (req.method === "POST" && /\/loadBalancers(\?|$)/.test(url)) {
           created.lb.push(JSON.parse(raw || "{}"));
           return json({ id: "op-lb-new", done: false });
+        }
+        const listener = url.match(/\/loadBalancers\/([^/:?]+):(addListener|removeListener|updateListener)/);
+        if (listener && req.method === "POST") {
+          const body = JSON.parse(raw || "{}");
+          created.listenerOps.push({ action: listener[2], lb: listener[1], body: body });
+          if (listener[2] === "addListener" && !flags.dropAdd) listeners[listener[1]].push(body.listenerSpec || {});
+          if (listener[2] === "removeListener" && !flags.dropRemove) {
+            listeners[listener[1]] = (listeners[listener[1]] || []).filter((x) => x.name !== (body.name || ""));
+          }
+          if (listener[2] === "updateListener" && !flags.dropUpdate) {
+            const spec = body.listenerSpec || {};
+            const fields = String(body.updateMask || "").split(",").map((x) => x.trim());
+            const list = listeners[listener[1]] || [];
+            const at = list.findIndex((x) => x.name === spec.name);
+            if (at >= 0) {
+              const before = list[at];
+              const next = {};
+              // Маска: названное берётся из тела, НЕназванное остаётся прежним, а
+              // поле, названное в маске и не присланное, сбрасывается — именно
+              // так облако и обещает (именно поэтому смена вида работает).
+              for (const key of ["name", "endpoints", "http", "tls", "stream"]) {
+                if (fields.indexOf(MASK_FIELD[key]) < 0) {
+                  if (before[key] !== undefined) next[key] = before[key];
+                  continue;
+                }
+                const given = key === "endpoints" ? spec.endpointSpecs : spec[key];
+                if (given === undefined) continue;
+                next[key] = key === "endpoints" ? (spec.endpointSpecs || []).map(endpointFromSpec) : given;
+              }
+              list[at] = next;
+            }
+          }
+          return json({ id: "op-listener", done: false });
+        }
+        const patch = url.match(/\/loadBalancers\/([^/?]+)$/);
+        if (patch && req.method === "PATCH") {
+          const body = JSON.parse(raw || "{}");
+          created.lbPatches.push({ lb: patch[1], body: body });
+          if (!flags.dropPatch) {
+            const m = meta[patch[1]];
+            const fields = String(body.updateMask || "").split(",").map((x) => x.trim());
+            if (fields.indexOf("name") >= 0) m.name = body.name;
+            if (fields.indexOf("description") >= 0) m.description = body.description || "";
+            if (fields.indexOf("security_group_ids") >= 0) m.securityGroupIds = body.securityGroupIds || [];
+          }
+          return json({ id: "op-lb-patch", done: false });
         }
         const power = url.match(/\/loadBalancers\/([^/:?]+):(start|stop)/);
         if (power && req.method === "POST") {
@@ -383,6 +495,7 @@ function startAlbStub() {
         created: created,
         deleted: deleted,
         status: status,
+        flags: flags,
         reset: () => {
           calls.length = 0;
           created.lb.length = 0;
@@ -390,6 +503,8 @@ function startAlbStub() {
           created.router.length = 0;
           created.targets.length = 0;
           created.bg.length = 0;
+          created.listenerOps.length = 0;
+          created.lbPatches.length = 0;
           deleted.clear();
         },
         base: "http://127.0.0.1:" + server.address().port,
@@ -553,6 +668,25 @@ const section = (src, channel) => {
     assert.strictEqual(stream.listeners[0].kind, "stream");
     assert.strictEqual(stream.listeners[0].backendGroupId, "bg-db", "поток не связан с группой бэкендов");
     assert.strictEqual(stream.listeners[0].addresses.length, 0, "пустой адрес не должен превращаться в выдумку");
+  });
+
+  await test("ycAlb: строка сертификата говорит состояние, домены и срок — просроченный виден сразу", () => {
+    assert.strictEqual(alb.certStatusHuman("VALIDATING"), "проверяется (запись подтверждения не готова)");
+    assert.strictEqual(alb.certStatusHuman("ISSUED"), "выпущен");
+    assert.ok(/выпускается/.test(alb.certStatusHuman("PROVISIONING")), alb.certStatusHuman("PROVISIONING"));
+    const line = alb.certLine({
+      listenerName: "secure",
+      certId: "cert-1",
+      cert: { id: "cert-1", name: "site-cert", statusHuman: "выпущен", domains: ["site.example"], notAfter: "2027-01-01T00:00:00Z", daysLeft: 92 },
+    });
+    assert.ok(/🔒 Слушатель «secure»/.test(line) && /site-cert/.test(line) && /выпущен/.test(line), line);
+    assert.ok(/домены: site\.example/.test(line) && /действует до 2027-01-01 \(осталось 92 дн\.\)/.test(line), line);
+    const expired = alb.certLine({
+      listenerName: "old",
+      certId: "cert-9",
+      cert: { name: "dead-cert", statusHuman: "выпущен", daysLeft: -3, notAfter: "2026-09-27T00:00:00Z" },
+    });
+    assert.ok(/просрочен 3 дн\. назад/.test(expired), "просроченный сертификат не назван: " + expired);
   });
 
   await test("ycAlb: занятый балансировщик отличается от работающего", () => {
@@ -980,14 +1114,20 @@ const section = (src, channel) => {
     assert.ok(/слушатель HTTPS\/TLS/.test(r.message), r.message);
   });
 
-  await test("ycAlb: stream-слушатель ведёт в группу бэкендов, а не в роутер", async () => {
+  await test("ycAlb: stream-слушатель ведёт только в группу вида stream, а HTTP-группу отбивает", async () => {
     stub.created.lb.length = 0;
-    const r = await alb.createLoadBalancer("oauth-1", { folderId: "folder-1", name: "tcp-lb", subnet: "app-subnet", listener: "stream", port: 5432, backendGroup: "web-backends" });
+    const r = await alb.createLoadBalancer("oauth-1", { folderId: "folder-1", name: "tcp-lb", subnet: "app-subnet", listener: "stream", port: 5432, backendGroup: "free-backends" });
     const l = stub.created.lb[0].listenerSpecs[0];
-    assert.strictEqual(l.stream.handler.backendGroupId, "bg-web");
+    assert.strictEqual(l.stream.handler.backendGroupId, "bg-free", "поток ушёл не в ту группу бэкендов");
     assert.strictEqual(l.http, undefined);
     assert.ok(/поток TCP/.test(r.message) && /порт 5432/.test(r.message), r.message);
     await assert.rejects(() => alb.createLoadBalancer("oauth-1", { folderId: "folder-1", name: "tcp-lb", subnet: "app-subnet", listener: "stream" }), /нужна группа бэкендов/);
+    // Справочник облака: потоковому слушателю годится только группа вида stream
+    // (для HTTP-группы облако отвечает «backend group type must be stream»).
+    await assert.rejects(
+      () => alb.createLoadBalancer("oauth-1", { folderId: "folder-1", name: "tcp-lb", subnet: "app-subnet", listener: "stream", port: 5432, backendGroup: "web-backends" }),
+      (e) => /группа вида stream/.test(e.message) && /web-backends/.test(e.message)
+    );
   });
 
   await test("ycAlb: отказы до сети — имя, порт, подсеть, зона, слушатель и группа безопасности", async () => {
@@ -1087,10 +1227,10 @@ const section = (src, channel) => {
     const ops = arr[1].split(",").map((x) => x.trim().replace(/^"|"$/g, ""));
     assert.deepStrictEqual(
       ops.slice().sort(),
-      ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "lbnew", "lbstart", "lbstop", "lbdel"].sort(),
+      ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"].sort(),
       "список действий канала: " + ops.join(", ")
     );
-    for (const part of ["ycAlb.loadBalancers(", "ycAlb.card(", "ycAlb.targetGroups(", "ycAlb.httpRouters(", "ycAlb.backendGroups(", "ycAlb.backendGroupLine(", "ycAlb.targetStates(", "ycAlb.createTargetGroup(", "ycAlb.changeTargets(", "ycAlb.createHttpRouter(", "ycAlb.createBackendGroup(", "ycAlb.removeBackendGroup(", "ycAlb.createLoadBalancer(", "ycAlb.power(", "ycAlb.remove(", "ycAlb.removeTargetGroup(", "ycAlb.removeRouter(", "ycAlb.lbLine(", "ycAlb.listenerLine(", "ycAlb.targetLine(", "ycAlb.tgLine(", "ycAlb.routerLine("]) {
+    for (const part of ["ycAlb.loadBalancers(", "ycAlb.card(", "ycAlb.targetGroups(", "ycAlb.httpRouters(", "ycAlb.backendGroups(", "ycAlb.backendGroupLine(", "ycAlb.targetStates(", "ycAlb.createTargetGroup(", "ycAlb.changeTargets(", "ycAlb.createHttpRouter(", "ycAlb.createBackendGroup(", "ycAlb.removeBackendGroup(", "ycAlb.createLoadBalancer(", "ycAlb.power(", "ycAlb.remove(", "ycAlb.removeTargetGroup(", "ycAlb.removeRouter(", "ycAlb.lbLine(", "ycAlb.listenerLine(", "ycAlb.targetLine(", "ycAlb.tgLine(", "ycAlb.routerLine(", "ycAlb.addListener(", "ycAlb.updateListener(", "ycAlb.removeListener(", "ycAlb.updateLoadBalancer(", "ycAlb.certLine("]) {
       assert.ok(body.includes(part), "канал не зовёт " + part);
     }
     assert.ok(/needsConfirm: true/.test(body) && /a\.confirm !== true/.test(body), "канал не спрашивает согласие на платное и необратимое");
@@ -1123,6 +1263,11 @@ const section = (src, channel) => {
     const card = await call({ op: "card", lb: "web-lb" });
     assert.strictEqual(card.ok, true, "канал отказал на карточке: " + (card.error || ""));
     assert.ok(card.lines.some((l) => /Слушатели \(1\)/.test(l)), "в карточке нет слушателей: " + card.lines.join(" | "));
+    // HTTPS-карточка обязана назвать сертификат: без него вход не отвечает.
+    const secure = await call({ op: "card", lb: "https-lb" });
+    assert.strictEqual(secure.ok, true, "канал отказал на HTTPS-карточке: " + (secure.error || ""));
+    assert.ok(secure.lines.some((l) => /🔒 Слушатель «secure»/.test(l) && /site-cert/.test(l)), "сертификат HTTPS-слушателя не показан: " + secure.lines.join(" | "));
+    assert.strictEqual(secure.certificates.length, 1, "канал не отдал сертификаты окну: " + secure.certificates.length);
     assert.ok(card.lines.some((l) => /Роутер «main-router»/.test(l)), "в карточке нет роутера: " + card.lines.join(" | "));
     assert.ok(card.lines.some((l) => /10\.10\.0\.5/.test(l)), "в карточке нет адресов целей: " + card.lines.join(" | "));
     assert.ok(card.lines.some((l) => /web-backends/.test(l)), "в карточке нет группы бэкендов: " + card.lines.join(" | "));
@@ -1296,9 +1441,34 @@ const section = (src, channel) => {
     const A = ctx.window.YcActions;
     assert.strictEqual(A.CHANNELS.alb, "ycAlb", "семейство смотрит не в тот канал");
     const ids = A.forService("alb");
-    for (const need of ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "lbnew", "lbstart", "lbstop", "lbdel"]) {
+    for (const need of ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"]) {
       assert.ok(ids.indexOf(need) >= 0, "в семействе нет действия " + need);
     }
+    const addListener = A.describe("alb", "listeneradd");
+    for (const field of ["listenerName", "listener", "port", "router", "certificate", "backendGroup", "address"]) {
+      assert.ok(addListener.fields.indexOf(field) >= 0, "в форме добавления слушателя нет поля " + field);
+    }
+    const addAction = A.actionsFor("alb").find((x) => x.id === "listeneradd");
+    assert.strictEqual(addAction.target.key, "lb", "у добавления слушателя нет цели-балансировщика");
+    assert.strictEqual(addListener.confirmArg, "", "добавление слушателя не платное — согласие тут только мешало бы");
+    assert.strictEqual(A.describe("alb", "listenerdel").danger, true, "удаление слушателя не помечено опасным");
+    assert.strictEqual(A.describe("alb", "listenerdel").confirmArg, "confirm", "удаление слушателя не спрашивает согласие");
+    const updListener = A.describe("alb", "lbupdate");
+    assert.ok(updListener.fields.indexOf("newName") >= 0 && updListener.fields.indexOf("description") >= 0 && updListener.fields.indexOf("securityGroups") >= 0, "в форме правки балансировщика не хватает полей: " + updListener.fields.join(", "));
+    const addReq = A.request("alb", "listeneradd", { lb: "web-lb", listenerName: "api", listener: "http", port: "8080" }, false);
+    assert.strictEqual(addReq.args.op, "listeneradd");
+    assert.strictEqual(addReq.args.lb, "web-lb", "балансировщик не ушёл в добавление слушателя");
+    assert.strictEqual(addReq.args.listenerName, "api", "имя слушателя не ушло");
+    assert.strictEqual(addReq.args.port, 8080, "порт не число");
+    assert.strictEqual(addReq.args.confirm, undefined, "лишний confirm у добавления слушателя");
+    const delReq = A.request("alb", "listenerdel", { lb: "web-lb", listenerName: "api" }, true);
+    assert.strictEqual(delReq.args.op, "listenerdel");
+    assert.strictEqual(delReq.args.listenerName, "api");
+    assert.strictEqual(delReq.args.confirm, true, "согласие на удаление слушателя не ушло");
+    const updReq = A.request("alb", "lbupdate", { lb: "web-lb", newName: "edge-lb", securityGroups: "sg-1, sg-2" }, false);
+    assert.strictEqual(updReq.args.op, "lbupdate");
+    assert.strictEqual(updReq.args.newName, "edge-lb");
+    assert.strictEqual(updReq.args.securityGroups, "sg-1, sg-2", "группы безопасности не ушли в правку");
     const create = A.describe("alb", "lbnew");
     assert.strictEqual(create.paid, true, "создание балансировщика не помечено платным");
     assert.strictEqual(create.confirmArg, "confirm", "форма не назвала аргумент согласия");
@@ -1362,10 +1532,16 @@ const section = (src, channel) => {
   await test("ycAlb: схема, группа «облако», промпт и права знают инструмент", () => {
     const at = SCHEMAS_SRC.indexOf('name: "ycAlb"');
     assert.ok(at > 0, "нет схемы инструмента в tool-schemas");
-    const schema = SCHEMAS_SRC.slice(at, at + 7400);
-    for (const part of ["action", "lb", "group", "router", "name", "ips", "subnet", "listener", "port", "certificate", "backendGroup", "targetGroup", "kind", "healthPath", "host", "pathPrefix", "address", "securityGroups", "confirm", 'required: ["action"]']) {
+    // Границы записи, а не число знаков: окно в 7400 ломалось от каждого нового
+    // поля схемы (заход 5 части 91 добавил sni), хотя проверяемое свойство —
+    // «схема знает эти поля» — не менялось.
+    const end = SCHEMAS_SRC.indexOf('type: "function"', at + 10);
+    const schema = SCHEMAS_SRC.slice(at, end > at ? end : at + 7400);
+    for (const part of ["action", "lb", "listenerName", "newName", "group", "router", "name", "ips", "subnet", "listener", "port", "certificate", "backendGroup", "targetGroup", "kind", "healthPath", "host", "pathPrefix", "address", "sni", "securityGroups", "confirm", 'required: ["action"]']) {
       assert.ok(schema.includes(part), "в схеме нет " + part);
     }
+    assert.ok(/listeneradd/.test(schema) && /listenerupd/.test(schema) && /listenerdel/.test(schema) && /lbupdate/.test(schema), "схема не знает правку слушателей и балансировщика");
+    assert.ok(/СОСТАВ СЛУШАТЕЛЕЙ меняют точечно/.test(schema), "схема не объясняет, что состав слушателей меняют точечно, а не перезаписью списка");
     assert.ok(/ЧЕТЫРЕ разных ресурса/.test(schema), "схема не объясняет, что ресурсов четыре");
     assert.ok(/ПОРТ целей и проверки здоровья/.test(schema), "схема молчит о порте целей и проверках здоровья");
     assert.ok(/action health/.test(schema), "схема не знает про здоровье целей");
@@ -1392,10 +1568,429 @@ const section = (src, channel) => {
     assert.ok(/адреса его СЛУШАТЕЛЕЙ/.test(GUIDE_SRC), "в yc.md не сказано, откуда берётся адрес");
     assert.ok(/ПО ЗОНАМ/.test(GUIDE_SRC), "в yc.md не сказано, что здоровье приходит по зонам");
     assert.ok(/backnew/.test(GUIDE_SRC) && /backdel/.test(GUIDE_SRC) && /`health`/.test(GUIDE_SRC), "в yc.md нет новых действий группы бэкендов");
+    assert.ok(/`listeneradd`/.test(GUIDE_SRC) && /`listenerupd`/.test(GUIDE_SRC) && /`listenerdel`/.test(GUIDE_SRC) && /`lbupdate`/.test(GUIDE_SRC), "в yc.md нет точечной правки слушателей и балансировщика");
+    assert.ok(/ЗАМЕНЯЕТСЯ целиком/.test(GUIDE_SRC), "в yc.md не сказано, что группы безопасности ЗАМЕНЯЮТСЯ целиком");
+    assert.ok(/сертификат, его домены и срок/.test(GUIDE_SRC), "в yc.md не сказано, что карточка показывает срок сертификата");
   });
 
   await test("ycAlb: набор стоит в цепочке npm test — иначе это не набор", () => {
     assert.ok(String(PKG.scripts.test || "").indexOf("test/yc-alb.test.js") >= 0, "набора нет в цепочке npm test");
+  });
+
+  console.log("\n[9] Правка слушателей, групп безопасности и HTTPS-карточка");
+
+  await test("ycAlb: слушатель добавляется точечно (:addListener) и подтверждается перечитыванием", async () => {
+    stub.created.listenerOps.length = 0;
+    const r = await alb.addListener("oauth-1", { folderId: "folder-1", lb: "web-lb", listenerName: "api2", listener: "http", port: 8080, router: "main-router" });
+    assert.strictEqual(stub.created.listenerOps.length, 1, "запрос добавления не ушёл");
+    const op = stub.created.listenerOps[0];
+    assert.strictEqual(op.action, "addListener");
+    assert.strictEqual(op.lb, "alb-web");
+    assert.ok(op.body.listenerSpec, "тело без listenerSpec — облако не поймёт, что добавлять");
+    assert.strictEqual(op.body.listenerSpec.name, "api2");
+    assert.strictEqual(op.body.listenerSpec.http.handler.httpRouterId, "router-1");
+    assert.deepStrictEqual(op.body.listenerSpec.endpointSpecs[0].ports, ["8080"]);
+    assert.strictEqual(op.body.listenerSpecs, undefined, "вместе со слушателем ушёл ВЕСЬ список: остальные были бы стёрты");
+    assert.strictEqual(r.changed, true);
+    assert.strictEqual(r.listenerName, "api2");
+    const after = await alb.loadBalancer("oauth-1", "alb-web");
+    assert.strictEqual(after.listeners.length, 2, "второй слушатель не появился: " + after.listeners.map((l) => l.name).join(", "));
+    assert.ok(after.listeners.some((l) => l.name === "api2" && l.kind === "http"), "разбор добавленного слушателя не сошёлся");
+    assert.ok(/получает слушателя «api2»/.test(r.message) && /HTTP/.test(r.message) && /порт 8080/.test(r.message), r.message);
+    assert.ok(r.warnings.some((w) => /выдаёт облако/.test(w)), "не сказано, откуда возьмётся адрес: " + r.warnings.join(" | "));
+  });
+
+  await test("ycAlb: HTTPS-слушатель ищет ВЫПУЩЕННЫЙ сертификат — и это отказ до сети", async () => {
+    const before = writes(stub).length;
+    await assert.rejects(() => alb.addListener("oauth-1", { folderId: "folder-1", lb: "web-lb", listenerName: "s1", listener: "https", router: "main-router" }), /нужен сертификат/);
+    await assert.rejects(() => alb.addListener("oauth-1", { folderId: "folder-1", lb: "web-lb", listenerName: "s1", listener: "https", router: "main-router", certificate: "нет-такого" }), /Не нашёл сертификат/);
+    await assert.rejects(
+      () => alb.addListener("oauth-1", { folderId: "folder-1", lb: "web-lb", listenerName: "s1", listener: "https", router: "main-router", certificate: "old-cert" }),
+      (e) => /ещё не выпущен/.test(e.message) && /VALIDATING/.test(e.message)
+    );
+    assert.strictEqual(writes(stub).length, before, "слушатель ушёл в облако без годного сертификата");
+    const r = await alb.addListener("oauth-1", { folderId: "folder-1", lb: "web-lb", listenerName: "secure2", listener: "https", router: "main-router", certificate: "site-cert" });
+    const op = stub.created.listenerOps.slice(-1)[0];
+    assert.strictEqual(op.body.listenerSpec.tls.defaultHandler.certificateIds[0], "cert-1", "в слушатель ушёл сертификат не из каталога");
+    assert.deepStrictEqual(op.body.listenerSpec.endpointSpecs[0].ports, ["443"], "у HTTPS не тот порт по умолчанию");
+    assert.strictEqual(op.body.listenerSpec.http, undefined, "у TLS-слушателя появился второй вид");
+    assert.ok(r.warnings.some((w) => /Сертификат должен оставаться выпущенным/.test(w)), r.warnings.join(" | "));
+    assert.ok(r.warnings.some((w) => /Порт 443 обязан быть открыт/.test(w)), r.warnings.join(" | "));
+    // Вторая HTTPS-проверка нужна карточке: сертификат, который скоро истечёт.
+    await alb.addListener("oauth-1", { folderId: "folder-1", lb: "https-lb", listenerName: "soon2", listener: "https", router: "main-router", certificate: "soon-cert" });
+  });
+
+  await test("ycAlb: потоковому слушателю и при добавлении — только группа вида stream", async () => {
+    const before = writes(stub).length;
+    await assert.rejects(
+      () => alb.addListener("oauth-1", { folderId: "folder-1", lb: "web-lb", listenerName: "tcp3", listener: "stream", port: 5432, backendGroup: "web-backends" }),
+      /группа вида stream/
+    );
+    assert.strictEqual(writes(stub).length, before, "поток с HTTP-группой ушёл в облако");
+    await assert.rejects(() => alb.addListener("oauth-1", { folderId: "folder-1", lb: "web-lb", listenerName: "tcp3", listener: "stream", port: 5432 }), /нужна группа бэкендов/);
+    const r = await alb.addListener("oauth-1", { folderId: "folder-1", lb: "stream-lb", listenerName: "tcp2", listener: "stream", port: 5433, backendGroup: "free-backends" });
+    const op = stub.created.listenerOps.slice(-1)[0];
+    assert.strictEqual(op.body.listenerSpec.stream.handler.backendGroupId, "bg-free");
+    assert.ok(r.warnings.some((w) => /порт слушателя должен совпадать/.test(w)), r.warnings.join(" | "));
+    const after = await alb.loadBalancer("oauth-1", "alb-stream");
+    assert.ok(after.listeners.some((l) => l.name === "tcp2" && l.kind === "stream"), "потоковый слушатель не появился");
+  });
+
+  await test("ycAlb: занятый балансировщик, чужое имя и кривые значения отбиваются ДО сети", async () => {
+    const before = writes(stub).length;
+    await assert.rejects(() => alb.addListener("oauth-1", { folderId: "folder-1", lb: "busy-lb", listenerName: "x1", listener: "http", router: "main-router" }), /занят/);
+    await assert.rejects(
+      () => alb.addListener("oauth-1", { folderId: "folder-1", lb: "web-lb", listenerName: "api2", listener: "http", router: "main-router" }),
+      (e) => /уже есть слушатель/.test(e.message) && /api2/.test(e.message)
+    );
+    await assert.rejects(() => alb.addListener("oauth-1", { folderId: "folder-1", lb: "web-lb", listenerName: "1bad", listener: "http", router: "main-router" }), /облако не примет/);
+    await assert.rejects(() => alb.addListener("oauth-1", { folderId: "folder-1", lb: "web-lb", listenerName: "p1", listener: "http", port: 70000, router: "main-router" }), /от 1 до 65535/);
+    await assert.rejects(() => alb.addListener("oauth-1", { folderId: "folder-1", lb: "web-lb", listenerName: "u1", listener: "udp", port: 80, router: "main-router" }), /http, https или stream/);
+    assert.strictEqual(writes(stub).length, before, "негодное добавление всё-таки ушло в облако");
+  });
+
+  await test("ycAlb: правка балансировщика уходит PATCH с маской — и не трогает слушателей", async () => {
+    stub.created.lbPatches.length = 0;
+    const r = await alb.updateLoadBalancer("oauth-1", { folderId: "folder-1", lb: "web-lb", newName: "edge-lb", description: "витрина 2", securityGroups: "ssh" });
+    assert.strictEqual(stub.created.lbPatches.length, 1, "PATCH не ушёл");
+    const patch = stub.created.lbPatches[0];
+    assert.strictEqual(patch.lb, "alb-web");
+    assert.strictEqual(patch.body.updateMask, "name,description,security_group_ids", "маска полей не та: " + patch.body.updateMask);
+    assert.strictEqual(patch.body.name, "edge-lb");
+    assert.strictEqual(patch.body.description, "витрина 2");
+    assert.deepStrictEqual(patch.body.securityGroupIds, ["sg-2"], "группа безопасности не разрешена в id (по имени ssh)");
+    assert.strictEqual(patch.body.listenerSpecs, undefined, "PATCH понёс ВЕСЬ список слушателей — он стёр бы всех, кого нет в теле");
+    assert.ok(r.warnings.some((w) => /ЗАМЕНЁН целиком/.test(w)), r.warnings.join(" | "));
+    assert.ok(r.warnings.some((w) => /подпись, а не адрес/.test(w)), r.warnings.join(" | "));
+    assert.ok(/обновляется: имя, описание, группы безопасности/.test(r.message), r.message);
+    const renamed = await alb.findLoadBalancer("oauth-1", "folder-1", "edge-lb");
+    assert.ok(renamed && renamed.listeners.length === 3, "переименование потеряло слушателей: " + (renamed ? renamed.listeners.length : "балансировщик не найден"));
+    // Поля «через запятую» из окна тоже разбираются (иначе группа искалась бы целой строкой).
+    stub.created.lbPatches.length = 0;
+    await alb.updateLoadBalancer("oauth-1", { folderId: "folder-1", lb: "edge-lb", securityGroups: "sg-1, ssh" });
+    assert.deepStrictEqual(stub.created.lbPatches[0].body.securityGroupIds, ["sg-1", "sg-2"], "строка «через запятую» не разобрана на группы");
+  });
+
+  await test("ycAlb: «облако промолчало» — это ошибка, а не успех (перечитывание)", async () => {
+    stub.flags.dropAdd = true;
+    await assert.rejects(
+      () => alb.addListener("oauth-1", { folderId: "folder-1", lb: "edge-lb", listenerName: "silent", listener: "http", router: "main-router" }),
+      (e) => /не появился/.test(e.message) && /alb\.editor/.test(e.message)
+    );
+    stub.flags.dropAdd = false;
+    stub.flags.dropRemove = true;
+    await assert.rejects(
+      () => alb.removeListener("oauth-1", { folderId: "folder-1", lb: "edge-lb", listenerName: "api2" }),
+      (e) => /остался/.test(e.message) && /alb\.editor/.test(e.message)
+    );
+    stub.flags.dropRemove = false;
+    stub.flags.dropPatch = true;
+    await assert.rejects(
+      () => alb.updateLoadBalancer("oauth-1", { folderId: "folder-1", lb: "edge-lb", newName: "edge-lb-2" }),
+      (e) => /не применилась/.test(e.message) && /alb\.editor/.test(e.message)
+    );
+    stub.flags.dropPatch = false;
+    const same = await alb.findLoadBalancer("oauth-1", "folder-1", "edge-lb");
+    assert.ok(same && same.name === "edge-lb", "молчащая правка всё-таки изменила имя");
+  });
+
+  await test("ycAlb: нечего менять и негодные значения — отказ ДО сети, а не пустой PATCH", async () => {
+    const before = stub.created.lbPatches.length;
+    await assert.rejects(() => alb.updateLoadBalancer("oauth-1", { folderId: "folder-1", lb: "edge-lb" }), /Нечего менять/);
+    await assert.rejects(() => alb.updateLoadBalancer("oauth-1", { folderId: "folder-1", lb: "edge-lb", newName: "edge-lb" }), /уже называется/);
+    await assert.rejects(() => alb.updateLoadBalancer("oauth-1", { folderId: "folder-1", lb: "edge-lb", securityGroups: ["нет-такой"] }), /Не нашёл группу безопасности/);
+    assert.strictEqual(stub.created.lbPatches.length, before, "пустая или негодная правка всё-таки ушла в облако");
+  });
+
+  await test("ycAlb: слушатель убирается :removeListener телом из одного имени", async () => {
+    stub.created.listenerOps.length = 0;
+    const beforeCalls = stub.calls.length;
+    const r = await alb.removeListener("oauth-1", { folderId: "folder-1", lb: "edge-lb", listenerName: "api2" });
+    const op = stub.created.listenerOps[0];
+    assert.strictEqual(op.action, "removeListener");
+    assert.strictEqual(op.lb, "alb-web");
+    assert.deepStrictEqual(op.body, { name: "api2" }, "тело удаления — только имя слушателя: " + JSON.stringify(op.body));
+    assert.ok(/убирается у балансировщика «edge-lb»/.test(r.message) && /вход по нему закроется/.test(r.message), r.message);
+    assert.ok(r.warnings.some((w) => /Порт 8080 закроется снаружи/.test(w)), r.warnings.join(" | "));
+    const after = await alb.loadBalancer("oauth-1", "alb-web");
+    assert.ok(!after.listeners.some((l) => l.name === "api2"), "слушатель остался после удаления");
+    assert.ok(!stub.calls.slice(beforeCalls).some((c) => c.method === "PATCH"), "удаление слушателя ушло через PATCH — целый список был бы перезаписан");
+
+    const web = await alb.removeListener("oauth-1", { folderId: "folder-1", lb: "edge-lb", listenerName: "web" });
+    assert.ok(web.warnings.some((w) => /Адрес 203\.0\.113\.10 освободится/.test(w)), web.warnings.join(" | "));
+    const last = await alb.removeListener("oauth-1", { folderId: "folder-1", lb: "edge-lb", listenerName: "secure2" });
+    assert.ok(last.warnings.some((w) => /не осталось слушателей/.test(w)), "о последнем слушателе не сказано: " + last.warnings.join(" | "));
+    assert.ok(last.warnings.some((w) => /Порт 443 закроется снаружи/.test(w)), last.warnings.join(" | "));
+    const empty = await alb.loadBalancer("oauth-1", "alb-web");
+    assert.strictEqual(empty.listeners.length, 0, "слушатели остались: " + empty.listeners.map((l) => l.name).join(", "));
+    await assert.rejects(() => alb.removeListener("oauth-1", { folderId: "folder-1", lb: "edge-lb", listenerName: "web" }), /нет слушателя/);
+    await assert.rejects(() => alb.removeListener("oauth-1", { folderId: "folder-1", lb: "edge-lb" }), /Не указано имя слушателя/);
+  });
+
+  await test("ycAlb: карточка HTTPS-слушателя читает сертификаты — домены, срок и «нет в каталоге»", async () => {
+    const c = await alb.card("oauth-1", "folder-1", "https-lb");
+    assert.ok(c, "карточка https-lb пустая");
+    assert.strictEqual(c.certificates.length, 2, "сертификаты слушателей не собраны: " + c.certificates.length);
+    const healthy = c.certificates.find((x) => x.listenerName === "secure");
+    assert.ok(healthy && healthy.cert.name === "site-cert", "сертификат слушателя secure не найден");
+    const healthyLine = alb.certLine(healthy);
+    assert.ok(/site-cert/.test(healthyLine) && /домены: site\.example/.test(healthyLine) && /осталось \d+ дн\./.test(healthyLine), healthyLine);
+    assert.ok(c.warnings.some((w) => /soon-cert/.test(w) && /истекает/.test(w)), "о скором истечении не сказано: " + c.warnings.join(" | "));
+    assert.ok(!c.warnings.some((w) => /site-cert/.test(w)), "здоровый сертификат попал в предупреждения: " + c.warnings.join(" | "));
+    const streamCard = await alb.card("oauth-1", "folder-1", "stream-lb");
+    assert.ok(streamCard.warnings.some((w) => /cert-gone/.test(w) && /не найден в каталоге/.test(w)), "сертификат, которого нет в каталоге, не назван: " + streamCard.warnings.join(" | "));
+  });
+
+  await test("yc:alb: добавление, удаление слушателя и правка идут через настоящий канал", async () => {
+    const handlers = new Map();
+    registerYcIpc(ipcDeps(handlers, settingsFor()));
+    const call = (args) => handlers.get("yc:alb")({}, args || {});
+
+    stub.created.listenerOps.length = 0;
+    const added = await call({ op: "listeneradd", lb: "stream-lb", listenerName: "ch1", listener: "http", port: 8081, router: "main-router" });
+    assert.strictEqual(added.ok, true, "канал отказал на добавлении слушателя: " + (added.error || ""));
+    assert.strictEqual(added.listenerName, "ch1");
+    const addOp = stub.created.listenerOps.slice(-1)[0];
+    assert.strictEqual(addOp.action, "addListener");
+    assert.strictEqual(addOp.body.listenerSpec.name, "ch1", "канал не передал имя слушателя");
+    assert.ok((added.lines || []).some((l) => /получает слушателя «ch1»/.test(l)), (added.lines || []).join(" | "));
+    assert.ok((added.warnings || []).some((w) => /выдаёт облако/.test(w)), "канал потерял предупреждения добавления");
+
+    const ask = await call({ op: "listenerdel", lb: "stream-lb", listenerName: "ch1" });
+    assert.strictEqual(ask.ok, false);
+    assert.strictEqual(ask.needsConfirm, true, "удаление слушателя не спросило человека");
+    assert.ok(/вход по нему закроется/.test(ask.error), ask.error);
+    assert.ok(!stub.created.listenerOps.some((o) => o.action === "removeListener"), "слушатель удалён без согласия");
+    const removed = await call({ op: "listenerdel", lb: "stream-lb", listenerName: "ch1", confirm: true });
+    assert.strictEqual(removed.ok, true, "канал отказал на удалении слушателя: " + (removed.error || ""));
+    assert.strictEqual(stub.created.listenerOps.slice(-1)[0].action, "removeListener");
+
+    stub.created.lbPatches.length = 0;
+    const upd = await call({ op: "lbupdate", lb: "stream-lb", newName: "stream-lb-2", securityGroups: "sg-2" });
+    assert.strictEqual(upd.ok, true, "канал отказал на правке балансировщика: " + (upd.error || ""));
+    assert.deepStrictEqual(upd.fields, ["name", "security_group_ids"]);
+    const patch = stub.created.lbPatches.slice(-1)[0];
+    assert.strictEqual(patch.lb, "alb-stream");
+    assert.strictEqual(patch.body.updateMask, "name,security_group_ids");
+    assert.deepStrictEqual(patch.body.securityGroupIds, ["sg-2"]);
+
+    const unknown = await call({ op: "nope" });
+    assert.ok(/Доступно: list, card, targets, routers, backends/.test(unknown.error), unknown.error);
+  });
+
+  await test("ycAlb (агент): слушатели и балансировщик правятся действиями инструмента", async () => {
+    const tools = buildTools();
+    stub.created.listenerOps.length = 0;
+    const added = await tools.ycAlb({ action: "listeneradd", lb: "stream-lb-2", name: "tool1", listener: "http", port: 8082, router: "main-router" });
+    assert.ok(/получает слушателя «tool1»/.test(added), added);
+    assert.ok(/состав слушателей НЕ переписывается/.test(added), "инструмент не сказал, что список не перезаписывается: " + added);
+    assert.strictEqual(stub.created.listenerOps.slice(-1)[0].body.listenerSpec.name, "tool1", "имя слушателя не доехало до облака");
+    const ask = await tools.ycAlb({ action: "listenerdel", lb: "stream-lb-2", listenerName: "tool1" });
+    assert.ok(/confirm: true/.test(ask), "удаление слушателя не просит подтверждения: " + ask);
+    assert.ok(!stub.created.listenerOps.some((o) => o.action === "removeListener"), "слушатель удалён без согласия");
+    const done = await tools.ycAlb({ action: "listenerdel", lb: "stream-lb-2", listenerName: "tool1", confirm: true });
+    assert.ok(/убирается у балансировщика/.test(done), done);
+    const upd = await tools.ycAlb({ action: "lbupdate", lb: "stream-lb-2", description: "поток для баз" });
+    assert.ok(/обновляется: описание/.test(upd), upd);
+    assert.ok(/С МАСКОЙ полей/.test(upd), "инструмент не сказал про маску: " + upd);
+  });
+
+  console.log("\n[10] Правка слушателя (:updateListener) и SNI-домены");
+
+  await test("ycAlb: слушатель правится :updateListener с маской — и продление сертификата не трогает остальное", async () => {
+    stub.created.listenerOps.length = 0;
+    const r = await alb.updateListener("oauth-1", { folderId: "folder-1", lb: "https-lb", listenerName: "secure", certificate: "fresh-cert" });
+    assert.strictEqual(stub.created.listenerOps.length, 1, "запрос правки слушателя не ушёл");
+    const op = stub.created.listenerOps[0];
+    assert.strictEqual(op.action, "updateListener");
+    assert.strictEqual(op.lb, "alb-https");
+    assert.strictEqual(op.body.updateMask, "name,endpoint_specs,tls", "маска правки слушателя не та: " + op.body.updateMask);
+    assert.deepStrictEqual(r.fields, ["name", "endpoint_specs", "tls"]);
+    assert.strictEqual(op.body.listenerSpec.name, "secure", "слушатель опознаётся по имени — оно не должно меняться");
+    assert.strictEqual(op.body.listenerSpec.tls.defaultHandler.certificateIds[0], "cert-5", "новый сертификат не доехал");
+    assert.deepStrictEqual(op.body.listenerSpec.endpointSpecs[0].ports, ["443"], "порт, которого не называли, изменился");
+    assert.strictEqual(op.body.listenerSpec.endpointSpecs[0].addressSpecs[0].externalIpv4AddressSpec.address, "203.0.113.11", "адрес слушателя не сохранён: домены смотрят именно на него");
+    assert.strictEqual(op.body.listenerSpec.http, undefined, "у TLS-слушателя появился второй вид");
+    assert.strictEqual(op.body.listenerSpecs, undefined, "вместе с правкой ушёл ВЕСЬ список слушателей");
+    assert.ok(/обновляется: сертификат cert-5/.test(r.message), r.message);
+    assert.ok(r.warnings.some((w) => /Сертификат должен оставаться выпущенным/.test(w)), r.warnings.join(" | "));
+    const after = await alb.loadBalancer("oauth-1", "alb-https");
+    const got = after.listeners.find((l) => l.name === "secure");
+    assert.ok(got && got.certificateIds.indexOf("cert-5") >= 0, "перечитывание не показывает новый сертификат");
+    assert.deepStrictEqual(got.ports, ["443"], "порт уехал: " + got.ports.join(","));
+    assert.strictEqual(got.routerId, "router-1", "роутер потерян при правке");
+    // Переименовать слушателя нельзя: такого поля у метода нет — говорим об этом словами.
+    await assert.rejects(() => alb.updateListener("oauth-1", { folderId: "folder-1", lb: "https-lb", listenerName: "nope", port: 443 }), (e) => /нет слушателя/.test(e.message) && /Переименовать слушателя нельзя/.test(e.message));
+    await assert.rejects(() => alb.updateListener("oauth-1", { folderId: "folder-1", lb: "https-lb", port: 443 }), /Не указано имя слушателя/);
+    await assert.rejects(() => alb.updateListener("oauth-1", { folderId: "folder-1", lb: "busy-lb", listenerName: "x", port: 443 }), /занят/);
+  });
+
+  await test("ycAlb: перевод HTTP на HTTPS меняет вид — в маске оказывается СТАРЫЙ вид", async () => {
+    await alb.addListener("oauth-1", { folderId: "folder-1", lb: "edge-lb", listenerName: "www", listener: "http", port: 80, router: "main-router" });
+    stub.created.listenerOps.length = 0;
+    const r = await alb.updateListener("oauth-1", { folderId: "folder-1", lb: "edge-lb", listenerName: "www", listener: "https", certificate: "site-cert" });
+    const op = stub.created.listenerOps[0];
+    assert.strictEqual(op.body.updateMask, "name,endpoint_specs,tls,http", "старый вид не попал в маску — облако оставило бы у слушателя ДВА вида: " + op.body.updateMask);
+    assert.ok(op.body.listenerSpec.tls, "в теле нет TLS-обработчика");
+    assert.strictEqual(op.body.listenerSpec.http, undefined, "в теле остался HTTP-обработчик");
+    assert.deepStrictEqual(op.body.listenerSpec.endpointSpecs[0].ports, ["80"], "порт, которого не называли, изменился");
+    assert.ok(r.warnings.some((w) => /Вид слушателя заменён целиком/.test(w)), r.warnings.join(" | "));
+    const after = await alb.loadBalancer("oauth-1", "alb-web");
+    const got = after.listeners.find((l) => l.name === "www");
+    assert.ok(got && got.kind === "tls", "после правки слушатель не HTTPS: " + (got ? got.kindHuman : "нет слушателя"));
+    assert.deepStrictEqual(got.certificateIds, ["cert-1"]);
+    assert.strictEqual(got.routerId, "router-1", "роутер не сохранён при смене вида");
+  });
+
+  await test("ycAlb: несколько доменов на одном HTTPS-слушателе — SNI со СВОИМ сертификатом у каждого", async () => {
+    stub.created.listenerOps.length = 0;
+    const r = await alb.addListener("oauth-1", {
+      folderId: "folder-1", lb: "https-lb", listenerName: "shop", listener: "https", port: 443, router: "main-router", certificate: "site-cert",
+      sni: "shop.example.com=shop-cert\nwww.example.com,example.com=site-cert",
+    });
+    const tls = stub.created.listenerOps[0].body.listenerSpec.tls;
+    assert.strictEqual(tls.sniHandlers.length, 2, "SNI-обработчиков не два: " + tls.sniHandlers.length);
+    assert.strictEqual(tls.defaultHandler.certificateIds[0], "cert-1", "основной сертификат не тот");
+    const shop = tls.sniHandlers.find((h) => h.serverNames[0] === "shop.example.com");
+    assert.ok(shop, "нет обработчика для shop.example.com");
+    assert.strictEqual(shop.handler.certificateIds[0], "cert-4", "у домена свой сертификат не доехал: " + JSON.stringify(shop.handler.certificateIds));
+    assert.strictEqual(shop.handler.httpHandler.httpRouterId, "router-1", "обработчик SNI должен быть того же типа, что основной");
+    assert.strictEqual(shop.name, "sni-shop-example-com", "имя обработчика не собрано из домена: " + shop.name);
+    const many = tls.sniHandlers.find((h) => h.serverNames.length === 2);
+    assert.deepStrictEqual(many.serverNames, ["www.example.com", "example.com"], "домены одной строки разобраны не все");
+    assert.strictEqual(r.sni.length, 2, "ответ не назвал SNI-домены");
+    assert.ok(/домены SNI: shop\.example\.com/.test(r.message), r.message);
+    // Карточка обязана читать сертификаты SNI-обработчиков: у них СВОИ.
+    const c = await alb.card("oauth-1", "folder-1", "https-lb");
+    const sniCert = c.certificates.find((x) => /SNI: shop\.example\.com/.test(x.listenerName));
+    assert.ok(sniCert && sniCert.cert.name === "shop-cert", "карточка не читает сертификат SNI-домена: " + c.certificates.map((x) => x.listenerName).join(" | "));
+    const line = alb.certLine(sniCert);
+    assert.ok(/shop-cert/.test(line) && /осталось \d+ дн\./.test(line), line);
+    const lbLine = alb.listenerLine((await alb.loadBalancer("oauth-1", "alb-https")).listeners.find((l) => l.name === "shop"));
+    assert.ok(/SNI: shop\.example\.com/.test(lbLine), "строка слушателя молчит про домены SNI: " + lbLine);
+  });
+
+  await test("ycAlb: негодные SNI-домены отбиваются ДО сети", async () => {
+    const before = writes(stub).length;
+    await assert.rejects(
+      () => alb.addListener("oauth-1", { folderId: "folder-1", lb: "edge-lb", listenerName: "sni-http", listener: "http", port: 80, router: "main-router", sni: "shop.example.com=shop-cert" }),
+      /только у HTTPS-слушателя/
+    );
+    await assert.rejects(
+      () => alb.addListener("oauth-1", { folderId: "folder-1", lb: "https-lb", listenerName: "sni-x", listener: "https", router: "main-router", certificate: "site-cert", sni: "shop.example.com=нет-такого" }),
+      /SNI: не нашёл сертификат/
+    );
+    await assert.rejects(
+      () => alb.addListener("oauth-1", { folderId: "folder-1", lb: "https-lb", listenerName: "sni-x", listener: "https", router: "main-router", certificate: "site-cert", sni: "shop.example.com=old-cert" }),
+      (e) => /SNI/.test(e.message) && /ещё не выпущен/.test(e.message) && /VALIDATING/.test(e.message)
+    );
+    await assert.rejects(
+      () => alb.addListener("oauth-1", { folderId: "folder-1", lb: "https-lb", listenerName: "sni-x", listener: "https", router: "main-router", certificate: "site-cert", sni: "shop.example.com=site-cert\nSHOP.example.com=site-cert" }),
+      /облако не примет/
+    );
+    await assert.rejects(
+      () => alb.addListener("oauth-1", { folderId: "folder-1", lb: "https-lb", listenerName: "sni-x", listener: "https", router: "main-router", certificate: "site-cert", sni: "shop.example.com,shop.example.com=site-cert" }),
+      /назван дважды/
+    );
+    await assert.rejects(
+      () => alb.addListener("oauth-1", { folderId: "folder-1", lb: "https-lb", listenerName: "sni-x", listener: "https", router: "main-router", certificate: "site-cert", sni: "shop.example.com" }),
+      /нет сертификата/
+    );
+    assert.strictEqual(writes(stub).length, before, "негодные SNI-домены всё-таки ушли в облако");
+  });
+
+  await test("ycAlb: правка без доменов сохраняет SNI, а «нет» — убирает", async () => {
+    // Домены не называем — они должны остаться: правка одного порта не повод
+    // потерять их вместе с сертификатами.
+    stub.created.listenerOps.length = 0;
+    const kept = await alb.updateListener("oauth-1", { folderId: "folder-1", lb: "https-lb", listenerName: "shop", port: 8443 });
+    const keptSpec = stub.created.listenerOps[0].body.listenerSpec;
+    assert.strictEqual(keptSpec.tls.sniHandlers.length, 2, "домены потеряны при правке порта: " + keptSpec.tls.sniHandlers.length);
+    assert.ok(kept.warnings.some((w) => /Порт слушателя: 443 → 8443/.test(w)), kept.warnings.join(" | "));
+    assert.ok(!kept.warnings.some((w) => /SNI/.test(w)), "о доменах сказано там, где их не трогали: " + kept.warnings.join(" | "));
+    const afterKeep = await alb.loadBalancer("oauth-1", "alb-https");
+    const keptListener = afterKeep.listeners.find((l) => l.name === "shop");
+    assert.strictEqual(keptListener.sni.length, 2, "перечитывание не видит домены SNI");
+    assert.deepStrictEqual(keptListener.ports, ["8443"]);
+    // А теперь убираем домены целиком — пустым списком (в окне это «нет»).
+    const gone = await alb.updateListener("oauth-1", { folderId: "folder-1", lb: "https-lb", listenerName: "shop", sni: [] });
+    const goneSpec = stub.created.listenerOps.slice(-1)[0].body.listenerSpec;
+    assert.strictEqual(goneSpec.tls.sniHandlers, undefined, "пустой список не убрал домены: " + JSON.stringify(goneSpec.tls.sniHandlers));
+    assert.ok(gone.warnings.some((w) => /Домены SNI убраны/.test(w) && /shop\.example\.com/.test(w)), gone.warnings.join(" | "));
+    assert.ok(/домены SNI: убраны/.test(gone.message), gone.message);
+    const afterGone = await alb.loadBalancer("oauth-1", "alb-https");
+    assert.strictEqual(afterGone.listeners.find((l) => l.name === "shop").sni.length, 0, "домены остались после удаления");
+    assert.strictEqual(afterGone.listeners.find((l) => l.name === "shop").certificateIds[0], "cert-1", "основной сертификат потерялся вместе с доменами");
+  });
+
+  await test("ycAlb: молчаливая правка слушателя — ошибка, а смена адреса предупреждает", async () => {
+    stub.flags.dropUpdate = true;
+    await assert.rejects(
+      () => alb.updateListener("oauth-1", { folderId: "folder-1", lb: "https-lb", listenerName: "secure", port: 9443 }),
+      (e) => /не применилась/.test(e.message) && /порт \(443\)/.test(e.message) && /alb\.editor/.test(e.message)
+    );
+    stub.flags.dropUpdate = false;
+    const moved = await alb.updateListener("oauth-1", { folderId: "folder-1", lb: "https-lb", listenerName: "secure", address: "203.0.113.99" });
+    assert.ok(moved.warnings.some((w) => /Адрес слушателя изменился: 203\.0\.113\.11 → 203\.0\.113\.99/.test(w)), moved.warnings.join(" | "));
+    // Возврат на прежний адрес — тоже смена адреса: предупреждение обязано быть.
+    const back = await alb.updateListener("oauth-1", { folderId: "folder-1", lb: "https-lb", listenerName: "secure", address: "203.0.113.11" });
+    assert.ok(back.warnings.some((w) => /Адрес слушателя изменился: 203\.0\.113\.99 → 203\.0\.113\.11/.test(w)), back.warnings.join(" | "));
+  });
+
+  await test("yc:alb и ycAlb: правка слушателя идёт через настоящий канал и инструмент", async () => {
+    const handlers = new Map();
+    registerYcIpc(ipcDeps(handlers, settingsFor()));
+    const call = (args) => handlers.get("yc:alb")({}, args || {});
+
+    stub.created.listenerOps.length = 0;
+    const upd = await call({ op: "listenerupd", lb: "https-lb", listenerName: "shop", port: 9443 });
+    assert.strictEqual(upd.ok, true, "канал отказал на правке слушателя: " + (upd.error || ""));
+    const op = stub.created.listenerOps.slice(-1)[0];
+    assert.strictEqual(op.action, "updateListener");
+    assert.strictEqual(op.body.listenerSpec.name, "shop");
+    assert.deepStrictEqual(upd.fields, ["name", "endpoint_specs", "tls"]);
+    assert.ok((upd.lines || []).some((l) => /обновляется/.test(l) && /порт 9443/.test(l)), (upd.lines || []).join(" | "));
+    const gone = await call({ op: "listenerupd", lb: "https-lb", listenerName: "nope", port: 9443 });
+    assert.strictEqual(gone.ok, false, "канал не отбил чужое имя слушателя");
+    assert.ok(/нет слушателя/.test(gone.error), gone.error);
+
+    const tools = buildTools();
+    stub.created.listenerOps.length = 0;
+    const text = await tools.ycAlb({ action: "listenerupd", lb: "https-lb", listenerName: "shop", certificate: "fresh-cert" });
+    assert.strictEqual(stub.created.listenerOps.slice(-1)[0].action, "updateListener");
+    assert.strictEqual(stub.created.listenerOps.slice(-1)[0].body.listenerSpec.tls.defaultHandler.certificateIds[0], "cert-5", "инструмент не донёс новый сертификат");
+    assert.ok(/:updateListener/.test(text), "инструмент не сказал, каким методом правит: " + text);
+    assert.ok(/маской полей/.test(text), text);
+    assert.ok(/listenerupd/.test(text), "инструмент не подсказал, как править слушателя: " + text);
+  });
+
+  await test("yc-actions: у правки слушателя своя форма, и SNI есть у создания балансировщика", () => {
+    const ctx = { window: {}, document: undefined, navigator: {}, console: console };
+    ctx.window.window = ctx.window;
+    vm.createContext(ctx);
+    vm.runInContext(ACTIONS_SRC, ctx, { filename: "yc-actions.js" });
+    const A = ctx.window.YcActions;
+    const upd = A.describe("alb", "listenerupd");
+    for (const field of ["listenerName", "listener", "port", "router", "certificate", "backendGroup", "address", "sni"]) {
+      assert.ok(upd.fields.indexOf(field) >= 0, "в форме правки слушателя нет поля " + field + ": " + upd.fields.join(", "));
+    }
+    assert.strictEqual(A.actionsFor("alb").find((x) => x.id === "listenerupd").target.key, "lb", "у правки слушателя нет цели-балансировщика");
+    assert.strictEqual(upd.danger, false, "правка слушателя — не удаление: опасной её называть не надо");
+    assert.strictEqual(upd.confirmArg, "", "правка слушателя не спрашивает согласие: она обратима");
+    const req = A.request("alb", "listenerupd", { lb: "web-lb", listenerName: "web", port: "9443" }, false);
+    assert.strictEqual(req.args.op, "listenerupd");
+    assert.strictEqual(req.args.lb, "web-lb", "балансировщик не ушёл в правку слушателя");
+    assert.strictEqual(req.args.listenerName, "web");
+    assert.strictEqual(req.args.port, 9443, "порт не число");
+    assert.strictEqual(req.args.certificate, undefined, "пустое поле ушло в запрос — модуль счёл бы это сменой настройки");
+    assert.strictEqual(req.args.confirm, undefined, "лишний confirm у правки слушателя");
+    const empty = A.request("alb", "listenerupd", { lb: "web-lb", listenerName: "web" }, false);
+    assert.strictEqual(empty.args.port, undefined, "пустой порт всё равно ушёл числом");
+    for (const id of ["listeneradd", "lbnew"]) {
+      assert.ok(A.describe("alb", id).fields.indexOf("sni") >= 0, "в форме " + id + " нет поля домены SNI");
+    }
+    const sniReq = A.request("alb", "listenerupd", { lb: "web-lb", listenerName: "web", sni: "shop.example.com=shop-cert" }, false);
+    assert.strictEqual(sniReq.args.sni, "shop.example.com=shop-cert", "домены SNI не ушли строкой");
   });
 
   stub.server.close();
