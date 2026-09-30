@@ -2568,6 +2568,38 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "ycAlb",
+      description:
+        "Yandex Cloud: ВХОД В ПРИЛОЖЕНИЕ С УЛИЦЫ — Application Load Balancer. Это ЧЕТЫРЕ разных ресурса одного сервиса, и путать их нельзя: ГРУППА ЦЕЛЕЙ (targets, targetnew, targetadd, targetremove, targetdel) — список адресов машин, знает ТОЛЬКО адрес и подсеть; HTTP-РОУТЕР (routers, routernew, routerdel) — правила «домен и путь → группа бэкендов»; БАЛАНСИРОВЩИК (list, card, lbnew, lbstart, lbstop, lbdel) — адреса, зоны и слушатели (http — через роутер, https — роутер и сертификат Certificate Manager со статусом Issued, stream — поток TCP на группу бэкендов); ГРУППА БЭКЕНДОВ (backends) — ТОЛЬКО ЧТЕНИЕ: маршрут обязан вести в существующую группу, и без неё роутер создавать некуда. Порядок работы: targetnew → (группа бэкендов уже существует) → routernew → lbnew. Балансировщик ПЛАТНЫЙ: ресурсные единицы и сам ресурс тарифицируются за час, даже без трафика, поэтому lbnew только с confirm: true после согласия человека (ориентир: ycBilling { action: \"price\", query: \"Application Load Balancer\" }); lbdel уносит слушатели и адреса (домен перестанет открываться), routerdel оставляет слушатель без ответа, targetdel теряет список целей — всё с confirm: true. Адрес балансировщика — это адреса его СЛУШАТЕЛЕЙ: пока слушатель не создан, адреса нет, и DNS-запись (ycDns) вешают только после. Состояние цели (здорова или нет) этим инструментом не видно: его отдаёт отдельный метод облака.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "list | card | targets | routers | backends | targetnew | targetadd | targetremove | targetdel | routernew | routerdel | lbnew | lbstart | lbstop | lbdel" },
+          lb: { type: "string", description: "Балансировщик — имя или id (для card, lbstart, lbstop, lbdel; без него работает, только если балансировщик в каталоге один)" },
+          group: { type: "string", description: "Группа целей — имя или id (для targetadd, targetremove, targetdel)" },
+          router: { type: "string", description: "HTTP-роутер — имя или id (для routerdel)" },
+          name: { type: "string", description: "Имя нового ресурса: группы целей (targetnew), роутера (routernew) или балансировщика (lbnew)" },
+          ips: { type: "array", items: { type: "string" }, description: "Адреса целей, например [\"10.10.0.5\", \"10.10.0.6\"] (targetnew, targetadd, targetremove). Цель — это адрес машины; порт задаёт группа бэкендов" },
+          subnet: { type: "string", description: "Имя или id подсети: для целей (targetnew, targetadd) — где живут их адреса, для балансировщика (lbnew) — в какой зоне встанет узел; список: ycVpc { action: \"subnets\" }" },
+          listener: { type: "string", description: "Вид слушателя (lbnew): http (по умолчанию — через роутер), https (роутер и сертификат) или stream (поток TCP на группу бэкендов)" },
+          port: { type: "integer", description: "Порт слушателя (lbnew; по умолчанию 80, для https — 443)" },
+          certificate: { type: "string", description: "Сертификат Certificate Manager — имя или id (lbnew для https; сертификат обязан быть в состоянии Issued, выпустить: ycCdn { action: \"certnew\" })" },
+          backendGroup: { type: "string", description: "Группа бэкендов — имя или id: обязательна для stream-слушателя и для маршрута routernew; список: action backends" },
+          host: { type: "string", description: "Домен виртуального хоста (routernew), например site.example.com; без него роутер отвечает на ЛЮБОЙ домен" },
+          pathPrefix: { type: "string", description: "Путь-префикс маршрута (routernew; по умолчанию /)" },
+          pathExact: { type: "string", description: "Точный путь вместо префикса (routernew)" },
+          address: { type: "string", description: "Статический внешний IPv4-адрес (lbnew; пусто — облако выдаст само)" },
+          securityGroups: { type: "array", items: { type: "string" }, description: "Группы безопасности (lbnew) — имена или id; без них порт закрыт снаружи группой по умолчанию" },
+          confirm: { type: "boolean", description: "true — согласие пользователя: на создание платного балансировщика или на необратимое удаление группы целей, роутера или балансировщика" },
+          description: { type: "string", description: "Описание ресурса" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "ycVpc",
       description:
         "Yandex Cloud: сеть VPC — подсети, группы безопасности и статические адреса. action: list (общая картина: сети, подсети, группы, адреса и предупреждение о простаивающих) | subnets (подсети: зона, диапазон, сеть) | addsubnet (создать подсеть) | delsubnet (удалить подсеть) | groups (группы безопасности с их правилами) | addgroup (создать группу) | delgroup (удалить группу) | addrule (добавить правило в группу) | delrule (убрать правило) | addresses (статические адреса: привязан или простаивает) | reserve (закрепить статический адрес) | release (освободить адрес). Подсеть живёт В ОДНОЙ ЗОНЕ и требует диапазон: name, network (имя или id сети), zone (ru-central1-a), cidr (10.10.0.0/24) — без cidr подберу свободный диапазон и скажу, какой выбрал. Правило: group, direction (ingress — вход, egress — выход), protocol (tcp/udp/icmp/any), port (22 или \"8000-8010\"; у icmp и any портов нет), cidr (203.0.113.10/32) или sourceGroup (группа-источник). Что нужно для виртуальной машины: подсеть + группа безопасности + правило на порт 22 ТОЛЬКО с адреса пользователя (/32), а не с 0.0.0.0/0 — правило 0.0.0.0/0 пускает к машине кого угодно. addsubnet/addgroup/reserve требуют чекбокса «Разрешить агенту создавать ресурсы», addrule/delrule — «Разрешить агенту менять контейнеры и правила сети», delsubnet/delgroup/release — «Разрешить агенту удалять ресурсы». Статический адрес платный и тарифицируется даже простаивающим, а освобождённый IP вернуть нельзя — не закрепляй адрес «про запас».",

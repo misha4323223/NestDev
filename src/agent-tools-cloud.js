@@ -62,6 +62,7 @@ function createCloudTools(deps) {
     ycMonitoring,
     ycMdb,
     ycIg,
+    ycAlb,
     readYcLogsText,
     ycCliStatus,
     ycCliInstall,
@@ -580,6 +581,170 @@ function createCloudTools(deps) {
           return "Ошибка: неизвестное действие ycIg «" + action + "». Доступно: " + ALL.join(", ") + ".";
         } catch (e) {
           return "Instance Groups (ycIg, действие " + action + "): " + ((e && e.message) || String(e));
+        }
+    },
+
+    "ycAlb": async (args) => {
+        const cfg = ycConfig(loadSettings());
+        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
+        if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud — балансировщик и его группы целей живут в каталоге.";
+        const action = String(args.action || "list").trim().toLowerCase();
+        const ALL = ["list", "card", "targets", "routers", "backends", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "lbnew", "lbstart", "lbstop", "lbdel"];
+        if (ALL.indexOf(action) === -1) return "Ошибка: неизвестное действие ycAlb «" + action + "». Доступно: " + ALL.join(", ") + ".";
+        const ref = String(args.lb || args.id || args.name || "").trim();
+        try {
+          if (action === "list") {
+            const list = await ycAlb.loadBalancers(cfg.oauth, cfg.folderId);
+            if (!list.length) {
+              return "Балансировщиков в каталоге «" + (cfg.folderName || cfg.folderId) + "» нет. Вход в приложение собирают по шагам: группа целей (ycAlb { action: \"targetnew\", name: \"web-targets\", ips: [\"10.10.0.5\"], subnet: \"<подсеть>\" }) → HTTP-роутер → балансировщик (платный, только с confirm: true).";
+            }
+            return "Балансировщики · каталог «" + (cfg.folderName || cfg.folderId) + "»\n" + list.map((l) => ycAlb.lbLine(l)).join("\n") +
+              "\n\nАдрес балансировщика — это адреса его СЛУШАТЕЛЕЙ: пока слушатель не создан, адреса нет, и DNS-запись (ycDns) вешают только после создания. Балансировщик платный — платит за час даже без трафика." +
+              "\nКарточка: ycAlb { action: \"card\", lb: \"<имя>\" } — слушатели, роутеры, группы целей.";
+          }
+          if (action === "targets") {
+            const list = await ycAlb.targetGroups(cfg.oauth, cfg.folderId);
+            return "Группы целей · каталог «" + (cfg.folderName || cfg.folderId) + "»\n" + (list.length ? list.map((g) => ycAlb.tgLine(g)).join("\n") : "групп целей нет") +
+              "\n\nГруппа целей знает ТОЛЬКО адрес и подсеть: ни порта, ни пути, ни проверок здоровья в ней нет — порт задаёт группа бэкендов, путь — роутер. Создать: ycAlb { action: \"targetnew\", name: \"web-targets\", ips: [\"10.10.0.5\"], subnet: \"<подсеть>\" }; добавить адреса: action targetadd.";
+          }
+          if (action === "routers") {
+            const list = await ycAlb.httpRouters(cfg.oauth, cfg.folderId);
+            return "HTTP-роутеры · каталог «" + (cfg.folderName || cfg.folderId) + "»\n" + (list.length ? list.map((r) => ycAlb.routerLine(r)).join("\n") : "роутеров нет") +
+              "\n\nРоутер — это правила «домен (authority) и путь → группа бэкендов», а не машины и не адреса. Создать: ycAlb { action: \"routernew\", name: \"main-router\", host: \"site.example.com\", backendGroup: \"<группа бэкендов>\" }.";
+          }
+          if (action === "backends") {
+            const list = await ycAlb.backendGroups(cfg.oauth, cfg.folderId);
+            return "Группы бэкендов · каталог «" + (cfg.folderName || cfg.folderId) + "»\n" + (list.length ? list.map((b) => "• " + b.name + " · бэкендов: " + b.backendCount).join("\n") : "групп бэкендов нет") +
+              "\n\nГруппы бэкендов здесь ТОЛЬКО читаются: в них живут проверки здоровья и балансировка, а создаются они в консоли (или в следующем заходе). Маршрут роутера обязан вести в СУЩЕСТВУЮЩУЮ группу — пустой список значит «роутер создавать некуда».";
+          }
+          if (action === "card") {
+            const c = await ycAlb.card(cfg.oauth, cfg.folderId, ref);
+            if (!c) return "Ошибка: не нашёл балансировщик «" + ref + "» в каталоге. Список — ycAlb { action: \"list\" }.";
+            const lines = [ycAlb.lbLine(c.lb)];
+            if (c.lb.listeners.length) {
+              lines.push("Слушатели (" + c.lb.listeners.length + "):");
+              for (const l of c.lb.listeners) lines.push("  " + ycAlb.listenerLine(l));
+            } else {
+              lines.push("Слушателей нет: балансировщик создан, но ни на одном порту не отвечает.");
+            }
+            for (const pair of c.listeners) {
+              lines.push("Роутер «" + pair.router.name + "»:");
+              for (const h of pair.router.hosts) {
+                for (const rt of h.routes) {
+                  lines.push("  " + (h.authority.length ? "домены: " + h.authority.join(", ") : "любой домен") + " · " + (rt.pathExact ? "точный путь " + rt.pathExact : "путь " + (rt.pathPrefix || "/") + "*") + " → группа бэкендов " + (rt.backendGroupId || "—"));
+                }
+              }
+            }
+            if (c.backendGroups.length) lines.push("Группы бэкендов: " + c.backendGroups.map((b) => b.name).join(", "));
+            if (c.targetGroups.length) {
+              lines.push("Группы целей (" + c.targetGroups.length + "):");
+              for (const g of c.targetGroups) {
+                lines.push("  " + ycAlb.tgLine(g));
+                for (const t of g.targets) lines.push("    " + ycAlb.targetLine(t));
+              }
+            }
+            lines.push(!c.targetGroupsResolved && c.targetGroups.length
+              ? "Связь с группами целей не подтвердилась (нет групп бэкендов или маршрутов): показаны все группы целей каталога."
+              : "Здоровье целей (здорова/не отвечает) отдаёт отдельный метод облака — в карточке его нет.");
+            return lines.join("\n");
+          }
+          if (action === "targetnew") {
+            const r = await ycAlb.createTargetGroup(cfg.oauth, {
+              folderId: cfg.folderId,
+              name: args.name,
+              ips: args.ips || args.targets,
+              subnet: args.subnet || args.subnetId,
+              description: args.description,
+            });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "") +
+              (r.groupId ? "\nСледующий шаг: HTTP-роутер, ycAlb { action: \"routernew\", backendGroup: \"<группа бэкендов>\" }." : "");
+          }
+          if (action === "targetadd" || action === "targetremove") {
+            const r = await ycAlb.changeTargets(cfg.oauth, action === "targetadd" ? "add" : "remove", {
+              folderId: cfg.folderId,
+              group: args.group || args.targetGroup || args.id,
+              ips: args.ips || args.targets,
+              subnet: args.subnet || args.subnetId,
+            });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "");
+          }
+          if (action === "targetdel") {
+            const g = await ycAlb.findTargetGroup(cfg.oauth, cfg.folderId, args.group || args.targetGroup || args.id || args.name);
+            if (!g) return "Ошибка: не нашёл группу целей «" + String(args.group || args.targetGroup || args.id || args.name || "").trim() + "» в каталоге. Список — ycAlb { action: \"targets\" }.";
+            if (args.confirm !== true) {
+              return "Удаление группы целей «" + g.name + "» необратимо: список из " + g.targetCount + " целей будет потерян. Сами машины не тронутся, но балансировщик перестанет знать, куда ходить. Вызови снова с confirm: true после согласия человека.";
+            }
+            const r = await ycAlb.removeTargetGroup(cfg.oauth, { folderId: cfg.folderId, group: g });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "");
+          }
+          if (action === "routernew") {
+            const r = await ycAlb.createHttpRouter(cfg.oauth, {
+              folderId: cfg.folderId,
+              name: args.name,
+              host: args.host || args.authority,
+              pathPrefix: args.pathPrefix || args.prefix,
+              pathExact: args.pathExact,
+              backendGroup: args.backendGroup || args.backendGroupId,
+              routeName: args.routeName,
+              description: args.description,
+            });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "") +
+              (r.routerId ? "\nСледующий шаг: слушатель балансировщика, ycAlb { action: \"lbnew\", listener: \"http\", router: \"" + (r.router && r.router.name ? r.router.name : r.routerId) + "\", confirm: true } — балансировщик платный." : "");
+          }
+          if (action === "routerdel") {
+            const r0 = await ycAlb.findHttpRouter(cfg.oauth, cfg.folderId, args.router || args.id || args.name);
+            if (!r0) return "Ошибка: не нашёл HTTP-роутер «" + String(args.router || args.id || args.name || "").trim() + "» в каталоге. Список — ycAlb { action: \"routers\" }.";
+            if (args.confirm !== true) {
+              return "Удаление HTTP-роутера «" + r0.name + "» необратимо: правила (" + r0.routeCount + ") будут потеряны, а слушатель, который на него смотрит, перестанет отвечать. Вызови снова с confirm: true после согласия человека.";
+            }
+            const r = await ycAlb.removeRouter(cfg.oauth, { folderId: cfg.folderId, router: r0 });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "");
+          }
+          if (action === "lbnew") {
+            if (args.confirm !== true) {
+              return "Создание балансировщика — решение с ценой: ресурсные единицы и сам ресурс тарифицируются за час, даже когда трафика нет. Проверь имя, подсеть, слушателя и вызови снова с confirm: true.\n" +
+                "Будет создан балансировщик «" + (args.name || "?") + "» · слушатель: " + (args.listener || "http") + " · порт: " + (args.port || (String(args.listener || "").toLowerCase() === "https" ? 443 : 80)) + " · зона: " + (args.zone || "по подсети " + (args.subnet || "?")) + ".\n" +
+                "Ориентир цены — каталог облака: ycBilling { action: \"price\", query: \"Application Load Balancer\" }; расход облако по API не отдаёт.";
+            }
+            const r = await ycAlb.createLoadBalancer(cfg.oauth, {
+              folderId: cfg.folderId,
+              name: args.name,
+              subnet: args.subnet || args.subnetId,
+              zone: args.zone || args.zoneId,
+              listener: args.listener || args.kind,
+              port: args.port,
+              listenerName: args.listenerName,
+              router: args.router || args.httpRouter || args.httpRouterId,
+              certificate: args.certificate || args.certificateId,
+              backendGroup: args.backendGroup || args.backendGroupId,
+              address: args.address || args.staticAddress,
+              securityGroups: args.securityGroups || args.securityGroupIds,
+              httpToHttps: args.httpToHttps,
+              minZoneSize: args.minZoneSize,
+              maxSize: args.maxSize,
+              description: args.description,
+            });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "") +
+              (r.lbId ? "\nСледить: ycAlb { action: \"card\", lb: \"" + r.lbId + "\" }. Адрес появится в карточке после создания — только потом вешай на него DNS-запись (ycDns)." : "");
+          }
+          if (action === "lbstart" || action === "lbstop") {
+            const lb = await ycAlb.findLoadBalancer(cfg.oauth, cfg.folderId, ref);
+            if (!lb) return "Ошибка: не нашёл балансировщик «" + ref + "» в каталоге. Список — ycAlb { action: \"list\" }.";
+            const r = await ycAlb.power(cfg.oauth, action === "lbstart" ? "start" : "stop", lb, { folderId: cfg.folderId });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "");
+          }
+          if (action === "lbdel") {
+            const lb = await ycAlb.findLoadBalancer(cfg.oauth, cfg.folderId, ref);
+            if (!lb) return "Ошибка: не нашёл балансировщик «" + ref + "» в каталоге. Список — ycAlb { action: \"list\" }.";
+            if (args.confirm !== true) {
+              return "Удаление балансировщика «" + lb.name + "» необратимо: он уйдёт вместе со слушателями и адресами" + (lb.addresses.length ? " (" + lb.addresses.join(", ") + ")" : "") + ", а домен, который на них смотрел, перестанет открываться. Вызови снова с confirm: true после согласия человека.";
+            }
+            const r = await ycAlb.remove(cfg.oauth, { folderId: cfg.folderId, lb: lb });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "");
+          }
+          return "Ошибка: неизвестное действие ycAlb «" + action + "». Доступно: " + ALL.join(", ") + ".";
+        } catch (e) {
+          return "Application Load Balancer (ycAlb, действие " + action + "): " + ((e && e.message) || String(e));
         }
     },
 

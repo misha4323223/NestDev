@@ -1143,6 +1143,20 @@ const ycIg = createYcIg({
   waitOperation: yandexCloud.waitOperation,
   serviceError: yandexCloud.serviceError,
 });
+
+// Application Load Balancer (часть 91, заход 2) — своим модулем: вход в
+// приложение (адреса, зоны, слушатели), группы целей, HTTP-роутеры и
+// ЧТЕНИЕ групп бэкендов (создание групп бэкендов — отдельный заход).
+// waitOperation нужен созданию, питанию и удалению: без ожидания операции
+// ответ не принёс бы id готового ресурса.
+const { createYcAlb } = require("./yc-alb.js");
+const ycAlb = createYcAlb({
+  fetchJson: yandexCloud._fetchJson,
+  endpoint: yandexCloud.endpoint,
+  getIamToken: yandexCloud.getIamToken,
+  waitOperation: yandexCloud.waitOperation,
+  serviceError: yandexCloud.serviceError,
+});
 const ycService = createYcService({ app, path, net, secrets, yandexCloud, ycCli, ycLogs, ycEnsurePath, loadSettings });
 const {
   ycConfig,
@@ -1159,7 +1173,7 @@ const {
 // ycAi — тот же экземпляр модуля, что у агента (один кэш IAM-токена); fs, path,
 // resolvePath и agentWorkDir нужны каналу «yc:ai»: снимки и записи он читает с
 // диска, а синтезированную речь кладёт в рабочую папку агента.
-registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, ycIg, fs, path, resolvePath, agentWorkDir, loadSettings, saveSettings, svc: ycService });
+registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, ycIg, ycAlb, fs, path, resolvePath, agentWorkDir, loadSettings, saveSettings, svc: ycService });
 
 // Память диалогов: каналы дневника памяток и запись самой памятки при сжатии контекста
 // (её кладёт прогон через onMemo). Собирается ПОСЛЕ путей-и-git и миссий: зеркало
@@ -1415,6 +1429,7 @@ const { executeTool } = createToolRegistry({
   ycMonitoring,
   ycMdb,
   ycIg,
+  ycAlb,
   readYcLogsText,
 
   ycCliStatus,

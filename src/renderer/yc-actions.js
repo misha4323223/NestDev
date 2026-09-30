@@ -61,6 +61,9 @@
     // канал — «yc:ig». Формы как у машин, но ресурс другой: группа сама создаёт
     // машины по шаблону и держит их число.
     instanceGroups: "ycIg",
+    // Application Load Balancer (часть 91, заход 2): балансировщики, группы
+    // целей, HTTP-роутеры и чтение групп бэкендов — один канал «yc:alb».
+    alb: "ycAlb",
   };
 
   // Допустимые действия каждого канала. Сверяется с отказами в src/yc-ipc.js.
@@ -78,6 +81,7 @@
     clickhouse: ["list", "presets", "card", "create", "hosts", "databases", "users", "logs", "operations", "start", "stop", "delete"],
     dns: ["zones", "card", "records", "add", "delete"],
     instanceGroups: ["list", "card", "instances", "operations", "create", "start", "stop", "delete"],
+    alb: ["list", "card", "targets", "routers", "backends", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "lbnew", "lbstart", "lbstop", "lbdel"],
   };
 
   const FAMILIES = {
@@ -101,6 +105,7 @@
     clickhouse: { title: "ClickHouse", ru: "кластер", fixed: { engine: "clickhouse" } },
     dns: { title: "DNS-зоны", ru: "запись" },
     instanceGroups: { title: "Группы машин", ru: "группа" },
+    alb: { title: "Application Load Balancer", ru: "балансировщик" },
   };
 
   // Действия управляемой базы. Одна форма на три базы: набор полей у PostgreSQL,
@@ -501,6 +506,59 @@
       { id: "start", ru: "▶ Запустить", op: "start", view: "lines", target: target("Группа (имя или id)", "group") },
       { id: "stop", ru: "■ Остановить (машины перестают платить)", op: "stop", view: "lines", target: target("Группа (имя или id)", "group") },
       { id: "delete", ru: "🗑 Удалить группу (вместе с машинами)", op: "delete", view: "lines", danger: true, confirmArg: "confirm", target: target("Группа (имя или id)", "group") },
+    ],
+
+    // ── Application Load Balancer ──
+    // Четыре ресурса одной семьи — один канал. Порядок работы такой: группа
+    // целей (адреса машин) → HTTP-роутер (правила домена и пути) → балансировщик
+    // со слушателем (адрес, порт, сертификат). Группы бэкендов здесь только
+    // читаются: маршрут обязан вести в СУЩЕСТВУЮЩУЮ группу, а создание групп
+    // бэкендов — отдельный заход.
+    alb: [
+      { id: "list", ru: "Балансировщики", op: "list", view: "lines" },
+      { id: "card", ru: "Карточка: слушатели, роутеры, цели", op: "card", view: "lines", target: target("Балансировщик (имя или id)", "lb") },
+      { id: "targets", ru: "Группы целей", op: "targets", view: "lines" },
+      { id: "routers", ru: "HTTP-роутеры", op: "routers", view: "lines" },
+      { id: "backends", ru: "Группы бэкендов (только чтение)", op: "backends", view: "lines" },
+      { id: "targetnew", ru: "＋ Создать группу целей", op: "targetnew", view: "lines",
+        fields: [
+          fld("name", "Имя группы целей", { required: true, placeholder: "web-targets" }),
+          fld("ips", "Адреса целей (через запятую)", { placeholder: "10.10.0.5, 10.10.0.6", hint: "Цель — это адрес машины; порт задаёт группа бэкендов, а не группа целей." }),
+          fld("subnet", "Подсеть адресов", { options: from("vpc", "subnets", (r) => (r.subnets || []).map((s) => s.name)) }),
+        ] },
+      { id: "targetadd", ru: "＋ Добавить цели", op: "targetadd", view: "lines", target: target("Группа целей (имя или id)", "group"),
+        fields: [
+          fld("ips", "Адреса (через запятую)", { required: true, placeholder: "10.10.0.7" }),
+          fld("subnet", "Подсеть новых целей", { options: from("vpc", "subnets", (r) => (r.subnets || []).map((s) => s.name)) }),
+        ] },
+      { id: "targetremove", ru: "— Убрать цели", op: "targetremove", view: "lines", target: target("Группа целей (имя или id)", "group"),
+        fields: [
+          fld("ips", "Адреса (через запятую)", { required: true, placeholder: "10.10.0.7" }),
+        ] },
+      { id: "targetdel", ru: "🗑 Удалить группу целей", op: "targetdel", view: "lines", danger: true, confirmArg: "confirm", target: target("Группа целей (имя или id)", "group") },
+      { id: "routernew", ru: "＋ Создать HTTP-роутер", op: "routernew", view: "lines",
+        fields: [
+          fld("name", "Имя роутера", { required: true, placeholder: "main-router" }),
+          fld("host", "Домен (что пришло в заголовке Host)", { placeholder: "site.example.com", hint: "Без домена роутер отвечает на ЛЮБОЙ домен." }),
+          fld("pathPrefix", "Путь (префикс)", { value: "/" }),
+          fld("backendGroup", "Группа бэкендов (имя или id)", { required: true, placeholder: "web-backends", hint: "Маршрут обязан вести в существующую группу — список в действии «Группы бэкендов»." }),
+        ] },
+      { id: "routerdel", ru: "🗑 Удалить HTTP-роутер", op: "routerdel", view: "lines", danger: true, confirmArg: "confirm", target: target("Роутер (имя или id)", "router") },
+      { id: "lbnew", ru: "＋ Создать балансировщик (платно)", op: "lbnew", view: "lines", paid: true, confirmArg: "confirm",
+        fields: [
+          fld("name", "Имя балансировщика", { required: true, placeholder: "web-lb" }),
+          fld("subnet", "Подсеть узла", { required: true, hint: "Балансировщик встанет в зоне подсети", options: from("vpc", "subnets", (r) => (r.subnets || []).map((s) => s.name)) }),
+          fld("listener", "Слушатель", { type: "select", options: ["http", "https", "stream"], value: "http", hint: "http и https — через роутер; stream — поток TCP на группу бэкендов." }),
+          fld("port", "Порт", { type: "number", value: "80" }),
+          fld("router", "HTTP-роутер (имя или id)", { placeholder: "нужен для http и https" }),
+          fld("certificate", "Сертификат (имя или id)", { placeholder: "нужен для https; выпустить: ycCdn certnew" }),
+          fld("backendGroup", "Группа бэкендов (для stream)", { placeholder: "нужна для потока TCP" }),
+          fld("address", "Статический адрес", { placeholder: "пусто — облако выдаст само" }),
+          fld("securityGroups", "Группы безопасности (через запятую)", { placeholder: "без них порт закрыт снаружи" }),
+        ] },
+      { id: "lbstart", ru: "▶ Запустить", op: "lbstart", view: "lines", target: target("Балансировщик (имя или id)", "lb") },
+      { id: "lbstop", ru: "■ Остановить (платится всё равно)", op: "lbstop", view: "lines", target: target("Балансировщик (имя или id)", "lb") },
+      { id: "lbdel", ru: "🗑 Удалить балансировщик", op: "lbdel", view: "lines", danger: true, confirmArg: "confirm", target: target("Балансировщик (имя или id)", "lb") },
     ],
 
     // ── Managed-базы: PostgreSQL, MySQL и ClickHouse ──

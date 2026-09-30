@@ -197,6 +197,7 @@ contextBridge.exposeInMainWorld("api", {
   ycMdb: (args) => ipcRenderer.invoke("yc:mdb", args || {}),
   // Группы машин: группа сама создаёт машины по шаблону и держит их число.
   ycIg: (args) => ipcRenderer.invoke("yc:ig", args || {}),
+  ycAlb: (args) => ipcRenderer.invoke("yc:alb", args || {}),
   // DNS-зоны и записи: у сервиса был агент и форма в карточке зоны, а действий
   // у плитки — не было. Канал один («yc:dns») и зовёт ТЕ ЖЕ функции Cloud DNS,
   // что агент и карточка: строгость API разобрана в src/yandex-cloud.js.

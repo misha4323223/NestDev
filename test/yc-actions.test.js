@@ -111,6 +111,9 @@ const FAMILY_CHANNEL = {
   // Группы машин: свой канал, потому что свой ресурс — группа сама создаёт
   // машины по шаблону и держит их число, а не «машины по одной».
   instanceGroups: "yc:ig",
+  // Application Load Balancer: четыре ресурса (балансировщики, группы целей,
+  // HTTP-роутеры и чтение групп бэкендов) — один канал, как у Managed-баз.
+  alb: "yc:alb",
 };
 
 function section(channel) {
@@ -204,8 +207,8 @@ function main() {
         // аргумент. Список ниже — не копия таблицы, а следствие: он проверяет,
         // что пометки не потерялись у тех действий, где за них платят или где
         // отменить уже нельзя.
-        const mustPay = ["compute:create", "compute:snapshot", "compute:restoredisk", "vpc:reserve", "cdn:cdncreate", "certificateManager:cdncreate", "postgresql:create", "mysql:create", "clickhouse:create", "instanceGroups:create"];
-        const mustDanger = ["compute:delete", "compute:delsnapshot", "vpc:delsubnet", "vpc:delgroup", "vpc:delrule", "vpc:release", "iam:delete", "iam:revoke", "iam:delkey", "cloudFunctions:delete", "cloudFunctions:delversion", "cloudFunctions:public", "cdn:cdndel", "certificateManager:certdel", "postgresql:delete", "mysql:delete", "clickhouse:delete", "dns:delete", "instanceGroups:delete"];
+        const mustPay = ["compute:create", "compute:snapshot", "compute:restoredisk", "vpc:reserve", "cdn:cdncreate", "certificateManager:cdncreate", "postgresql:create", "mysql:create", "clickhouse:create", "instanceGroups:create", "alb:lbnew"];
+        const mustDanger = ["compute:delete", "compute:delsnapshot", "vpc:delsubnet", "vpc:delgroup", "vpc:delrule", "vpc:release", "iam:delete", "iam:revoke", "iam:delkey", "cloudFunctions:delete", "cloudFunctions:delversion", "cloudFunctions:public", "cdn:cdndel", "certificateManager:certdel", "postgresql:delete", "mysql:delete", "clickhouse:delete", "dns:delete", "instanceGroups:delete", "alb:targetdel", "alb:routerdel", "alb:lbdel"];
         const problems = [];
         const seen = new Set();
         for (const service of Object.keys(A.ACTIONS)) {

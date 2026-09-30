@@ -68,6 +68,9 @@ const KNOWN_ENDPOINTS = {
   "log-reading": "https://reader.logging.yandexcloud.net",
   "log-ingestion": "https://ingester.logging.yandexcloud.net",
   "vpc": "https://vpc.api.cloud.yandex.net",
+  // Application Load Balancer (часть 91, заход 2) — свой хост: адреса,
+  // зоны и слушатели живут на alb.api.cloud.yandex.net.
+  "alb": "https://alb.api.cloud.yandex.net",
   // Postbox — SES-совместимый API (см. auth в SERVICES), не обычный REST каталога.
   "postbox": "https://postbox.cloud.yandex.net",
   // Яндекс AI (речь, зрение и перевод) — четыре РАЗНЫХ хоста, хотя каталог
@@ -382,6 +385,10 @@ const SERVICES = [
   // Группы машин (Instance Groups) — тот же хост, что у Compute, но ДРУГОЙ
   // ресурс: группа сама создаёт машины по шаблону и держит их число (часть 91).
   { key: "instanceGroups", ru: "Группы машин", title: "Instance Groups", icon: "🧩", svc: "compute", listPath: "/compute/v1/instanceGroups", listKey: "instanceGroups" },
+  // Application Load Balancer (часть 91, заход 2) — ВХОД в приложение с
+  // улицы: адреса, зоны и слушатели. Плитка показывает балансировщики;
+  // группы целей, роутеры и группы бэкендов видны из карточки действий.
+  { key: "alb", ru: "Балансировщики", title: "Application Load Balancer", icon: "🛡️", svc: "alb", listPath: "/apploadbalancer/v1/loadBalancers", listKey: "loadBalancers" },
   // Monitoring — не ресурс, а измеритель: «список» у него — сами метрики
   // каталога (метаданные), поэтому запрос идёт по своим правилам (query
   // "monitoring": только folderId, без pageSize, которого сервис не знает).

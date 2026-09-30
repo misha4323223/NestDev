@@ -73,6 +73,18 @@ const RELATIONS = {
     { key: "operations", title: "Операции", icon: "🕘", listKey: "operations",
       attempts: [{ path: (c) => "/compute/v1/instanceGroups/" + enc(c.id) + "/operations?pageSize=100" }] },
   ],
+  // Балансировщик — четыре ресурса одной семьи: связи читаются ПО КАТАЛОГУ
+  // (списки групп целей, роутеров и групп бэкендов), потому что ссылки на
+  // группу целей у балансировщика нет вовсе — путь к ней лежит через группу
+  // бэкендов, которую читает карточка действий полки.
+  alb: [
+    { key: "targets", title: "Группы целей", icon: "🎯", listKey: "targetGroups",
+      attempts: [{ path: (c) => "/apploadbalancer/v1/targetGroups?folderId=" + enc(c.folderId) + "&pageSize=1000" }] },
+    { key: "routers", title: "HTTP-роутеры", icon: "🧭", listKey: "httpRouters",
+      attempts: [{ path: (c) => "/apploadbalancer/v1/httpRouters?folderId=" + enc(c.folderId) + "&pageSize=1000" }] },
+    { key: "backends", title: "Группы бэкендов", icon: "🧱", listKey: "backendGroups",
+      attempts: [{ path: (c) => "/apploadbalancer/v1/backendGroups?folderId=" + enc(c.folderId) + "&pageSize=1000" }] },
+  ],
   compute: [],
   containerRegistry: [
     { key: "images", title: "Образы", icon: "🖼", listKey: "images",
@@ -171,6 +183,7 @@ const DETAIL_PATHS = {
   cloudFunctions: (c) => "/functions/v1/functions/" + enc(c.id),
   compute: (c) => "/compute/v1/instances/" + enc(c.id),
   instanceGroups: (c) => "/compute/v1/instanceGroups/" + enc(c.id),
+  alb: (c) => "/apploadbalancer/v1/loadBalancers/" + enc(c.id),
   postgresql: (c) => "/managed-postgresql/v1/clusters/" + enc(c.id),
   mysql: (c) => "/managed-mysql/v1/clusters/" + enc(c.id),
   clickhouse: (c) => "/managed-clickhouse/v1/clusters/" + enc(c.id),
@@ -193,6 +206,7 @@ const SERVICE_ENDPOINT = {
   vpc: "vpc",
   instanceGroups: "compute",
   compute: "compute",
+  alb: "alb",
   storage: "storage-api",
   postbox: "postbox",
   postgresql: "managed-postgresql",
@@ -458,6 +472,9 @@ const RELATION_COLUMNS = {
   "dns:recordSets": ["name", "type", "ttl", "data"],
   "instanceGroups:instances": ["name", "zoneId", "status"],
   "instanceGroups:operations": ["description", "done", "createdAt"],
+  "alb:targets": ["name", "targetCount", "age"],
+  "alb:routers": ["name", "hostCount", "routeCount"],
+  "alb:backends": ["name", "backendCount"],
   "storage:objects": ["key", "size", "lastModified"],
   "ydb:tables": ["name"],
   "postgresql:hosts": ["name", "zoneId", "role", "health"],
@@ -760,6 +777,7 @@ const SERVICE_TITLES = {
   mysql: "Managed Service for MySQL",
   clickhouse: "Managed Service for ClickHouse",
   instanceGroups: "Instance Groups",
+  alb: "Application Load Balancer",
 };
 
 function labelService(key) {
