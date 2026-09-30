@@ -26,13 +26,15 @@
      GET    /loadBalancers/{id}                         карточка
      POST   /loadBalancers                              создание
      POST   /loadBalancers/{id}:start | :stop           питание
-     PATCH  /loadBalancers/{id}                         правка (имя, описание, группы безопасности)
+     PATCH  /loadBalancers/{id}                         правка (имя, описание, группы безопасности,
+                                                        доступ-логи, авто-масштаб, сдвиг зоны)
      POST   /loadBalancers/{id}:addListener             добавить слушателя
      POST   /loadBalancers/{id}:updateListener          правка слушателя (updateMask + listenerSpec)
      POST   /loadBalancers/{id}:removeListener          убрать слушателя (по имени)
      DELETE /loadBalancers/{id}                         удаление
      GET    /targetGroups?folderId=…                    группы целей
      POST   /targetGroups                               создание
+     PATCH  /targetGroups/{id}                          правка (имя, описание)
      POST   /targetGroups/{id}:addTargets | :removeTargets   состав целей
      DELETE /targetGroups/{id}
      GET    /httpRouters?folderId=…                     роутеры
@@ -112,6 +114,12 @@
      • БАЛАНСИРОВЩИК ПЛАТНЫЙ и тарифицируется за час (ресурсные единицы плюс
        сам ресурс), поэтому создание требует согласия и называет, что будет
        создано; удаление необратимо и забирает слушатели вместе с адресами.
+     • У БАЛАНСИРОВЩИКА, КРОМЕ ИМЕНИ И ГРУПП БЕЗОПАСНОСТИ, ПРАВЯТСЯ ДОСТУП-ЛОГИ,
+       АВТО-МАСШТАБ И СДВИГ ЗОНЫ: logOptions (группа логов ЛИБО выключатель),
+       autoScalePolicy (минимум единиц на зону и максимум всего) и allowZonalShift.
+       Маска log_options заменяет настройку ЦЕЛИКОМ, а у авто-масштаба в теле
+       обязаны уйти ОБА числа — неназванное берётся из текущего состояния, иначе
+       облако сбросило бы его в значение по умолчанию.
      • ЗАНЯТЫЙ балансировщик (CREATING/STARTING/STOPPING/DELETING) отбивает
        питание и удаление ДО сети.
 
@@ -181,6 +189,9 @@ const LB_FIELD_RU = {
   name: "имя",
   description: "описание",
   security_group_ids: "группы безопасности",
+  log_options: "доступ-логи",
+  auto_scale_policy: "авто-масштаб",
+  allow_zonal_shift: "допуск к сдвигу зоны",
   endpoint_specs: "адрес и порт",
   http: "вид HTTP",
   tls: "вид HTTPS/TLS",
@@ -203,6 +214,12 @@ const GROUP_FIELD_RU = {
   http: "бэкенды (HTTP)",
   stream: "бэкенды (поток TCP)",
   grpc: "бэкенды (gRPC)",
+};
+
+// Поля группы целей, которые правит updateTargetGroup, — словами для ответа.
+const TG_FIELD_RU = {
+  name: "имя",
+  description: "описание",
 };
 
 // Обратная запись списка: облако отдаёт служебные поля (id, status), а на запрос
@@ -261,6 +278,18 @@ function checkPort(v) {
     throw new Error("Порт слушателя — целое от 1 до 65535 (дано: " + v + ").");
   }
   return Math.round(p);
+}
+
+// Целое число с границами — для авто-масштаба: облако принимает только целые
+// значения, и «1.5 ресурсной единицы» оно отклонит уже после запроса.
+function checkWhole(v, what, min, max) {
+  const n = Number(v);
+  if (!isFinite(n) || Math.round(n) !== n) {
+    throw new Error(what + " — целое число (дано: " + v + ").");
+  }
+  if (min != null && n < min) throw new Error(what + " не меньше " + min + " (дано: " + n + ").");
+  if (max != null && n > max) throw new Error(what + " не больше " + max + " (дано: " + n + ").");
+  return n;
 }
 
 function checkIpList(list) {
@@ -380,7 +409,11 @@ function lbInfo(lb) {
     addresses: listeners.reduce((acc, l) => acc.concat(l.addresses), []),
     ports: listeners.reduce((acc, l) => acc.concat(l.ports), []),
     autoScale: o.autoScalePolicy ? { min: one(o.autoScalePolicy.minZoneSize), max: one(o.autoScalePolicy.maxSize) } : null,
-    logGroupId: one(o.logOptions && o.logOptions.logGroupId),
+    // Доступ-логи: в ответе группы логов два места — старое верхнего уровня и
+    // настройка logOptions; читаем оба, а выключатель живёт только в logOptions.
+    logGroupId: one(o.logOptions && o.logOptions.logGroupId) || one(o.logGroupId),
+    logsDisabled: !!(o.logOptions && o.logOptions.disable),
+    allowZonalShift: o.allowZonalShift === true,
   };
 }
 
@@ -1026,6 +1059,76 @@ function createYcAlb(deps) {
       warnings: act === "add"
         ? ["Проверку здоровья цели задаёт группа бэкендов: новая цель может отвечать не сразу, а первое время числиться «проверяется»."]
         : [],
+    };
+  }
+
+  // ── Правка группы целей: имя и описание ────────────────────────────────────
+  // Набор целей правится ТОЧЕЧНО (addTargets/removeTargets), а имя и описание —
+  // общим PATCH: отдельного «переименовать» у облака нет. Поле targets в PATCH
+  // ЗАМЕНЯЕТ список целиком, поэтому модуль его не трогает вовсе: «правка
+  // подписи» не должна уносить машины.
+  async function updateTargetGroup(oauthToken, opts) {
+    const o = opts || {};
+    const folderId = checkFolder(o.folderId);
+    const g = o.group && o.group.id ? o.group : await findTargetGroup(oauthToken, folderId, o.group || o.targetGroup || o.id || o.name);
+    if (!g) {
+      throw new Error("Не нашёл группу целей «" + one(o.group || o.targetGroup || o.id || o.name) + "» в каталоге. Список — действие targets.");
+    }
+    const body = {};
+    const mask = [];
+    const newName = one(o.newName || o.rename);
+    if (newName) {
+      checkName(newName, "группы целей");
+      if (newName === g.name) {
+        throw new Error("Группа целей уже называется «" + newName + "»: назови другое имя или убери newName.");
+      }
+      // Имя уникально в каталоге: занятое отбивается ДО сети, иначе облако
+      // ответило бы отказом уже после запроса.
+      const busy = (await targetGroups(oauthToken, folderId)).find((x) => x.name === newName && x.id !== g.id);
+      if (busy) {
+        throw new Error("Имя «" + newName + "» в каталоге занято — группой целей " + busy.id + ". Имя обязано быть уникальным: назови другое.");
+      }
+      body.name = newName;
+      mask.push("name");
+    }
+    if (o.description != null) {
+      const d = one(o.description);
+      if (d === one(g.description)) {
+        throw new Error("У группы целей «" + g.name + "» уже такое описание — назови новое или убери description.");
+      }
+      if (d.length > 256) throw new Error("Описание группы целей — до 256 знаков (дано: " + d.length + ").");
+      body.description = d;
+      mask.push("description");
+    }
+    if (!mask.length) {
+      throw new Error(
+        "Нечего менять: назови newName (новое имя группы целей) или description (описание). Состав целей меняют точечно — targetadd и targetremove, а НЕ правкой: в PATCH список целей заменяется целиком, и машины так теряются."
+      );
+    }
+    body.updateMask = mask.join(",");
+    const j = await alb(oauthToken, "PATCH", ALB_BASE + "/targetGroups/" + encodeURIComponent(g.id), body, 40000);
+    await run(oauthToken, j, 120000);
+    const after = await targetGroup(oauthToken, g.id).catch(() => null);
+    const now = after || g;
+    const bad = [];
+    if (mask.indexOf("name") >= 0 && now.name !== body.name) bad.push("имя («" + now.name + "»)");
+    if (mask.indexOf("description") >= 0 && one(now.description) !== one(body.description)) bad.push("описание («" + one(now.description) + "»)");
+    if (bad.length) {
+      throw new Error("Правка группы целей «" + g.name + "» не применилась: " + bad.join(", ") + ". Нужна роль alb.editor (или admin).");
+    }
+    const warnings = [
+      "Цели в группе НЕ трогались: имя и описание — это подпись, а адреса машин живут отдельно. Добавляют и убирают их действиями targetadd и targetremove.",
+    ];
+    if (mask.indexOf("name") >= 0) {
+      warnings.push("Переименование не разрывает связей: группа бэкендов держит группу целей по id, а не по имени, — маршруты продолжат работать.");
+    }
+    return {
+      changed: true,
+      group: now,
+      fields: mask,
+      operationId: one(j && j.id),
+      message: "Группа целей «" + g.name + "» обновляется: " + mask.map((f) => TG_FIELD_RU[f] || f).join(", ") + ".",
+      warnings: warnings,
     };
   }
 
@@ -1789,9 +1892,60 @@ function createYcAlb(deps) {
       body.securityGroupIds = await securityGroupIdsOf(oauthToken, folderId, o.securityGroupIds != null ? o.securityGroupIds : o.securityGroups);
       mask.push("security_group_ids");
     }
+    // Доступ-логи — ОДНА настройка из двух половин (группа логов и выключатель),
+    // и маска log_options заменяет её ЦЕЛИКОМ: «куда писать» и «выключить»
+    // вместе противоречат друг другу, поэтому или одно, или другое.
+    const logGroup = one(o.logGroup || o.logs || o.logGroupId);
+    const noLogs = o.noLogs === true || o.disableLogs === true;
+    if (logGroup && noLogs) {
+      throw new Error(
+        "Доступ-логи: нельзя разом назвать группу логов (logGroup) и выключить их (noLogs) — это одно поле logOptions, и оно заменяется целиком. Выбери одно."
+      );
+    }
+    if (logGroup || noLogs) {
+      body.logOptions = logGroup ? { logGroupId: logGroup } : { disable: true };
+      mask.push("log_options");
+    }
+    // Авто-масштаб — тоже ОДНА настройка из двух чисел (минимум единиц на зону и
+    // максимум всего): в маске она заменяется целиком, поэтому в тело обязаны
+    // уйти ОБА числа — неназванное берётся из текущего состояния (а если его нет
+    // вовсе — из значений по умолчанию), иначе облако сбросило бы его.
+    const zones = Math.max(1, (lb.locations || []).length || 1);
+    let scaleMin = null;
+    let scaleMax = null;
+    if (o.minZoneSize != null || o.maxSize != null) {
+      const cur = lb.autoScale || {};
+      scaleMin = o.minZoneSize != null
+        ? checkWhole(o.minZoneSize, "Минимум ресурсных единиц на зону", 2, 1000)
+        : (cur.min != null && cur.min !== "" ? Number(cur.min) : 2);
+      scaleMax = o.maxSize != null
+        ? checkWhole(o.maxSize, "Максимум ресурсных единиц", 0, 1000)
+        : (cur.max != null && cur.max !== "" ? Number(cur.max) : Math.max(4, scaleMin * zones));
+      if (scaleMax > 0 && scaleMax < scaleMin * zones) {
+        throw new Error(
+          "Максимум ресурсных единиц (" + scaleMax + ") меньше минимума, умноженного на число зон (" + scaleMin + " × " + zones + " = " + scaleMin * zones + "): облако такой авто-масштаб отклонит. «Без предела» — это 0."
+        );
+      }
+      body.autoScalePolicy = { minZoneSize: String(scaleMin), maxSize: String(scaleMax) };
+      mask.push("auto_scale_policy");
+    }
+    // Допуск к сдвигу зоны: при отказе или обслуживании зоны облако САМО гасит в
+    // ней трафик, а остальные зоны подхватывают нагрузку. По умолчанию это
+    // запрещено — включение осознанное, поэтому идёт через «да»/«нет».
+    const shiftRaw = o.allowZonalShift != null ? o.allowZonalShift : o.zonalShift;
+    let shiftWanted = null;
+    if (shiftRaw != null && shiftRaw !== "") {
+      const s = one(shiftRaw).toLowerCase();
+      const yes = shiftRaw === true || shiftRaw === 1 || ["true", "да", "вкл", "on", "включить"].indexOf(s) >= 0;
+      const no = shiftRaw === false || shiftRaw === 0 || ["false", "нет", "выкл", "off", "выключить"].indexOf(s) >= 0;
+      if (!yes && !no) throw new Error("Допуск к сдвигу зоны (allowZonalShift) — да или нет (дано: " + shiftRaw + ").");
+      shiftWanted = yes;
+      body.allowZonalShift = yes;
+      mask.push("allow_zonal_shift");
+    }
     if (!mask.length) {
       throw new Error(
-        "Нечего менять: назови новое имя (newName), описание (description) или группы безопасности (securityGroups). Состав слушателей правят отдельными действиями — добавление, правка и удаление слушателя (listeneradd, listenerupd, listenerdel)."
+        "Нечего менять: назови новое имя (newName), описание (description), группы безопасности (securityGroups), доступ-логи (logGroup или noLogs), авто-масштаб (minZoneSize и maxSize) или допуск к сдвигу зоны (allowZonalShift). Состав слушателей правят отдельными действиями — добавление, правка и удаление слушателя (listeneradd, listenerupd, listenerdel)."
       );
     }
     body.updateMask = mask.join(",");
@@ -1807,6 +1961,22 @@ function createYcAlb(deps) {
     if (mask.indexOf("security_group_ids") >= 0 && now.securityGroupIds.slice().sort().join(",") !== body.securityGroupIds.slice().sort().join(",")) {
       bad.push("группы безопасности (" + (now.securityGroupIds.join(", ") || "их нет") + ")");
     }
+    if (mask.indexOf("log_options") >= 0) {
+      const wantDisable = body.logOptions.disable === true;
+      const gotDisable = now.logsDisabled === true;
+      if (wantDisable ? !gotDisable : gotDisable || one(now.logGroupId) !== one(body.logOptions.logGroupId)) {
+        bad.push("доступ-логи (" + (gotDisable ? "выключены" : one(now.logGroupId) || "группа не названа") + ")");
+      }
+    }
+    if (mask.indexOf("auto_scale_policy") >= 0) {
+      const got = now.autoScale || {};
+      if (one(got.min) !== String(scaleMin) || one(got.max) !== String(scaleMax)) {
+        bad.push("авто-масштаб (мин " + (one(got.min) || "—") + ", макс " + (one(got.max) || "—") + ")");
+      }
+    }
+    if (mask.indexOf("allow_zonal_shift") >= 0 && now.allowZonalShift !== shiftWanted) {
+      bad.push("допуск к сдвигу зоны (" + (now.allowZonalShift ? "да" : "нет") + ")");
+    }
     if (bad.length) {
       throw new Error("Правка балансировщика «" + lb.name + "» не применилась: " + bad.join(", ") + ". Нужна роль alb.editor (или admin).");
     }
@@ -1819,6 +1989,29 @@ function createYcAlb(deps) {
     }
     if (mask.indexOf("name") >= 0) {
       warnings.push("Имя — это подпись, а не адрес: домены смотрят на адреса слушателей, поэтому переименование их не трогает.");
+    }
+    if (mask.indexOf("log_options") >= 0) {
+      warnings.push(
+        body.logOptions.disable === true
+          ? "Доступ-логи ВЫКЛЮЧЕНЫ: журнал запросов к балансировщику больше не пишется, и разбирать «кто и куда ходил» будет нечем. Включить обратно — logGroup (имя или id группы Cloud Logging)."
+          : "Логи пишутся в группу Cloud Logging «" + body.logOptions.logGroupId + "»: это единственный журнал, где видно, куда балансировщик отправлял запросы и что ответили цели. Хранение логов тарифицируется по правилам Cloud Logging."
+      );
+    }
+    if (mask.indexOf("auto_scale_policy") >= 0) {
+      warnings.push(
+        "Ресурсные единицы — узлы, за которые платит балансировщик: минимум " + scaleMin + " на зону × " + zones + " " +
+          (zones === 1 ? "зона" : "зоны") + " = не меньше " + scaleMin * zones + " единиц в час даже без трафика" +
+          (scaleMax === 0
+            ? ", а верхнего предела нет: при наплыве трафика единиц станет больше и счёт вырастет."
+            : ", максимум всего — " + scaleMax + ".")
+      );
+    }
+    if (mask.indexOf("allow_zonal_shift") >= 0) {
+      warnings.push(
+        body.allowZonalShift === true
+          ? "Допуск к сдвигу зоны ВКЛЮЧЁН: если зона уйдёт на обслуживание или начнёт отказывать, облако САМО погасит в ней трафик, а остальные зоны подхватят нагрузку. Какую именно зону гасить — не выбирают."
+          : "Допуск к сдвигу зоны снят (значение по умолчанию): при обслуживании или отказе зоны балансировщик продолжит считать её рабочей — запросы в неё пойдут и будут теряться, пока зона не вернётся."
+      );
     }
     return {
       changed: true,
@@ -2365,6 +2558,7 @@ function createYcAlb(deps) {
     findCertificate: findCertificate,
     createTargetGroup: createTargetGroup,
     changeTargets: changeTargets,
+    updateTargetGroup: updateTargetGroup,
     createHttpRouter: createHttpRouter,
     power: power,
     remove: remove,
@@ -2411,5 +2605,6 @@ module.exports = {
   LB_FIELD_RU: LB_FIELD_RU,
   ROUTER_FIELD_RU: ROUTER_FIELD_RU,
   GROUP_FIELD_RU: GROUP_FIELD_RU,
+  TG_FIELD_RU: TG_FIELD_RU,
   writableDeep: writableDeep,
 };

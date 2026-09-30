@@ -387,10 +387,25 @@ ${STUBS}
             "Порт — это порт, который слушают ЦЕЛИ (машины), а не балансировщик: если там слушают другой, вход начнёт отдавать 502. Порт слушателя балансировщика этим не меняется."],
           message: "Группа бэкендов обновляется." };
       }
+      // Правка группы целей (заход 7): имя и описание — а состав (targets) в
+      // PATCH заменяется ЦЕЛИКОМ, поэтому элемент его не трогает и об этом
+      // говорит предупреждением.
+      if (a.op === "tgupdate") {
+        return { ok: true, changed: true, targetGroup: { id: "tg1", name: a.newName || "web-targets" }, fields: ["name", "description"],
+          lines: ["Группа целей «" + a.group + "» обновляется: имя, описание."],
+          warnings: ["Цели в группе НЕ трогались: имя и описание — это подпись, а адреса машин живут отдельно. Добавляют и убирают их действиями targetadd и targetremove."],
+          message: "Группа целей обновляется." };
+      }
       if (a.op === "lbupdate") {
+        const extra = [];
+        if (a.logGroup) extra.push("доступ-логи → группа «" + a.logGroup + "»");
+        if (a.noLogs) extra.push("доступ-логи выключены");
+        if (a.minZoneSize != null || a.maxSize != null) extra.push("авто-масштаб " + (a.minZoneSize != null ? a.minZoneSize : "—") + "/" + (a.maxSize != null ? a.maxSize : "—"));
+        if (a.allowZonalShift != null) extra.push("допуск к сдвигу зоны: " + a.allowZonalShift);
         return { ok: true, changed: true, lb: { id: "lb1", name: a.newName || a.lb }, fields: ["name", "description", "security_group_ids"],
-          lines: ["Балансировщик «" + a.lb + "» обновляется: имя, описание, группы безопасности."],
-          warnings: ["Список групп безопасности ЗАМЕНЁН целиком, а не дополнен: правила приёма трафика на порты слушателей должны быть открыты в НОВЫХ группах — иначе вход закроется снаружи."],
+          lines: ["Балансировщик «" + a.lb + "» обновляется: имя, описание, группы безопасности." + (extra.length ? " А также: " + extra.join("; ") + "." : "")],
+          warnings: ["Список групп безопасности ЗАМЕНЁН целиком, а не дополнен: правила приёма трафика на порты слушателей должны быть открыты в НОВЫХ группах — иначе вход закроется снаружи.",
+            "Авто-масштаб — это платные ресурсные единицы: минимум на каждую зону оплачивается даже без трафика."],
           message: "Балансировщик обновляется." };
       }
       // Группа бэкендов (часть 91, заход 3): порт целей и проверки здоровья
@@ -1281,7 +1296,8 @@ fs.writeFileSync(SHOT, PAGE, "utf8");
       return { btn: !!btn, title: title, listed: listed, called: !!sent, text: document.getElementById("yc-act-out").textContent };
     });
     ok(albTile.btn && /Application Load Balancer/.test(albTile.title || ""), "у плитки «Балансировщики» есть кнопка действий", JSON.stringify({ btn: albTile.btn, title: albTile.title }));
-    ok(albTile.listed.length === 24, "в семействе двадцать четыре действия: " + albTile.listed.length);
+    ok(albTile.listed.length === 25, "в семействе двадцать пять действий: " + albTile.listed.length);
+    ok(albTile.listed.some((t) => /Правка группы целей/.test(t)), "список называет правку группы целей: " + albTile.listed.join(", "));
     ok(
       albTile.listed.some((t) => /Добавить слушателя/.test(t)) && albTile.listed.some((t) => /Править слушателя/.test(t)) && albTile.listed.some((t) => /Убрать слушателя/.test(t)) && albTile.listed.some((t) => /Правка балансировщика/.test(t)),
       "список называет правку слушателей и балансировщика: " + albTile.listed.join(", ")
@@ -1678,6 +1694,75 @@ fs.writeFileSync(SHOT, PAGE, "utf8");
     ok(albBackUpdRun.args && albBackUpdRun.args.noHealthCheck === false && albBackUpdRun.args.healthService === undefined, "снятая галочка ушла значением, а пустая проверка — нет", JSON.stringify(albBackUpdRun.args));
     ok(/обновляется: порт 3000, проверка здоровья HTTP \/health/.test(albBackUpdRun.text), "ответ назвал порт и проверку здоровья", albBackUpdRun.text.slice(0, 300));
     ok(/Список бэкендов уходит ЦЕЛИКОМ/.test(albBackUpdRun.text) && /Порт — это порт, который слушают ЦЕЛИ/.test(albBackUpdRun.text), "панель предупредила, что список бэкендов ЗАМЕНЯЕТСЯ целиком, а порт — ЦЕЛЕЙ", albBackUpdRun.text.slice(0, 400));
+
+    // Правка группы целей и настройки балансировщика (заход 7): у группы
+    // целей правятся только имя и описание, а у балансировщика — доступ-логи,
+    // авто-масштаб и допуск к сдвигу зоны. Форма обязана собирать их в те же
+    // аргументы, а ответ — называть словами.
+    const albTgUpdLabels = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Правка группы целей/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      return { labels: [...form.querySelectorAll(".yc-act-label")].map((x) => x.textContent) };
+    });
+    for (const part of ["Группа целей (имя или id) *", "Новое имя группы", "Новое описание"]) {
+      ok(albTgUpdLabels.labels.some((l) => l.indexOf(part) >= 0), "в форме правки группы целей нет поля «" + part + "»: " + albTgUpdLabels.labels.join(" | "));
+    }
+
+    const albTgUpdRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Группа целей/.test(label)) input.value = "web-targets";
+        if (/^Новое имя группы/.test(label)) input.value = "web-targets-2";
+        if (/^Новое описание/.test(label)) input.value = "витрина и API";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "tgupdate").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(albTgUpdRun.args && albTgUpdRun.args.group === "web-targets" && albTgUpdRun.args.newName === "web-targets-2" && albTgUpdRun.args.description === "витрина и API", "форма правки группы целей собрала имя и описание", JSON.stringify(albTgUpdRun.args));
+    ok(/обновляется: имя, описание/.test(albTgUpdRun.text) && /НЕ трогались/.test(albTgUpdRun.text), "ответ назвал правку и сказал, что состав целей не тронут", albTgUpdRun.text.slice(0, 260));
+
+    const albLbExtrasRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Правка балансировщика/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      const labels = [];
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        labels.push(label);
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Балансировщик/.test(label)) input.value = "web-lb";
+        if (/^Группа логов/.test(label)) input.value = "lg-web";
+        if (/^Авто-масштаб: минимум/.test(label)) input.value = "3";
+        if (/^Авто-масштаб: максимум/.test(label)) input.value = "0";
+        if (/^Допуск к сдвигу зоны/.test(label)) input.value = "да";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "lbupdate").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, labels: labels, text: document.getElementById("yc-act-out").textContent };
+    });
+    for (const part of ["Группа логов Cloud Logging (доступ-логи)", "Выключить доступ-логи", "Авто-масштаб: минимум единиц на зону", "Авто-масштаб: максимум всего (0 — без предела)", "Допуск к сдвигу зоны"]) {
+      ok(albLbExtrasRun.labels.some((l) => l.indexOf(part) >= 0), "в форме правки балансировщика нет поля «" + part + "»: " + albLbExtrasRun.labels.join(" | "));
+    }
+    ok(albLbExtrasRun.args && albLbExtrasRun.args.lb === "web-lb" && albLbExtrasRun.args.logGroup === "lg-web" && albLbExtrasRun.args.minZoneSize === 3 && albLbExtrasRun.args.maxSize === 0 && albLbExtrasRun.args.allowZonalShift === "да", "форма правки собрала логи, авто-масштаб и допуск", JSON.stringify(albLbExtrasRun.args));
+    ok(albLbExtrasRun.args && albLbExtrasRun.args.noLogs === false, "снятая галочка «выключить логи» ушла значением, а не пропала", JSON.stringify(albLbExtrasRun.args));
+    ok(/доступ-логи → группа «lg-web»/.test(albLbExtrasRun.text) && /авто-масштаб 3\/0/.test(albLbExtrasRun.text) && /допуск к сдвигу зоны: да/.test(albLbExtrasRun.text), "ответ назвал логи, авто-масштаб и допуск", albLbExtrasRun.text.slice(0, 320));
 
   } finally {
     await browser.close();

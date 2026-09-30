@@ -81,7 +81,7 @@
     clickhouse: ["list", "presets", "card", "create", "hosts", "databases", "users", "logs", "operations", "start", "stop", "delete"],
     dns: ["zones", "card", "records", "add", "delete"],
     instanceGroups: ["list", "card", "instances", "operations", "create", "start", "stop", "delete"],
-    alb: ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerupd", "routerdel", "backnew", "backupd", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"],
+    alb: ["list", "card", "targets", "routers", "backends", "health", "targetnew", "tgupdate", "targetadd", "targetremove", "targetdel", "routernew", "routerupd", "routerdel", "backnew", "backupd", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"],
   };
 
   const FAMILIES = {
@@ -563,17 +563,30 @@
         fields: [
           fld("listenerName", "Имя слушателя", { required: true, hint: "Вместе со слушателем закрываются его порт и адрес — состав показывает карточка." }),
         ] },
-      { id: "lbupdate", ru: "✎ Правка балансировщика: имя, описание, группы безопасности", op: "lbupdate", view: "lines", target: target("Балансировщик (имя или id)", "lb"),
+      { id: "lbupdate", ru: "✎ Правка балансировщика: имя, логи и авто-масштаб", op: "lbupdate", view: "lines", target: target("Балансировщик (имя или id)", "lb"),
         fields: [
           fld("newName", "Новое имя", { placeholder: "пусто — имя не меняется" }),
           fld("description", "Описание", { placeholder: "короткая подпись, что это за вход" }),
           fld("securityGroups", "Группы безопасности (через запятую)", { hint: "Список ЗАМЕНЯЕТСЯ целиком: перечисли ВСЕ нужные группы, иначе вход закроется снаружи." }),
+          fld("logGroup", "Группа логов Cloud Logging (доступ-логи)", { placeholder: "имя или id группы; пусто — не менять", hint: "Доступ-логи — единственный журнал, где видно, куда балансировщик отправлял запросы. Включение снимает «выключено»." }),
+          fld("noLogs", "Выключить доступ-логи", { type: "check", hint: "Журнал запросов перестанет писаться. Включить обратно — поле группы логов." }),
+          fld("minZoneSize", "Авто-масштаб: минимум единиц на зону", { type: "number", placeholder: "по умолчанию 2", hint: "Ресурсные единицы — платные узлы: минимум × число зон оплачивается даже без трафика. Оба числа заменяются вместе." }),
+          fld("maxSize", "Авто-масштаб: максимум всего (0 — без предела)", { type: "number", placeholder: "пусто — прежний" }),
+          fld("allowZonalShift", "Допуск к сдвигу зоны", { type: "select", options: ["да", "нет"], hint: "«Да» — при отказе или обслуживании зоны облако само погасит в ней трафик, остальные зоны подхватят. По умолчанию запрещено; «не менять» — оставь пустым." }),
         ] },
       { id: "targetnew", ru: "＋ Создать группу целей", op: "targetnew", view: "lines",
         fields: [
           fld("name", "Имя группы целей", { required: true, placeholder: "web-targets" }),
           fld("ips", "Адреса целей (через запятую)", { placeholder: "10.10.0.5, 10.10.0.6", hint: "Цель — это адрес машины; порт задаёт группа бэкендов, а не группа целей." }),
           fld("subnet", "Подсеть адресов", { options: from("vpc", "subnets", (r) => (r.subnets || []).map((s) => s.name)) }),
+        ] },
+      // Группа целей правится по имени и описанию; состав целей здесь НЕ
+      // трогается — его меняют точечно (targetadd/targetremove), а в PATCH
+      // список целей заменяется целиком.
+      { id: "tgupdate", ru: "✎ Правка группы целей: имя и описание", op: "tgupdate", view: "lines", target: target("Группа целей (имя или id)", "group"),
+        fields: [
+          fld("newName", "Новое имя группы", { placeholder: "пусто — имя не меняется", hint: "Имя обязано быть уникальным в каталоге: занятое отбивается до запроса. Переименование не рвёт связей — маршруты держат группу по id." }),
+          fld("description", "Новое описание", { placeholder: "пусто — не меняется" }),
         ] },
       { id: "targetadd", ru: "＋ Добавить цели", op: "targetadd", view: "lines", target: target("Группа целей (имя или id)", "group"),
         fields: [

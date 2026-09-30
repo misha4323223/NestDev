@@ -589,7 +589,7 @@ function createCloudTools(deps) {
         if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
         if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud — балансировщик и его группы целей живут в каталоге.";
         const action = String(args.action || "list").trim().toLowerCase();
-        const ALL = ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerupd", "routerdel", "backnew", "backupd", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"];
+        const ALL = ["list", "card", "targets", "routers", "backends", "health", "targetnew", "tgupdate", "targetadd", "targetremove", "targetdel", "routernew", "routerupd", "routerdel", "backnew", "backupd", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"];
         if (ALL.indexOf(action) === -1) return "Ошибка: неизвестное действие ycAlb «" + action + "». Доступно: " + ALL.join(", ") + ".";
         const ref = String(args.lb || args.id || args.name || "").trim();
         try {
@@ -636,6 +636,20 @@ function createCloudTools(deps) {
             } else {
               lines.push("Слушателей нет: балансировщик создан, но ни на одном порту не отвечает.");
             }
+            // Настройки самого ресурса: доступ-логи, авто-масштаб и сдвиг зоны.
+            // Без них карточка молчит о том, почему «не находится» разбор
+            // запросов и почему счёт за простой выше ожидаемого.
+            const setup = [];
+            setup.push(c.lb.logsDisabled
+              ? "доступ-логи выключены"
+              : c.lb.logGroupId
+                ? "доступ-логи в группу " + c.lb.logGroupId
+                : "доступ-логи не заданы (пишутся в группу каталога по умолчанию)");
+            if (c.lb.autoScale) {
+              setup.push("авто-масштаб: минимум " + (c.lb.autoScale.min || "2") + " единиц на зону" + (c.lb.autoScale.max === "0" ? ", без верхнего предела" : ", максимум " + (c.lb.autoScale.max || "?") + " всего"));
+            }
+            setup.push(c.lb.allowZonalShift ? "сдвиг зоны разрешён" : "сдвиг зоны запрещён (по умолчанию)");
+            lines.push("Настройки: " + setup.join(" · ") + ". Меняют их правкой: lbupdate { logGroup | noLogs, minZoneSize, maxSize, allowZonalShift }.");
             for (const pair of c.listeners) {
               lines.push("Роутер «" + pair.router.name + "»:");
               for (const h of pair.router.hosts) {
@@ -674,6 +688,16 @@ function createCloudTools(deps) {
             });
             return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "") +
               (r.groupId ? "\nСледующий шаг: группа бэкендов — ycAlb { action: \"backnew\", name: \"web-backends\", targetGroup: \"" + ((r.group && r.group.name) || r.groupId) + "\" }." : "");
+          }
+          if (action === "tgupdate") {
+            const r = await ycAlb.updateTargetGroup(cfg.oauth, {
+              folderId: cfg.folderId,
+              group: args.group || args.targetGroup || args.id || args.name,
+              newName: args.newName || args.rename,
+              description: args.description != null && String(args.description).trim() !== "" ? String(args.description).trim() : undefined,
+            });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "") +
+              "\nСостав целей при этом не трогается: адреса добавляют и убирают точечно — targetadd и targetremove, а в PATCH список целей заменяется целиком.";
           }
           if (action === "targetadd" || action === "targetremove") {
             const r = await ycAlb.changeTargets(cfg.oauth, action === "targetadd" ? "add" : "remove", {
@@ -835,9 +859,14 @@ function createCloudTools(deps) {
               newName: args.newName || args.rename,
               description: args.description != null && String(args.description).trim() !== "" ? String(args.description).trim() : undefined,
               securityGroups: args.securityGroups || args.securityGroupIds,
+              logGroup: args.logGroup || args.logs || args.logGroupId,
+              noLogs: args.noLogs === true || args.disableLogs === true,
+              minZoneSize: args.minZoneSize,
+              maxSize: args.maxSize,
+              allowZonalShift: args.allowZonalShift != null ? args.allowZonalShift : args.zonalShift,
             });
             return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "") +
-              "\nПравка ушла С МАСКОЙ полей: облако меняет только названное, а слушателей трогают отдельные действия listeneradd и listenerdel.";
+              "\nПравка ушла С МАСКОЙ полей: облако меняет только названное, а слушателей трогают отдельные действия listeneradd и listenerdel. Доступ-логи — logGroup или noLogs, авто-масштаб — minZoneSize/maxSize, допуск к сдвигу зоны — allowZonalShift: правка обратима и согласия не требует.";
           }
           if (action === "lbnew") {
             if (args.confirm !== true) {

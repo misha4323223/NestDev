@@ -178,7 +178,12 @@ const albState = { lbCreated: [], lbDeleted: new Set(), tgCreated: [], tgDeleted
   routerHosts: [{ name: "main", authority: ["site.example.com"], routes: [{ name: "main", http: { match: { path: { prefixMatch: "/" } }, route: { backendGroupId: "bg-web" } } }] }],
   routerPatches: [], bgPatches: [],
   bgName: "web-backends",
-  bgBackends: [{ name: "web", port: "8080", targetGroups: { targetGroupIds: ["tg-web"] }, healthchecks: [{ timeout: "1s", interval: "2s", http: { path: "/" } }] }] };
+  bgBackends: [{ name: "web", port: "8080", targetGroups: { targetGroupIds: ["tg-web"] }, healthchecks: [{ timeout: "1s", interval: "2s", http: { path: "/" } }] }],
+  // Часть 91, заход 7: имя и описание группы целей, доступ-логи, авто-масштаб и
+  // допуск к сдвигу зоны балансировщика тоже изменяемые — правка обязана быть
+  // видна следующему чтению, иначе проверка «применилось» ничего не значит.
+  tgName: "web-targets", tgDescription: "", tgPatches: [],
+  lbLogGroup: "", lbLogsDisabled: false, lbScale: { minZoneSize: "2", maxSize: "4" }, lbShift: false };
 // Правка слушателя (:updateListener): тело — updateMask + listenerSpec, а сам
 // слушатель опознаётся ПО ИМЕНИ (переименовать его нельзя). Стенд повторяет
 // поведение облака: названное в маске берётся из тела, НЕназванное остаётся
@@ -213,9 +218,12 @@ const albLbBody = () => ({
   regionId: "ru-central1", networkId: "net-1", securityGroupIds: albState.securityGroupIds,
   allocationPolicy: { locations: [{ zoneId: "ru-central1-a", subnetId: "sub-a" }] },
   listeners: albState.listeners,
+  logOptions: albState.lbLogsDisabled ? { disable: true } : (albState.lbLogGroup ? { logGroupId: albState.lbLogGroup } : undefined),
+  autoScalePolicy: albState.lbScale,
+  allowZonalShift: albState.lbShift,
 });
 const albTgBody = (id, name, targets) => ({
-  id: id || "tg-web", name: name || "web-targets", folderId: "f1", createdAt: "2026-08-02T10:00:00Z",
+  id: id || "tg-web", name: name || albState.tgName, folderId: "f1", description: albState.tgDescription, createdAt: "2026-08-02T10:00:00Z",
   targets: (targets || albState.targets).map((ip) => ({ ipAddress: ip, subnetId: "sub-a" })),
 });
 const albRouterBody = () => ({
@@ -681,7 +689,26 @@ function startFakeYc() {
           if (fields.indexOf("name") >= 0) albState.name = albSent.name;
           if (fields.indexOf("description") >= 0) albState.description = albSent.description || "";
           if (fields.indexOf("security_group_ids") >= 0) albState.securityGroupIds = albSent.securityGroupIds || [];
+          // Настройка в маске заменяется ЦЕЛИКОМ: logOptions — или группа, или
+          // выключатель, autoScalePolicy — пара чисел, allowZonalShift — да/нет.
+          if (fields.indexOf("log_options") >= 0) {
+            albState.lbLogsDisabled = !!(albSent.logOptions && albSent.logOptions.disable === true);
+            albState.lbLogGroup = albState.lbLogsDisabled ? "" : String((albSent.logOptions && albSent.logOptions.logGroupId) || "");
+          }
+          if (fields.indexOf("auto_scale_policy") >= 0) albState.lbScale = albSent.autoScalePolicy || {};
+          if (fields.indexOf("allow_zonal_shift") >= 0) albState.lbShift = albSent.allowZonalShift === true;
           return json({ id: "op-alb-patch", done: false });
+        }
+        // Правка группы целей: имя и описание. Состав (targets) в теле заменял бы
+        // список ЦЕЛИКОМ — поэтому стенд принимает его только отдельной веткой
+        // и именно на этом держится проверка «состав не ушёл в запрос».
+        if (req.method === "PATCH" && /\/targetGroups\/tg-web$/.test(p)) {
+          albState.tgPatches.push(albSent);
+          const tgFields = String(albSent.updateMask || "").split(",").map((s) => s.trim());
+          if (tgFields.indexOf("name") >= 0) albState.tgName = albSent.name;
+          if (tgFields.indexOf("description") >= 0) albState.tgDescription = albSent.description || "";
+          if (tgFields.indexOf("targets") >= 0) albState.targets = (albSent.targets || []).map((t) => t.ipAddress);
+          return json({ id: "op-alb-tgpatch", done: false });
         }
         // Правка роутера и группы бэкендов приходит ЗАМЕНОЙ вложенного списка:
         // облако не умеет «поменять путь» или «поменять порт» отдельным методом.
@@ -1830,6 +1857,55 @@ watchdog.unref();
   const uiBgTool = plain(await call("ycAlb", { action: "backupd", group: "edge-backends", port: 9090 }));
   ok(/обновляется: порт 9090/.test(uiBgTool) && /ЦЕЛИКОМ/.test(uiBgTool), "инструмент правит группу тем же действием: " + uiBgTool.slice(0, 200));
   ok(/Порт слушателя/.test(uiBgTool), "инструмент сказал, что порт слушателя этим не меняется: " + uiBgTool.slice(0, 200));
+
+  // ── Правка группы целей и настройки балансировщика (часть 91, заход 7) ──
+  // У группы целей правятся имя и описание: состав (targets) в запрос не идёт
+  // вовсе — в PATCH он заменяет список ЦЕЛИКОМ, и машины так теряются.
+  const uiTgUpd = await callAlb({ op: "tgupdate", group: "web-targets", newName: "edge-targets", description: "витрина" });
+  ok(uiTgUpd.ok === true && /обновляется: имя, описание/.test(uiTgUpd.message || ""), "правка группы целей из окна: " + String(uiTgUpd.message || "").slice(0, 140));
+  const tgPatchCall = albCalls.filter((c) => c.method === "PATCH" && /\/targetGroups\/tg-web$/.test(c.path)).pop() || {};
+  const tgPatch = (() => { try { return JSON.parse(tgPatchCall.body || "{}"); } catch { return {}; } })();
+  ok(tgPatch.updateMask === "name,description", "маска правки группы целей: " + tgPatch.updateMask);
+  ok(tgPatch.targets === undefined && tgPatch.id === undefined, "состав или служебные поля ушли в запрос: " + Object.keys(tgPatch).join(","));
+  ok((uiTgUpd.warnings || []).join(" ").includes("НЕ трогались"), "окно предупреждено, что цели не трогались: " + (uiTgUpd.warnings || []).join(" | "));
+  const uiTgList = await callAlb({ op: "targets" });
+  ok((uiTgList.lines || []).some((l) => /edge-targets/.test(l) && /целей: 2/.test(l)), "группа перечитана после правки, цели на месте: " + (uiTgList.lines || []).join(" | "));
+  const tgWrites = albWrites();
+  ok(/Нечего менять/.test((await callAlb({ op: "tgupdate", group: "edge-targets" })).error || ""), "правка группы целей без полей отбита до сети");
+  ok(/занято/.test((await callAlb({ op: "tgupdate", group: "web-targets2", newName: "edge-targets" })).error || ""), "занятое имя отбито до сети со списком того, что есть");
+  ok(albWrites() === tgWrites, "на отказах в облако не ушло ничего: " + (albWrites() - tgWrites));
+  const uiTgTool = plain(await call("ycAlb", { action: "tgupdate", group: "edge-targets", description: "витрина и API" }));
+  ok(/targetadd/.test(uiTgTool) && /целиком/.test(uiTgTool), "инструмент правит группу целей и говорит, чем меняют состав: " + uiTgTool.slice(0, 220));
+
+  // Доступ-логи — одно поле logOptions: или группа, или выключатель, и вместе
+  // они противоречат друг другу. Авто-масштаб — пара чисел: минимум на КАЖДУЮ
+  // зону и максимум всего, где 0 значит «без предела».
+  const uiLbLogs = await callAlb({ op: "lbupdate", lb: "lb-web", logGroup: "lg-web" });
+  ok(uiLbLogs.ok === true && uiLbLogs.lb && uiLbLogs.lb.logGroupId === "lg-web", "группа логов подтвердилась перечитыванием: " + JSON.stringify((uiLbLogs.lb || {}).logGroupId));
+  const lbLogsPatch = (() => { try { return JSON.parse((albCalls.filter((c) => c.method === "PATCH" && /\/loadBalancers\/lb-web$/.test(c.path)).pop() || {}).body || "{}"); } catch { return {}; } })();
+  ok(lbLogsPatch.updateMask === "log_options" && lbLogsPatch.logOptions.logGroupId === "lg-web", "логи ушли отдельной маской: " + JSON.stringify(lbLogsPatch).slice(0, 160));
+  ok((uiLbLogs.warnings || []).join(" ").includes("Cloud Logging"), "окно предупреждено, куда пишутся логи");
+  const uiLbOff = await callAlb({ op: "lbupdate", lb: "lb-web", noLogs: true });
+  ok(uiLbOff.ok === true && uiLbOff.lb.logsDisabled === true, "выключатель логов подтвердился перечитыванием: " + JSON.stringify(((uiLbOff.lb || {}).logsDisabled)));
+  const uiLbScale = await callAlb({ op: "lbupdate", lb: "lb-web", minZoneSize: 3, maxSize: 0 });
+  const lbScalePatch = (() => { try { return JSON.parse((albCalls.filter((c) => c.method === "PATCH" && /\/loadBalancers\/lb-web$/.test(c.path)).pop() || {}).body || "{}"); } catch { return {}; } })();
+  ok(lbScalePatch.autoScalePolicy && lbScalePatch.autoScalePolicy.minZoneSize === "3" && lbScalePatch.autoScalePolicy.maxSize === "0", "авто-масштаб ушёл парой чисел, 0 — без предела: " + JSON.stringify(lbScalePatch.autoScalePolicy));
+  ok(uiLbScale.lb.autoScale.min === "3" && uiLbScale.lb.autoScale.max === "0", "авто-масштаб подтвердился перечитыванием: " + JSON.stringify(uiLbScale.lb.autoScale));
+  const uiLbShift = await callAlb({ op: "lbupdate", lb: "lb-web", allowZonalShift: "да" });
+  const lbShiftPatch = (() => { try { return JSON.parse((albCalls.filter((c) => c.method === "PATCH" && /\/loadBalancers\/lb-web$/.test(c.path)).pop() || {}).body || "{}"); } catch { return {}; } })();
+  ok(lbShiftPatch.allowZonalShift === true && uiLbShift.lb.allowZonalShift === true, "допуск к сдвигу зоны подтвердился перечитыванием: " + JSON.stringify(lbShiftPatch.allowZonalShift));
+  const lbWrites = albWrites();
+  ok(/разом/.test((await callAlb({ op: "lbupdate", lb: "lb-web", logGroup: "lg-x", noLogs: true })).error || ""), "группа логов и выключатель вместе отбиты до сети");
+  ok(/не меньше 2/.test((await callAlb({ op: "lbupdate", lb: "lb-web", minZoneSize: 1 })).error || ""), "минимум ниже двух отбит до сети");
+  ok(/число зон/.test((await callAlb({ op: "lbupdate", lb: "lb-web", minZoneSize: 10, maxSize: 5 })).error || ""), "максимум ниже минимума × число зон отбит до сети");
+  ok(/да или нет/.test((await callAlb({ op: "lbupdate", lb: "lb-web", allowZonalShift: "может быть" })).error || ""), "непонятный ответ про сдвиг зоны отбит до сети");
+  ok(albWrites() === lbWrites, "на отказах в облако не ушло ничего: " + (albWrites() - lbWrites));
+  const uiLbCard2 = await callAlb({ op: "card", lb: "lb-web" });
+  ok((uiLbCard2.lines || []).some((l) => /Настройки:/.test(l) && /доступ-логи выключены/.test(l) && /без верхнего предела/.test(l) && /сдвиг зоны разрешён/.test(l)), "карточка показала настройки словами: " + (uiLbCard2.lines || []).join(" | ").slice(0, 300));
+  const uiAlbNoTgUpd = await callAlb({ op: "nope" });
+  ok(/tgupdate/.test(uiAlbNoTgUpd.error || ""), "список действий канала знает правку группы целей: " + String(uiAlbNoTgUpd.error || "").slice(0, 200));
+  const uiLbTool2 = plain(await call("ycAlb", { action: "lbupdate", lb: "lb-web", logGroup: "lg-web", minZoneSize: 2 }));
+  ok(/С МАСКОЙ/.test(uiLbTool2) && /авто-масштаб/.test(uiLbTool2) && /сдвиг[уа] зоны/.test(uiLbTool2), "инструмент правит настройки и объясняет, чем: " + uiLbTool2.slice(-260));
 
   srv.close();
   clearTimeout(watchdog);

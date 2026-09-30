@@ -130,11 +130,11 @@ const ycConsole = require(path.join(ROOT, "src", "yc-console.js"));
 // облаке, чтобы проверять правку настоящими запросами.
 function startAlbStub() {
   const calls = [];
-  const created = { lb: [], tg: [], router: [], targets: [], bg: [], listenerOps: [], lbPatches: [], routerPatches: [], bgPatches: [] };
+  const created = { lb: [], tg: [], router: [], targets: [], bg: [], listenerOps: [], lbPatches: [], routerPatches: [], bgPatches: [], tgPatches: [] };
   const deleted = new Set();
   // «Облако приняло, но не сделало» — так бывает при нехватке прав (alb.editor):
   // модуль обязан заметить это перечитыванием, а не показать успех.
-  const flags = { dropAdd: false, dropRemove: false, dropUpdate: false, dropPatch: false, dropRouterPatch: false, dropBackendPatch: false };
+  const flags = { dropAdd: false, dropRemove: false, dropUpdate: false, dropPatch: false, dropRouterPatch: false, dropBackendPatch: false, dropTgPatch: false };
   const status = { "alb-web": "ACTIVE", "alb-https": "STOPPED", "alb-busy": "CREATING", "alb-stream": "ACTIVE" };
   // Имя, описание и группы безопасности — изменяемые: правка (lbupdate) обязана
   // быть видна следующему чтению, иначе проверка «применилось ли» ничего не значит.
@@ -180,6 +180,13 @@ function startAlbStub() {
       },
     ],
   };
+  // Доступ-логи, авто-масштаб и сдвиг зоны — тоже изменяемые (PATCH): правка
+  // обязана быть видна следующему чтению, как у настоящего облака. У части
+  // балансировщиков эти настройки не заданы вовсе — так проверяется и пустое
+  // значение («логи не заданы», авто-масштаба нет).
+  const logOpts = { "alb-web": { logGroupId: "lg-web" }, "alb-stream": { disable: true } };
+  const scale = { "alb-web": { minZoneSize: "2", maxSize: "4" }, "alb-stream": { minZoneSize: "2", maxSize: "0" } };
+  const shift = { "alb-stream": true };
   const lbBase = (id) => ({
     id: id,
     name: meta[id].name,
@@ -192,6 +199,9 @@ function startAlbStub() {
     networkId: "net-1",
     regionId: "ru-central1",
     securityGroupIds: meta[id].securityGroupIds,
+    logOptions: logOpts[id],
+    autoScalePolicy: scale[id],
+    allowZonalShift: shift[id],
   });
   // Правка слушателя в облаке — это НОВЫЙ слушатель с тем же именем: в теле
   // приходит форма ЗАПРОСА (endpointSpecs/addressSpecs), а читается она потом в
@@ -409,6 +419,11 @@ function startAlbStub() {
             if (fields.indexOf("name") >= 0) m.name = body.name;
             if (fields.indexOf("description") >= 0) m.description = body.description || "";
             if (fields.indexOf("security_group_ids") >= 0) m.securityGroupIds = body.securityGroupIds || [];
+            // Настройка в маске заменяется ЦЕЛИКОМ — как logOptions и
+            // autoScalePolicy у настоящего облака.
+            if (fields.indexOf("log_options") >= 0) logOpts[patch[1]] = body.logOptions || {};
+            if (fields.indexOf("auto_scale_policy") >= 0) scale[patch[1]] = body.autoScalePolicy || {};
+            if (fields.indexOf("allow_zonal_shift") >= 0) shift[patch[1]] = body.allowZonalShift === true;
           }
           return json({ id: "op-lb-patch", done: false });
         }
@@ -454,6 +469,22 @@ function startAlbStub() {
         if (change && req.method === "POST") {
           created.targets.push({ group: change[1], action: change[2], body: JSON.parse(raw || "{}") });
           return json({ id: "op-targets", done: false });
+        }
+        const patch = url.match(/\/targetGroups\/([^/?]+)$/);
+        if (patch && req.method === "PATCH") {
+          const body = JSON.parse(raw || "{}");
+          created.tgPatches.push({ group: patch[1], body: body });
+          const g = groups[patch[1]];
+          // Маска: названное меняется, НЕназванное остаётся прежним — как у
+          // настоящего облака. Поле targets в маске ЗАМЕНИЛО бы список целиком,
+          // и тест проверяет, что модуль его туда НЕ кладёт.
+          if (g && !flags.dropTgPatch) {
+            const fields = String(body.updateMask || "").split(",").map((x) => x.trim());
+            if (fields.indexOf("name") >= 0) g.name = body.name;
+            if (fields.indexOf("description") >= 0) g.description = body.description || "";
+            if (fields.indexOf("targets") >= 0) g.targets = body.targets || [];
+          }
+          return json({ id: "op-tg-patch", done: false });
         }
         const del = url.match(/\/targetGroups\/([^/?]+)$/);
         if (del && req.method === "DELETE") {
@@ -580,6 +611,7 @@ function startAlbStub() {
           created.lbPatches.length = 0;
           created.routerPatches.length = 0;
           created.bgPatches.length = 0;
+          created.tgPatches.length = 0;
           deleted.clear();
         },
         base: "http://127.0.0.1:" + server.address().port,
@@ -1302,10 +1334,10 @@ const section = (src, channel) => {
     const ops = arr[1].split(",").map((x) => x.trim().replace(/^"|"$/g, ""));
     assert.deepStrictEqual(
       ops.slice().sort(),
-      ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerupd", "routerdel", "backnew", "backupd", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"].sort(),
+      ["list", "card", "targets", "routers", "backends", "health", "targetnew", "tgupdate", "targetadd", "targetremove", "targetdel", "routernew", "routerupd", "routerdel", "backnew", "backupd", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"].sort(),
       "список действий канала: " + ops.join(", ")
     );
-    for (const part of ["ycAlb.loadBalancers(", "ycAlb.card(", "ycAlb.targetGroups(", "ycAlb.httpRouters(", "ycAlb.backendGroups(", "ycAlb.backendGroupLine(", "ycAlb.targetStates(", "ycAlb.createTargetGroup(", "ycAlb.changeTargets(", "ycAlb.createHttpRouter(", "ycAlb.createBackendGroup(", "ycAlb.removeBackendGroup(", "ycAlb.createLoadBalancer(", "ycAlb.power(", "ycAlb.remove(", "ycAlb.removeTargetGroup(", "ycAlb.removeRouter(", "ycAlb.lbLine(", "ycAlb.listenerLine(", "ycAlb.targetLine(", "ycAlb.tgLine(", "ycAlb.routerLine(", "ycAlb.addListener(", "ycAlb.updateListener(", "ycAlb.removeListener(", "ycAlb.updateLoadBalancer(", "ycAlb.updateHttpRouter(", "ycAlb.updateBackendGroup(", "ycAlb.certLine("]) {
+    for (const part of ["ycAlb.loadBalancers(", "ycAlb.card(", "ycAlb.targetGroups(", "ycAlb.httpRouters(", "ycAlb.backendGroups(", "ycAlb.backendGroupLine(", "ycAlb.targetStates(", "ycAlb.createTargetGroup(", "ycAlb.changeTargets(", "ycAlb.updateTargetGroup(", "ycAlb.createHttpRouter(", "ycAlb.createBackendGroup(", "ycAlb.removeBackendGroup(", "ycAlb.createLoadBalancer(", "ycAlb.power(", "ycAlb.remove(", "ycAlb.removeTargetGroup(", "ycAlb.removeRouter(", "ycAlb.lbLine(", "ycAlb.listenerLine(", "ycAlb.targetLine(", "ycAlb.tgLine(", "ycAlb.routerLine(", "ycAlb.addListener(", "ycAlb.updateListener(", "ycAlb.removeListener(", "ycAlb.updateLoadBalancer(", "ycAlb.updateHttpRouter(", "ycAlb.updateBackendGroup(", "ycAlb.certLine("]) {
       assert.ok(body.includes(part), "канал не зовёт " + part);
     }
     assert.ok(/needsConfirm: true/.test(body) && /a\.confirm !== true/.test(body), "канал не спрашивает согласие на платное и необратимое");
@@ -1516,7 +1548,7 @@ const section = (src, channel) => {
     const A = ctx.window.YcActions;
     assert.strictEqual(A.CHANNELS.alb, "ycAlb", "семейство смотрит не в тот канал");
     const ids = A.forService("alb");
-    for (const need of ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"]) {
+    for (const need of ["list", "card", "targets", "routers", "backends", "health", "targetnew", "tgupdate", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"]) {
       assert.ok(ids.indexOf(need) >= 0, "в семействе нет действия " + need);
     }
     const addListener = A.describe("alb", "listeneradd");
@@ -1529,7 +1561,9 @@ const section = (src, channel) => {
     assert.strictEqual(A.describe("alb", "listenerdel").danger, true, "удаление слушателя не помечено опасным");
     assert.strictEqual(A.describe("alb", "listenerdel").confirmArg, "confirm", "удаление слушателя не спрашивает согласие");
     const updListener = A.describe("alb", "lbupdate");
-    assert.ok(updListener.fields.indexOf("newName") >= 0 && updListener.fields.indexOf("description") >= 0 && updListener.fields.indexOf("securityGroups") >= 0, "в форме правки балансировщика не хватает полей: " + updListener.fields.join(", "));
+    for (const field of ["newName", "description", "securityGroups", "logGroup", "noLogs", "minZoneSize", "maxSize", "allowZonalShift"]) {
+      assert.ok(updListener.fields.indexOf(field) >= 0, "в форме правки балансировщика нет поля " + field + ": " + updListener.fields.join(", "));
+    }
     const addReq = A.request("alb", "listeneradd", { lb: "web-lb", listenerName: "api", listener: "http", port: "8080" }, false);
     assert.strictEqual(addReq.args.op, "listeneradd");
     assert.strictEqual(addReq.args.lb, "web-lb", "балансировщик не ушёл в добавление слушателя");
@@ -2312,14 +2346,17 @@ const section = (src, channel) => {
   await test("ycAlb: схема, справочник и промпт знают правку роутера и группы", () => {
     const at = SCHEMAS_SRC.indexOf('name: "ycAlb"');
     const schema = SCHEMAS_SRC.slice(at, SCHEMAS_SRC.indexOf('name: "ycVpc"', at));
-    for (const part of ["routerupd", "backupd", "routeName", "vhost", "noHealthCheck", "healthService"]) {
+    for (const part of ["routerupd", "backupd", "tgupdate", "routeName", "vhost", "noHealthCheck", "healthService", "logGroup", "noLogs", "minZoneSize", "maxSize", "allowZonalShift"]) {
       assert.ok(schema.includes(part), "в схеме нет " + part);
     }
     assert.ok(/ЗАМЕНА ВЛОЖЕННОГО СПИСКА/.test(schema), "схема не объясняет замену вложенного списка");
-    assert.ok(/routerupd/.test(GUIDE_SRC) && /backupd/.test(GUIDE_SRC), "справочник yc.md не знает правку");
+    assert.ok(/logOptions/.test(schema) && /без предела/.test(schema), "схема не объясняет доступ-логи и авто-масштаб");
+    assert.ok(/зоны при её отказе|зоне при её отказе/.test(schema), "схема не объясняет допуск к сдвигу зоны");
+    assert.ok(/routerupd/.test(GUIDE_SRC) && /backupd/.test(GUIDE_SRC) && /tgupdate/.test(GUIDE_SRC), "справочник yc.md не знает правку");
     assert.ok(/routeName/.test(GUIDE_SRC) && /noHealthCheck/.test(GUIDE_SRC), "справочник не объясняет поля правки");
     assert.ok(/ТОЛЬКО ЗАМЕНОЙ/.test(GUIDE_SRC), "справочник не говорит, что список меняется только заменой");
-    assert.ok(/routerupd/.test(PROMPTS_SRC) && /backupd/.test(PROMPTS_SRC), "промпт не называет действия правки");
+    assert.ok(/logGroup/.test(GUIDE_SRC) && /allowZonalShift/.test(GUIDE_SRC), "справочник не знает логи и сдвиг зоны");
+    assert.ok(/routerupd/.test(PROMPTS_SRC) && /backupd/.test(PROMPTS_SRC) && /tgupdate/.test(PROMPTS_SRC), "промпт не называет действия правки");
     const line = PROMPTS_SRC.split("\n").find((l) => l.startsWith("Доступные инструменты:")) || "";
     assert.ok(/ycAlb/.test(line), "инструмента нет в списке для модели");
   });
@@ -2362,8 +2399,189 @@ const section = (src, channel) => {
     const off = A.request("alb", "backupd", { group: "web-backends", port: "3000", noHealthCheck: false }, false);
     assert.strictEqual(off.args.noHealthCheck, false, "снятая галочка ушла не значением");
 
+    // Группа целей: правка — только имя и описание, и пустое описание НЕ уходит
+    // в запрос (оно стёрло бы подпись, а не «оставило прежней»).
+    const tg = A.describe("alb", "tgupdate");
+    for (const field of ["newName", "description"]) {
+      assert.ok(tg.fields.indexOf(field) >= 0, "в форме правки группы целей нет поля " + field + ": " + tg.fields.join(", "));
+    }
+    assert.strictEqual(A.actionsFor("alb").find((x) => x.id === "tgupdate").target.key, "group", "у правки группы целей нет цели-группы");
+    assert.strictEqual(tg.confirmArg, "", "правка группы целей не спрашивает согласие");
+    const tgReq = A.request("alb", "tgupdate", { group: "web-targets", newName: "edge-targets", description: "" }, false);
+    assert.strictEqual(tgReq.args.op, "tgupdate");
+    assert.strictEqual(tgReq.args.group, "web-targets");
+    assert.strictEqual(tgReq.args.newName, "edge-targets");
+    assert.strictEqual(tgReq.args.description, undefined, "пустое описание ушло в запрос — оно стёрло бы подпись");
+
+    // Балансировщик: доступ-логи, авто-масштаб и сдвиг зоны — своими полями.
+    const upd = A.describe("alb", "lbupdate");
+    for (const field of ["logGroup", "noLogs", "minZoneSize", "maxSize", "allowZonalShift"]) {
+      assert.ok(upd.fields.indexOf(field) >= 0, "в форме правки балансировщика нет поля " + field);
+    }
+    const lbReq = A.request("alb", "lbupdate", { lb: "web-lb", minZoneSize: "3", maxSize: "0", allowZonalShift: "да", noLogs: false }, false);
+    assert.strictEqual(lbReq.args.minZoneSize, 3, "минимум единиц не число");
+    assert.strictEqual(lbReq.args.maxSize, 0, "0 — это «без предела», а не пустое значение");
+    assert.strictEqual(lbReq.args.allowZonalShift, "да", "допуск к сдвигу зоны не ушёл");
+    assert.strictEqual(lbReq.args.noLogs, false, "снятая галочка ушла не значением");
+    const lbEmpty = A.request("alb", "lbupdate", { lb: "web-lb", maxSize: "", allowZonalShift: "", logGroup: "" }, false);
+    assert.strictEqual(lbEmpty.args.maxSize, undefined, "пустой максимум ушёл в запрос");
+    assert.strictEqual(lbEmpty.args.allowZonalShift, undefined, "пустой выбор сдвига зоны ушёл в запрос");
+    assert.strictEqual(lbEmpty.args.logGroup, undefined, "пустая группа логов ушла в запрос");
+
     const ops = A.forService("alb");
-    assert.ok(ops.indexOf("routerupd") >= 0 && ops.indexOf("backupd") >= 0, "правки нет в списке действий семейства: " + ops.join(", "));
+    assert.ok(ops.indexOf("routerupd") >= 0 && ops.indexOf("backupd") >= 0 && ops.indexOf("tgupdate") >= 0, "правки нет в списке действий семейства: " + ops.join(", "));
+  });
+
+  await test("yc:alb: правка группы целей — это имя и описание, а состав целей не уходит", async () => {
+    const handlers = new Map();
+    const settings = settingsFor();
+    registerYcIpc(ipcDeps(handlers, settings));
+    const call = (args) => handlers.get("yc:alb")({}, args || {});
+
+    stub.created.tgPatches.length = 0;
+    const r = await call({ op: "tgupdate", group: "web-targets", newName: "edge-targets", description: "витрина и API" });
+    assert.strictEqual(r.ok, true, "канал отказал на правке группы целей: " + (r.error || ""));
+    assert.strictEqual(stub.created.tgPatches.length, 1, "правка группы целей не ушла");
+    const sent = stub.created.tgPatches[0];
+    assert.strictEqual(sent.group, "tg-web", "правка ушла не по id группы: " + sent.group);
+    assert.strictEqual(sent.body.updateMask, "name,description", "маска правки: " + sent.body.updateMask);
+    assert.strictEqual(sent.body.targets, undefined, "состав целей ушёл в запрос — облако заменило бы список целиком");
+    assert.ok((r.lines || []).some((l) => /имя, описание/.test(l)), (r.lines || []).join(" | "));
+    assert.ok((r.warnings || []).some((w) => /НЕ трогались/.test(w)), "не сказано, что цели не трогались");
+    assert.ok((r.warnings || []).some((w) => /по id/.test(w)), "не сказано, что переименование не рвёт связей");
+    // Перечитывание подтвердило правку настоящим чтением стенда.
+    assert.strictEqual(r.targetGroup.name, "edge-targets");
+    assert.strictEqual(r.targetGroup.description, "витрина и API");
+    assert.strictEqual(r.targetGroup.targets.length, 2, "цели потерялись при правке");
+    assert.strictEqual(r.needsConfirm, undefined, "правка группы целей спросила согласие");
+
+    // Занятое имя отбивается ДО сети, а не отказом облака.
+    const patches = stub.created.tgPatches.length;
+    const busy = await call({ op: "tgupdate", group: "empty-targets", newName: "edge-targets" });
+    assert.strictEqual(busy.ok, false);
+    assert.ok(/занято/.test(busy.error) && /edge-targets/.test(busy.error), busy.error);
+    assert.strictEqual(stub.created.tgPatches.length, patches, "занятое имя всё равно ушло в облако");
+
+    // Одно и то же имя и описание — это «нечего менять», а не запрос.
+    const same = await call({ op: "tgupdate", group: "edge-targets", newName: "edge-targets" });
+    assert.strictEqual(same.ok, false);
+    assert.ok(/уже называется/.test(same.error), same.error);
+    const same2 = await call({ op: "tgupdate", group: "edge-targets", description: "витрина и API" });
+    assert.strictEqual(same2.ok, false);
+    assert.ok(/уже такое описание/.test(same2.error), same2.error);
+    const empty = await call({ op: "tgupdate", group: "edge-targets" });
+    assert.strictEqual(empty.ok, false);
+    assert.ok(/Нечего менять/.test(empty.error) && /targetadd/.test(empty.error), empty.error);
+    const bad = await call({ op: "tgupdate", group: "edge-targets", newName: "Плохое Имя" });
+    assert.strictEqual(bad.ok, false);
+    assert.ok(/облако не примет/.test(bad.error), bad.error);
+
+    // «Облако промолчало» — это ошибка, а не успех: без перечитывания её не видно.
+    stub.created.tgPatches.length = 0;
+    stub.flags.dropTgPatch = true;
+    const dropped = await call({ op: "tgupdate", group: "edge-targets", description: "новая подпись" });
+    stub.flags.dropTgPatch = false;
+    assert.strictEqual(dropped.ok, false);
+    assert.ok(/не применилась/.test(dropped.error) && /alb\.editor/.test(dropped.error), dropped.error);
+
+    // Инструмент агента: тот же путь и словами про то, чем правят состав.
+    const tools = buildTools();
+    stub.created.tgPatches.length = 0;
+    const text = await tools.ycAlb({ action: "tgupdate", group: "empty-targets", description: "пустая группа для опытов" });
+    assert.strictEqual(stub.created.tgPatches.length, 1, "инструмент не донёс правку группы целей");
+    assert.ok(/targetadd/.test(text) && /заменяется целиком/.test(text), text);
+    const none = await tools.ycAlb({ action: "tgupdate", group: "нет-такой", newName: "x-y" });
+    assert.ok(/Не нашёл группу целей/.test(none), none);
+
+    // Имя возвращено — на нём стоят проверки карточки в других наборах.
+    const back = await call({ op: "tgupdate", group: "edge-targets", newName: "web-targets" });
+    assert.strictEqual(back.ok, true, "обратное переименование отказало: " + (back.error || ""));
+  });
+
+  await test("yc:alb: правка балансировщика — доступ-логи, авто-масштаб и сдвиг зоны", async () => {
+    const handlers = new Map();
+    const settings = settingsFor();
+    registerYcIpc(ipcDeps(handlers, settings));
+    const call = (args) => handlers.get("yc:alb")({}, args || {});
+
+    // Балансировщик берётся ПО id: имя web-lb предыдущие проверки уже сменили.
+    // Доступ-логи: группа и выключатель — ОДНО поле logOptions, и оно уходит целиком.
+    stub.created.lbPatches.length = 0;
+    const logs = await call({ op: "lbupdate", lb: "alb-web", logGroup: "lg-new" });
+    assert.strictEqual(logs.ok, true, "канал отказал на включении логов: " + (logs.error || ""));
+    const first = stub.created.lbPatches[0];
+    assert.strictEqual(first.body.updateMask, "log_options", "маска доступ-логов: " + first.body.updateMask);
+    assert.deepStrictEqual(first.body.logOptions, { logGroupId: "lg-new" }, "в теле не только группа логов: " + JSON.stringify(first.body.logOptions));
+    assert.strictEqual(logs.lb.logGroupId, "lg-new", "перечитывание не подтвердило группу логов");
+    assert.ok((logs.warnings || []).some((w) => /Cloud Logging/.test(w)), "не сказано, куда пишутся логи");
+
+    const off = await call({ op: "lbupdate", lb: "alb-web", noLogs: true });
+    assert.strictEqual(off.ok, true, off.error);
+    assert.deepStrictEqual(stub.created.lbPatches.slice(-1)[0].body.logOptions, { disable: true }, "выключатель ушёл не один: " + JSON.stringify(stub.created.lbPatches.slice(-1)[0].body.logOptions));
+    assert.strictEqual(off.lb.logsDisabled, true, "выключатель логов не подтвердился перечитыванием");
+    assert.ok((off.warnings || []).some((w) => /ВЫКЛЮЧЕНЫ/.test(w)), "не сказано, что журнал перестанет писаться");
+    const both = await call({ op: "lbupdate", lb: "alb-web", logGroup: "lg-new", noLogs: true });
+    assert.strictEqual(both.ok, false);
+    assert.ok(/разом/.test(both.error) && /logOptions/.test(both.error), both.error);
+
+    // Авто-масштаб: оба числа уходят вместе, а неназванное берётся из текущего состояния.
+    stub.created.lbPatches.length = 0;
+    const up = await call({ op: "lbupdate", lb: "alb-web", minZoneSize: 3, maxSize: 9 });
+    assert.strictEqual(up.ok, true, up.error);
+    const scaleBody = stub.created.lbPatches.slice(-1)[0].body;
+    assert.strictEqual(scaleBody.updateMask, "auto_scale_policy");
+    assert.deepStrictEqual(scaleBody.autoScalePolicy, { minZoneSize: "3", maxSize: "9" }, "авто-масштаб ушёл не парой: " + JSON.stringify(scaleBody.autoScalePolicy));
+    assert.strictEqual(up.lb.autoScale.min, "3", "минимум не подтвердился перечитыванием");
+    assert.strictEqual(up.lb.autoScale.max, "9", "максимум не подтвердился перечитыванием");
+    assert.ok((up.warnings || []).some((w) => /единиц в час|Ресурсные единицы/.test(w)), "не сказано, за что платят единицы");
+    const only = await call({ op: "lbupdate", lb: "alb-web", minZoneSize: 4 });
+    assert.deepStrictEqual(stub.created.lbPatches.slice(-1)[0].body.autoScalePolicy, { minZoneSize: "4", maxSize: "9" }, "неназванный максимум не сохранился");
+    // «Без предела» — это 0, и он тоже переживает правку одного числа.
+    const endless = await call({ op: "lbupdate", lb: "alb-web", maxSize: 0 });
+    assert.deepStrictEqual(stub.created.lbPatches.slice(-1)[0].body.autoScalePolicy, { minZoneSize: "4", maxSize: "0" }, "0 не сохранился как «без предела»");
+
+    // Отказы ДО сети: дробное, меньше двух и максимум ниже минимума × число зон.
+    const patches = stub.created.lbPatches.length;
+    const frac = await call({ op: "lbupdate", lb: "alb-web", minZoneSize: 2.5 });
+    assert.strictEqual(frac.ok, false);
+    assert.ok(/целое число/.test(frac.error), frac.error);
+    const small = await call({ op: "lbupdate", lb: "alb-web", minZoneSize: 1 });
+    assert.strictEqual(small.ok, false);
+    assert.ok(/не меньше 2/.test(small.error), small.error);
+    const tight = await call({ op: "lbupdate", lb: "alb-web", minZoneSize: 10, maxSize: 5 });
+    assert.strictEqual(tight.ok, false);
+    assert.ok(/число зон/.test(tight.error), tight.error);
+    assert.strictEqual(stub.created.lbPatches.length, patches, "отказной авто-масштаб всё равно ушёл в облако");
+
+    // Допуск к сдвигу зоны: «да»/«нет» словами, подтверждение перечитыванием.
+    const yes = await call({ op: "lbupdate", lb: "alb-https", allowZonalShift: "да" });
+    assert.strictEqual(yes.ok, true, yes.error);
+    assert.strictEqual(stub.created.lbPatches.slice(-1)[0].body.allowZonalShift, true, "допуск ушёл не булевым значением");
+    assert.strictEqual(yes.lb.allowZonalShift, true, "допуск не подтвердился перечитыванием");
+    assert.ok((yes.warnings || []).some((w) => /ВКЛЮЧЁН/.test(w)), "не сказано, что даёт допуск");
+    const no = await call({ op: "lbupdate", lb: "alb-https", allowZonalShift: "нет" });
+    assert.strictEqual(no.ok, true, no.error);
+    assert.strictEqual(no.lb.allowZonalShift, false, "снятие допуска не подтвердилось перечитыванием");
+    const garbage = await call({ op: "lbupdate", lb: "alb-https", allowZonalShift: "может быть" });
+    assert.strictEqual(garbage.ok, false);
+    assert.ok(/да или нет/.test(garbage.error), garbage.error);
+
+    // Карточка показывает настройки, а не молчит о них.
+    const card = await call({ op: "card", lb: "alb-stream" });
+    assert.ok((card.lines || []).some((l) => /доступ-логи выключены/.test(l)), (card.lines || []).join(" | "));
+    assert.ok((card.lines || []).some((l) => /без верхнего предела/.test(l)), (card.lines || []).join(" | "));
+    assert.ok((card.lines || []).some((l) => /сдвиг зоны разрешён/.test(l)), (card.lines || []).join(" | "));
+
+    // Инструмент агента: та же правка и словами про плату за единицы, а после
+    // неё карточка видит уже ВКЛЮЧЁННЫЕ логи — настройка не потерялась.
+    const tools = buildTools();
+    stub.created.lbPatches.length = 0;
+    const text = await tools.ycAlb({ action: "lbupdate", lb: "alb-web", logGroup: "lg-web2", minZoneSize: 2 });
+    assert.strictEqual(stub.created.lbPatches.length, 1, "инструмент не донёс правку балансировщика");
+    assert.ok(/МАСКОЙ/.test(text) && /Доступ-логи/.test(text), text);
+    const cardWeb = await call({ op: "card", lb: "alb-web" });
+    assert.ok((cardWeb.lines || []).some((l) => /доступ-логи в группу lg-web2/.test(l)), (cardWeb.lines || []).join(" | "));
+    assert.ok((cardWeb.lines || []).some((l) => /авто-масштаб: минимум 2 единиц на зону/.test(l)), (cardWeb.lines || []).join(" | "));
   });
 
   stub.server.close();

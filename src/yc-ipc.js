@@ -2085,7 +2085,7 @@ ipcMain.handle("yc:alb", async (_e, args) => {
   if (!ycAlb) return { ok: false, error: "Модуль Application Load Balancer не подключён к приложению (src/yc-alb.js)." };
   if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках (Настройки → «☁️ Yandex Cloud»)." };
   if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
-  const ALL = ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerupd", "routerdel", "backnew", "backupd", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"];
+  const ALL = ["list", "card", "targets", "routers", "backends", "health", "targetnew", "tgupdate", "targetadd", "targetremove", "targetdel", "routernew", "routerupd", "routerdel", "backnew", "backupd", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"];
   if (ALL.indexOf(op) === -1) return { ok: false, error: "Неизвестное действие Application Load Balancer: " + op + ". Доступно: " + ALL.join(", ") + "." };
   const ref = String(a.lb || a.id || a.name || "").trim();
   const missingLb = { ok: false, error: "Не нашёл балансировщик «" + ref + "» в каталоге. Список — действие list." };
@@ -2165,6 +2165,20 @@ ipcMain.handle("yc:alb", async (_e, args) => {
       } else {
         lines.push("Слушателей нет: балансировщик создан, но ни на одном порту не отвечает.");
       }
+      // Настройки самого ресурса: доступ-логи, авто-масштаб и сдвиг зоны. Раньше
+      // они молчали в карточке, хотя именно из-за них «не находится» разбор
+      // запросов и растёт счёт за простой.
+      const setup = [];
+      setup.push(c.lb.logsDisabled
+        ? "доступ-логи выключены"
+        : c.lb.logGroupId
+          ? "доступ-логи в группу " + c.lb.logGroupId
+          : "доступ-логи не заданы (пишутся в группу каталога по умолчанию)");
+      if (c.lb.autoScale) {
+        setup.push("авто-масштаб: минимум " + (c.lb.autoScale.min || "2") + " единиц на зону" + (c.lb.autoScale.max === "0" ? ", без верхнего предела" : ", максимум " + (c.lb.autoScale.max || "?") + " всего"));
+      }
+      setup.push(c.lb.allowZonalShift ? "сдвиг зоны разрешён" : "сдвиг зоны запрещён (по умолчанию)");
+      lines.push("Настройки: " + setup.join(" · ") + ".");
       for (const pair of c.listeners) {
         lines.push("Роутер «" + pair.router.name + "»:");
         for (const h of pair.router.hosts) {
@@ -2213,6 +2227,17 @@ ipcMain.handle("yc:alb", async (_e, args) => {
         description: a.description,
       });
       return { ok: true, changed: true, targetGroup: r.group, groupId: r.groupId, operationId: r.operationId, lines: [r.message], warnings: r.warnings || [], message: r.message };
+    }
+    if (op === "tgupdate") {
+      // Правка группы целей — это имя и описание: состав меняют точечно
+      // (targetadd/targetremove), а не правкой, где список заменяется целиком.
+      const r = await ycAlb.updateTargetGroup(cfg.oauth, {
+        folderId: cfg.folderId,
+        group: a.group || a.targetGroup || a.id || a.name,
+        newName: a.newName || a.rename,
+        description: a.description != null && String(a.description).trim() !== "" ? String(a.description).trim() : undefined,
+      });
+      return { ok: true, changed: true, targetGroup: r.group, fields: r.fields, operationId: r.operationId, lines: [r.message], warnings: r.warnings || [], message: r.message };
     }
     if (op === "targetadd" || op === "targetremove") {
       const r = await ycAlb.changeTargets(cfg.oauth, op === "targetadd" ? "add" : "remove", {
@@ -2387,15 +2412,21 @@ ipcMain.handle("yc:alb", async (_e, args) => {
       return { ok: true, changed: true, listenerName: r.listenerName, lb: r.lb, lines: [r.message], warnings: r.warnings || [], message: r.message };
     }
     if (op === "lbupdate") {
-      // Правка самого балансировщика: имя, описание и группы безопасности.
-      // Состав слушателей меняют отдельными действиями — PATCH с listenerSpecs[]
-      // стёр бы всех, кого нет в списке.
+      // Правка самого балансировщика: имя, описание, группы безопасности,
+      // доступ-логи, авто-масштаб и допуск к сдвигу зоны. Состав слушателей
+      // меняют отдельными действиями — PATCH с listenerSpecs[] стёр бы всех,
+      // кого нет в списке.
       const r = await ycAlb.updateLoadBalancer(cfg.oauth, {
         folderId: cfg.folderId,
         lb: ref,
         newName: a.newName || a.rename,
         description: a.description != null && String(a.description).trim() !== "" ? String(a.description).trim() : undefined,
         securityGroups: a.securityGroups || a.securityGroupIds,
+        logGroup: a.logGroup || a.logs || a.logGroupId,
+        noLogs: a.noLogs === true || a.disableLogs === true,
+        minZoneSize: a.minZoneSize,
+        maxSize: a.maxSize,
+        allowZonalShift: a.allowZonalShift != null ? a.allowZonalShift : a.zonalShift,
       });
       return { ok: true, changed: true, lb: r.lb, fields: r.fields, operationId: r.operationId, lines: [r.message], warnings: r.warnings || [], message: r.message };
     }
