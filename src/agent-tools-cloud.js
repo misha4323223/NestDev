@@ -61,6 +61,7 @@ function createCloudTools(deps) {
     ycAi,
     ycMonitoring,
     ycMdb,
+    ycIg,
     readYcLogsText,
     ycCliStatus,
     ycCliInstall,
@@ -483,6 +484,105 @@ function createCloudTools(deps) {
     // Создание и удаление платные/необратимые и требуют confirm: true после
     // согласия человека. Пароль пользователя облако отдаёт РОВНО ОДИН раз —
     // при создании; повторно его не покажут ни в списке, ни в консоли.
+    // ── Группы одинаковых машин (Instance Groups) ──────────────────────────────
+    // Группа — не «несколько машин», а другой ресурс: она создаёт машины по
+    // шаблону, держит их число и пересоздаёт удалённые руками. Платят МАШИНЫ
+    // группы — как обычные машины, за каждый час работы, поэтому создание и
+    // удаление требуют confirm: true после согласия человека, а размер группы
+    // называется прямо: это и есть цена.
+    "ycIg": async (args) => {
+        const cfg = ycConfig(loadSettings());
+        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
+        if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud — группы машин живут в каталоге.";
+        const action = String(args.action || "list").trim().toLowerCase();
+        const ALL = ["list", "card", "instances", "operations", "create", "start", "stop", "delete"];
+        if (ALL.indexOf(action) === -1) return "Ошибка: неизвестное действие ycIg «" + action + "». Доступно: " + ALL.join(", ") + ".";
+        const ref = String(args.group || args.groupId || args.id || args.name || "").trim();
+        try {
+          if (action === "list") {
+            const list = await ycIg.groups(cfg.oauth, cfg.folderId);
+            if (!list.length) {
+              return "Групп машин в каталоге «" + (cfg.folderName || cfg.folderId) + "» нет. Создать: ycIg { action: \"create\", name: \"web\", subnet: \"<имя подсети>\", size: 2, confirm: true } — каждая машина группы платит за час работы, как обычная машина Compute Cloud.";
+            }
+            return "Группы машин · каталог «" + (cfg.folderName || cfg.folderId) + "»\n" + list.map((g) => ycIg.groupLine(g)).join("\n") +
+              "\n\nМашины группы создаёт САМА группа: удалённая руками машина вернётся — число меняют размером группы, а не удалением машин. Каждая машина платит за час работы (ориентир: ycCosts { service: \"compute\" })." +
+              "\nКарточка: ycIg { action: \"card\", group: \"<имя>\" } — шаблон, машины, операции.";
+          }
+          if (action === "create") {
+            if (args.confirm !== true) {
+              return "Создание группы машин — решение с ценой: каждая машина группы платит за час работы, как обычная машина, а группа сама создаёт и пересоздаёт машины. Проверь имя, размер и подсеть и вызови снова с confirm: true.\n" +
+                "Будет создана группа «" + (args.name || "?") + "» · машин: " + (Number(args.size) > 0 ? Number(args.size) : 2) + " · на машину: " + (args.cores || 2) + " vCPU" + (args.memoryGb ? ", " + args.memoryGb + " ГБ" : "") + " · подсеть: " + (args.subnet || "?") + ".\n" +
+                "Ориентир цены даёт ycCosts { service: \"compute\" }, цену за час — каталог облака: ycBilling { action: \"price\", query: \"Compute\" }.";
+            }
+            const r = await ycIg.create(cfg.oauth, {
+              folderId: cfg.folderId,
+              name: args.name,
+              subnet: args.subnet || args.subnetId,
+              size: args.size,
+              cores: args.cores,
+              memoryGb: args.memoryGb,
+              coreFraction: args.coreFraction,
+              diskSizeGb: args.diskSizeGb != null ? args.diskSizeGb : args.diskGb,
+              diskType: args.diskType,
+              zone: args.zone,
+              imageFamily: args.imageFamily || args.image,
+              imageId: args.imageId,
+              platformId: args.platformId || args.platform,
+              publicIp: args.publicIp,
+              preemptible: args.preemptible,
+              securityGroups: args.securityGroups || args.securityGroupIds,
+              serviceAccountId: args.serviceAccountId,
+              sshPublicKey: args.sshPublicKey,
+              sshUser: args.sshUser,
+              description: args.description,
+            });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "") +
+              (r.groupId ? "\nСледить: ycIg { action: \"card\", group: \"" + r.groupId + "\" }." : "");
+          }
+          const g = await ycIg.findGroup(cfg.oauth, cfg.folderId, ref);
+          if (!g && action !== "delete") return "Ошибка: не нашёл группу «" + ref + "» в каталоге. Список — ycIg { action: \"list\" }.";
+          if (action === "card") {
+            const c = await ycIg.card(cfg.oauth, cfg.folderId, ref);
+            if (!c) return "Ошибка: не нашёл группу «" + ref + "» в каталоге.";
+            const t = c.group.template;
+            return ycIg.groupLine(c.group) + "\n" +
+              "Шаблон: " + (t.platformId || "—") + " · " + (t.cores || "?") + " vCPU" + (t.memoryHuman ? ", " + t.memoryHuman : "") + (t.diskHuman ? " · диск " + t.diskHuman : "") + (t.hasPublicIp ? " · с публичным адресом" : " · без публичного адреса") + (t.preemptible ? " · прерываемые" : "") +
+              ((c.group.targetGroupId || c.group.appTargetGroupId) ? "\nОтдаёт трафик балансировщику: target group " + (c.group.targetGroupId || c.group.appTargetGroupId) : "") +
+              "\nМашины (" + c.instances.length + "):" + (c.instances.length ? "\n  " + c.instances.map((i) => ycIg.instanceLine(i)).join("\n  ") : " пока нет") +
+              (c.operations.length ? "\nОперации: " + c.operations.slice(0, 5).map((o) => (o.done ? "✓" : "…") + " " + (o.description || o.id)).join(" · ") : "") +
+              "\nПитание: ycIg { action: \"stop\", group: \"" + c.group.name + "\" } — машины перестают платить за вычисления (диски продолжают).";
+          }
+          if (action === "instances") {
+            const list = await ycIg.instances(cfg.oauth, g.id);
+            return list.length
+              ? "Машины группы «" + g.name + "» (" + list.length + "):\n  " + list.map((i) => ycIg.instanceLine(i)).join("\n  ")
+              : "Машин в группе «" + g.name + "» нет: группа их создаёт по шаблону — подожди или проверь состояние группы (карточка).";
+          }
+          if (action === "operations") {
+            const list = await ycIg.operations(cfg.oauth, g.id);
+            return list.length
+              ? "Операции группы «" + g.name + "» (" + list.length + "):\n  " + list.map((o) => (o.done ? "✓" : "…") + " " + (o.description || o.id) + (o.createdAt ? " · " + o.createdAt : "")).join("\n  ")
+              : "Операций у группы «" + g.name + "» не видно.";
+          }
+          if (action === "start" || action === "stop") {
+            const r = await ycIg.power(cfg.oauth, action, g, { folderId: cfg.folderId });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "");
+          }
+          if (action === "delete") {
+            const target = g || (await ycIg.findGroup(cfg.oauth, cfg.folderId, ref));
+            if (!target) return "Ошибка: не нашёл группу «" + ref + "» в каталоге.";
+            if (args.confirm !== true) {
+              return "Удаление группы «" + target.name + "» необратимо: она будет удалена ВМЕСТЕ с машинами" + (target.targetSize ? " (" + target.targetSize + " шт.)" : "") + " и их дисками — снимки нужно сделать заранее. Вызови снова с confirm: true после согласия человека.";
+            }
+            const r = await ycIg.remove(cfg.oauth, { folderId: cfg.folderId, group: target });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "");
+          }
+          return "Ошибка: неизвестное действие ycIg «" + action + "». Доступно: " + ALL.join(", ") + ".";
+        } catch (e) {
+          return "Instance Groups (ycIg, действие " + action + "): " + ((e && e.message) || String(e));
+        }
+    },
+
     "ycMdb": async (args, settings) => {
         const cfg = ycConfig(loadSettings());
         if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
@@ -627,7 +727,7 @@ function createCloudTools(deps) {
         }
     },
 
-    // ── Яндекс AI: перевод, текст со снимка и речь ─────────────────────────────
+    // ── Яндекс AI: перевод, текст со снимка, речь и модели AI Studio ───────────
     // Четыре сервиса в ОДНОМ инструменте, потому что задача у них одна —
     // превратить одно в другое: язык в язык, картинку в текст, текст в звук,
     // звук в текст. Чекбоксы разрешений не спрашиваем: это не ресурсы каталога,
@@ -635,12 +735,14 @@ function createCloudTools(deps) {
     // об этом прямо, а не удивляет счётом.
     // Формы принимают СПИСКИ: targets (несколько языков), files (несколько
     // снимков), voices (несколько голосов) — «сразу пачкой» здесь и есть смысл.
+    // AI Studio — тот же токен и каталог: список моделей каталога (Models API),
+    // ответ модели (TextGeneration), токены (бесплатно, до запроса) и векторы.
     "ycAi": async (args, settings) => {
         const cfg = ycConfig(loadSettings());
         if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud» (SpeechKit, Vision и Translate работают по тому же токену).";
         if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud — сервисы Яндекс AI привязаны к каталогу.";
         const action = String(args.action || "translate").trim().toLowerCase();
-        const ALL = ["translate", "languages", "ocr", "speak", "listen", "voices"];
+        const ALL = ["translate", "languages", "ocr", "speak", "listen", "voices", "models", "tokens", "complete", "embed"];
         if (ALL.indexOf(action) === -1) {
           return "Ошибка: неизвестное действие ycAi «" + action + "». Доступно: " + ALL.join(", ") + ".";
         }
@@ -687,6 +789,45 @@ function createCloudTools(deps) {
               r.voices.map((v) => "• " + v.id + (v.lang ? " — " + v.lang : "") + (v.who && v.who !== v.id ? " · " + v.who : "")).join("\n") +
               "\n\nОзвучить: ycAi { action: \"speak\", text: \"…\", voices: [\"alena\", \"filipp\"] } — голосов можно указать несколько, каждый станет отдельным файлом." +
               "\nЭмоции (good / evil / neutral) понимают только русские голоса; формат по умолчанию mp3, для иного укажи format: oggopus, lpcm, wav.";
+          }
+          if (action === "models") {
+            const r = await ycAi.listModels(cfg.oauth, cfg.folderId);
+            if (!r.models.length) return "Облако не отдало список моделей AI Studio — попробуй позже.";
+            return "Модели AI Studio" + (r.fromCloud ? " (список каталога «" + (cfg.folderName || cfg.folderId) + "»)" : " (проверенные; облако список не отдало)") + ":\n" +
+              r.models.map((m) => "• " + m.id + (m.kind ? " — " + m.kind : "") + (m.who ? " · " + m.who : "")).join("\n") +
+              "\n\nСпросить модель: ycAi { action: \"complete\", prompt: \"…\", model: \"yandexgpt-5-lite\" }. " + ycAi.aiPriceLine("yandexgpt-5-lite") +
+              "\nПеред платным запросом посчитай токены — это БЕСПЛАТНО: ycAi { action: \"tokens\", text: \"…\", model: \"…\" }.";
+          }
+          if (action === "tokens") {
+            const text = String(args.text || args.prompt || "").trim();
+            if (!text) return "Ошибка: нужен text (или prompt) — текст, токены которого посчитать. Это бесплатно.";
+            const model = String(args.model || "yandexgpt-5-lite").trim();
+            const r = await ycAi.tokenize(cfg.oauth, { text: text, model: model, folderId: cfg.folderId });
+            return "Токены текста: " + r.count + " (модель " + ycAi.modelNameOf(r.modelUri) + ", " + text.length + " символов)" +
+              (r.first.length ? "\nПервые токены: " + r.first.join(" · ") : "") +
+              "\n\nТокенизация бесплатна — считай ДО запроса. " + ycAi.aiPriceLine(r.modelUri) +
+              "\nОтвет: ycAi { action: \"complete\", prompt: \"…\", model: \"" + model + "\" }.";
+          }
+          if (action === "complete") {
+            const prompt = String(args.prompt || args.text || args.question || "").trim();
+            if (!prompt) return "Ошибка: нужен prompt (или text) — запрос к модели AI Studio.";
+            const model = String(args.model || "yandexgpt-5-lite").trim();
+            const r = await ycAi.complete(cfg.oauth, { prompt: prompt, system: args.system, model: model, temperature: args.temperature, maxTokens: args.maxTokens, folderId: cfg.folderId });
+            const t = r.text.length > 6000 ? r.text.slice(0, 6000) + "\n…(всего " + r.text.length + " символов)" : r.text;
+            const cost = ycAi.aiCostText(r.modelUri, r.usage);
+            return t + "\n\n— модель " + ycAi.modelNameOf(r.modelUri) + (r.modelVersion ? " (" + r.modelVersion + ")" : "") +
+              (r.usage.total ? ", токенов: вход " + r.usage.input + ", ответ " + r.usage.output : "") +
+              (cost ? ", " + cost : "") + "\n" + ycAi.aiPriceLine(r.modelUri) +
+              "\nСписок моделей: ycAi { action: \"models\" }.";
+          }
+          if (action === "embed") {
+            const text = String(args.text || "").trim();
+            if (!text) return "Ошибка: нужен text — текст, который превратить в вектор; модель — имя (text-search-doc) или полный адрес.";
+            const model = String(args.model || "text-search-doc").trim();
+            const r = await ycAi.embed(cfg.oauth, { text: text, model: model, folderId: cfg.folderId });
+            return "Вектор текста готов: " + r.dims + " чисел, модель " + ycAi.modelNameOf(r.modelUri) + ".\nПервые числа: " + r.vector.slice(0, 8).map((x) => String(Math.round(x * 1000) / 1000)).join(", ") + ", …" +
+              "\n\nВекторизация платная: " + ycAi.aiPriceLine(r.modelUri) +
+              "\nДокументы и запросы векторизуют РАЗНЫМИ моделями (text-search-doc и text-search-query) — близость между чужими пространствами смысла не имеет.";
           }
           if (action === "ocr") {
             const files = asList(args.files && args.files.length ? args.files : args.file);

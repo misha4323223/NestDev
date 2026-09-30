@@ -1129,6 +1129,20 @@ const ycMdb = createYcMdb({
   serviceError: yandexCloud.serviceError,
   isNetworkError: yandexCloud.isNetworkError,
 });
+
+// Группы машин (Instance Groups) — своим модулем (часть 91). Хост тот же, что у
+// машин (compute.api.cloud.yandex.net), но это ДРУГОЙ ресурс: группа сама
+// создаёт машины по шаблону, держит их число и пересоздаёт удалённые руками.
+// waitOperation нужен созданию, питанию и удалению: группа перестраивается не
+// мгновенно, и без ожидания операция осталась бы без ответа.
+const { createYcIg } = require("./yc-ig.js");
+const ycIg = createYcIg({
+  fetchJson: yandexCloud._fetchJson,
+  endpoint: yandexCloud.endpoint,
+  getIamToken: yandexCloud.getIamToken,
+  waitOperation: yandexCloud.waitOperation,
+  serviceError: yandexCloud.serviceError,
+});
 const ycService = createYcService({ app, path, net, secrets, yandexCloud, ycCli, ycLogs, ycEnsurePath, loadSettings });
 const {
   ycConfig,
@@ -1145,7 +1159,7 @@ const {
 // ycAi — тот же экземпляр модуля, что у агента (один кэш IAM-токена); fs, path,
 // resolvePath и agentWorkDir нужны каналу «yc:ai»: снимки и записи он читает с
 // диска, а синтезированную речь кладёт в рабочую папку агента.
-registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, fs, path, resolvePath, agentWorkDir, loadSettings, saveSettings, svc: ycService });
+registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, ycIg, fs, path, resolvePath, agentWorkDir, loadSettings, saveSettings, svc: ycService });
 
 // Память диалогов: каналы дневника памяток и запись самой памятки при сжатии контекста
 // (её кладёт прогон через onMemo). Собирается ПОСЛЕ путей-и-git и миссий: зеркало
@@ -1400,6 +1414,7 @@ const { executeTool } = createToolRegistry({
   ycAi,
   ycMonitoring,
   ycMdb,
+  ycIg,
   readYcLogsText,
 
   ycCliStatus,

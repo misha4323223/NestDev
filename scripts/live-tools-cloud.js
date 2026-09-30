@@ -57,7 +57,17 @@
          engine), needsConfirm вместо отказа и пароль отдельным полем secret;
      [18] yc:dns: канал ОКНА — зоны каталога, записи зоны, постановка записи
          значениями через запятую и согласие на удаление (CNAME на вершине
-         отбивается ДО сети).
+         отбивается ДО сети);
+     [19] ycAi: AI Studio — модели каталога (каталог в заголовке
+         OpenAI-Project), бесплатный счёт токенов, ответ модели с ценой по
+         настоящим токенам и вектор с префиксом emb://;
+     [20] yc:ai: канал ОКНА — те же четыре действия AI Studio через
+         настоящий main.js: строки, токены ответа и размерность вектора;
+     [21] ycIg: ГРУППЫ МАШИН — группа читается со счётом машин (в том числе
+         устаревших, которые группа пересоздаст), создание уходит с подсетью,
+         образом по семейству и размером группы, а без согласия не уходит вовсе;
+     [22] yc:ig: канал ОКНА — тот же модуль через настоящий main.js: список,
+         карточка с машинами и согласие на платное и необратимое.
 
    Ничего в репозитории приложения не пишется: всё в temp-папках. */
 
@@ -124,6 +134,12 @@ const dbTables = new Map();
 // несколько языков ушло несколько запросов», «синтез речи ушёл ФОРМОЙ», «текст
 // со снимка прочитан» — то есть каждая из ЧЕТЫРЁХ разных форм запроса.
 const aiCalls = [];
+// Запросы Групп машин (Instance Groups): на них держатся проверки «создание
+// ушло с размером группы и подсетью», «удаление забрало машины вместе с
+// группой» и «на отказе без согласия в облако не ушло ничего». Стенд помнит
+// удаление — по этому видно, что удаление правда выполнено, а не «запущено».
+const igCalls = [];
+const igState = { created: [], deleted: new Set(), status: "ACTIVE" };
 // Запросы Monitoring: на них держится проверка «данные ушли телом с прореживанием,
 // а метаданные — строкой», и что полка видит метрики каталога.
 const monCalls = [];
@@ -353,6 +369,42 @@ function startFakeYc() {
           return res.end(audio);      }
       if (p === "/speech/v1/stt:recognize") return json({ result: "включи свет на кухне" });
       }
+      // ── AI Studio: модели каталога, ответ, токены и вектор ───────────────
+      // И здесь две формы одного сервиса: список моделей — OpenAI-совместимый
+      // GET с каталогом в заголовке OpenAI-Project, а генерация, токены и
+      // векторы — старый REST foundationModels с каталогом В ТЕЛЕ и адресом
+      // модели (gpt:// для текста, emb:// для векторов).
+      if (p === "/v1/models" || /^\/foundationModels\/v1\//.test(p)) {
+        aiCalls.push({
+          method: req.method, path: p, search: u.search || "",
+          auth: String(req.headers.authorization || ""), project: String(req.headers["openai-project"] || ""),
+          folder: String(req.headers["x-folder-id"] || ""),
+          contentType: String(req.headers["content-type"] || ""), body: body,
+        });
+        if (p === "/v1/models") {
+          return json({
+            data: [
+              { id: "yandexgpt-5-lite", owned_by: "yandex" },
+              { id: "yandexgpt-5.1", owned_by: "yandex" },
+              { id: "text-search-doc", owned_by: "yandex" },
+            ],
+          });
+        }
+        if (p === "/foundationModels/v1/completion") {
+          let b = {};
+          try { b = body ? JSON.parse(body) : {}; } catch { b = {}; }
+          const asked = (b.messages || []).map((m) => m.text).join(" | ");
+          return json({
+            result: {
+              alternatives: [{ message: { text: "Модель услышала: " + asked }, status: "ALTERNATIVE_STATUS_FINAL" }],
+              usage: { inputTextTokens: "1200", completionTokens: "400", totalTokens: "1600" },
+              modelVersion: "v5.1",
+            },
+          });
+        }
+        if (p === "/foundationModels/v1/tokenizeCompletion") return json({ tokens: [{ text: "Счёт" }, { text: " на" }, { id: 17 }] });
+        if (p === "/foundationModels/v1/textEmbedding") return json({ embedding: Array.from({ length: 256 }, (_, i) => (i + 1) / 1000) });
+      }
       // ── Managed-базы: PostgreSQL, MySQL и ClickHouse ─────────────────────
       // Сеть VPC нужна здесь ровно за одним полем — networkId подсети: без него
       // кластер не создать, и модуль ищет его сам.
@@ -404,6 +456,63 @@ function startFakeYc() {
           config: { version: "16", resources: { resourcePresetId: "s2.micro", diskSize: "21474836480", diskTypeId: "network-ssd" } },
         });
       }
+      // ── Группы машин (Instance Groups) ────────────────────────────────────
+      // Хост тот же, что у Compute (адрес выверен в KNOWN_ENDPOINTS), но ресурс
+      // ДРУГОЙ: группа сама создаёт машины по шаблону и держит их число. Стенд
+      // отдаёт одну группу с настоящим шаблоном и счётчиками машин, умеет её
+      // создавать, останавливать и удалять — и помнит удаление.
+      if (p === "/compute/v1/images:latestByFamily") return json({ id: "img-ubuntu", name: "ubuntu-2204-lts" });
+      if (p === "/vpc/v1/securityGroups") return json({ securityGroups: [{ id: "sg-web", name: "web" }] });
+      if (p === "/compute/v1/instanceGroups" || p.indexOf("/compute/v1/instanceGroups/") === 0) {
+        igCalls.push({ method: req.method, path: p, search: u.search || "", body: body });
+        if (req.method === "POST" && p === "/compute/v1/instanceGroups") {
+          igState.created.push(body);
+          return json({ id: "op-ig-create", done: false });
+        }
+        if (/:start$/.test(p)) { igState.status = "ACTIVE"; return json({ id: "op-ig-start", done: false }); }
+        if (/:stop$/.test(p)) { igState.status = "STOPPED"; return json({ id: "op-ig-stop", done: false }); }
+        if (req.method === "DELETE") { igState.deleted.add(p.split("/").pop()); return json({ id: "op-ig-del", done: false }); }
+        if (/\/instances$/.test(p)) {
+          return json({
+            instances: [
+              { id: "epd1", instanceId: "epd1", name: "web-1", fqdn: "web-1.auto.internal", status: "RUNNING_ACTUAL", zoneId: "ru-central1-a",
+                networkInterfaces: [{ subnetId: "sub-a", primaryV4Address: { address: "10.10.0.5", oneToOneNat: { address: "203.0.113.5" } } }] },
+              { id: "epd2", instanceId: "epd2", name: "web-2", fqdn: "web-2.auto.internal", status: "RUNNING_OUTDATED", statusMessage: "обновление конфигурации", zoneId: "ru-central1-a",
+                networkInterfaces: [{ subnetId: "sub-a", primaryV4Address: { address: "10.10.0.6" } }] },
+            ],
+          });
+        }
+        if (/\/operations$/.test(p)) {
+          return json({ operations: [{ id: "op-ig-1", description: "Create instance group", createdAt: "2026-08-01T09:00:00Z", done: true }] });
+        }
+        if (p === "/compute/v1/instanceGroups") {
+          return json({
+            instanceGroups: igState.deleted.has("ig-web") ? [] : [{
+              id: "ig-web", name: "web", folderId: "f1", createdAt: "2026-08-01T10:00:00Z",
+              status: igState.status, deletionProtection: false, serviceAccountId: "sa-1",
+              instanceTemplate: {
+                platformId: "standard-v3", resourcesSpec: { cores: "2", memory: "2147483648", coreFraction: "100" },
+                bootDiskSpec: { diskSpec: { typeId: "network-ssd", size: "21474836480", imageId: "img-ubuntu" } },
+                networkInterfaceSpecs: [{ networkId: "net-1", subnetIds: ["sub-a"], securityGroupIds: ["sg-web"], primaryV4AddressSpec: { oneToOneNatSpec: { ipVersion: "IPV4" } } }],
+              },
+              scalePolicy: { fixedScale: { size: "3" } },
+              allocationPolicy: { zones: [{ zoneId: "ru-central1-a" }] },
+              loadBalancerState: { targetGroupId: "tg-nlb-1" },
+              healthChecksSpec: { healthCheckSpecs: [{}] },
+              managedInstancesState: { targetSize: "3", runningActualCount: "1", runningOutdatedCount: "1", processingCount: "1" },
+            }],
+          });
+        }
+        // Удалённой группы больше нет — по этому и видно, что удаление выполнено.
+        if (igState.deleted.has(p.split("/").pop())) return json({ message: "Instance group not found" }, 404);
+        return json({
+          id: "ig-web", name: "web", folderId: "f1", status: igState.status,
+          instanceTemplate: { resourcesSpec: { cores: "2", memory: "2147483648", coreFraction: "100" }, networkInterfaceSpecs: [{ primaryV4AddressSpec: { oneToOneNatSpec: {} } }] },
+          scalePolicy: { fixedScale: { size: "3" } }, allocationPolicy: { zones: [{ zoneId: "ru-central1-a" }] },
+          managedInstancesState: { targetSize: "3", runningActualCount: "1", runningOutdatedCount: "1", processingCount: "1" },
+        });
+      }
+
       // Прочие сервисы каталога: пустой список — этого достаточно для сводки.
       return json({});
     });
@@ -530,9 +639,9 @@ watchdog.unref();
 
   console.log("\n[2] инструменты облака отвечают через настоящий реестр");
   const tools = seenWiring.tools || {};
-  const cloudNames = ["ycStatus", "ycList", "ycCreate", "ycCosts", "ycDelete", "ycDeploy", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycDb", "ycAi", "ycMonitor", "ycMdb", "ycLogs", "ycInstall"];
+  const cloudNames = ["ycStatus", "ycList", "ycCreate", "ycCosts", "ycDelete", "ycDeploy", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycDb", "ycAi", "ycMonitor", "ycMdb", "ycIg", "ycLogs", "ycInstall"];
   const missing = cloudNames.filter((n) => typeof tools[n] !== "function");
-  ok(missing.length === 0, "все семнадцать на месте" + (missing.length ? ": нет " + missing.join(", ") : ""));
+  ok(missing.length === 0, "все восемнадцать на месте" + (missing.length ? ": нет " + missing.join(", ") : ""));
   const unknown = await call("ycContainer", { action: "overview" });
   ok(!/неизвестный инструмент/.test(plain(unknown)), "реестр знает ycContainer: " + plain(unknown).slice(0, 60));
 
@@ -1009,6 +1118,149 @@ watchdog.unref();
   const uiDnsNoFolder = await callDns({ op: "zones" });
   ok(uiDnsNoFolder.ok === false && /Не выбран каталог/.test(uiDnsNoFolder.error || ""), "без каталога — отказ словами");
   writeSettings();
+
+  // ── AI Studio: модели, токены, ответ и вектор (часть 90) ────────────────
+  // Модели AI Studio в приложении были только как провайдер чата; у ОБЛАЧНОГО
+  // инструмента их не было. Проверяем обе половины сразу: список моделей идёт
+  // OpenAI-совместимым GET-ом с каталогом в заголовке, а ответ, токены и вектор —
+  // старым REST-ом с адресом модели в теле (gpt:// и emb:// — РАЗНЫЕ префиксы).
+  console.log("\n[19] ycAi: AI Studio — модели, токены, ответ и вектор");
+  const aiModels = plain(await call("ycAi", { action: "models" }));
+  ok(/yandexgpt-5-lite/.test(aiModels) && /text-search-doc/.test(aiModels), "модели каталога перечислены: " + lineN(aiModels, 1));
+  ok(/бесплатн/i.test(aiModels) && /0\.2 ₽/.test(aiModels), "сказано, что список и токены бесплатны, а ответ платный");
+  const listCall = aiCalls.filter((c) => c.path === "/v1/models").pop() || {};
+  ok(listCall.project === "f1" && /^Bearer /.test(listCall.auth), "каталог ушёл заголовком OpenAI-Project, авторизация — IAM-токеном");
+
+  const aiTokens = plain(await call("ycAi", { action: "tokens", text: "Счёт на четыре тысячи рублей" }));
+  ok(/Токены текста: 3/.test(aiTokens), "токены посчитаны: " + lineN(aiTokens, 0));
+  const tokCall = aiCalls.filter((c) => c.path === "/foundationModels/v1/tokenizeCompletion").pop() || {};
+  let tokBody = {};
+  try { tokBody = JSON.parse(tokCall.body || "{}"); } catch { tokBody = {}; }
+  ok(tokBody.modelUri === "gpt://f1/yandexgpt-5-lite" && tokBody.text === "Счёт на четыре тысячи рублей", "тело токенизации собрано адресом модели: " + (tokCall.body || ""));
+
+  const aiDone = plain(await call("ycAi", { action: "complete", prompt: "Сколько будет 2+2?", system: "Отвечай коротко" }));
+  ok(/Модель услышала: Отвечай коротко \| Сколько будет 2\+2\?/.test(aiDone), "ответ модели показан: " + lineN(aiDone, 0));
+  ok(/вход 1200, ответ 400/.test(aiDone) && /≈ 0\.32 ₽/.test(aiDone), "токены и цена ответа посчитаны: " + lineN(aiDone, 2));
+  const doneCall = aiCalls.filter((c) => c.path === "/foundationModels/v1/completion").pop() || {};
+  let doneBody = {};
+  try { doneBody = JSON.parse(doneCall.body || "{}"); } catch { doneBody = {}; }
+  ok(doneBody.completionOptions && doneBody.completionOptions.stream === false && doneBody.completionOptions.maxTokens === "2000", "ответ запрошен синхронно, длина ушла строкой: " + JSON.stringify(doneBody.completionOptions));
+  ok((doneBody.messages || []).map((m) => m.role).join(",") === "system,user", "роль ушла первой, запрос — вторым");
+
+  const aiVec = plain(await call("ycAi", { action: "embed", text: "договор поставки", model: "text-search-doc" }));
+  ok(/256 чисел/.test(aiVec) && /text-search-doc/.test(aiVec), "вектор посчитан: " + lineN(aiVec, 0));
+  ok(/0\.0101/.test(aiVec), "тариф векторов назван");
+  const vecCall = aiCalls.filter((c) => c.path === "/foundationModels/v1/textEmbedding").pop() || {};
+  let vecBody = {};
+  try { vecBody = JSON.parse(vecCall.body || "{}"); } catch { vecBody = {}; }
+  ok(vecBody.modelUri === "emb://f1/text-search-doc", "адрес вектора собран с префиксом emb://: " + vecBody.modelUri);
+
+  const aiRef = aiCalls.length;
+  ok(/нужен prompt/.test(plain(await call("ycAi", { action: "complete" }))), "без запроса — отказ словами до сети");
+  ok(/нужен text/.test(plain(await call("ycAi", { action: "tokens" }))), "без текста — отказ словами до сети");
+  ok(aiCalls.length === aiRef, "на отказах в облако не ушло ничего");
+
+  // ── Те же четыре действия — из ОКНА (часть 90) ──────────────────────────
+  // Канал «yc:ai» — второй вход в тот же модуль: окно не должно видеть ни
+  // адресов модели, ни разбора ответа — оно получает готовые строки, токены
+  // ответа для показа и размерность вектора.
+  console.log("\n[20] yc:ai: AI Studio из окна — модели, токены, ответ и вектор");
+  const uiModels = await callAi({ op: "models" });
+  ok(uiModels.ok === true && (uiModels.lines || []).length === 3, "модели каталога пришли строками: " + ((uiModels.lines || [])[0] || ""));
+  const uiModelsCall = aiCalls.filter((c) => c.path === "/v1/models").pop() || {};
+  ok(uiModelsCall.project === "f1", "окно тоже называет каталог заголовком");
+  const uiTokens = await callAi({ op: "tokens", text: "Счёт на четыре тысячи рублей" });
+  ok(uiTokens.ok === true && uiTokens.tokens === 3, "токены из окна: " + uiTokens.tokens);
+  ok((uiTokens.warnings || []).join(" ").includes("Токенизация бесплатна"), "окно говорит, что токенизация бесплатна");
+  const uiComplete = await callAi({ op: "complete", prompt: "Сколько будет 2+2?", system: "Отвечай коротко" });
+  ok(uiComplete.ok === true && /Модель услышала/.test(uiComplete.answer || ""), "ответ модели вернулся в окно: " + String(uiComplete.answer || "").slice(0, 80));
+  ok(uiComplete.usage && uiComplete.usage.input === 1200 && uiComplete.usage.output === 400, "окно получило токены ответа для показа");
+  ok((uiComplete.lines || []).join("\n").includes("≈ 0.32 ₽"), "цена ответа показана в строках");
+  const uiEmbed = await callAi({ op: "embed", text: "договор поставки" });
+  ok(uiEmbed.ok === true && uiEmbed.dims === 256, "вектор из окна: " + uiEmbed.dims + " чисел");
+  ok(/Первые числа: 0\.001/.test((uiEmbed.lines || []).join("\n")), "первые числа вектора показаны");
+  const uiRef = aiCalls.length;
+  ok((await callAi({ op: "tokens" })).ok === false, "пустые токены из окна отклонены до сети");
+  ok((await callAi({ op: "complete" })).ok === false, "пустой запрос из окна отклонён до сети");
+  ok(aiCalls.length === uiRef, "на отказах окно в облако не ходило");
+
+  // ── Группы машин: группа не «несколько машин» (часть 91) ───────────────
+  // Группа сама создаёт машины по шаблону, держит их число и пересоздаёт
+  // удалённые. Платят МАШИНЫ группы — за час, как обычные, поэтому создание и
+  // удаление требуют согласия, а отказ обязан назвать цену и последствия.
+  console.log("\n[21] ycIg: Группы машин — размер, карточка, создание и отказы");
+  const igList = plain(await call("ycIg", { action: "list" }));
+  ok(/Группы машин/.test(igList) && /web/.test(igList), "группа каталога показана: " + lineN(igList, 1));
+  ok(/3 машин/.test(igList) && /машин 1\/3/.test(igList), "размер группы и счёт машин названы: " + lineN(igList, 1));
+  ok(/устаревших 1/.test(igList), "устаревшие машины названы — группа их пересоздаст");
+  ok(/ycCosts/.test(igList) && /платит за час/.test(igList), "сказано, что платят машины группы, и где смотреть цену");
+  ok(/удалённая руками машина вернётся/.test(igList), "сказано главное: машины группы пересоздаются сами");
+  const igListCall = igCalls.filter((c) => c.path === "/compute/v1/instanceGroups").pop() || {};
+  ok(/folderId=f1/.test(igListCall.search || ""), "список ушёл с каталогом: " + (igListCall.search || ""));
+
+  const igCard = plain(await call("ycIg", { action: "card", group: "web" }));
+  ok(/Шаблон: standard-v3/.test(igCard), "карточка назвала шаблон: " + lineN(igCard, 1));
+  ok(/Машины \(2\):/.test(igCard) && /203\.0\.113\.5/.test(igCard), "машины группы показаны с адресами: " + lineN(igCard, 3));
+  ok(/балансировщику/.test(igCard) && /target group tg-nlb-1/.test(igCard), "карточка назвала связь с балансировщиком: " + lineN(igCard, 2));
+  ok(/операц/i.test(igCard), "история операций показана");
+
+  writeSettings({ ycAllowAgentCreate: true });
+  const igNoConfirm = plain(await call("ycIg", { action: "create", name: "web-2", subnet: "app-subnet", size: 2 }));
+  ok(/ценой/.test(igNoConfirm) && /confirm: true/.test(igNoConfirm), "создание без согласия назвало цену и ждёт согласия");
+  ok(igState.created.length === 0, "без согласия группа не создана");
+  const igCreate = plain(await call("ycIg", { action: "create", name: "web-2", subnet: "app-subnet", size: 2, publicIp: true, securityGroups: ["web"], confirm: true }));
+  ok(/web-2/.test(igCreate) && /машин 2/.test(igCreate), "группа создана и названа: " + lineN(igCreate, 0));
+  const createdBody = JSON.parse(igState.created[0] || "{}");
+  ok(createdBody.scalePolicy && createdBody.scalePolicy.fixedScale.size === "2", "размер группы ушёл в scalePolicy.fixedScale: " + JSON.stringify(createdBody.scalePolicy));
+  ok(createdBody.instanceTemplate.networkInterfaceSpecs[0].subnetIds[0] === "sub-a", "подсеть ушла в шаблон машины");
+  ok(createdBody.instanceTemplate.bootDiskSpec.diskSpec.imageId === "img-ubuntu", "образ найден по семейству");
+  ok(createdBody.instanceTemplate.networkInterfaceSpecs[0].securityGroupIds[0] === "sg-web", "группа безопасности разрешена по имени");
+  ok(createdBody.allocationPolicy.zones[0].zoneId === "ru-central1-a", "зона взята у подсети");
+
+  const igStop = plain(await call("ycIg", { action: "stop", group: "web" }));
+  ok(/останавливается/.test(igStop) && /диски/.test(igStop), "остановка названа и сказано про диски: " + lineN(igStop, 0));
+  ok(igState.status === "STOPPED", "состояние группы правда изменилось: " + igState.status);
+  const igNoDel = plain(await call("ycIg", { action: "delete", group: "web" }));
+  ok(/необратимо/.test(igNoDel) && /ВМЕСТЕ с машинами/.test(igNoDel) && /confirm: true/.test(igNoDel), "удаление без согласия назвало последствия");
+  ok(igState.deleted.size === 0, "без согласия группа не удалена");
+  const igDel = plain(await call("ycIg", { action: "delete", group: "web", confirm: true }));
+  ok(/удаляется/.test(igDel) && /дисками/.test(igDel), "удаление выполнено и объяснено: " + lineN(igDel, 0));
+  ok(igState.deleted.has("ig-web"), "удаление действительно дошло до облака");
+  const igGone = plain(await call("ycIg", { action: "card", group: "web" }));
+  ok(/не нашёл группу/.test(igGone), "удалённой группы больше нет: " + lineN(igGone, 0));
+
+  const igBad = igCalls.length;
+  ok(/неизвестное действие ycIg/.test(plain(await call("ycIg", { action: "nope" }))), "чужое действие отбито словами");
+  ok(/нужно имя|Не указано имя/.test(plain(await call("ycIg", { action: "create", confirm: true }))), "создание без имени отбито до сети");
+  ok(igCalls.length === igBad, "на отказах в облако не ушло ничего");
+  writeSettings();
+
+  // ── Те же действия — из ОКНА (часть 91) ────────────────────────────────
+  // Канал «yc:ig» — второй вход в тот же модуль: окно получает готовые строки,
+  // id созданной группы и предупреждения, а согласие спрашивает флагом confirm.
+  console.log("\n[22] yc:ig: группы машин из окна — список, карточка и согласие");
+  // Стенд возвращает группу: проверка удаления уже сделана выше, а этому
+  // разделу нужна группа, с которой окно работает (как после пересоздания).
+  igState.deleted.clear();
+  igState.status = "ACTIVE";
+  const igHandler = handlers.get("yc:ig");
+  ok(typeof igHandler === "function", "канал yc:ig зарегистрирован настоящим main.js");
+  const callIg = (args) => igHandler({}, args || {});
+  const uiIgList = await callIg({ op: "list" });
+  ok(uiIgList.ok === true && (uiIgList.lines || []).length === 1, "список групп пришёл строками: " + ((uiIgList.lines || [])[0] || ""));
+  ok(/машин 1\/3/.test((uiIgList.lines || [])[0] || ""), "окно видит счёт машин группы");
+  ok((uiIgList.warnings || []).join(" ").includes("устаревш"), "окно предупреждено про устаревшие машины");
+  const uiIgCard = await callIg({ op: "card", group: "web" });
+  ok(uiIgCard.ok === true && (uiIgCard.lines || []).some((l) => /Шаблон:/.test(l)), "карточка группы собрана из строк: " + JSON.stringify((uiIgCard.lines || []).slice(0, 2)));
+  ok((uiIgCard.instances || []).length === 2, "машины группы вернулись окну: " + (uiIgCard.instances || []).length);
+  const uiIgNew = await callIg({ op: "create", name: "web-3", subnet: "app-subnet", size: 2 });
+  ok(uiIgNew.ok === false && uiIgNew.needsConfirm === true, "создание из окна спросило человека, а не отказало");
+  ok(/ценой/.test(uiIgNew.error || "") && (uiIgNew.lines || []).some((l) => /Машин: 2/.test(l)), "вопрос назвал цену и размер: " + JSON.stringify((uiIgNew.lines || [])[0]));
+  const uiIgRef = igCalls.length;
+  ok((await callIg({ op: "create", name: "web-3", subnet: "app-subnet", size: 2, confirm: true })).ok === true, "с согласием создание прошло");
+  ok(igCalls.length > uiIgRef, "и действительно ушло в облако");
+  const uiIgNoAuth = await callIg({ op: "nope" });
+  ok(uiIgNoAuth.ok === true || uiIgNoAuth.ok === false, "чужое действие не сломало канал");
 
   srv.close();
   clearTimeout(watchdog);

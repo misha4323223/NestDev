@@ -57,6 +57,10 @@
     // DNS-зоны и записи: записи умели агент и карточка зоны, а у плитки действий
     // не было вовсе. Канал один на зоны и записи: они живут вместе.
     dns: "ycDns",
+    // Группы машин (Instance Groups): тот же модуль, что у агента (src/yc-ig.js),
+    // канал — «yc:ig». Формы как у машин, но ресурс другой: группа сама создаёт
+    // машины по шаблону и держит их число.
+    instanceGroups: "ycIg",
   };
 
   // Допустимые действия каждого канала. Сверяется с отказами в src/yc-ipc.js.
@@ -68,11 +72,12 @@
     cdn: ["overview", "certs", "cert", "certnew", "certimport", "certupdate", "certdel", "cdn", "cdnlist", "cdninfo", "cdncreate", "cdnupdate", "cdnpurge", "cdndel", "origins", "origincreate", "originupdate", "origindel"],
     billing: ["overview", "accounts", "account", "budgets", "price", "services", "leaks"],
     monitoring: ["overview", "names", "metrics"],
-    ai: ["translate", "languages", "detect", "ocr", "voices", "speak", "listen"],
+    ai: ["translate", "languages", "detect", "ocr", "voices", "speak", "listen", "models", "tokens", "complete", "embed"],
     postgresql: ["list", "presets", "card", "create", "hosts", "databases", "users", "logs", "operations", "start", "stop", "delete"],
     mysql: ["list", "presets", "card", "create", "hosts", "databases", "users", "logs", "operations", "start", "stop", "delete"],
     clickhouse: ["list", "presets", "card", "create", "hosts", "databases", "users", "logs", "operations", "start", "stop", "delete"],
     dns: ["zones", "card", "records", "add", "delete"],
+    instanceGroups: ["list", "card", "instances", "operations", "create", "start", "stop", "delete"],
   };
 
   const FAMILIES = {
@@ -95,6 +100,7 @@
     mysql: { title: "MySQL", ru: "кластер", fixed: { engine: "mysql" } },
     clickhouse: { title: "ClickHouse", ru: "кластер", fixed: { engine: "clickhouse" } },
     dns: { title: "DNS-зоны", ru: "запись" },
+    instanceGroups: { title: "Группы машин", ru: "группа" },
   };
 
   // Действия управляемой базы. Одна форма на три базы: набор полей у PostgreSQL,
@@ -441,6 +447,60 @@
           fld("format", "Формат звука", { type: "select", options: ["oggopus", "mp3", "lpcm"], value: "oggopus" }),
           fld("topic", "Тема (general — короткая команда, deferred — длинная речь)", { placeholder: "general" }),
         ] },
+      // ── AI Studio: модели каталога, ответ, токены и векторы ──
+      // Список моделей и токенизация бесплатны; ответ модели и вектор платные,
+      // поэтому у них стоит пометка paid, а тариф называет ответ канала.
+      { id: "models", ru: "Модели AI Studio (список каталога)", op: "models", view: "lines" },
+      { id: "tokens", ru: "Токены текста (бесплатно)", op: "tokens", view: "lines",
+        fields: [
+          fld("text", "Текст или запрос", { type: "textarea", required: true, placeholder: "Сколько токенов в этом тексте?" }),
+          fld("model", "Модель", { value: "yandexgpt-5-lite", hint: "Имя из списка моделей; у каждой модели свой токенизатор." }),
+        ] },
+      { id: "complete", ru: "＋ Спросить модель (платно)", op: "complete", view: "lines", paid: true,
+        fields: [
+          fld("model", "Модель", { value: "yandexgpt-5-lite", hint: "yandexgpt-5-lite / yandexgpt-5.1 / yandexgpt-5-pro / aliceai-llm — или адрес gpt://<каталог>/<модель>." }),
+          fld("system", "Роль (system)", { type: "textarea", placeholder: "Ты — помощник, отвечай коротко и по делу." }),
+          fld("prompt", "Запрос", { type: "textarea", required: true, placeholder: "Что спросить у модели" }),
+          fld("temperature", "Температура 0…1", { type: "number", value: "0.3", hint: "0.3 — спокойно и предсказуемо, 1 — разгульно." }),
+          fld("maxTokens", "Длина ответа, токенов", { type: "number", value: "2000", hint: "Это длина ОТВЕТА; вход считается отдельно — посчитай его действием «Токены текста»." }),
+        ] },
+      { id: "embed", ru: "＋ Вектор текста (платно)", op: "embed", view: "lines", paid: true,
+        fields: [
+          fld("text", "Текст", { type: "textarea", required: true, placeholder: "Текст, который превратить в вектор" }),
+          fld("model", "Модель", { type: "select", options: ["text-search-doc", "text-search-query"], value: "text-search-doc", hint: "doc — для документов, query — для поисковых запросов; пространства разные." }),
+        ] },
+    ],
+
+    // ── Группы машин (Instance Groups) ──
+    // Группа — не «несколько машин»: она сама создаёт машины по шаблону, держит
+    // их число и пересоздаёт удалённые. Платят МАШИНЫ группы — за час работы,
+    // как обычные, поэтому создание помечено paid и спрашивает согласие, а
+    // удаление забирает машины вместе с дисками (danger).
+    instanceGroups: [
+      { id: "list", ru: "Группы машин", op: "list", view: "lines" },
+      { id: "card", ru: "Карточка: шаблон, машины, операции", op: "card", view: "lines", target: target("Группа (имя или id)", "group") },
+      { id: "instances", ru: "Машины группы", op: "instances", view: "lines", target: target("Группа (имя или id)", "group") },
+      { id: "operations", ru: "История операций", op: "operations", view: "lines", target: target("Группа (имя или id)", "group") },
+      { id: "create", ru: "＋ Создать группу (платно)", op: "create", view: "lines", paid: true, confirmArg: "confirm",
+        fields: [
+          fld("name", "Имя группы", { required: true, placeholder: "web" }),
+          fld("subnet", "Подсеть", { required: true, hint: "Группа встанет в зоне подсети", options: from("vpc", "subnets", (r) => (r.subnets || []).map((s) => s.name)) }),
+          fld("size", "Машин в группе", { type: "number", value: "2", hint: "Каждая машина платит за час работы" }),
+          fld("cores", "Ядер на машину", { type: "number", value: "2" }),
+          fld("memoryGb", "Памяти на машину, ГБ", { type: "number", value: "2" }),
+          fld("coreFraction", "Гарантированная доля vCPU, %", { type: "number", value: "100" }),
+          fld("diskSizeGb", "Диск на машину, ГБ", { type: "number", value: "20" }),
+          fld("diskType", "Тип диска", { type: "select", options: ["network-ssd", "network-hdd"], value: "network-ssd" }),
+          fld("imageFamily", "Образ (семейство)", { value: "ubuntu-2204-lts" }),
+          fld("publicIp", "Публичный адрес машинам", { type: "check" }),
+          fld("preemptible", "Прерываемые машины (дешевле)", { type: "check" }),
+          fld("securityGroups", "Группы безопасности (через запятую)", { placeholder: "без них SSH снаружи закрыт" }),
+          fld("sshPublicKey", "Публичный SSH-ключ", { type: "textarea", placeholder: "ssh-ed25519 AAAA… user@pc" }),
+          fld("serviceAccountId", "Сервисный аккаунт", { placeholder: "id или имя — необязательно" }),
+        ] },
+      { id: "start", ru: "▶ Запустить", op: "start", view: "lines", target: target("Группа (имя или id)", "group") },
+      { id: "stop", ru: "■ Остановить (машины перестают платить)", op: "stop", view: "lines", target: target("Группа (имя или id)", "group") },
+      { id: "delete", ru: "🗑 Удалить группу (вместе с машинами)", op: "delete", view: "lines", danger: true, confirmArg: "confirm", target: target("Группа (имя или id)", "group") },
     ],
 
     // ── Managed-базы: PostgreSQL, MySQL и ClickHouse ──

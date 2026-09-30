@@ -1208,8 +1208,9 @@
         "переведи", "перевод", "распознай", "текст с картинки", "озвучь", "расшифруй", "речь", "speechkit", "ocr",
         "метрик", "monitoring", "нагрузка", "график нагрузки", "загружен ли",
         "база данных", "базу данных", "бд", "кластер баз", "postgres", "postgresql", "постгрес", "mysql", "clickhouse",
-        "миграц", "дамп"],
-      names: ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycVpc", "ycCompute", "ycIam", "ycFunctions", "ycBilling", "ycCdn", "ycDb", "ycAi", "ycMonitor", "ycMdb", "ycCosts", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"],
+        "миграц", "дамп",
+        "группа машин", "группы машин", "instance group", "автомасштаб"],
+      names: ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycVpc", "ycCompute", "ycIam", "ycFunctions", "ycBilling", "ycCdn", "ycDb", "ycAi", "ycMonitor", "ycMdb", "ycIg", "ycCosts", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"],
     },
     {
       id: "sheets",

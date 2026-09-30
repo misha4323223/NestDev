@@ -793,7 +793,12 @@ function buildTools(over, settingsOver) {
     assert.ok(/list/.test(schema) && /upload/.test(schema) && /download/.test(schema) && /delete/.test(schema), "схема не называет действия");
     assert.ok(/создавать ресурсы/.test(schema) && /удалять ресурсы/.test(schema), "схема не называет разрешения");
     assert.ok(/публичный доступ/.test(schema), "схема не предупреждает про публичный доступ к бакету");
-    const group = CORE_SRC.slice(CORE_SRC.indexOf('id: "cloud"'), CORE_SRC.indexOf('id: "cloud"') + 700);
+    // Границы записи группы, а не число знаков: окно в 700 знаков ломалось от
+    // каждого нового ключевого слова группы (часть 91 добавила «группа машин»),
+    // хотя проверяемое свойство — «инструмент есть в группе облака» — не менялось.
+    const gAt = CORE_SRC.indexOf('id: "cloud"');
+    const gEnd = CORE_SRC.indexOf('id: "', gAt + 10);
+    const group = CORE_SRC.slice(gAt, gEnd > gAt ? gEnd : gAt + 1400);
     assert.ok(/ycStorage/.test(group), "инструмента нет в группе «облако» — модель его не увидит");
     const line = PROMPTS_SRC.split("\n").find((l) => l.startsWith("Доступные инструменты:")) || "";
     assert.ok(/ycStorage/.test(line), "инструмента нет в списке для модели");

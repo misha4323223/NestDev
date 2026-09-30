@@ -1,10 +1,10 @@
 {
   "app": "ai-agent",
-  "version": "1.5.253",
-  "codeVersion": "1.5.243",
-  "builtAt": 1790758331457,
-  "files": 200,
-  "sha256": "0448eb9695aebaf5568093f99b8c85be69f0f2ef3ce32658eb02af193c485709",
+  "version": "1.5.255",
+  "codeVersion": "1.5.245",
+  "builtAt": 1790766254704,
+  "files": 201,
+  "sha256": "60ee541856e94a0b64e99bebcc081c1ef4ceaf2ebc727106a42c4b8a1d59dc49",
   "sig": "",
   "keyId": ""
 }

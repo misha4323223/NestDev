@@ -10,11 +10,13 @@
    заголовком `x-folder-id`. Отдельный ключ API (Api-Key) не нужен — иначе
    человеку пришлось бы заводить ВТОРОЙ секрет ради тех же сервисов.
 
-   Четыре сервиса, у каждого свой хост:
+   Сервисы, у каждого свой хост:
      Translate   translate.api.cloud.yandex.net/translate/v2/...    — текст между языками
      Vision OCR  ocr.api.cloud.yandex.net/ocr/v1/recognizeText      — текст со снимка/PDF
      SpeechKit   tts.api.cloud.yandex.net/speech/v1/tts:synthesize  — текст в звук
      SpeechKit   stt.api.cloud.yandex.net/speech/v1/stt:recognize   — звук в текст
+     AI Studio   ai.api.cloud.yandex.net/v1/models                 — модели каталога
+     AI Studio   llm.api.cloud.yandex.net/foundationModels/v1/...  — ответ модели, токены, векторы
 
    Деньги: все четыре тарифицируются ПО ЗАПРОСУ (SpeechKit — ещё и по длине
    звука), поэтому действие говорит о тарифе до отправки, а не удивляет счётом.
@@ -63,6 +65,79 @@ const OCR_MODELS = [
 
 const TTS_FORMATS = ["mp3", "oggopus", "lpcm", "wav"]; // lpcm — только с sampleRateHertz
 const STT_FORMATS = ["oggopus", "lpcm", "mp3"];
+
+// Модели AI Studio, которые есть почти наверняка (2026): список отдаёт облако
+// (Models API), но когда оно молчит, подсказка обязана быть — как у голосов
+// SpeechKit. Здесь только имена и роль; цены живут рядом, в AI_PRICES.
+const AI_MODELS = [
+  { id: "yandexgpt-5-lite", kind: "текст", who: "YandexGPT Lite 5 — дешёвая, контекст 32k" },
+  { id: "yandexgpt-5.1", kind: "текст", who: "YandexGPT Pro 5.1 — контекст 32k" },
+  { id: "yandexgpt-5-pro", kind: "текст", who: "YandexGPT Pro 5 — контекст 32k" },
+  { id: "aliceai-llm", kind: "текст", who: "Alice AI LLM — контекст 128k" },
+  { id: "text-search-doc", kind: "векторы", who: "Векторы документов (256 чисел)" },
+  { id: "text-search-query", kind: "векторы", who: "Векторы поисковых запросов (256 чисел)" },
+];
+
+// Тариф AI Studio (₽ за 1000 токенов, синхронный режим, сверено 30.09.2026):
+// у YandexGPT вход и выход по одной цене, у Alice — разные, а ТОКЕНИЗАЦИЯ
+// бесплатна. Таблица нужна, чтобы ответ говорил цену до запроса, а не после
+// счёта: у модели свой токенизатор, и длина запроса заранее неизвестна.
+const AI_PRICES = [
+  { match: /^yandexgpt-5-lite/, ru: "YandexGPT Lite 5", in1000: 0.2, out1000: 0.2 },
+  { match: /^yandexgpt-5\.1/, ru: "YandexGPT Pro 5.1", in1000: 0.8, out1000: 0.8 },
+  { match: /^yandexgpt-5-pro/, ru: "YandexGPT Pro 5", in1000: 1.2, out1000: 1.2 },
+  { match: /^yandexgpt/, ru: "YandexGPT", in1000: 0.8, out1000: 0.8 },
+  { match: /^aliceai-llm/, ru: "Alice AI LLM", in1000: 0.5, out1000: 1.2 },
+  { match: /^text-search|^bge|^multilingual/, ru: "Векторы", in1000: 0.0101, out1000: 0.0101 },
+];
+
+// Имя модели из адреса: у AI Studio модель — это URI с каталогом внутри
+// (`gpt://<каталог>/yandexgpt-5-lite[/версия]`), а человек пишет просто имя.
+function modelNameOf(model) {
+  let s = String(model == null ? "" : model).trim();
+  if (/^[a-z]+:\/\//i.test(s)) {
+    const parts = s.replace(/^[a-z]+:\/\//i, "").split("/").filter(Boolean);
+    s = parts.length > 1 ? parts[1] : parts[0] || "";
+  }
+  return s.split("/")[0];
+}
+
+function aiPriceFor(model) {
+  const name = modelNameOf(model).toLowerCase();
+  if (!name) return null;
+  for (const p of AI_PRICES) if (p.match.test(name)) return { name: name, ru: p.ru, in1000: p.in1000, out1000: p.out1000 };
+  return null;
+}
+
+// Строка о тарифе до запроса — одна для инструмента, канала и окна.
+function aiPriceLine(model) {
+  const p = aiPriceFor(model);
+  if (!p) return "Тариф этой модели не записан — цену называет страница тарифов AI Studio.";
+  return p.ru + ": " + p.in1000 + " ₽ за 1000 входящих и " + p.out1000 + " ₽ за 1000 исходящих токенов; токенизация бесплатна.";
+}
+
+// Адрес модели: имя без адреса достраивается до URI с каталогом внутри.
+// Полный адрес принимается КАК ЕСТЬ: список моделей облака отдаёт готовые URI,
+// и переписывать их нельзя. Для векторов свой префикс emb://, не gpt://.
+function modelUriFor(model, folderId, kind) {
+  const m = String(model == null ? "" : model).trim();
+  if (!m) throw new Error("Не указана модель: имя (yandexgpt-5-lite) или полный адрес gpt://<каталог>/<модель>. Список моделей — действие models.");
+  if (/^[a-z]+:\/\//i.test(m)) return m;
+  const folder = String(folderId == null ? "" : folderId).trim();
+  if (!folder) throw new Error("Не указан каталог — без него не собрать адрес модели. Выбери каталог в Настройках → «☁️ Yandex Cloud».");
+  return (kind === "embed" ? "emb://" : "gpt://") + folder + "/" + m;
+}
+
+// Оценка стоимости одного ответа по настоящим токенам из ответа облака.
+function aiCostText(model, usage) {
+  const p = aiPriceFor(model);
+  const u = usage || {};
+  const inT = Number(u.input) > 0 ? Number(u.input) : 0;
+  const outT = Number(u.output) > 0 ? Number(u.output) : 0;
+  if (!p || (!inT && !outT)) return "";
+  const rub = (inT / 1000) * p.in1000 + (outT / 1000) * p.out1000;
+  return "≈ " + (rub < 1 ? Math.round(rub * 10000) / 10000 : Math.round(rub * 100) / 100) + " ₽";
+}
 
 // Расширение файла → mimeType для Vision. Список закрытый: облако принимает
 // строго эти типы, и «угадать по имени» лучше здесь, чем получить отказ сервиса.
@@ -311,9 +386,119 @@ function createYcAi(deps) {
     return { voices: VOICES, fromCloud: false };
   }
 
+  // ── AI Studio: модели каталога ─────────────────────────────────────────────
+  // Список моделей отдаёт Models API — OpenAI-совместимый вход AI Studio:
+  // GET https://ai.api.cloud.yandex.net/v1/models, каталог — заголовком
+  // OpenAI-Project (тем же, что у чата в окне); авторизация — тот же IAM-токен.
+  async function listModels(oauth, folderId) {
+    try {
+      const base = await baseOf("ai-llm");
+      const h = await headers(oauth, folderId, null);
+      if (folderId) h["OpenAI-Project"] = String(folderId);
+      const j = await fetchJson(base + "/v1/models", { method: "GET", headers: h }, 20000);
+      const raw = Array.isArray(j && j.data) ? j.data : Array.isArray(j && j.models) ? j.models : [];
+      const list = raw
+        .map((m) => ({
+          id: one(m && (m.id || m.name || m.modelId)),
+          kind: one(m && (m.kind || m.type || m.task)) || "",
+          who: one(m && (m.description || m.owned_by || m.owner)) || "",
+        }))
+        .filter((m) => m.id)
+        .map((m) => ({ id: m.id, kind: m.kind || (/embed|search/i.test(m.id) ? "векторы" : "текст"), who: m.who }));
+      if (list.length) return { models: list, fromCloud: true };
+    } catch (e) {
+      if (isNetworkError && isNetworkError(e)) return { models: AI_MODELS, fromCloud: false, why: "сеть" };
+    }
+    return { models: AI_MODELS, fromCloud: false };
+  }
+
+  // ── AI Studio: ответ модели ────────────────────────────────────────────────
+  // Синхронное порождение текста — старый (и по-прежнему описанный в
+  // справочнике) REST TextGeneration: POST /foundationModels/v1/completion.
+  // Синхронный режим берёт до 10 одновременных запросов — квота AI Studio.
+  async function complete(oauth, opts) {
+    const o = opts || {};
+    const prompt = one(o.prompt || o.text || o.question);
+    if (!prompt) throw new Error("Нечего спросить: нужен prompt (или text) — текст запроса к модели.");
+    const folderId = one(o.folderId);
+    const modelUri = modelUriFor(o.model || "yandexgpt-5-lite", folderId);
+    const temperature = o.temperature == null || o.temperature === "" ? 0.3 : Number(o.temperature);
+    if (!isFinite(temperature) || temperature < 0 || temperature > 1) throw new Error("temperature — число от 0 до 1 (0.3 — спокойно, 1 — разгульно); дано: " + o.temperature + ".");
+    let maxTokens = parseInt(o.maxTokens, 10);
+    if (o.maxTokens != null && o.maxTokens !== "" && (!isFinite(maxTokens) || maxTokens < 1 || maxTokens > 32000)) {
+      throw new Error("maxTokens — целое от 1 до 32000 (это длина ОТВЕТА; вход считается отдельно); дано: " + o.maxTokens + ".");
+    }
+    if (!isFinite(maxTokens) || maxTokens < 1) maxTokens = 2000;
+    const messages = [];
+    if (one(o.system)) messages.push({ role: "system", text: one(o.system) });
+    messages.push({ role: "user", text: prompt });
+    const body = { modelUri: modelUri, completionOptions: { stream: false, temperature: temperature, maxTokens: String(maxTokens) }, messages: messages };
+    const base = await baseOf("ai");
+    const path = "/foundationModels/v1/completion";
+    const j = await fetchJson(base + path, { method: "POST", headers: await headers(oauth, folderId, "application/json"), body: JSON.stringify(body) }, 120000).catch((e) => {
+      throw new Error(serviceError(e, base, path));
+    });
+    const res = (j && j.result) || {};
+    const alt = (res.alternatives || [])[0] || {};
+    const text = one(alt.message && alt.message.text);
+    if (!text) throw new Error("Облако не вернуло текст ответа" + (alt.status ? " (статус " + alt.status + ")" : "") + " — проверь модель и каталог.");
+    const u = res.usage || {};
+    const num = (v) => {
+      const n = parseInt(v, 10);
+      return isFinite(n) && n > 0 ? n : 0;
+    };
+    return {
+      text: text,
+      modelUri: modelUri,
+      modelVersion: one(res.modelVersion),
+      status: one(alt.status),
+      usage: { input: num(u.inputTextTokens), output: num(u.completionTokens), total: num(u.totalTokens) },
+      price: aiPriceFor(modelUri),
+    };
+  }
+
+  // ── AI Studio: токены (сколько стоит запрос — бесплатно) ───────────────────
+  // Токенизация НЕ тарифицируется, и это единственный честный способ узнать,
+  // во сколько обойдётся запрос, ДО запроса: у каждой модели свой токенизатор.
+  async function tokenize(oauth, opts) {
+    const o = opts || {};
+    const text = one(o.text || o.prompt);
+    if (!text) throw new Error("Нечего считать: нужен text — текст или запрос к модели.");
+    const folderId = one(o.folderId);
+    const modelUri = modelUriFor(o.model || "yandexgpt-5-lite", folderId);
+    const base = await baseOf("ai");
+    const path = "/foundationModels/v1/tokenizeCompletion";
+    const j = await fetchJson(base + path, { method: "POST", headers: await headers(oauth, folderId, "application/json"), body: JSON.stringify({ modelUri: modelUri, text: text }) }, 30000).catch((e) => {
+      throw new Error(serviceError(e, base, path));
+    });
+    const tokens = Array.isArray(j && j.tokens) ? j.tokens : Array.isArray(j && j.result && j.result.tokens) ? j.result.tokens : [];
+    return { count: tokens.length, first: tokens.slice(0, 12).map((t) => one(t && (t.text != null ? t.text : t.id))).filter(Boolean), modelUri: modelUri };
+  }
+
+  // ── AI Studio: вектор текста (эмбеддинги) ─────────────────────────────────
+  // У документа и у поискового запроса РАЗНЫЕ модели (text-search-doc и
+  // text-search-query): их нельзя путать, иначе близость считается между
+  // чужими пространствами. Векторов у обеих 256 — число берётся из ответа.
+  async function embed(oauth, opts) {
+    const o = opts || {};
+    const text = one(o.text);
+    if (!text) throw new Error("Нечего векторизовать: нужен text.");
+    const folderId = one(o.folderId);
+    const modelUri = modelUriFor(o.model || "text-search-doc", folderId, "embed");
+    const base = await baseOf("ai");
+    const path = "/foundationModels/v1/textEmbedding";
+    const j = await fetchJson(base + path, { method: "POST", headers: await headers(oauth, folderId, "application/json"), body: JSON.stringify({ modelUri: modelUri, text: text }) }, 30000).catch((e) => {
+      throw new Error(serviceError(e, base, path));
+    });
+    const vector = Array.isArray(j && j.embedding) ? j.embedding.map((x) => Number(x)).filter((x) => isFinite(x)) : [];
+    if (!vector.length) throw new Error("Облако не вернуло вектор — проверь модель (text-search-doc или text-search-query) и каталог.");
+    return { vector: vector, dims: vector.length, modelUri: modelUri, price: aiPriceFor(modelUri) };
+  }
+
   return {
     VOICES,
     OCR_MODELS,
+    AI_MODELS,
     TTS_FORMATS,
     STT_FORMATS,
     mimeForExt,
@@ -324,7 +509,30 @@ function createYcAi(deps) {
     synthesize,
     recognizeSpeech,
     listVoices,
+    listModels,
+    complete,
+    tokenize,
+    embed,
+    modelNameOf,
+    modelUriFor,
+    aiPriceFor,
+    aiPriceLine,
+    aiCostText,
   };
 }
 
-module.exports = { createYcAi, VOICES, OCR_MODELS, TTS_FORMATS, STT_FORMATS, MIME_BY_EXT };
+module.exports = {
+  createYcAi,
+  VOICES,
+  OCR_MODELS,
+  AI_MODELS,
+  AI_PRICES,
+  TTS_FORMATS,
+  STT_FORMATS,
+  MIME_BY_EXT,
+  modelNameOf,
+  modelUriFor,
+  aiPriceFor,
+  aiPriceLine,
+  aiCostText,
+};

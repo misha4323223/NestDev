@@ -38,7 +38,17 @@
      [10] MANAGED-БАЗЫ: три плитки (PostgreSQL, MySQL, ClickHouse) зовут один
          канал, но каждая подставляет СВОЙ engine; создание показывает цену,
          спрашивает согласие и отдаёт пароль один раз отдельной рамкой, а
-         удаление необратимо и потому спрашивает дважды — человека и облако.
+         удаление необратимо и потому спрашивает дважды — человека и облако;
+     [11] DNS-ЗОНЫ: плитка действий зовёт yc:dns, запись собирается из формы
+         (зона, имя, тип, TTL, значения), а удаление сначала называет саму
+         запись и спрашивает человека, и только потом уходит с confirm;
+     [12] AI STUDIO: у семейства Яндекс AI теперь одиннадцать действий —
+         модели каталога, бесплатные токены, ответ модели с ценой по настоящим
+         токенам и вектор текста; каждое собирает свои аргументы из формы, а
+         ответ показывает строки канала;
+     [13] ГРУППЫ МАШИН: у плитки «Группы машин» свои восемь действий — список,
+         карточка с шаблоном и машинами, создание (сначала цена и размер,
+         потом согласие) и удаление, которое забирает машины вместе с дисками.
 
    Этот прогон уже нашёл настоящую ошибку: поиск по «функц» не находил плитку
    «Функции» — строка поиска не включала русское имя, а человек ищет по тому, что
@@ -131,6 +141,10 @@ ${STUBS}
     { key: "iam", ru: "Сервисные аккаунты", title: "Identity and Access Management", ok: true, count: 4, items: [{ id: "s1", name: "deploy-bot" }] },
     { key: "lockbox", ru: "Секреты", title: "Lockbox", ok: false, count: 0, error: "403: нет роли lockbox.viewer — попроси владельца каталога" },
     { key: "compute", ru: "Виртуальные машины", title: "Compute Cloud", ok: true, count: 1, items: [{ id: "vm1", name: "web-1" }] },
+    // Группы машин (Instance Groups): тот же хост, что у Compute, но ресурс
+    // другой — группа сама создаёт машины по шаблону. Своя плитка и своё
+    // семейство действий (канал yc:ig).
+    { key: "instanceGroups", ru: "Группы машин", title: "Instance Groups", ok: true, count: 1, items: [{ id: "ig1", name: "web" }] },
     // Managed-базы: три плитки у одного канала (yc:mdb). Какая это база, видно
     // только по полю engine, которое подставляет само семейство, — в этом весь
     // смысл проверки [10].
@@ -147,7 +161,7 @@ ${STUBS}
   window.uiToast = () => {};
   const api = {
     ycStatus: async () => ({ loggedIn: true, iamOk: true, folderId: "b1g", folderName: "prod-web" }),
-    ycResources: async () => ({ ok: true, services, total: 16, activeServices: 8 }),
+    ycResources: async () => ({ ok: true, services, total: 17, activeServices: 9 }),
     ycBilling: async () => ({
       ok: true,
       account: { id: "acc", name: "Облако", currency: "RUB", balance: 1234.56, balanceHuman: "1 234,56 ₽", active: true },
@@ -184,6 +198,59 @@ ${STUBS}
       window.__calls.push(["ycAi", a]);
       if (a.op === "voices") return { ok: true, voices: [{ id: "alena", lang: "ru-RU" }, { id: "filipp", lang: "ru-RU" }], lines: ["alena — ru-RU", "filipp — ru-RU"], message: "Голоса из облака: 2.", warnings: ["Синтез речи платный: тарифицируется по длине звука."] };
       if (a.op === "translate") return { ok: true, lines: ["→ EN", "   [EN] " + a.text, "→ DE", "   [DE] " + a.text], message: "Переведено на 2 языка — это 2 запроса.", warnings: ["Перевод платный: каждый целевой язык — отдельный запрос."] };
+      // AI Studio: список моделей и токены — бесплатны, ответ и вектор — платные;
+      // отвечаем теми же формами, что настоящий канал (src/yc-ipc.js).
+      if (a.op === "models") return { ok: true, models: [{ id: "yandexgpt-5-lite", kind: "текст" }, { id: "text-search-doc", kind: "векторы" }], lines: ["yandexgpt-5-lite — текст", "text-search-doc — векторы"], message: "Моделей: 2 (список облака).", warnings: ["Ответ модели тарифицируется по токенам — тариф называет действие «Спросить модель» до отправки; токенизация бесплатна."] };
+      if (a.op === "tokens") return { ok: true, tokens: 3, lines: ["Токенов: 3 (модель yandexgpt-5-lite)", "Первые токены: Счёт · на"], message: "Токенов: 3.", warnings: ["Токенизация бесплатна. Ориентир цены ответа: YandexGPT Lite 5: 0.2 ₽ за 1000 входящих и 0.2 ₽ за 1000 исходящих токенов; токенизация бесплатна."] };
+      if (a.op === "complete") {
+        const said = "Модель услышала: " + (a.system ? a.system + " | " : "") + a.prompt;
+        return { ok: true, answer: said, usage: { input: 1200, output: 400, total: 1600 }, lines: [said, "—", "Токенов: вход 1200, ответ 400 · версия модели v5.1 · ≈ 0.32 ₽"], message: "Ответ модели yandexgpt-5-lite готов.", warnings: ["Ответ тарифицируется по токенам: YandexGPT Lite 5: 0.2 ₽ за 1000 входящих и 0.2 ₽ за 1000 исходящих токенов; токенизация бесплатна."] };
+      }
+      if (a.op === "embed") return { ok: true, dims: 256, lines: ["Вектор: 256 чисел (модель text-search-doc)", "Первые числа: 0.001, 0.002, 0.003, …"], message: "Вектор готов: 256 чисел.", warnings: ["Векторизация платная: Векторы: 0.0101 ₽ за 1000 входящих и 0.0101 ₽ за 1000 исходящих токенов; токенизация бесплатна."] };
+      return { ok: true, lines: ["готово: " + a.op], message: "готово: " + a.op };
+    },
+    // Группы машин: тот же контракт, что у остальных каналов действий — строки,
+    // предупреждения и needsConfirm на платное. Отвечаем как настоящий канал
+    // (src/yc-ipc.js), включая размер группы в вопросе о создании.
+    ycIg: async (a) => {
+      window.__calls.push(["ycIg", a]);
+      if (a.op === "list") {
+        return { ok: true, groups: [{ id: "ig1", name: "web" }],
+          // Две строки, а не одна с символом перевода строки: страница стенда
+          // собирается шаблонной строкой, и обратный слэш-n внутри неё стал бы
+          // настоящим переводом строки прямо посреди строкового литерала.
+          lines: ["● web — работает · 3 машин(ы) · машин 1/3 (устаревших 1) · 2 vCPU, 2 ГБ · зоны: ru-central1-a", "    id ig1"],
+          message: "Групп: 1.",
+          warnings: ["У части групп есть машины с устаревшей конфигурацией: группа пересоздаст их сама — это нормальный ход обновления."] };
+      }
+      if (a.op === "card") {
+        return { ok: true, group: { id: "ig1", name: a.group },
+          lines: ["● web — работает · 3 машин(ы) · машин 1/3", "Шаблон: standard-v3 · 2 vCPU · 2 ГБ · диск 20 ГБ network-ssd · с публичным адресом",
+            "Отдаёт трафик Network Load Balancer: target group tg-nlb-1", "Машины (2):", "  • web-1 — работает, ru-central1-a, внутренний 10.10.0.5, публичный 203.0.113.5", "  • web-2 — работает, конфигурация устарела — будет пересоздана"],
+          message: "Группа «web»: работает." };
+      }
+      if (a.op === "create" && a.confirm !== true) {
+        return { ok: false, needsConfirm: true,
+          error: "Создание группы машин — решение с ценой: каждая машина группы платит за час работы, как обычная машина Compute Cloud, а группа сама создаёт и пересоздаёт машины. Проверь имя, размер и подсеть, затем подтверди.",
+          lines: ["Будет создана группа «" + a.name + "» в каталоге «prod-web».", "Машин: " + a.size + " · на машину: 2 vCPU, 2 ГБ · подсеть: " + a.subnet + "."] };
+      }
+      if (a.op === "create") {
+        return { ok: true, changed: true, groupId: "ig-new",
+          lines: ["Группа «" + a.name + "» создаётся: машин " + a.size + ", 2 vCPU и 2 ГБ на машину, зона ru-central1-a."],
+          warnings: ["Группа НЕ бесплатна: каждая её машина платит как обычная машина Compute Cloud — за каждый час работы (ориентир: ycCosts)."],
+          message: "Группа создаётся." };
+      }
+      if (a.op === "delete" && a.confirm !== true) {
+        return { ok: false, needsConfirm: true,
+          error: "Удаление группы «web» необратимо: она будет удалена ВМЕСТЕ с машинами (3 шт.) и их дисками. Снимки нужно сделать заранее. Подтверди удаление.",
+          lines: ["● web — работает · 3 машин(ы)"] };
+      }
+      if (a.op === "delete") {
+        return { ok: true, changed: true, deleted: true, groupId: "ig1",
+          lines: ["Группа «web» удаляется вместе с машинами (3 шт.) и их дисками — отменить нельзя."],
+          warnings: ["Диски машин удаляются вместе с группой: если данные нужны — сними снимки заранее."],
+          message: "Группа удаляется." };
+      }
       return { ok: true, lines: ["готово: " + a.op], message: "готово: " + a.op };
     },
     // Managed-базы: один канал на три базы — какая именно, видно по полю engine,
@@ -308,8 +375,8 @@ fs.writeFileSync(SHOT, PAGE, "utf8");
           .slice(0, 6),
       };
     });
-    ok(info.tiles === 11, "плиток столько же, сколько сервисов (одиннадцать)", String(info.tiles));
-    ok(info.icons === 11, "у каждой плитки своя официальная иконка", String(info.icons));
+    ok(info.tiles === 12, "плиток столько же, сколько сервисов (двенадцать)", String(info.tiles));
+    ok(info.icons === 12, "у каждой плитки своя официальная иконка", String(info.icons));
     ok(info.columns === 2, "полка в две колонки при ширине панели 460px", "колонок: " + info.columns);
     ok(
       info.logo && Math.round(info.logo.width) === 32 && Math.round(info.logo.height) === 32,
@@ -795,6 +862,213 @@ fs.writeFileSync(SHOT, PAGE, "utf8");
     ok(/A www\.example\.com\./.test(dnsDel.warnText), "перед удалением панель назвала саму запись");
     ok(dnsDel.firstConfirm === undefined && dnsDel.confirmSent, "согласие облаку ушло только вторым нажатием", JSON.stringify({ first: dnsDel.firstConfirm, last: dnsDel.confirmSent }));
     ok(/удалена/.test(dnsDel.text), "ответ об удалении показан словами облака", dnsDel.text.slice(0, 160));
+
+    // ── AI Studio в панели (часть 90) ──────────────────────────────────────
+    // Модели AI Studio жили в окне только провайдером чата; у ОБЛАЧНОЙ панели их
+    // не было. Проверяем живьём: список действий вырос до одиннадцати, у AI
+    // Studio четыре своих кнопки, форма собирает аргументы, а ответ показывает
+    // бесплатные токены, цену ответа и размерность вектора.
+    section("[12] AI Studio в панели: модели, токены, ответ и вектор");
+    const aiList = await page.evaluate(async () => {
+      const chip = [...document.querySelectorAll("#yc-summary .yc-chip")].find((c) => /Яндекс AI/.test(c.textContent));
+      chip.click();
+      await new Promise((r) => setTimeout(r, 40));
+      return [...document.querySelectorAll("#yc-actions .yc-act-btn")].map((b) => b.textContent.trim());
+    });
+    ok(aiList.length === 11, "в семействе Яндекс AI одиннадцать действий: " + aiList.length);
+    ok(
+      aiList.some((t) => /Модели AI Studio/.test(t)) && aiList.some((t) => /Токены текста/.test(t)) && aiList.some((t) => /Спросить модель/.test(t)) && aiList.some((t) => /Вектор текста/.test(t)),
+      "четыре действия AI Studio на месте: " + aiList.join(", ")
+    );
+
+    const aiModelsRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Модели AI Studio/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 80));
+      const sent = window.__calls.filter((c) => c[0] === "ycAi" && c[1].op === "models").slice(-1)[0];
+      return { called: !!sent, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(aiModelsRun.called && /yandexgpt-5-lite/.test(aiModelsRun.text) && /text-search-doc/.test(aiModelsRun.text), "список моделей спрашивается без формы и показывается строками", aiModelsRun.text.slice(0, 160));
+
+    const aiTokensRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Токены текста/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Текст/.test(label)) input.value = "Счёт на четыре тысячи рублей";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 80));
+      const sent = window.__calls.filter((c) => c[0] === "ycAi" && c[1].op === "tokens").slice(-1)[0];
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(aiTokensRun.args && /четыре тысячи/.test(String(aiTokensRun.args.text)) && aiTokensRun.args.model === "yandexgpt-5-lite", "форма токенов ушла с текстом и моделью по умолчанию", JSON.stringify(aiTokensRun.args));
+    ok(/Токенов: 3/.test(aiTokensRun.text) && /бесплатн/.test(aiTokensRun.text), "ответ показал токены и назвал бесплатность", aiTokensRun.text.slice(0, 160));
+
+    const aiCompleteRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Спросить модель/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/Роль/.test(label)) input.value = "Отвечай коротко";
+        if (/^Запрос/.test(label)) input.value = "Сколько будет 2+2?";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 80));
+      const sent = window.__calls.filter((c) => c[0] === "ycAi" && c[1].op === "complete").slice(-1)[0];
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(aiCompleteRun.args && aiCompleteRun.args.system === "Отвечай коротко" && aiCompleteRun.args.prompt === "Сколько будет 2+2?", "форма ответа собрала роль и запрос", JSON.stringify(aiCompleteRun.args));
+    ok(/Модель услышала/.test(aiCompleteRun.text) && /≈ 0\.32 ₽/.test(aiCompleteRun.text), "ответ панели показал текст модели и цену", aiCompleteRun.text.slice(0, 200));
+
+    const aiEmbedRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Вектор текста/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Текст/.test(label)) input.value = "договор поставки";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 80));
+      const sent = window.__calls.filter((c) => c[0] === "ycAi" && c[1].op === "embed").slice(-1)[0];
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(aiEmbedRun.args && aiEmbedRun.args.text === "договор поставки" && aiEmbedRun.args.model === "text-search-doc", "форма вектора ушла с текстом и моделью документов", JSON.stringify(aiEmbedRun.args));
+    ok(/256 чисел/.test(aiEmbedRun.text), "ответ показал размерность вектора", aiEmbedRun.text.slice(0, 160));
+
+    // ── Группы машин в панели (часть 91) ──────────────────────────────────
+    // Группа — не «несколько машин»: у неё своё семейство действий, и панель
+    // обязана показать и счёт машин (в том числе устаревших, которые группа
+    // пересоздаст), и цену создания ДО согласия, и необратимость удаления.
+    section("[13] Группы машин: плитка действий, создание с ценой и удаление");
+    const igTile = await page.evaluate(async () => {
+      const tile = [...document.querySelectorAll("#yc-dash .yc-tile")].find((t) => /Группы машин/.test(t.textContent));
+      const btn = tile && [...tile.querySelectorAll("button")].find((b) => /Действия/.test(b.textContent));
+      if (btn) btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const box = document.getElementById("yc-actions");
+      const title = box ? (box.querySelector(".yc-act-title") || {}).textContent : "";
+      const listed = box ? [...box.querySelectorAll(".yc-act-btn")].map((b) => b.textContent.trim()) : [];
+      const listBtn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /Группы машин/.test(b.textContent));
+      if (listBtn) listBtn.click();
+      await new Promise((r) => setTimeout(r, 70));
+      const sent = window.__calls.filter((c) => c[0] === "ycIg" && c[1].op === "list").slice(-1)[0];
+      return { btn: !!btn, title: title, listed: listed, called: !!sent, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(igTile.btn && /Группы машин/.test(igTile.title || ""), "у плитки «Группы машин» есть кнопка действий", JSON.stringify({ btn: igTile.btn, title: igTile.title }));
+    ok(igTile.listed.length === 8, "в семействе восемь действий: " + igTile.listed.length);
+    ok(
+      igTile.listed.some((t) => /Создать группу/.test(t)) && igTile.listed.some((t) => /Машины группы/.test(t)) && igTile.listed.some((t) => /Удалить группу/.test(t)),
+      "список называет создание, машины группы и удаление: " + igTile.listed.join(", ")
+    );
+    ok(igTile.called && /машин 1\/3/.test(igTile.text), "действие «Группы машин» позвало канал и показало счёт машин", igTile.text.slice(0, 200));
+
+    const igCardRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Карточка: шаблон/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /Группа/.test(label)) input.value = "web";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 70));
+      const sent = window.__calls.filter((c) => c[0] === "ycIg" && c[1].op === "card").slice(-1)[0];
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(igCardRun.args && igCardRun.args.group === "web", "форма карточки ушла с именем группы", JSON.stringify(igCardRun.args));
+    ok(/Шаблон: standard-v3/.test(igCardRun.text) && /203\.0\.113\.5/.test(igCardRun.text), "карточка показала шаблон и машину с адресом", igCardRun.text.slice(0, 220));
+
+    const igCreateRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Создать группу/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const before = window.__confirmCalls;
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Имя группы/.test(label)) input.value = "web-2";
+        if (/^Подсеть/.test(label)) input.value = "app-subnet";
+        if (/Машин в группе/.test(label)) input.value = "2";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const askedHuman = window.__confirmCalls > before;
+      const first = window.__calls.filter((c) => c[0] === "ycIg" && c[1].op === "create").slice(-1)[0] || null;
+      const warnText = document.getElementById("yc-act-out").textContent;
+      const confirmBtn = [...document.querySelectorAll("#yc-act-out button")].find((b) => /Подтвердить/.test(b.textContent));
+      if (confirmBtn) confirmBtn.click();
+      await new Promise((r) => setTimeout(r, 90));
+      const last = window.__calls.filter((c) => c[0] === "ycIg" && c[1].op === "create").slice(-1)[0] || null;
+      return {
+        askedHuman: askedHuman,
+        hadConfirmBtn: !!confirmBtn,
+        firstConfirm: first ? first[1].confirm : null,
+        size: first ? first[1].size : null,
+        subnet: first ? first[1].subnet : null,
+        confirmSent: last ? last[1].confirm === true : false,
+        warnText: warnText,
+        text: document.getElementById("yc-act-out").textContent,
+      };
+    });
+    // Платное в панели спрашивает ДВА раза и по-разному: сперва показывает цену и
+    // размер, а согласие уходит только вторым нажатием кнопки «Подтвердить».
+    ok(igCreateRun.size === 2 && igCreateRun.subnet === "app-subnet", "форма собрала размер группы и подсеть", JSON.stringify({ size: igCreateRun.size, subnet: igCreateRun.subnet }));
+    ok(/ценой/.test(igCreateRun.warnText) && /Машин: 2/.test(igCreateRun.warnText), "перед согласием панель назвала цену и размер", igCreateRun.warnText.slice(0, 220));
+    ok(igCreateRun.firstConfirm !== true && igCreateRun.confirmSent, "согласие облаку ушло только вторым нажатием", JSON.stringify({ first: igCreateRun.firstConfirm, last: igCreateRun.confirmSent }));
+    ok(/создаётся/.test(igCreateRun.text) && /платит/.test(igCreateRun.text), "ответ показал создание и предупредил про деньги", igCreateRun.text.slice(0, 200));
+
+    const igDelRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Удалить группу/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const before = window.__confirmCalls;
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /Группа/.test(label)) input.value = "web";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const askedHuman = window.__confirmCalls > before;
+      const first = window.__calls.filter((c) => c[0] === "ycIg" && c[1].op === "delete").slice(-1)[0] || null;
+      const warnText = document.getElementById("yc-act-out").textContent;
+      return { askedHuman: askedHuman, firstConfirm: first ? first[1].confirm : null, group: first ? first[1].group : "", warnText: warnText };
+    });
+    ok(igDelRun.askedHuman && /ВМЕСТЕ с машинами/.test(igDelRun.warnText) && /дисками/.test(igDelRun.warnText), "удаление объяснило последствия до запроса", igDelRun.warnText.slice(0, 220));
+    ok(igDelRun.group === "web" && igDelRun.firstConfirm !== true, "первый запрос ушёл без согласия, но с именем группы", JSON.stringify(igDelRun));
   } finally {
     await browser.close();
     try {

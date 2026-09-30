@@ -22,6 +22,8 @@
 
 | № | О чём | Полный текст | Строк |
 |---:|---|---|---:|
+| 91 | Группы машин (Instance Groups): группа САМА создаёт машины по шаблону, держит их число и пересоздаёт удалённые — модуль `src/yc-ig.js`, инструмент `ycIg`, канал `yc:ig` (32-й) и восемь действий окна с ценой до согласия и удалением вместе с машинами | [`notes/chast-91-gruppy-mashin-instance-groups-sama-sozdaet-mashiny.md`](notes/chast-91-gruppy-mashin-instance-groups-sama-sozdaet-mashiny.md) | 95 |
+| 90 | Модели AI Studio: список моделей каталога, бесплатные токены, ответ с ценой по настоящим токенам и векторы `emb://` — инструмент `ycAi`, канал `yc:ai` и одиннадцать действий окна | [`notes/chast-90-modeli-ai-studio-otvet-tokeny-i-vektory.md`](notes/chast-90-modeli-ai-studio-otvet-tokeny-i-vektory.md) | 82 |
 | 89 | DNS-записи зон: проверка записи ДО сети (CNAME на вершине, адреса, приоритеты) и действия окна — канал `yc:dns`, семейство в таблице действий и живая панель | [`notes/chast-89-dns-zapisi-zon-proverka-do-seti-i-deystviya-okna.md`](notes/chast-89-dns-zapisi-zon-proverka-do-seti-i-deystviya-okna.md) | 84 |
 | 88 | Managed-базы: PostgreSQL, MySQL и ClickHouse — один модуль и канал на три базы, инструмент `ycMdb`, три плитки с действиями, ценой до согласия и паролем в отдельной рамке | [`notes/chast-88-upravlyaemye-bazy-postgresql-mysql-clickhouse.md`](notes/chast-88-upravlyaemye-bazy-postgresql-mysql-clickhouse.md) | 86 |
 | 87 | Яндекс AI в интерфейсе: канал `yc:ai`, семь действий с формами, чип панели и плеер для речи в ответе | [`notes/chast-87-yandeks-ai-v-interfeise-konsoli.md`](notes/chast-87-yandeks-ai-v-interfeise-konsoli.md) | 74 |

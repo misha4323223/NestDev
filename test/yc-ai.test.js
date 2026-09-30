@@ -27,7 +27,11 @@
      • ИНТЕРФЕЙС (часть 87): семейство действий в src/renderer/yc-actions.js и
        канал «yc:ai» через НАСТОЯЩИЙ registerYcIpc с подменённым окном — перевод
        пачкой языков, снимок с диска, речь с проигрыванием и расшифровка записи,
-       а также вход в действия из панели облака.
+       а также вход в действия из панели облака;
+     • AI STUDIO (часть 90): список моделей каталога (с запасным списком при
+       молчании облака), ответ модели с разбором `alternatives` и `usage`,
+       БЕСПЛАТНЫЙ счёт токенов и вектор текста — в модуле, в инструменте ycAi и
+       в канале «yc:ai»; тарифы считаются до запроса и после ответа.
 
    Сеть не нужна: облако подменено локальным HTTP-сервером (штатный хук
    AI_AGENT_YC_BASE), а файлы живут во временной папке. */
@@ -65,7 +69,7 @@ function test(name, fn) {
 const read = (...p) => fs.readFileSync(path.join(ROOT, ...p), "utf8");
 
 const yandex = require(path.join(ROOT, "src", "yandex-cloud.js"));
-const { createYcAi, VOICES } = require(path.join(ROOT, "src", "yc-ai.js"));
+const { createYcAi, VOICES, AI_MODELS, modelNameOf, modelUriFor, aiPriceFor, aiPriceLine, aiCostText } = require(path.join(ROOT, "src", "yc-ai.js"));
 const { createCloudTools } = require(path.join(ROOT, "src", "agent-tools-cloud.js"));
 
 const SCHEMAS_SRC = read("src", "renderer", "tool-schemas.js");
@@ -96,6 +100,7 @@ const work = fs.mkdtempSync(path.join(os.tmpdir(), "yc-ai-"));
 function startAiStub() {
   const calls = [];
   let voicesFail = false;
+  let modelsFail = false;
   const server = http.createServer((req, res) => {
     const parts = [];
     req.on("data", (c) => parts.push(c));
@@ -135,6 +140,35 @@ function startAiStub() {
         if (voicesFail) return json({ message: "Not found" }, 404);
         return json({ voices: [{ id: "alena", name: "Алёна", languages: ["ru-RU"] }, { id: "filipp", name: "Филипп", languages: ["ru-RU"] }] });
       }
+      // ── AI Studio: список моделей, ответ, токены и вектор ──
+      // Формы те же, что у живого облака: модели — OpenAI-совместимый `data`,
+      // ответ — `result.alternatives[0].message.text` и `usage`, токены —
+      // массив с текстом/номером, вектор — `embedding` из 256 чисел.
+      if (url.indexOf("/v1/models") >= 0) {
+        if (modelsFail) return json({ message: "Not found" }, 404);
+        return json({
+          data: [
+            { id: "yandexgpt-5-lite", owned_by: "yandex", kind: "текст" },
+            { id: "text-search-doc", owned_by: "yandex" },
+          ],
+        });
+      }
+      if (url.indexOf("/foundationModels/v1/completion") >= 0) {
+        const b = JSON.parse(raw.toString("utf8") || "{}");
+        return json({
+          result: {
+            alternatives: [{ message: { text: "Ответ модели: " + (b.messages || []).map((m) => m.text).join(" | ") }, status: "ALTERNATIVE_STATUS_FINAL" }],
+            usage: { inputTextTokens: "1200", completionTokens: "400", totalTokens: "1600" },
+            modelVersion: "v5.1",
+          },
+        });
+      }
+      if (url.indexOf("/foundationModels/v1/tokenizeCompletion") >= 0) {
+        return json({ tokens: [{ text: "При" }, { text: "вет" }, { id: 42 }] });
+      }
+      if (url.indexOf("/foundationModels/v1/textEmbedding") >= 0) {
+        return json({ embedding: Array.from({ length: 256 }, (_, i) => (i + 1) / 1000) });
+      }
       return json({});
     });
   });
@@ -146,6 +180,9 @@ function startAiStub() {
         base: "http://127.0.0.1:" + server.address().port,
         setVoicesFail: (v) => {
           voicesFail = !!v;
+        },
+        setModelsFail: (v) => {
+          modelsFail = !!v;
         },
       })
     );
@@ -330,7 +367,86 @@ const callsTo = (stub, part) => stub.calls.filter((c) => c.url.indexOf(part) >= 
     assert.ok(VOICES.some((v) => v.id === "alena"), "запасной список без alena");
   });
 
-  console.log("\n[4] Инструмент агента ycAi");
+  console.log("\n[4] AI Studio: модели, токены, ответ и вектор");
+
+  await test("ycAi: адрес модели, тарифы и оценка ответа считаются без сети", () => {
+    assert.strictEqual(modelUriFor("yandexgpt-5-lite", "f1"), "gpt://f1/yandexgpt-5-lite", "адрес текстовой модели не собран");
+    assert.strictEqual(modelUriFor("text-search-doc", "f1", "embed"), "emb://f1/text-search-doc", "у векторов не префикс emb://");
+    assert.strictEqual(modelUriFor("gpt://f1/aliceai-llm/rc", "f9"), "gpt://f1/aliceai-llm/rc", "полный адрес переписан");
+    assert.strictEqual(modelNameOf("gpt://f1/yandexgpt-5-lite/rc"), "yandexgpt-5-lite", "имя из адреса не вынуто");
+    assert.throws(() => modelUriFor("", "f1"), /Не указана модель/, "пустая модель принята");
+    assert.throws(() => modelUriFor("yandexgpt-5-lite", ""), /каталог/, "без каталога адрес не собрать");
+    const alice = aiPriceFor("gpt://f1/aliceai-llm");
+    assert.ok(alice && alice.in1000 === 0.5 && alice.out1000 === 1.2, "тариф Alice не найден: " + JSON.stringify(alice));
+    assert.strictEqual(aiPriceFor("незнакомая-модель"), null, "чужой модели приписан тариф");
+    const line = aiPriceLine("yandexgpt-5-lite");
+    assert.ok(/0\.2 ₽/.test(line) && /бесплатна/.test(line), "тариф Lite не назван: " + line);
+    assert.strictEqual(aiCostText("yandexgpt-5-lite", { input: 1200, output: 400 }), "≈ 0.32 ₽", "цена ответа посчитана неверно");
+    assert.strictEqual(aiCostText("незнакомая", { input: 10 }), "", "неизвестной модели приписана цена");
+    assert.strictEqual(AI_MODELS.length, 6, "запасной список моделей неполон: " + AI_MODELS.length);
+    assert.ok(AI_MODELS.some((m) => m.id === "text-search-doc" && m.kind === "векторы"), "в запасе нет модели векторов");
+  });
+
+  await test("ycAi: модели — из облака и запасным списком, каталог уходит заголовком", async () => {
+    const r = await ai.listModels("oauth-1", "folder-1");
+    assert.strictEqual(r.fromCloud, true, "список облака не разобран");
+    assert.deepStrictEqual(r.models.map((m) => m.id), ["yandexgpt-5-lite", "text-search-doc"], "модели не разобраны");
+    assert.strictEqual(r.models[1].kind, "векторы", "вид модели не угадан по имени: " + r.models[1].kind);
+    assert.strictEqual(r.models[0].kind, "текст", "вид модели не взят из ответа: " + r.models[0].kind);
+    const sent = callsTo(stub, "/v1/models").slice(-1)[0];
+    assert.strictEqual(sent.headers["openai-project"], "folder-1", "каталог не ушёл заголовком OpenAI-Project");
+    assert.strictEqual(sent.headers.authorization, "Bearer iam-test", "нет IAM-токена у списка моделей");
+    stub.setModelsFail(true);
+    const fb = await ai.listModels("oauth-1", "folder-1");
+    stub.setModelsFail(false);
+    assert.strictEqual(fb.fromCloud, false, "отказ облака не распознан");
+    assert.ok(fb.models.some((m) => m.id === "text-search-doc"), "подсказка про модели пропала вместе с сетью");
+  });
+
+  await test("ycAi: ответ модели — синхронный запрос с ролью и оценкой по токенам", async () => {
+    const from = stub.calls.length;
+    const r = await ai.complete("oauth-1", { prompt: "Привет", system: "Отвечай коротко", folderId: "folder-1" });
+    assert.ok(stub.calls.length > from, "запрос к модели не ушёл");
+    const b = JSON.parse(callsTo(stub, "/foundationModels/v1/completion").slice(-1)[0].body);
+    assert.strictEqual(b.modelUri, "gpt://folder-1/yandexgpt-5-lite", "адрес модели не собран");
+    assert.strictEqual(b.completionOptions.stream, false, "это не синхронный режим");
+    assert.strictEqual(b.completionOptions.temperature, 0.3, "температура по умолчанию не 0.3");
+    assert.strictEqual(b.completionOptions.maxTokens, "2000", "maxTokens ушёл не строкой: " + JSON.stringify(b.completionOptions.maxTokens));
+    assert.deepStrictEqual(b.messages.map((m) => m.role), ["system", "user"], "роль не ушла первой");
+    assert.strictEqual(r.text, "Ответ модели: Отвечай коротко | Привет", "текст ответа не разобран: " + r.text);
+    assert.deepStrictEqual(r.usage, { input: 1200, output: 400, total: 1600 }, "токены ответа не разобраны");
+    assert.strictEqual(r.modelVersion, "v5.1", "версия модели не разобрана");
+    assert.strictEqual(r.status, "ALTERNATIVE_STATUS_FINAL", "статус альтернативы не разобран");
+    assert.ok(r.price && r.price.in1000 === 0.2, "тариф не приложен к ответу");
+  });
+
+  await test("ycAi: без запроса, с температурой 2 и длиной 0 — отказ ДО сети", async () => {
+    const from = stub.calls.length;
+    await assert.rejects(() => ai.complete("oauth-1", { folderId: "folder-1" }), /Нечего спросить/);
+    await assert.rejects(() => ai.complete("oauth-1", { prompt: "а", temperature: 2, folderId: "folder-1" }), /temperature — число от 0 до 1/);
+    await assert.rejects(() => ai.complete("oauth-1", { prompt: "а", maxTokens: 0, folderId: "folder-1" }), /maxTokens — целое от 1 до 32000/);
+    await assert.rejects(() => ai.tokenize("oauth-1", { folderId: "folder-1" }), /Нечего считать/);
+    await assert.rejects(() => ai.embed("oauth-1", { folderId: "folder-1" }), /Нечего векторизовать/);
+    assert.strictEqual(stub.calls.length, from, "на отказах всё-таки ушли запросы");
+  });
+
+  await test("ycAi: токены считаются бесплатно, вектор — эмбеддингом из 256 чисел", async () => {
+    const tk = await ai.tokenize("oauth-1", { text: "Привет", model: "yandexgpt-5.1", folderId: "folder-1" });
+    const tb = JSON.parse(callsTo(stub, "/foundationModels/v1/tokenizeCompletion").slice(-1)[0].body);
+    assert.deepStrictEqual(tb, { modelUri: "gpt://folder-1/yandexgpt-5.1", text: "Привет" }, "тело токенизации разошлось");
+    assert.strictEqual(tk.count, 3, "токены не посчитаны: " + tk.count);
+    assert.deepStrictEqual(tk.first, ["При", "вет", "42"], "первые токены не разобраны: " + JSON.stringify(tk.first));
+    const em = await ai.embed("oauth-1", { text: "документ", folderId: "folder-1" });
+    const eb = JSON.parse(callsTo(stub, "/foundationModels/v1/textEmbedding").slice(-1)[0].body);
+    assert.deepStrictEqual(eb, { modelUri: "emb://folder-1/text-search-doc", text: "документ" }, "тело вектора разошлось");
+    assert.strictEqual(em.dims, 256, "размерность вектора: " + em.dims);
+    assert.strictEqual(em.vector[0], 0.001, "числа вектора не разобраны: " + em.vector[0]);
+    const q = await ai.embed("oauth-1", { text: "запрос", model: "text-search-query", folderId: "folder-1" });
+    assert.strictEqual(q.modelUri, "emb://folder-1/text-search-query", "у поискового запроса своя модель");
+    assert.ok(q.price && q.price.in1000 === 0.0101, "тариф векторов не приложен к ответу");
+  });
+
+  console.log("\n[5] Инструмент агента ycAi");
 
   await test("ycAi: без подключения, без каталога и с чужим действием — до сети", async () => {
     const off = buildTools({ yandexOauthToken: "" });
@@ -417,22 +533,55 @@ const callsTo = (stub, part) => stub.calls.filter((c) => c.url.indexOf(part) >= 
     assert.ok(/voices: \[/.test(voices), "ответ про голоса не подсказывает про несколько сразу");
   });
 
-  console.log("\n[5] Согласованность: схема, промпт, политика, справочник");
+  await test("ycAi: модели, токены, ответ и вектор отвечают словами и называют цену", async () => {
+    const env = buildTools();
+    const models = await env.tools.ycAi({ action: "models" }, {});
+    assert.ok(/yandexgpt-5-lite/.test(models) && /text-search-doc/.test(models), "модели не перечислены: " + models.slice(0, 220));
+    assert.ok(/0\.2 ₽/.test(models), "тариф Lite не назван в списке моделей");
+    assert.ok(/action: "tokens"/.test(models), "ответ не подсказывает бесплатный счёт токенов");
+    const tokens = await env.tools.ycAi({ action: "tokens", text: "Привет" }, {});
+    assert.ok(/Токены текста: 3/.test(tokens), "токены не посчитаны: " + tokens.slice(0, 200));
+    assert.ok(/бесплатн/.test(tokens), "не сказано, что токенизация бесплатна");
+    assert.ok(/yandexgpt-5-lite/.test(tokens), "модель по умолчанию не названа");
+    const done = await env.tools.ycAi({ action: "complete", prompt: "Привет", system: "Отвечай коротко" }, {});
+    assert.ok(/Ответ модели: Отвечай коротко \| Привет/.test(done), "текст ответа не отдан: " + done.slice(0, 220));
+    assert.ok(/вход 1200, ответ 400/.test(done), "токены ответа не названы");
+    assert.ok(/≈ 0\.32 ₽/.test(done), "цена ответа не посчитана: " + done.slice(0, 320));
+    assert.ok(/YandexGPT Lite 5/.test(done), "тариф после ответа не назван");
+    const vec = await env.tools.ycAi({ action: "embed", text: "документ" }, {});
+    assert.ok(/256 чисел/.test(vec), "размерность вектора не названа: " + vec.slice(0, 220));
+    assert.ok(/text-search-doc/.test(vec) && /text-search-query/.test(vec), "модели векторов не названы");
+    assert.ok(/0\.0101/.test(vec), "тариф векторов не назван");
+    assert.ok(/Ошибка: нужен text/.test(await env.tools.ycAi({ action: "tokens" }, {})), "нет отказа без текста для токенов");
+    assert.ok(/Ошибка: нужен prompt/.test(await env.tools.ycAi({ action: "complete" }, {})), "нет отказа без запроса к модели");
+    assert.ok(/Ошибка: нужен text/.test(await env.tools.ycAi({ action: "embed" }, {})), "нет отказа без текста для вектора");
+  });
+
+  console.log("\n[6] Согласованность: схема, промпт, политика, справочник");
 
   await test("ycAi: схема, группа облака, промпт и права знают инструмент", () => {
     const at = SCHEMAS_SRC.indexOf('name: "ycAi"');
     assert.ok(at > 0, "нет схемы инструмента в tool-schemas");
-    const schema = SCHEMAS_SRC.slice(at, at + 5200);
-    for (const part of ["action", "text", "texts", "target", "targets", "source", "file", "files", "langs", "model", "voice", "voices", "lang", "format", "speed", "emotion", "out", "topic", "sampleRateHertz", 'required: ["action"]']) {
+    const schema = SCHEMAS_SRC.slice(at, at + 7200);
+    for (const part of ["action", "text", "texts", "target", "targets", "source", "file", "files", "langs", "model", "voice", "voices", "lang", "format", "speed", "emotion", "out", "topic", "sampleRateHertz", "prompt", "system", "temperature", "maxTokens", 'required: ["action"]']) {
       assert.ok(schema.includes(part), "в схеме нет " + part);
     }
     assert.ok(/SpeechKit/.test(schema) && /Vision OCR|Vision/.test(schema), "схема не называет сервисы");
     assert.ok(/10 МБ/.test(schema) && /1 МБ/.test(schema), "схема не называет пределы");
+    assert.ok(/AI Studio/.test(schema), "схема не называет AI Studio");
+    assert.ok(/models \(модели AI Studio каталога\)/.test(schema) && /tokens/.test(schema) && /complete/.test(schema) && /embed/.test(schema), "схема не описывает действия AI Studio");
+    assert.ok(/temperature 0…1/.test(schema) && /maxTokens — длина ответа/.test(schema), "схема не объясняет температуру и длину ответа");
+    // Границы записи группы, а не число знаков: окно в 800 знаков ломалось от
+    // каждого нового ключевого слова группы (часть 91 добавила «группа машин»),
+    // хотя проверяемое свойство — «инструмент есть в группе облака» — не менялось.
     const groupAt = CORE_SRC.indexOf('id: "cloud"');
-    assert.ok(groupAt > 0 && CORE_SRC.slice(groupAt, groupAt + 800).includes('"ycAi"'), "инструмента нет в группе «облако» — модель его не увидит");
+    const groupEnd = CORE_SRC.indexOf('id: "', groupAt + 10);
+    const cloudGroup = CORE_SRC.slice(groupAt, groupEnd > groupAt ? groupEnd : groupAt + 1400);
+    assert.ok(groupAt > 0 && cloudGroup.includes('"ycAi"'), "инструмента нет в группе «облако» — модель его не увидит");
     const line = PROMPTS_SRC.split("\n").find((l) => l.startsWith("Доступные инструменты:")) || "";
     assert.ok(/ycAi/.test(line), "инструмента нет в списке для модели");
     assert.ok(/ycAi \(ЯНДЕКС AI/.test(PROMPTS_SRC), "промпт не объясняет, зачем ycAi");
+    assert.ok(/AI Studio/.test(PROMPTS_SRC) && /tokens — посчитать токены текста/.test(PROMPTS_SRC), "промпт не называет действия AI Studio");
     const capAt = POLICY_SRC.indexOf('cap: "cloud.read"');
     assert.ok(capAt > 0 && POLICY_SRC.slice(capAt, capAt + 260).includes('"ycAi"'), "нет назначения cloud.read для ycAi");
     assert.ok(SMOKE_SRC.includes('"ycAi"'), "smoke-набор не знает про ycAi");
@@ -444,6 +593,8 @@ const callsTo = (stub, part) => stub.calls.filter((c) => c.url.indexOf(part) >= 
     assert.ok(/targets: \[/.test(GUIDE_SRC) && /voices: \[/.test(GUIDE_SRC), "в yc.md нет примера со списками");
     assert.ok(/10 МБ/.test(GUIDE_SRC) && /1 МБ/.test(GUIDE_SRC), "в yc.md нет пределов");
     assert.ok(/ключа API заводить НЕ нужно|отдельного ключа API/.test(GUIDE_SRC), "в yc.md не сказано, что ключ API не нужен");
+    assert.ok(/AI Studio/.test(GUIDE_SRC) && /tokens/.test(GUIDE_SRC), "в yc.md нет действий AI Studio");
+    assert.ok(/text-search-doc/.test(GUIDE_SRC) && /text-search-query/.test(GUIDE_SRC), "в yc.md не названы модели векторов");
   });
 
   await test("ycAi: адреса четырёх сервисов известны облаку без сети", () => {
@@ -452,6 +603,8 @@ const callsTo = (stub, part) => stub.calls.filter((c) => c.url.indexOf(part) >= 
       '"ocr": "https://ocr.api.cloud.yandex.net"',
       '"tts": "https://tts.api.cloud.yandex.net"',
       '"stt": "https://stt.api.cloud.yandex.net"',
+      '"ai": "https://llm.api.cloud.yandex.net"',
+      '"ai-llm": "https://ai.api.cloud.yandex.net"',
     ]) {
       assert.ok(YC_SRC.includes(part), "в KNOWN_ENDPOINTS нет " + part);
     }
@@ -465,7 +618,7 @@ const callsTo = (stub, part) => stub.calls.filter((c) => c.url.indexOf(part) >= 
     assert.ok(String(PKG.scripts.test || "").indexOf("test/yc-ai.test.js") >= 0, "набора нет в цепочке npm test");
   });
 
-  console.log("\n[6] Интерфейс: канал «yc:ai» и вход в панели");
+  console.log("\n[7] Интерфейс: канал «yc:ai» и вход в панели");
 
   await test("yc:ai: канал отвечает теми же действиями, что форма, и зовёт тот же модуль", () => {
     // Якорь именно на ОБЪЯВЛЕНИЕ КАНАЛА, а не на список ops в интерфейсе: у них
@@ -475,14 +628,18 @@ const callsTo = (stub, part) => stub.calls.filter((c) => c.url.indexOf(part) >= 
     let end = IPC_SRC.indexOf("ipcMain.handle(\"", at + 10);
     if (end < 0) end = IPC_SRC.length;
     const body = IPC_SRC.slice(at, end);
-    const m = body.match(/Доступно:\s*([^"]+?)\./);
-    assert.ok(m, "в канале нет списка доступных действий");
+    // Список действий печатается СБОРКОЙ из массива ALL (`"Доступно: " + ALL.join(", ")`)
+    // — разбор строки здесь ничего не найдёт. Читаем сам массив: он и есть список,
+    // а строка «Доступно:» обязана звать именно его.
+    const arr = body.match(/const ALL = \[([^\]]+)\];/);
+    assert.ok(arr, "в канале нет списка доступных действий");
+    assert.ok(/Доступно:\s*" \+ ALL\.join\(", "\)/.test(body), "отказ канала не называет действия из ALL");
     assert.deepStrictEqual(
-      m[1].split(",").map((x) => x.trim()),
-      ["translate", "languages", "detect", "ocr", "voices", "speak", "listen"],
+      arr[1].split(",").map((x) => x.trim().replace(/^"|"$/g, "")),
+      ["translate", "languages", "detect", "ocr", "voices", "speak", "listen", "models", "tokens", "complete", "embed"],
       "список действий канала разошёлся с интерфейсом"
     );
-    for (const part of ["ycAi.translate(", "ycAi.listLanguages(", "ycAi.detectLanguage(", "ycAi.recognizeText(", "ycAi.listVoices(", "ycAi.synthesize(", "ycAi.recognizeSpeech(", "ycAi.mimeForExt("]) {
+    for (const part of ["ycAi.translate(", "ycAi.listLanguages(", "ycAi.detectLanguage(", "ycAi.recognizeText(", "ycAi.listVoices(", "ycAi.synthesize(", "ycAi.recognizeSpeech(", "ycAi.mimeForExt(", "ycAi.listModels(", "ycAi.complete(", "ycAi.tokenize(", "ycAi.embed("]) {
       assert.ok(body.includes(part), "канал не зовёт " + part);
     }
     assert.ok(PRELOAD_SRC.includes('ycAi: (args) => ipcRenderer.invoke("yc:ai", args || {})'), "preload не пробрасывает Яндекс AI в окно");
@@ -598,14 +755,46 @@ const callsTo = (stub, part) => stub.calls.filter((c) => c.url.indexOf(part) >= 
     assert.ok(/не подключён/.test((await noToken.call({ op: "languages" })).error), "отказ про токен не сказан");
   });
 
+  await test("yc:ai: модели, токены, ответ и вектор — канал отвечает теми же формами", async () => {
+    const env = buildIpc(settingsFor());
+    const models = await env.call({ op: "models" });
+    assert.strictEqual(models.ok, true, "канал отказал: " + (models.error || ""));
+    assert.deepStrictEqual((models.lines || []).length, 2, "строк не две: " + JSON.stringify(models.lines));
+    assert.ok(/yandexgpt-5-lite/.test((models.lines || []).join("\n")), "моделей нет в строках");
+    const sent = callsTo(stub, "/v1/models").slice(-1)[0];
+    assert.strictEqual(sent.headers["openai-project"], "folder-1", "канал не назвал каталог заголовком");
+    const tk = await env.call({ op: "tokens", text: "Привет" });
+    assert.strictEqual(tk.ok, true, "токены отказали: " + (tk.error || ""));
+    assert.strictEqual(tk.tokens, 3, "токенов не 3: " + tk.tokens);
+    assert.ok(/бесплатн/.test((tk.warnings || []).join(" ")), "о бесплатности токенизации не сказано");
+    const done = await env.call({ op: "complete", prompt: "Привет", system: "Роль" });
+    assert.strictEqual(done.ok, true, "ответ модели отказал: " + (done.error || ""));
+    assert.ok(/Ответ модели: Роль \| Привет/.test(done.answer), "текст ответа не отдан: " + done.answer);
+    assert.deepStrictEqual(done.usage, { input: 1200, output: 400, total: 1600 }, "токены ответа не разобраны");
+    assert.ok(/≈ 0\.32 ₽/.test((done.lines || []).join("\n")), "цена не посчитана: " + (done.lines || []).join(" | "));
+    const em = await env.call({ op: "embed", text: "документ" });
+    assert.strictEqual(em.ok, true, "вектор отказал: " + (em.error || ""));
+    assert.strictEqual(em.dims, 256, "размерность вектора: " + em.dims);
+    assert.ok(/Первые числа: 0\.001/.test((em.lines || []).join("\n")), "первые числа не показаны: " + (em.lines || []).join(" | "));
+    const bad = await env.call({ op: "tokens" });
+    assert.strictEqual(bad.ok, false, "пустые токены приняты");
+    assert.ok(/Впиши текст/.test(bad.error), "отказ без текста не объяснён: " + bad.error);
+    const noPrompt = await env.call({ op: "complete" });
+    assert.strictEqual(noPrompt.ok, false, "пустой запрос к модели принят");
+    assert.ok(/Впиши запрос/.test(noPrompt.error), "отказ без запроса не объяснён: " + noPrompt.error);
+    const noVec = await env.call({ op: "embed" });
+    assert.strictEqual(noVec.ok, false, "пустой текст для вектора принят");
+    assert.ok(/Впиши текст/.test(noVec.error), "отказ без текста для вектора не объяснён: " + noVec.error);
+  });
+
   await test("yc:ai: семейство в интерфейсе, вход в панели и плеер для звука", () => {
     assert.ok(/ai: "ycAi"/.test(ACTIONS_SRC), "в таблице действий нет канала Яндекс AI");
-    assert.ok(/ai: \["translate", "languages", "detect", "ocr", "voices", "speak", "listen"\]/.test(ACTIONS_SRC), "нет списка допустимых действий");
+    assert.ok(/ai: \["translate", "languages", "detect", "ocr", "voices", "speak", "listen", "models", "tokens", "complete", "embed"\]/.test(ACTIONS_SRC), "нет списка допустимых действий");
     assert.ok(/ai: \{ title: "Яндекс AI", ru: "запрос" \}/.test(ACTIONS_SRC), "нет подписи семейства");
     const at = ACTIONS_SRC.indexOf('ai: [\n      { id: "languages"');
     assert.ok(at > 0, "нет таблицы действий Яндекс AI");
     const body = ACTIONS_SRC.slice(at, ACTIONS_SRC.indexOf("\n    ],", at));
-    for (const part of ['op: "translate"', 'op: "ocr"', 'op: "voices"', 'op: "speak"', 'op: "listen"', "targets", "files", "model", "emotion"]) {
+    for (const part of ['op: "translate"', 'op: "ocr"', 'op: "voices"', 'op: "speak"', 'op: "listen"', 'op: "models"', 'op: "tokens"', 'op: "complete"', 'op: "embed"', "targets", "files", "model", "emotion", "prompt", "temperature"]) {
       assert.ok(body.includes(part), "в семействе Яндекс AI нет " + part);
     }
     assert.ok(/paid: true/.test(body), "платные запросы не помечены");

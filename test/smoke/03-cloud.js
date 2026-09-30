@@ -468,7 +468,7 @@ async function testYandexCloud() {
 
   await test("Yandex Cloud: инструменты, алиасы промпта, мост и интерфейс согласованы", () => {
     const names = core.TOOL_DEFINITIONS.map((d) => d.function && d.function.name);
-    for (const n of ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycVpc", "ycCompute", "ycIam", "ycFunctions", "ycBilling", "ycCdn", "ycDb", "ycAi", "ycMonitor", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"]) {
+    for (const n of ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycVpc", "ycCompute", "ycIam", "ycFunctions", "ycBilling", "ycCdn", "ycDb", "ycAi", "ycMonitor", "ycIg", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"]) {
       assert.ok(names.includes(n), "нет инструмента " + n);
     }
     const prompt = core.SYSTEM_PROMPT || "";
@@ -1474,7 +1474,7 @@ async function testYcSplit() {
       "yc:status", "yc:setToken", "yc:folders", "yc:setFolder", "yc:setPermissions",
       "yc:logout", "yc:console:overview", "yc:console:list", "yc:console:rollback", "yc:console:secretVersion", "yc:console:dnsRecord", "yc:console:registryImage", "yc:console:storageObject", "yc:console:bucketAccess",
       "yc:resources", "yc:costs", "yc:create", "yc:delete", "yc:logs",
-      "yc:cliStatus", "yc:installCli",      "yc:vpc", "yc:compute", "yc:iam", "yc:functions", "yc:billing", "yc:cdn", "yc:ai", "yc:mdb", "yc:dns",
+      "yc:cliStatus", "yc:installCli",      "yc:vpc", "yc:compute", "yc:iam", "yc:functions", "yc:billing", "yc:cdn", "yc:ai", "yc:mdb", "yc:ig", "yc:dns",
     ];
     for (const ch of channels) {
       assert.ok(!main.includes('ipcMain.handle("' + ch + '"'), "канал остался в main.js: " + ch);
@@ -1490,7 +1490,7 @@ async function testYcSplit() {
     assert.ok(main.includes('require("./yc-service.js")') && main.includes('require("./yc-ipc.js")'), "main.js не подключает вынесенные модули");
     assert.ok(/registerYcIpc\(\{ ipcMain/.test(main), "IPC-мост не регистрируется");
     const found = [...ipcSrc.matchAll(/ipcMain\.handle\("(yc:[^"]+)"/g)].map((m) => m[1]);
-    assert.strictEqual(found.length, 31, "каналов в мосте должно быть 31 (yc:deploy остаётся мостом деплоя): " + found.length);
+    assert.strictEqual(found.length, 32, "каналов в мосте должно быть 32 (yc:deploy остаётся мостом деплоя): " + found.length);
   });
 
   await test("Yandex Cloud: служебный слой работает сам, без main.js", () => {

@@ -65,6 +65,14 @@ const RELATIONS = {
   // карточку каждой машины ВСЕ диски каталога. Что действительно относится к
   // машине (диски, снимки, подсети, группы, хвосты) показывает карточка действий
   // полки — она спрашивает ycCompute, а тот считает связи сам.
+  // Группа машин — не машина: у неё свои связи (машины группы и история
+  // операций), и они читаются по её id, а не по каталогу.
+  instanceGroups: [
+    { key: "instances", title: "Машины группы", icon: "🖥", listKey: "instances",
+      attempts: [{ path: (c) => "/compute/v1/instanceGroups/" + enc(c.id) + "/instances?pageSize=1000" }] },
+    { key: "operations", title: "Операции", icon: "🕘", listKey: "operations",
+      attempts: [{ path: (c) => "/compute/v1/instanceGroups/" + enc(c.id) + "/operations?pageSize=100" }] },
+  ],
   compute: [],
   containerRegistry: [
     { key: "images", title: "Образы", icon: "🖼", listKey: "images",
@@ -162,6 +170,7 @@ const DETAIL_PATHS = {
   serverlessContainers: (c) => "/containers/v1/containers/" + enc(c.id),
   cloudFunctions: (c) => "/functions/v1/functions/" + enc(c.id),
   compute: (c) => "/compute/v1/instances/" + enc(c.id),
+  instanceGroups: (c) => "/compute/v1/instanceGroups/" + enc(c.id),
   postgresql: (c) => "/managed-postgresql/v1/clusters/" + enc(c.id),
   mysql: (c) => "/managed-mysql/v1/clusters/" + enc(c.id),
   clickhouse: (c) => "/managed-clickhouse/v1/clusters/" + enc(c.id),
@@ -182,6 +191,7 @@ const SERVICE_ENDPOINT = {
   serverlessContainers: "serverless-containers",
   cloudFunctions: "serverless-functions",
   vpc: "vpc",
+  instanceGroups: "compute",
   compute: "compute",
   storage: "storage-api",
   postbox: "postbox",
@@ -446,6 +456,8 @@ const RELATION_COLUMNS = {
   "iam:apiKeys": ["id", "createdAt", "expiresAt"],
   "lockbox:versions": ["id", "status", "createdAt"],
   "dns:recordSets": ["name", "type", "ttl", "data"],
+  "instanceGroups:instances": ["name", "zoneId", "status"],
+  "instanceGroups:operations": ["description", "done", "createdAt"],
   "storage:objects": ["key", "size", "lastModified"],
   "ydb:tables": ["name"],
   "postgresql:hosts": ["name", "zoneId", "role", "health"],
@@ -747,6 +759,7 @@ const SERVICE_TITLES = {
   postgresql: "Managed Service for PostgreSQL",
   mysql: "Managed Service for MySQL",
   clickhouse: "Managed Service for ClickHouse",
+  instanceGroups: "Instance Groups",
 };
 
 function labelService(key) {

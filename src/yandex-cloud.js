@@ -80,6 +80,10 @@ const KNOWN_ENDPOINTS = {
   // Foundation Models (YandexGPT и генерация картинок) — тот же хост, что у
   // YandexART в renderer/image-tools.js: он и есть AI Studio.
   "ai": "https://llm.api.cloud.yandex.net",
+  // Модели каталога и OpenAI-совместимый вход AI Studio живут на ДРУГОМ хосте:
+  // в каталоге эндпоинтов это id ai-llm (ai.api.cloud.yandex.net, сверено 30.09.2026 —
+  // полный список эндпоинтов из документации, обновлён 18.05.2026).
+  "ai-llm": "https://ai.api.cloud.yandex.net",
   // Monitoring: данные метрик и их метаданные. Отдельный хост от остальных
   // сервисов каталога, и без строки здесь первый же запрос ждал бы каталог 8 с.
   "monitoring": "https://monitoring.api.cloud.yandex.net",
@@ -375,6 +379,9 @@ const SERVICES = [
   // агента: создание, питание, снимки и метрики — а в окне их не было видно
   // даже списком, то есть человек не знал, что у него вообще есть машины.
   { key: "compute", ru: "Виртуальные машины", title: "Compute Cloud", icon: "🖥️", svc: "compute", listPath: "/compute/v1/instances", listKey: "instances" },
+  // Группы машин (Instance Groups) — тот же хост, что у Compute, но ДРУГОЙ
+  // ресурс: группа сама создаёт машины по шаблону и держит их число (часть 91).
+  { key: "instanceGroups", ru: "Группы машин", title: "Instance Groups", icon: "🧩", svc: "compute", listPath: "/compute/v1/instanceGroups", listKey: "instanceGroups" },
   // Monitoring — не ресурс, а измеритель: «список» у него — сами метрики
   // каталога (метаданные), поэтому запрос идёт по своим правилам (query
   // "monitoring": только folderId, без pageSize, которого сервис не знает).
