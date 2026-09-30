@@ -395,8 +395,13 @@ const section = (src, channel) => {
     }
     assert.ok(/метаданные/.test(schema) && /СПРАВОЧНИК|метаданные/.test(schema), "схема не объясняет метаданные");
     assert.ok(/алерт/.test(schema), "схема молчит про то, что алертов нет");
+    // Границы записи, а не число знаков: окно в 900 знаков ломалось от каждого
+    // нового ключевого слова группы (заход 2 части 91 добавил «балансировщик»),
+    // хотя проверяемое свойство — «инструмент есть в группе облака» — не менялось.
     const groupAt = CORE_SRC.indexOf('id: "cloud"');
-    assert.ok(groupAt > 0 && CORE_SRC.slice(groupAt, groupAt + 900).includes('"ycMonitor"'), "инструмента нет в группе «облако»");
+    const groupEnd = CORE_SRC.indexOf('id: "', groupAt + 10);
+    const cloudGroup = CORE_SRC.slice(groupAt, groupEnd > groupAt ? groupEnd : groupAt + 1400);
+    assert.ok(cloudGroup.includes('"ycMonitor"'), "инструмента нет в группе «облако»");
     const line = PROMPTS_SRC.split("\n").find((l) => l.startsWith("Доступные инструменты:")) || "";
     assert.ok(/ycMonitor/.test(line), "инструмента нет в списке для модели");
     assert.ok(/ycMonitor \(METRIKI/.test(PROMPTS_SRC), "промпт не объясняет, зачем ycMonitor");

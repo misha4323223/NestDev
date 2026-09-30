@@ -49,6 +49,13 @@
      [13] ГРУППЫ МАШИН: у плитки «Группы машин» свои восемь действий — список,
          карточка с шаблоном и машинами, создание (сначала цена и размер,
          потом согласие) и удаление, которое забирает машины вместе с дисками.
+     [14] БАЛАНСИРОВЩИКИ: у плитки «Балансировщики» восемнадцать действий —
+         карточка проходит путь слушатель → роутер → группа бэкендов → группа
+         целей, создание сначала показывает цену и порт, а удаление называет
+         адреса слушателей и спрашивает человека; группа бэкендов собирается из
+         формы (вид, порт целей, путь проверки), здоровье спрашивают у пары
+         «бэкенды + цели» и показывают ПО ЗОНАМ, а удаление группы сначала
+         спрашивает человека.
 
    Этот прогон уже нашёл настоящую ошибку: поиск по «функц» не находил плитку
    «Функции» — строка поиска не включала русское имя, а человек ищет по тому, что
@@ -130,7 +137,7 @@ ${STUBS}
 <script src="${BASE}src/renderer/yc-panel.js"></script>
 <script src="${BASE}src/renderer/yc-actions.js"></script>
 <script>
-  // Данные стенда: одиннадцать сервисов (в том числе три managed-базы), один
+  // Данные стенда: тринадцать сервисов (три managed-базы, группа машин и балансировщики), один
   // отказал, есть ресурсы, деньги и хвосты.
   const services = [
     { key: "storage", ru: "Объектное хранилище", title: "Object Storage", ok: true, count: 3, items: [{ id: "b1", name: "site-bucket" }, { id: "b2", name: "logs-archive" }, { id: "b3", name: "backups" }] },
@@ -144,7 +151,13 @@ ${STUBS}
     // Группы машин (Instance Groups): тот же хост, что у Compute, но ресурс
     // другой — группа сама создаёт машины по шаблону. Своя плитка и своё
     // семейство действий (канал yc:ig).
-    { key: "instanceGroups", ru: "Группы машин", title: "Instance Groups", ok: true, count: 1, items: [{ id: "ig1", name: "web" }] },
+    { key: "instanceGroups", ru: "Группы машин", title: "Instance Groups", ok: true, count: 1, items: [{ id: "ig1", name: "web" }] },    // Балансировщики: вход в приложение — слушатели, группы целей, HTTP-роутеры
+    // и группы бэкендов. У плитки своё семейство из восемнадцати действий (канал
+    // ycAlb): создание балансировщика платное — цена спрашивается до согласия, а
+    // группа бэкендов задаёт порт целей и проверку здоровья, поэтому её создание
+    // и здоровье целей — отдельные действия.
+    { key: "alb", ru: "Балансировщики", title: "Application Load Balancer", ok: true, count: 1, items: [{ id: "lb1", name: "web-lb" }] },
+
     // Managed-базы: три плитки у одного канала (yc:mdb). Какая это база, видно
     // только по полю engine, которое подставляет само семейство, — в этом весь
     // смысл проверки [10].
@@ -161,7 +174,7 @@ ${STUBS}
   window.uiToast = () => {};
   const api = {
     ycStatus: async () => ({ loggedIn: true, iamOk: true, folderId: "b1g", folderName: "prod-web" }),
-    ycResources: async () => ({ ok: true, services, total: 17, activeServices: 9 }),
+    ycResources: async () => ({ ok: true, services, total: 18, activeServices: 10 }),
     ycBilling: async () => ({
       ok: true,
       account: { id: "acc", name: "Облако", currency: "RUB", balance: 1234.56, balanceHuman: "1 234,56 ₽", active: true },
@@ -250,6 +263,92 @@ ${STUBS}
           lines: ["Группа «web» удаляется вместе с машинами (3 шт.) и их дисками — отменить нельзя."],
           warnings: ["Диски машин удаляются вместе с группой: если данные нужны — сними снимки заранее."],
           message: "Группа удаляется." };
+      }
+      return { ok: true, lines: ["готово: " + a.op], message: "готово: " + a.op };
+    },
+    // Балансировщик: вход в приложение — и канал у него свой (ycAlb). Отвечаем
+    // как настоящий src/yc-ipc.js: строки, needsConfirm на платное, а согласие
+    // спрашивает панель — первый запрос уходит БЕЗ confirm.
+    ycAlb: async (a) => {
+      window.__calls.push(["ycAlb", a]);
+      if (a.op === "list") {
+        return { ok: true, loadBalancers: [{ id: "lb1", name: "web-lb" }],
+          lines: ["● web-lb — работает · HTTP 80 203.0.113.10 · зоны: ru-central1-a", "    id lb1"],
+          message: "Балансировщиков: 1." };
+      }
+      if (a.op === "card") {
+        return { ok: true, lb: { id: "lb1", name: a.lb },
+          lines: ["● web-lb — работает · HTTP 80 203.0.113.10", "Слушатели (1):", "  • web — HTTP 203.0.113.10:80 → роутер rt-web",
+            "Роутер «web-router»:", "  домены: site.example.com · путь /* → группа бэкендов bg-web",
+            "Группы целей (1):", "  • web-targets · целей: 2", "    10.10.0.5 (подсеть sub-a)"],
+          message: "Балансировщик «web-lb»: работает." };
+      }
+      if (a.op === "lbnew" && a.confirm !== true) {
+        return { ok: false, needsConfirm: true,
+          error: "Балансировщик ПЛАТНЫЙ: ресурсные единицы и сам ресурс тарифицируются за час, даже когда трафика нет. Подтверди создание.",
+          lines: ["Будет создан балансировщик «" + a.name + "» в каталоге «prod-web».",
+            "Слушатель: " + a.listener + " · порт " + a.port + " · зона: по подсети " + a.subnet] };
+      }
+      if (a.op === "lbnew") {
+        return { ok: true, changed: true, lbId: "lb-new",
+          lines: ["Балансировщик «" + a.name + "» создаётся: слушатель HTTP, порт " + a.port + ", зона ru-central1-a."],
+          warnings: ["Балансировщик платный: он тарифицируется за час, даже когда трафика нет."], message: "Балансировщик создаётся." };
+      }
+      if (a.op === "lbdel" && a.confirm !== true) {
+        return { ok: false, needsConfirm: true,
+          error: "Удаление балансировщика «web-lb» необратимо: он уйдёт вместе со слушателями и адресами (203.0.113.10). Подтверди удаление.",
+          lines: ["● web-lb — работает · HTTP 80 203.0.113.10"] };
+      }
+      if (a.op === "lbdel") {
+        return { ok: true, changed: true, lbId: "lb1",
+          lines: ["Балансировщик «web-lb» удаляется вместе со слушателями и адресами (203.0.113.10) — отменить нельзя."],
+          warnings: ["Домен, который смотрел на этот адрес, перестанет открываться."], message: "Балансировщик удаляется." };
+      }
+      // Группа бэкендов (часть 91, заход 3): порт целей и проверки здоровья
+      // живут ЗДЕСЬ, здоровье приходит ПО ЗОНАМ, а удаление необратимо.
+      if (a.op === "backends" || a.op === "targets") {
+        if (a.op === "targets") {
+          return { ok: true, targetGroups: [{ id: "tg1", name: "web-targets" }],
+            lines: ["• web-targets · целей: 2", "    id tg1"], message: "Групп целей: 1." };
+        }
+        return { ok: true, backendGroups: [{ id: "bg1", name: "web-backends" }, { id: "bg2", name: "free-backends" }],
+          lines: ["• web-backends · HTTP · бэкендов: 1 · группы целей: tg-web · проверок здоровья: 1", "    id bg1",
+            "• free-backends · поток TCP · бэкендов: 1 · группы целей: tg-web"],
+          warnings: ["Порт целей и проверки здоровья задаются в ГРУППЕ БЭКЕНДОВ, а не в группе целей: создание — backnew, а здоровье целей показывает действие health."],
+          message: "Групп бэкендов: 2." };
+      }
+      if (a.op === "health") {
+        return { ok: true, lb: { id: "lb1", name: a.lb }, backendGroup: { id: "bg1", name: "web-backends" }, targetGroup: { id: "tg1", name: a.targetGroup },
+          states: [
+            { ipAddress: "10.10.0.5", zones: [{ zoneId: "ru-central1-a", status: "HEALTHY", statusHuman: "здорова" }], healthy: true },
+            { ipAddress: "10.10.0.6", zones: [{ zoneId: "ru-central1-a", status: "HEALTHY", statusHuman: "здорова" }, { zoneId: "ru-central1-b", status: "UNHEALTHY", statusHuman: "не отвечает", failedActiveHc: true }], healthy: false },
+          ],
+          healthy: 1,
+          lines: ["Здоровье целей группы «" + a.targetGroup + "» (группа бэкендов «web-backends», балансировщик «" + a.lb + "»):",
+            "  • 10.10.0.5 (подсеть sub-a) — ru-central1-a: здорова",
+            "  • 10.10.0.6 (подсеть sub-a) — ru-central1-a: здорова · ru-central1-b: не отвечает (не проходит активную проверку)",
+            "Целей: 2 · здоровых: 1."],
+          warnings: ["В маршрут попадут только здоровые цели: проверь машины, порт целей и путь проверки в группе бэкендов."],
+          message: "Здоровье целей «" + a.targetGroup + "»: целей 2, здоровых 1." };
+      }
+      if (a.op === "backnew") {
+        return { ok: true, changed: true, backendGroup: { id: "bg-new", name: a.name }, groupId: "bg-new",
+          lines: ["Группа бэкендов «" + a.name + "» создаётся: " + (a.kind === "stream" ? "поток TCP" : a.kind === "grpc" ? "gRPC" : "HTTP") + ", бэкенд «main» — порт " + a.port + ", группа целей «" + a.targetGroup + "»" + (a.healthPath ? ", проверка здоровья " + a.healthPath : "") + "."],
+          warnings: a.healthPath
+            ? ["Дальше: маршрут роутера (routernew, backendGroup) или потоковый слушатель балансировщика (lbnew, listener «stream»)."]
+            : ["Проверки здоровья не заданы: облако будет считать цель здоровой всегда — упавшая машина останется в ротации. Путь проверки задаётся полем healthPath (например, «/»)."],
+          message: "Группа бэкендов создаётся." };
+      }
+      if (a.op === "backdel" && a.confirm !== true) {
+        return { ok: false, needsConfirm: true,
+          error: "Удаление группы бэкендов «web-backends» необратимо: проверки здоровья и настройки балансировки будут потеряны, а роутер или потоковый слушатель, который на неё смотрит, перестанет отвечать. Подтверди удаление.",
+          lines: ["• web-backends · HTTP · бэкендов: 1 · группы целей: tg-web"] };
+      }
+      if (a.op === "backdel") {
+        return { ok: true, changed: true, groupId: "bg1",
+          lines: ["Группа бэкендов «" + (a.group || "web-backends") + "» удаляется: проверки здоровья и настройки балансировки будут потеряны."],
+          warnings: ["Группы целей, машины и роутеры не трогаются: удаляется только связка «какие цели и как проверять»."],
+          message: "Группа бэкендов удаляется." };
       }
       return { ok: true, lines: ["готово: " + a.op], message: "готово: " + a.op };
     },
@@ -375,8 +474,8 @@ fs.writeFileSync(SHOT, PAGE, "utf8");
           .slice(0, 6),
       };
     });
-    ok(info.tiles === 12, "плиток столько же, сколько сервисов (двенадцать)", String(info.tiles));
-    ok(info.icons === 12, "у каждой плитки своя официальная иконка", String(info.icons));
+    ok(info.tiles === 13, "плиток столько же, сколько сервисов (тринадцать)", String(info.tiles));
+    ok(info.icons === 13, "у каждой плитки своя официальная иконка", String(info.icons));
     ok(info.columns === 2, "полка в две колонки при ширине панели 460px", "колонок: " + info.columns);
     ok(
       info.logo && Math.round(info.logo.width) === 32 && Math.round(info.logo.height) === 32,
@@ -1069,6 +1168,196 @@ fs.writeFileSync(SHOT, PAGE, "utf8");
     });
     ok(igDelRun.askedHuman && /ВМЕСТЕ с машинами/.test(igDelRun.warnText) && /дисками/.test(igDelRun.warnText), "удаление объяснило последствия до запроса", igDelRun.warnText.slice(0, 220));
     ok(igDelRun.group === "web" && igDelRun.firstConfirm !== true, "первый запрос ушёл без согласия, но с именем группы", JSON.stringify(igDelRun));
+    // ── Балансировщики в панели (часть 91, заходы 2–3) ─────────────────────
+    // Балансировщик — вход в приложение: у плитки своё семейство из восемнадцати
+    // действий, карточка проходит путь слушатель → роутер → группа бэкендов →
+    // группа целей, платное создание сначала показывает цену и порт и только
+    // потом уходит облаку с согласием, а группа бэкендов собирается из формы и
+    // её здоровье панель спрашивает у пары «бэкенды + цели».
+    section("[14] Балансировщики: плитка действий, карточка с цепочкой, группа бэкендов и здоровье");
+    const albTile = await page.evaluate(async () => {
+      const tile = [...document.querySelectorAll("#yc-dash .yc-tile")].find((t) => /Балансировщики/.test(t.textContent));
+      const btn = tile && [...tile.querySelectorAll("button")].find((b) => /Действия/.test(b.textContent));
+      if (btn) btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const box = document.getElementById("yc-actions");
+      const title = box ? (box.querySelector(".yc-act-title") || {}).textContent : "";
+      const listed = box ? [...box.querySelectorAll(".yc-act-btn")].map((b) => b.textContent.trim()) : [];
+      const listBtn = [...box.querySelectorAll(".yc-act-btn")].find((b) => b.textContent.trim() === "Балансировщики");
+      if (listBtn) listBtn.click();
+      await new Promise((r) => setTimeout(r, 70));
+      const sent = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "list").slice(-1)[0];
+      return { btn: !!btn, title: title, listed: listed, called: !!sent, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(albTile.btn && /Application Load Balancer/.test(albTile.title || ""), "у плитки «Балансировщики» есть кнопка действий", JSON.stringify({ btn: albTile.btn, title: albTile.title }));
+    ok(albTile.listed.length === 18, "в семействе восемнадцать действий: " + albTile.listed.length);
+    ok(
+      albTile.listed.some((t) => /Создать группу бэкендов/.test(t)) && albTile.listed.some((t) => /Здоровье целей/.test(t)) && albTile.listed.some((t) => /Удалить группу бэкендов/.test(t)),
+      "список называет группу бэкендов и здоровье: " + albTile.listed.join(", ")
+    );
+    ok(
+      albTile.listed.some((t) => /Создать балансировщик/.test(t)) && albTile.listed.some((t) => /Карточка: слушатели/.test(t)) && albTile.listed.some((t) => /Удалить балансировщик/.test(t)),
+      "список называет карточку, создание и удаление: " + albTile.listed.join(", ")
+    );
+    ok(albTile.called && /203\.0\.113\.10/.test(albTile.text), "действие «Балансировщики» позвало канал и показало адрес слушателя", albTile.text.slice(0, 200));
+
+    const albCardRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Карточка: слушатели/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /Балансировщик/.test(label)) input.value = "web-lb";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 70));
+      const sent = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "card").slice(-1)[0];
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(albCardRun.args && albCardRun.args.lb === "web-lb", "форма карточки ушла с именем балансировщика", JSON.stringify(albCardRun.args));
+    ok(/роутер rt-web/.test(albCardRun.text) && /группа бэкендов bg-web/.test(albCardRun.text), "карточка показала цепочку слушатель → роутер → бэкенды", albCardRun.text.slice(0, 240));
+
+    const albCreateRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Создать балансировщик/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const before = window.__confirmCalls;
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Имя балансировщика/.test(label)) input.value = "web-lb-2";
+        if (/^Подсеть узла/.test(label)) input.value = "app-subnet";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const askedHuman = window.__confirmCalls > before;
+      const first = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "lbnew").slice(-1)[0] || null;
+      const warnText = document.getElementById("yc-act-out").textContent;
+      const confirmBtn = [...document.querySelectorAll("#yc-act-out button")].find((b) => /Подтвердить/.test(b.textContent));
+      if (confirmBtn) confirmBtn.click();
+      await new Promise((r) => setTimeout(r, 90));
+      const last = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "lbnew").slice(-1)[0] || null;
+      return {
+        askedHuman: askedHuman,
+        subnet: first ? first[1].subnet : null,
+        firstConfirm: first ? first[1].confirm : null,
+        confirmSent: last ? last[1].confirm === true : false,
+        warnText: warnText,
+        text: document.getElementById("yc-act-out").textContent,
+      };
+    });
+    // Платное в панели спрашивает ДВА раза и по-разному: сперва цена и порт без
+    // согласия, а согласие уходит только вторым нажатием кнопки «Подтвердить».
+    ok(albCreateRun.subnet === "app-subnet", "форма собрала подсеть узла", JSON.stringify({ subnet: albCreateRun.subnet }));
+    ok(/ПЛАТНЫЙ/.test(albCreateRun.warnText) && /порт 80/.test(albCreateRun.warnText), "перед согласием панель назвала цену и порт", albCreateRun.warnText.slice(0, 220));
+    ok(albCreateRun.firstConfirm !== true && albCreateRun.confirmSent, "согласие облаку ушло только вторым нажатием", JSON.stringify({ first: albCreateRun.firstConfirm, last: albCreateRun.confirmSent }));
+    ok(/создаётся/.test(albCreateRun.text) && /платный/.test(albCreateRun.text), "ответ показал создание и предупредил про деньги", albCreateRun.text.slice(0, 200));
+
+    const albDelRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Удалить балансировщик/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const before = window.__confirmCalls;
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /Балансировщик/.test(label)) input.value = "web-lb";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const askedHuman = window.__confirmCalls > before;
+      const first = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "lbdel").slice(-1)[0] || null;
+      const warnText = document.getElementById("yc-act-out").textContent;
+      return { askedHuman: askedHuman, firstConfirm: first ? first[1].confirm : null, lb: first ? first[1].lb : "", warnText: warnText };
+    });
+    ok(albDelRun.askedHuman && /203\.0\.113\.10/.test(albDelRun.warnText) && /необратимо/.test(albDelRun.warnText), "удаление назвало адреса и спросило человека до запроса", albDelRun.warnText.slice(0, 220));
+    ok(albDelRun.lb === "web-lb" && albDelRun.firstConfirm !== true, "первый запрос ушёл без согласия, но с именем балансировщика", JSON.stringify(albDelRun));
+
+    // Группа бэкендов и здоровье — из панели (часть 91, заход 3): форма собирает
+    // вид, порт ЦЕЛЕЙ и путь проверки, здоровье показывается по зонам, а удаление
+    // группы сначала спрашивает человека.
+    const albBackNewRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Создать группу бэкендов/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Имя группы бэкендов/.test(label)) input.value = "api-backends";
+        if (/^Группа целей/.test(label)) input.value = "web-targets";
+        if (/^Порт целей/.test(label)) input.value = "8080";
+        if (/^Путь проверки здоровья/.test(label)) input.value = "/health";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "backnew").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(albBackNewRun.args && albBackNewRun.args.kind === "http" && albBackNewRun.args.port === 8080 && albBackNewRun.args.healthPath === "/health", "форма группы бэкендов собрала вид, порт целей и путь проверки", JSON.stringify(albBackNewRun.args));
+    ok(/порт 8080/.test(albBackNewRun.text) && /проверка здоровья \/health/.test(albBackNewRun.text), "ответ назвал порт ЦЕЛЕЙ и проверку здоровья", albBackNewRun.text.slice(0, 220));
+
+    const albHealthRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Здоровье целей/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Балансировщик/.test(label)) input.value = "web-lb";
+        if (/^Группа целей/.test(label)) input.value = "web-targets";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "health").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(albHealthRun.args && albHealthRun.args.lb === "web-lb" && albHealthRun.args.targetGroup === "web-targets", "форма здоровья ушла с балансировщиком и группой целей", JSON.stringify(albHealthRun.args));
+    ok(/здоровых: 1/.test(albHealthRun.text) && /ru-central1-b: не отвечает/.test(albHealthRun.text), "панель показала здоровье ПО ЗОНАМ", albHealthRun.text.slice(0, 260));
+
+    const albBackDelRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Удалить группу бэкендов/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const before = window.__confirmCalls;
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /Группа бэкендов/.test(label)) input.value = "free-backends";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const askedHuman = window.__confirmCalls > before;
+      const first = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "backdel").slice(-1)[0] || null;
+      return { askedHuman: askedHuman, args: first ? first[1] : null, warnText: document.getElementById("yc-act-out").textContent };
+    });
+    ok(albBackDelRun.askedHuman && /необратимо/.test(albBackDelRun.warnText) && /настройки балансировки/.test(albBackDelRun.warnText), "удаление группы объяснило последствия до запроса", albBackDelRun.warnText.slice(0, 260));
+    ok(albBackDelRun.args && albBackDelRun.args.group === "free-backends" && albBackDelRun.args.confirm !== true, "первый запрос ушёл без согласия, но с именем группы", JSON.stringify(albBackDelRun.args));
+
   } finally {
     await browser.close();
     try {

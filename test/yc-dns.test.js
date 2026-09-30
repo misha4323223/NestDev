@@ -434,7 +434,12 @@ function buildTools(over, settingsOver) {
     }
     assert.ok(/создавать ресурсы/.test(schema) && /удалять ресурсы/.test(schema), "схема не называет разрешения");
     assert.ok(/БЕЗ точки/.test(schema) && /С точкой/.test(schema), "схема не объясняет точку в имени");
-    const group = CORE_SRC.slice(CORE_SRC.indexOf('id: "cloud"'), CORE_SRC.indexOf('id: "cloud"') + 800);
+    // Границы записи, а не число знаков: окно в 800 знаков ломалось от каждого
+    // нового ключевого слова группы (заход 2 части 91 добавил «балансировщик»),
+    // хотя проверяемое свойство — «инструмент есть в группе облака» — не менялось.
+    const gAt = CORE_SRC.indexOf('id: "cloud"');
+    const gEnd = CORE_SRC.indexOf('id: "', gAt + 10);
+    const group = CORE_SRC.slice(gAt, gEnd > gAt ? gEnd : gAt + 800);
     assert.ok(/ycDns/.test(group), "инструмента нет в группе «облако» — модель его не увидит");
     const line = PROMPTS_SRC.split("\n").find((l) => l.startsWith("Доступные инструменты:")) || "";
     assert.ok(/ycDns/.test(line), "инструмента нет в списке для модели");

@@ -589,14 +589,14 @@ function createCloudTools(deps) {
         if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
         if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud — балансировщик и его группы целей живут в каталоге.";
         const action = String(args.action || "list").trim().toLowerCase();
-        const ALL = ["list", "card", "targets", "routers", "backends", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "lbnew", "lbstart", "lbstop", "lbdel"];
+        const ALL = ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "lbnew", "lbstart", "lbstop", "lbdel"];
         if (ALL.indexOf(action) === -1) return "Ошибка: неизвестное действие ycAlb «" + action + "». Доступно: " + ALL.join(", ") + ".";
         const ref = String(args.lb || args.id || args.name || "").trim();
         try {
           if (action === "list") {
             const list = await ycAlb.loadBalancers(cfg.oauth, cfg.folderId);
             if (!list.length) {
-              return "Балансировщиков в каталоге «" + (cfg.folderName || cfg.folderId) + "» нет. Вход в приложение собирают по шагам: группа целей (ycAlb { action: \"targetnew\", name: \"web-targets\", ips: [\"10.10.0.5\"], subnet: \"<подсеть>\" }) → HTTP-роутер → балансировщик (платный, только с confirm: true).";
+              return "Балансировщиков в каталоге «" + (cfg.folderName || cfg.folderId) + "» нет. Вход в приложение собирают по шагам: группа целей (ycAlb { action: \"targetnew\", name: \"web-targets\", ips: [\"10.10.0.5\"], subnet: \"<подсеть>\" }) → группа бэкендов → HTTP-роутер → балансировщик (платный, только с confirm: true).";
             }
             return "Балансировщики · каталог «" + (cfg.folderName || cfg.folderId) + "»\n" + list.map((l) => ycAlb.lbLine(l)).join("\n") +
               "\n\nАдрес балансировщика — это адреса его СЛУШАТЕЛЕЙ: пока слушатель не создан, адреса нет, и DNS-запись (ycDns) вешают только после создания. Балансировщик платный — платит за час даже без трафика." +
@@ -614,8 +614,17 @@ function createCloudTools(deps) {
           }
           if (action === "backends") {
             const list = await ycAlb.backendGroups(cfg.oauth, cfg.folderId);
-            return "Группы бэкендов · каталог «" + (cfg.folderName || cfg.folderId) + "»\n" + (list.length ? list.map((b) => "• " + b.name + " · бэкендов: " + b.backendCount).join("\n") : "групп бэкендов нет") +
-              "\n\nГруппы бэкендов здесь ТОЛЬКО читаются: в них живут проверки здоровья и балансировка, а создаются они в консоли (или в следующем заходе). Маршрут роутера обязан вести в СУЩЕСТВУЮЩУЮ группу — пустой список значит «роутер создавать некуда».";
+            return "Группы бэкендов · каталог «" + (cfg.folderName || cfg.folderId) + "»\n" + (list.length ? list.map((b) => ycAlb.backendGroupLine(b)).join("\n") : "групп бэкендов нет — создай: ycAlb { action: \"backnew\", name: \"web-backends\", targetGroup: \"<группа целей>\" }") +
+              "\n\nГруппа бэкендов задаёт ПОРТ целей и проверки здоровья: создаётся из группы целей действием backnew, а без неё маршрут роутера вести некуда. Здоровье целей показывает действие health — оно спрашивает пару «группа бэкендов + группа целей» у балансировщика.";
+          }
+          if (action === "health") {
+            const r = await ycAlb.targetStates(cfg.oauth, {
+              folderId: cfg.folderId,
+              lb: ref,
+              backendGroup: args.backendGroup || args.backendGroupId || args.backends,
+              targetGroup: args.targetGroup || args.target || args.group,
+            });
+            return r.lines.join("\n") + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "");
           }
           if (action === "card") {
             const c = await ycAlb.card(cfg.oauth, cfg.folderId, ref);
@@ -645,7 +654,7 @@ function createCloudTools(deps) {
             }
             lines.push(!c.targetGroupsResolved && c.targetGroups.length
               ? "Связь с группами целей не подтвердилась (нет групп бэкендов или маршрутов): показаны все группы целей каталога."
-              : "Здоровье целей (здорова/не отвечает) отдаёт отдельный метод облака — в карточке его нет.");
+              : "Здоровье целей (здорова/не отвечает) — действие health: ycAlb { action: \"health\", lb: \"<балансировщик>\", targetGroup: \"<группа целей>\" }.");
             return lines.join("\n");
           }
           if (action === "targetnew") {
@@ -657,7 +666,7 @@ function createCloudTools(deps) {
               description: args.description,
             });
             return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "") +
-              (r.groupId ? "\nСледующий шаг: HTTP-роутер, ycAlb { action: \"routernew\", backendGroup: \"<группа бэкендов>\" }." : "");
+              (r.groupId ? "\nСледующий шаг: группа бэкендов — ycAlb { action: \"backnew\", name: \"web-backends\", targetGroup: \"" + ((r.group && r.group.name) || r.groupId) + "\" }." : "");
           }
           if (action === "targetadd" || action === "targetremove") {
             const r = await ycAlb.changeTargets(cfg.oauth, action === "targetadd" ? "add" : "remove", {
@@ -698,6 +707,30 @@ function createCloudTools(deps) {
               return "Удаление HTTP-роутера «" + r0.name + "» необратимо: правила (" + r0.routeCount + ") будут потеряны, а слушатель, который на него смотрит, перестанет отвечать. Вызови снова с confirm: true после согласия человека.";
             }
             const r = await ycAlb.removeRouter(cfg.oauth, { folderId: cfg.folderId, router: r0 });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "");
+          }
+          if (action === "backnew") {
+            const r = await ycAlb.createBackendGroup(cfg.oauth, {
+              folderId: cfg.folderId,
+              name: args.name,
+              kind: args.kind || args.type,
+              targetGroup: args.targetGroup || args.group,
+              port: args.port,
+              backendName: args.backendName,
+              healthPath: args.healthPath || args.healthCheckPath,
+              healthService: args.healthService,
+              description: args.description,
+            });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "") +
+              (r.groupId ? "\nСледующий шаг: маршрут роутера — ycAlb { action: \"routernew\", backendGroup: \"" + ((r.group && r.group.name) || r.groupId) + "\" } или потоковый слушатель: lbnew { listener: \"stream\" }." : "");
+          }
+          if (action === "backdel") {
+            const g = await ycAlb.findBackendGroup(cfg.oauth, cfg.folderId, args.group || args.backendGroup || args.id || args.name);
+            if (!g) return "Ошибка: не нашёл группу бэкендов «" + String(args.group || args.backendGroup || args.id || args.name || "").trim() + "» в каталоге. Список — ycAlb { action: \"backends\" }.";
+            if (args.confirm !== true) {
+              return "Удаление группы бэкендов «" + g.name + "» необратимо: проверки здоровья и настройки балансировки будут потеряны, а роутер или потоковый слушатель, который на неё смотрит, перестанет отвечать. Вызови снова с confirm: true после согласия человека.";
+            }
+            const r = await ycAlb.removeBackendGroup(cfg.oauth, { folderId: cfg.folderId, group: g });
             return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "");
           }
           if (action === "lbnew") {

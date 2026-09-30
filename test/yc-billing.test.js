@@ -781,7 +781,12 @@ const writeCalls = (calls) => calls.filter((c) => c.method !== "GET" && c.url.in
     assert.ok(/billing\.viewer/.test(schema), "схема не называет роль для биллинга");
     assert.ok(/ТОЛЬКО читает/.test(schema), "схема не говорит, что инструмент ничего не меняет");
 
-    const group = CORE_SRC.slice(CORE_SRC.indexOf('id: "cloud"'), CORE_SRC.indexOf('id: "cloud"') + 900);
+    // Границы записи, а не число знаков: окно в 900 знаков ломалось от каждого
+    // нового ключевого слова группы (заход 2 части 91 добавил «балансировщик»),
+    // хотя проверяемое свойство — «инструмент есть в группе облака» — не менялось.
+    const gAt = CORE_SRC.indexOf('id: "cloud"');
+    const gEnd = CORE_SRC.indexOf('id: "', gAt + 10);
+    const group = CORE_SRC.slice(gAt, gEnd > gAt ? gEnd : gAt + 900);
     assert.ok(/ycBilling/.test(group), "инструмента нет в группе «облако» — модель его не увидит");
     const line = PROMPTS_SRC.split("\n").find((l) => l.startsWith("Доступные инструменты:")) || "";
     assert.ok(/ycBilling/.test(line), "инструмента нет в списке для модели");

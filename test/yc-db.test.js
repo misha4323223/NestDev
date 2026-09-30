@@ -480,7 +480,12 @@ function buildTool(over, settingsOver) {
     // Проверяем СМЫСЛ («имя в группе облака»), а не соседство строк: точная
     // последовательность имён ломается от появления любого соседнего инструмента
     // (так и вышло с ycVpc), и падение было бы не про ycDb, а про порядок слов.
-    const cloudGroup = CORE_SRC.slice(CORE_SRC.indexOf('id: "cloud"'), CORE_SRC.indexOf('id: "cloud"') + 900);
+    // Границы записи, а не число знаков: окно в 900 знаков ломалось от каждого
+    // нового ключевого слова группы (заход 2 части 91 добавил «балансировщик»),
+    // хотя проверяемое свойство — «инструмент есть в группе облака» — не менялось.
+    const gAt = CORE_SRC.indexOf('id: "cloud"');
+    const gEnd = CORE_SRC.indexOf('id: "', gAt + 10);
+    const cloudGroup = CORE_SRC.slice(gAt, gEnd > gAt ? gEnd : gAt + 900);
     assert.ok(/"ycDb"/.test(cloudGroup), "ycDb не в группе облака в ядре роутера");
     assert.ok(/ycDb \(таблицы и записи/.test(PROMPTS_SRC), "правило 28 не знает ycDb");
     const toolLine = PROMPTS_SRC.split("\n").find((l) => l.startsWith("Доступные инструменты:")) || "";

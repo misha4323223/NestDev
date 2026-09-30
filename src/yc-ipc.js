@@ -2085,7 +2085,7 @@ ipcMain.handle("yc:alb", async (_e, args) => {
   if (!ycAlb) return { ok: false, error: "Модуль Application Load Balancer не подключён к приложению (src/yc-alb.js)." };
   if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках (Настройки → «☁️ Yandex Cloud»)." };
   if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
-  const ALL = ["list", "card", "targets", "routers", "backends", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "lbnew", "lbstart", "lbstop", "lbdel"];
+  const ALL = ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "lbnew", "lbstart", "lbstop", "lbdel"];
   if (ALL.indexOf(op) === -1) return { ok: false, error: "Неизвестное действие Application Load Balancer: " + op + ". Доступно: " + ALL.join(", ") + "." };
   const ref = String(a.lb || a.id || a.name || "").trim();
   const missingLb = { ok: false, error: "Не нашёл балансировщик «" + ref + "» в каталоге. Список — действие list." };
@@ -2097,7 +2097,7 @@ ipcMain.handle("yc:alb", async (_e, args) => {
         loadBalancers: list,
         lines: list.length
           ? list.map((l) => ycAlb.lbLine(l))
-          : ["Балансировщиков в каталоге нет. Вход в приложение собирают по шагам: группа целей → HTTP-роутер → балансировщик со слушателем."],
+          : ["Балансировщиков в каталоге нет. Вход в приложение собирают по шагам: группа целей → группа бэкендов → HTTP-роутер → балансировщик со слушателем."],
         message: "Балансировщиков: " + list.length + ".",
         warnings: list.some((l) => !l.active)
           ? ["Часть балансировщиков не в работе: остановленный перестаёт отвечать по адресам, но тарифицируется всё равно."]
@@ -2128,9 +2128,31 @@ ipcMain.handle("yc:alb", async (_e, args) => {
       return {
         ok: true,
         backendGroups: list,
-        lines: list.length ? list.map((b) => "• " + b.name + " · бэкендов: " + b.backendCount) : ["Групп бэкендов в каталоге нет: маршрут роутера обязан вести в существующую группу, а создаются они в консоли (или в следующем заходе)."],
+        lines: list.length ? list.map((b) => ycAlb.backendGroupLine(b)) : ["Групп бэкендов в каталоге нет: маршрут роутера обязан вести в существующую группу — создай её из группы целей действием «Создать группу бэкендов» (backnew)."],
         message: "Групп бэкендов: " + list.length + ".",
-        warnings: ["Группы бэкендов здесь только читаются: проверки здоровья и балансировка настраиваются в них, а не в группе целей."],
+        warnings: ["Порт целей и проверки здоровья задаются в ГРУППЕ БЭКЕНДОВ, а не в группе целей: создание — backnew, а здоровье целей показывает действие health."],
+      };
+    }
+    if (op === "health") {
+      // Здоровье — у ПАРЫ «группа бэкендов + группа целей»: пара ищется у
+      // балансировщика, потому что ссылки на группу целей нет ни у него, ни у
+      // роутера. Группа называется полем backendGroup, когда их несколько.
+      const r = await ycAlb.targetStates(cfg.oauth, {
+        folderId: cfg.folderId,
+        lb: ref,
+        backendGroup: a.backendGroup || a.backendGroupId || a.backends,
+        targetGroup: a.targetGroup || a.target || a.group,
+      });
+      return {
+        ok: true,
+        lb: r.lb,
+        backendGroup: r.backendGroup,
+        targetGroup: r.targetGroup,
+        states: r.states,
+        healthy: r.healthyCount,
+        lines: r.lines,
+        message: r.message,
+        warnings: r.warnings || [],
       };
     }
     if (op === "card") {
@@ -2231,6 +2253,34 @@ ipcMain.handle("yc:alb", async (_e, args) => {
       }
       const r = await ycAlb.removeRouter(cfg.oauth, { folderId: cfg.folderId, router: r0 });
       return { ok: true, changed: true, routerId: r.routerId, lines: [r.message], warnings: r.warnings || [], message: r.message };
+    }
+    if (op === "backnew") {
+      const r = await ycAlb.createBackendGroup(cfg.oauth, {
+        folderId: cfg.folderId,
+        name: a.name,
+        kind: a.kind || a.type,
+        targetGroup: a.targetGroup || a.group,
+        port: a.port,
+        backendName: a.backendName,
+        healthPath: a.healthPath || a.healthCheckPath,
+        healthService: a.healthService,
+        description: a.description,
+      });
+      return { ok: true, changed: true, backendGroup: r.group, groupId: r.groupId, operationId: r.operationId, lines: [r.message], warnings: r.warnings || [], message: r.message };
+    }
+    if (op === "backdel") {
+      const g = await ycAlb.findBackendGroup(cfg.oauth, cfg.folderId, a.group || a.backendGroup || a.id || a.name);
+      if (!g) return { ok: false, error: "Не нашёл группу бэкендов «" + (a.group || a.backendGroup || a.id || a.name || "") + "» в каталоге. Список — действие backends." };
+      if (a.confirm !== true) {
+        return {
+          ok: false,
+          needsConfirm: true,
+          error: "Удаление группы бэкендов «" + g.name + "» необратимо: проверки здоровья и настройки балансировки будут потеряны, а роутер или потоковый слушатель, который на неё смотрит, перестанет отвечать. Подтверди удаление.",
+          lines: [ycAlb.backendGroupLine(g)],
+        };
+      }
+      const r = await ycAlb.removeBackendGroup(cfg.oauth, { folderId: cfg.folderId, group: g });
+      return { ok: true, changed: true, groupId: r.groupId, lines: [r.message], warnings: r.warnings || [], message: r.message };
     }
     if (op === "lbnew") {
       if (a.confirm !== true) {

@@ -332,8 +332,13 @@ function buildTools(over, settingsOver) {
       assert.ok(schema.includes(part), "в схеме нет " + part);
     }
     assert.ok(/Разрешить агенту создавать ресурсы/.test(schema), "схема не называет разрешение");
-    assert.ok(/ycSecret/.test(CORE_SRC.slice(CORE_SRC.indexOf('id: "cloud"'), CORE_SRC.indexOf('id: "cloud"') + 700)),
-      "инструмента нет в группе «облако» — модель его не увидит");
+    // Границы записи, а не число знаков: окно в 700 знаков ломалось от каждого
+    // нового ключевого слова группы (заход 2 части 91 добавил «балансировщик»),
+    // хотя проверяемое свойство — «инструмент есть в группе облака» — не менялось.
+    const gAt = CORE_SRC.indexOf('id: "cloud"');
+    const gEnd = CORE_SRC.indexOf('id: "', gAt + 10);
+    const group = CORE_SRC.slice(gAt, gEnd > gAt ? gEnd : gAt + 1600);
+    assert.ok(/ycSecret/.test(group), "инструмента нет в группе «облако» — модель его не увидит");
     const line = PROMPTS_SRC.split("\n").find((l) => l.startsWith("Доступные инструменты:")) || "";
     assert.ok(/ycSecret/.test(line), "инструмента нет в списке для модели");
     assert.ok(/ycSecret/.test(PROMPTS_SRC) && /наполнить секрет/.test(PROMPTS_SRC), "промпт не объясняет, зачем ycSecret");

@@ -655,7 +655,12 @@ const writeCalls = (calls) =>
     assert.ok(/0\.0\.0\.0\/0/.test(schema), "схема не предупреждает про открытое правило");
     assert.ok(/статические адреса/.test(schema), "схема не объясняет, что такое статический адрес");
 
-    const group = CORE_SRC.slice(CORE_SRC.indexOf('id: "cloud"'), CORE_SRC.indexOf('id: "cloud"') + 900);
+    // Границы записи, а не число знаков: окно в 900 знаков ломалось от каждого
+    // нового ключевого слова группы (заход 2 части 91 добавил «балансировщик»),
+    // хотя проверяемое свойство — «инструмент есть в группе облака» — не менялось.
+    const gAt = CORE_SRC.indexOf('id: "cloud"');
+    const gEnd = CORE_SRC.indexOf('id: "', gAt + 10);
+    const group = CORE_SRC.slice(gAt, gEnd > gAt ? gEnd : gAt + 900);
     assert.ok(/ycVpc/.test(group), "инструмента нет в группе «облако» — модель его не увидит");
     const line = PROMPTS_SRC.split("\n").find((l) => l.startsWith("Доступные инструменты:")) || "";
     assert.ok(/ycVpc/.test(line), "инструмента нет в списке для модели");

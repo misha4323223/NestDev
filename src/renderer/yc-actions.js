@@ -81,7 +81,7 @@
     clickhouse: ["list", "presets", "card", "create", "hosts", "databases", "users", "logs", "operations", "start", "stop", "delete"],
     dns: ["zones", "card", "records", "add", "delete"],
     instanceGroups: ["list", "card", "instances", "operations", "create", "start", "stop", "delete"],
-    alb: ["list", "card", "targets", "routers", "backends", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "lbnew", "lbstart", "lbstop", "lbdel"],
+    alb: ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "lbnew", "lbstart", "lbstop", "lbdel"],
   };
 
   const FAMILIES = {
@@ -510,16 +510,30 @@
 
     // ── Application Load Balancer ──
     // Четыре ресурса одной семьи — один канал. Порядок работы такой: группа
-    // целей (адреса машин) → HTTP-роутер (правила домена и пути) → балансировщик
-    // со слушателем (адрес, порт, сертификат). Группы бэкендов здесь только
-    // читаются: маршрут обязан вести в СУЩЕСТВУЮЩУЮ группу, а создание групп
-    // бэкендов — отдельный заход.
+    // целей (адреса машин) → группа бэкендов (порт целей и проверки здоровья) →
+    // HTTP-роутер (правила домена и пути) → балансировщик со слушателем (адрес,
+    // порт, сертификат). Здоровье целей спрашивают отдельным действием: оно
+    // живёт у пары «группа бэкендов + группа целей».
     alb: [
       { id: "list", ru: "Балансировщики", op: "list", view: "lines" },
       { id: "card", ru: "Карточка: слушатели, роутеры, цели", op: "card", view: "lines", target: target("Балансировщик (имя или id)", "lb") },
       { id: "targets", ru: "Группы целей", op: "targets", view: "lines" },
       { id: "routers", ru: "HTTP-роутеры", op: "routers", view: "lines" },
-      { id: "backends", ru: "Группы бэкендов (только чтение)", op: "backends", view: "lines" },
+      { id: "backends", ru: "Группы бэкендов", op: "backends", view: "lines" },
+      { id: "health", ru: "Здоровье целей: спросить у облака", op: "health", view: "lines", target: target("Балансировщик (имя или id)", "lb"),
+        fields: [
+          fld("backendGroup", "Группа бэкендов (имя или id)", { placeholder: "если она у балансировщика одна — можно не указывать", options: from("alb", "backends", (r) => (r.backendGroups || []).map((b) => b.name)) }),
+          fld("targetGroup", "Группа целей (имя или id)", { required: true, placeholder: "web-targets", options: from("alb", "targets", (r) => (r.targetGroups || []).map((g) => g.name)) }),
+        ] },
+      { id: "backnew", ru: "＋ Создать группу бэкендов", op: "backnew", view: "lines",
+        fields: [
+          fld("name", "Имя группы бэкендов", { required: true, placeholder: "web-backends" }),
+          fld("kind", "Вид группы", { type: "select", options: ["http", "grpc", "stream"], value: "http", hint: "http — сайт и API, grpc — сервисы, stream — базы и брокеры (поток TCP)." }),
+          fld("targetGroup", "Группа целей (имя или id)", { required: true, placeholder: "web-targets", hint: "Группа бэкендов без группы целей никуда не ведёт." }),
+          fld("port", "Порт целей", { type: "number", value: "80", hint: "Порт, который слушают МАШИНЫ (у базы он свой: у PostgreSQL 6432); у потока его назвать обязательно." }),
+          fld("healthPath", "Путь проверки здоровья (http)", { placeholder: "/health", hint: "Без проверок облако считает цель здоровой всегда — упавшая машина останется в ротации." }),
+        ] },
+      { id: "backdel", ru: "🗑 Удалить группу бэкендов", op: "backdel", view: "lines", danger: true, confirmArg: "confirm", target: target("Группа бэкендов (имя или id)", "group") },
       { id: "targetnew", ru: "＋ Создать группу целей", op: "targetnew", view: "lines",
         fields: [
           fld("name", "Имя группы целей", { required: true, placeholder: "web-targets" }),

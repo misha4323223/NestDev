@@ -68,6 +68,14 @@
          образом по семейству и размером группы, а без согласия не уходит вовсе;
      [22] yc:ig: канал ОКНА — тот же модуль через настоящий main.js: список,
          карточка с машинами и согласие на платное и необратимое.
+     [23] ycAlb: ВХОД В ПРИЛОЖЕНИЕ — слушатели в форме ОТВЕТА облака (адрес
+         виден), карточка проходит путь слушатель → роутер → маршрут → группа
+         бэкендов → группа целей, создание уходит с подсетью и ценой; ГРУППА
+         БЭКЕНДОВ создаётся с портом целей и проверкой здоровья, занятую
+         облако удалять откажется, а здоровье цели спрашивают у ПАРЫ
+         «бэкенды + цели» и приходит оно ПО ЗОНАМ;
+     [24] yc:alb: канал ОКНА — тот же модуль через настоящий main.js: строки,
+         цена до согласия, согласие на необратимое и здоровье числом.
 
    Ничего в репозитории приложения не пишется: всё в temp-папках. */
 
@@ -139,7 +147,37 @@ const aiCalls = [];
 // группой» и «на отказе без согласия в облако не ушло ничего». Стенд помнит
 // удаление — по этому видно, что удаление правда выполнено, а не «запущено».
 const igCalls = [];
-const igState = { created: [], deleted: new Set(), status: "ACTIVE" };
+const igState = { created: [], deleted: new Set(), status: "ACTIVE" };// Запросы Application Load Balancer (часть 91, заход 2): вход в приложение —
+// слушатели, группы целей, HTTP-роутеры и группы бэкендов. Стенд держит всю
+// цепочку «слушатель → роутер → маршрут → группа бэкендов → группа целей» и
+// отдаёт слушателей в форме ОТВЕТА облака (endpoints → addresses →
+// externalIpv4Address): модуль обязан читать адрес оттуда, а форма запроса
+// (endpointSpecs/addressSpecs) — только запасная. Как и у групп машин, стенд
+// помнит созданное и удалённое: по этому видно, что действие правда дошло.
+const albCalls = [];
+const albState = { lbCreated: [], lbDeleted: new Set(), tgCreated: [], tgDeleted: new Set(), bgCreated: [], bgDeleted: new Set(), routerCreated: [], targets: ["10.10.0.5", "10.10.0.6"], status: "ACTIVE" };
+const albLbBody = () => ({
+  id: "lb-web", name: "web-lb", folderId: "f1", createdAt: "2026-08-03T10:00:00Z", status: albState.status,
+  regionId: "ru-central1", networkId: "net-1", securityGroupIds: ["sg-web"],
+  allocationPolicy: { locations: [{ zoneId: "ru-central1-a", subnetId: "sub-a" }] },
+  listeners: [{ name: "web", endpoints: [{ addresses: [{ externalIpv4Address: { address: "203.0.113.10" } }], ports: ["80"] }], http: { handler: { httpRouterId: "rt-web" } } }],
+});
+const albTgBody = (id, name, targets) => ({
+  id: id || "tg-web", name: name || "web-targets", folderId: "f1", createdAt: "2026-08-02T10:00:00Z",
+  targets: (targets || albState.targets).map((ip) => ({ ipAddress: ip, subnetId: "sub-a" })),
+});
+const albRouterBody = () => ({
+  id: "rt-web", name: "web-router", folderId: "f1", createdAt: "2026-08-02T11:00:00Z",
+  virtualHosts: [{ name: "main", authority: ["site.example.com"], routes: [{ name: "main", http: { match: { path: { prefixMatch: "/" } }, route: { backendGroupId: "bg-web" } } }] }],
+});
+// Группа бэкендов: ПОРТ целей и проверки здоровья живут именно здесь.
+const albBackendBody = () => ({ id: "bg-web", name: "web-backends", folderId: "f1", createdAt: "2026-08-02T12:00:00Z",
+  http: { backends: [{ name: "web", port: "8080", targetGroups: { targetGroupIds: ["tg-web"] }, healthchecks: [{ timeout: "1s", interval: "2s", http: { path: "/" } }] }] } });
+// Свободная группа бэкендов: на неё никто не смотрит — её и удалим, а занятая
+// (та, в которую ведёт маршрут роутера) обязана отбиться словами.
+const albFreeBackendBody = () => ({ id: "bg-free", name: "free-backends", folderId: "f1", createdAt: "2026-08-02T13:00:00Z",
+  stream: { backends: [{ name: "free", port: "1521", targetGroups: { targetGroupIds: ["tg-web"] } }] } });
+
 // Запросы Monitoring: на них держится проверка «данные ушли телом с прореживанием,
 // а метаданные — строкой», и что полка видит метрики каталога.
 const monCalls = [];
@@ -234,7 +272,16 @@ function startFakeYc() {
         const opId = p.slice("/operations/".length);
         // У операции создания версии секрета свой id ответа: по нему инструмент
         // называет человеку номер версии.
-        if (opId === "op-sec") return json({ id: opId, done: true, response: { id: "ver3" } });
+        if (opId === "op-sec") return json({ id: opId, done: true, response: { id: "ver3" } });        // Операции ALB: id созданного ресурса приходит ТОЛЬКО в metadata —
+        // модуль обязан читать его оттуда (иначе созданное «теряется»).
+        if (opId === "op-alb-tg") return json({ id: opId, done: true, metadata: { targetGroupId: "tg-new" } });
+        if (opId === "op-alb-rt") return json({ id: opId, done: true, metadata: { httpRouterId: "rt-web" } });
+        if (opId === "op-alb-lb") return json({ id: opId, done: true, metadata: { loadBalancerId: "lb-new" } });
+        // Созданная группа бэкендов: id — в metadata, и он УНИКАЛЕН для каждой
+        // группы (иначе вторая созданная читалась бы как первая).
+        const bgOp = /^op-alb-bg(\d+)$/.exec(opId);
+        if (bgOp) return json({ id: opId, done: true, metadata: { backendGroupId: "bg-new" + bgOp[1] } });
+
         return json({ id: opId, done: true, response: { id: "cont1" } });
       }
       if (p === "/containers/v1/containers/cont1") {
@@ -513,6 +560,75 @@ function startFakeYc() {
         });
       }
 
+      // ── Application Load Balancer (часть 91, заход 2) ─────────────────────
+      // Вход в приложение: балансировщик, слушатели, группы целей, роутеры и
+      // группы бэкендов. Слушатели отдаются в форме ОТВЕТА облака; группа
+      // целей достижима только через группу бэкендов — стенд держит цепочку.
+      if (p.indexOf("/apploadbalancer/v1/") === 0) {
+        albCalls.push({ method: req.method, path: p, search: u.search || "", body: body });
+        const albSent = (() => { try { return body ? JSON.parse(body) : {}; } catch { return {}; } })();
+        if (req.method === "POST" && p === "/apploadbalancer/v1/loadBalancers") { albState.lbCreated.push(body); return json({ id: "op-alb-lb", done: false }); }
+        if (req.method === "POST" && p === "/apploadbalancer/v1/targetGroups") { albState.tgCreated.push(body); return json({ id: "op-alb-tg", done: false }); }
+        if (req.method === "POST" && p === "/apploadbalancer/v1/httpRouters") { albState.routerCreated.push(body); return json({ id: "op-alb-rt", done: false }); }
+        if (req.method === "POST" && p === "/apploadbalancer/v1/backendGroups") {
+          const n = albState.bgCreated.length + 1;
+          albState.bgCreated.push({ id: "bg-new" + n, body: albSent });
+          return json({ id: "op-alb-bg" + n, done: false });
+        }
+        if (req.method === "POST" && /:start$/.test(p)) { albState.status = "ACTIVE"; return json({ id: "op-alb-start", done: false }); }
+        if (req.method === "POST" && /:stop$/.test(p)) { albState.status = "STOPPED"; return json({ id: "op-alb-stop", done: false }); }
+        if (req.method === "POST" && /:addTargets$/.test(p)) {
+          (albSent.targets || []).forEach((t) => { if (albState.targets.indexOf(t.ipAddress) < 0) albState.targets.push(t.ipAddress); });
+          return json({ id: "op-alb-tadd", done: false });
+        }
+        if (req.method === "POST" && /:removeTargets$/.test(p)) {
+          albState.targets = albState.targets.filter((ip) => !(albSent.targets || []).some((t) => t.ipAddress === ip));
+          return json({ id: "op-alb-trem", done: false });
+        }
+        if (req.method === "DELETE") {
+          if (/\/loadBalancers\//.test(p)) { albState.lbDeleted.add("lb-web"); return json({ id: "op-alb-lbdel", done: false }); }
+          if (/\/targetGroups\//.test(p)) { albState.tgDeleted.add("tg-web"); return json({ id: "op-alb-tgdel", done: false }); }
+          if (/\/httpRouters\//.test(p)) { albState.routerDeleted = true; return json({ id: "op-alb-rtdel", done: false }); }
+          if (/\/backendGroups\//.test(p)) { albState.bgDeleted.add(p.slice(p.lastIndexOf("/") + 1)); return json({ id: "op-alb-bgdel", done: false }); }
+        }
+        // Здоровье приходит ПО ЗОНАМ: у цели их может быть несколько, и «здорова»
+        // решается по каждой зоне отдельно.
+        if (/\/targetStates\//.test(p)) {
+          return json({ targetStates: [
+            { target: { ipAddress: "10.10.0.5", subnetId: "sub-a" }, status: { zoneStatuses: [
+              { zoneId: "ru-central1-a", status: "HEALTHY" }, { zoneId: "ru-central1-b", status: "HEALTHY" }] } },
+            { target: { ipAddress: "10.10.0.6", subnetId: "sub-a" }, status: { zoneStatuses: [
+              { zoneId: "ru-central1-a", status: "HEALTHY" }, { zoneId: "ru-central1-b", status: "UNHEALTHY", failedActiveHc: true }] } },
+          ] });
+        }
+        if (p === "/apploadbalancer/v1/loadBalancers") return json({ loadBalancers: albState.lbDeleted.has("lb-web") ? [] : [albLbBody()] });
+        if (albState.lbDeleted.has("lb-web") && /\/loadBalancers\//.test(p)) return json({ message: "Load balancer not found" }, 404);
+        if (p === "/apploadbalancer/v1/loadBalancers/lb-web") return json(albLbBody());
+        if (p === "/apploadbalancer/v1/targetGroups") {
+          const list = albState.tgDeleted.has("tg-web") ? [] : [albTgBody()];
+          if (albState.tgCreated.length) list.push(albTgBody("tg-new", "web-targets2", []));
+          return json({ targetGroups: list });
+        }
+        if (p === "/apploadbalancer/v1/targetGroups/tg-web") return json(albTgBody());
+        if (p === "/apploadbalancer/v1/targetGroups/tg-new") return json(albTgBody("tg-new", "web-targets2", []));
+        if (p === "/apploadbalancer/v1/httpRouters") return json({ httpRouters: albState.routerDeleted ? [] : [albRouterBody()] });
+        if (p === "/apploadbalancer/v1/httpRouters/rt-web") return json(albRouterBody());
+        if (p === "/apploadbalancer/v1/backendGroups") {
+          const list = [];
+          if (!albState.bgDeleted.has("bg-web")) list.push(albBackendBody());
+          if (!albState.bgDeleted.has("bg-free")) list.push(albFreeBackendBody());
+          albState.bgCreated.forEach((x) => { if (!albState.bgDeleted.has(x.id)) list.push(Object.assign({ id: x.id }, x.body)); });
+          return json({ backendGroups: list });
+        }
+        const bgById = /^\/apploadbalancer\/v1\/backendGroups\/(bg-[a-z0-9]+)$/.exec(p);
+        if (bgById) {
+          if (bgById[1] === "bg-web") return albState.bgDeleted.has("bg-web") ? json({ message: "Backend group not found" }, 404) : json(albBackendBody());
+          if (bgById[1] === "bg-free") return json(albFreeBackendBody());
+          const made = albState.bgCreated.find((x) => x.id === bgById[1]);
+          return made ? json(Object.assign({ id: made.id }, made.body)) : json({ message: "Backend group not found" }, 404);
+        }
+        return json({ message: "Not found" }, 404);
+      }
       // Прочие сервисы каталога: пустой список — этого достаточно для сводки.
       return json({});
     });
@@ -639,9 +755,9 @@ watchdog.unref();
 
   console.log("\n[2] инструменты облака отвечают через настоящий реестр");
   const tools = seenWiring.tools || {};
-  const cloudNames = ["ycStatus", "ycList", "ycCreate", "ycCosts", "ycDelete", "ycDeploy", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycDb", "ycAi", "ycMonitor", "ycMdb", "ycIg", "ycLogs", "ycInstall"];
+  const cloudNames = ["ycStatus", "ycList", "ycCreate", "ycCosts", "ycDelete", "ycDeploy", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycDb", "ycAi", "ycMonitor", "ycMdb", "ycIg", "ycAlb", "ycLogs", "ycInstall"];
   const missing = cloudNames.filter((n) => typeof tools[n] !== "function");
-  ok(missing.length === 0, "все восемнадцать на месте" + (missing.length ? ": нет " + missing.join(", ") : ""));
+  ok(missing.length === 0, "все девятнадцать на месте" + (missing.length ? ": нет " + missing.join(", ") : ""));
   const unknown = await call("ycContainer", { action: "overview" });
   ok(!/неизвестный инструмент/.test(plain(unknown)), "реестр знает ycContainer: " + plain(unknown).slice(0, 60));
 
@@ -1261,6 +1377,176 @@ watchdog.unref();
   ok(igCalls.length > uiIgRef, "и действительно ушло в облако");
   const uiIgNoAuth = await callIg({ op: "nope" });
   ok(uiIgNoAuth.ok === true || uiIgNoAuth.ok === false, "чужое действие не сломало канал");
+
+  // ── Application Load Balancer: вход в приложение (часть 91, заходы 2–3) ──
+  // Балансировщик — не «ещё один ресурс»: за одним адресом стоят слушатели,
+  // группы целей, роутеры и группы бэкендов. Стенд отдаёт слушателей в форме
+  // ОТВЕТА облака, поэтому раздел проверяет и чтение адреса, и весь путь
+  // слушатель → роутер → маршрут → группа бэкендов → группа целей. Группа
+  // бэкендов здесь же задаёт ПОРТ целей и проверку здоровья, а здоровье цели
+  // облако отдаёт ПО ЗОНАМ.
+  console.log("\n[23] ycAlb: вход в приложение — слушатели, роутер, группы бэкендов и здоровье целей");
+  const albList = plain(await call("ycAlb", { action: "list" }));
+  ok(/Балансировщики/.test(albList) && /web-lb/.test(albList), "балансировщик каталога показан: " + lineN(albList, 1));
+  ok(/HTTP 80 203\.0\.113\.10/.test(albList), "адрес прочитан из ФОРМЫ ОТВЕТА облака: " + lineN(albList, 1));
+  ok(/зоны: ru-central1-a/.test(albList), "зона узла названа");
+  ok(/платный/.test(albList) && /DNS-запись/.test(albList), "сказано про цену и про DNS только после создания");
+  const albListCall = albCalls.filter((c) => c.path === "/apploadbalancer/v1/loadBalancers").pop() || {};
+  ok(/folderId=f1/.test(albListCall.search || ""), "список ушёл с каталогом: " + (albListCall.search || ""));
+
+  const albCard = plain(await call("ycAlb", { action: "card", lb: "web-lb" }));
+  ok(/Слушатели \(1\)/.test(albCard) && /роутер rt-web/.test(albCard), "слушатель и его роутер названы: " + lineN(albCard, 2));
+  ok(/домены: site\.example\.com/.test(albCard) && /группа бэкендов bg-web/.test(albCard), "маршрут показан доменом и группой бэкендов: " + lineN(albCard, 4));
+  ok(/Группы бэкендов: web-backends/.test(albCard), "группа бэкендов найдена из слушателя и маршрута");
+  const cardBgCall = albCalls.filter((c) => c.path === "/apploadbalancer/v1/backendGroups/bg-web").pop() || {};
+  ok(!!cardBgCall.method, "карточка правда читала группу бэкендов по id");
+  ok(/Группы целей \(1\)/.test(albCard) && /10\.10\.0\.5/.test(albCard), "группа целей дошла из группы бэкендов: " + lineN(albCard, 7));
+  ok(/Здоровье целей/.test(albCard), "сказано, где здоровье целей: в карточке его нет");
+
+  const albTargets = plain(await call("ycAlb", { action: "targets" }));
+  ok(/web-targets/.test(albTargets) && /целей: 2/.test(albTargets), "группа целей и её размер показаны: " + lineN(albTargets, 1));
+  const albRouters = plain(await call("ycAlb", { action: "routers" }));
+  ok(/web-router/.test(albRouters) && /домены: site\.example\.com/.test(albRouters), "роутер с доменом показан: " + lineN(albRouters, 1));
+  const albBackends = plain(await call("ycAlb", { action: "backends" }));
+  ok(/web-backends/.test(albBackends) && /бэкендов: 1/.test(albBackends), "группа бэкендов показана: " + lineN(albBackends, 1));
+  ok(/ПОРТ целей/.test(albBackends) && /проверок здоровья: 1/.test(albBackends), "сказано, что порт целей и проверки живут В ГРУППЕ БЭКЕНДОВ");
+
+  // Группа бэкендов создаётся из группы целей и задаёт ПОРТ (его слушают ЦЕЛИ) и
+  // проверку здоровья; у потока порт не угадывается — его спрашивают явно.
+  const bgNoPort = plain(await call("ycAlb", { action: "backnew", name: "stream-backends", kind: "stream", targetGroup: "web-targets" }));
+  ok(/порт не угадывается/.test(bgNoPort), "у потока порт спрошен явно, а не угадан: " + lineN(bgNoPort, 0));
+  ok(albState.bgCreated.length === 0, "на этом отказе в облако не ушло ничего");
+  const bgNew = plain(await call("ycAlb", { action: "backnew", name: "api-backends", targetGroup: "web-targets", port: 8080, healthPath: "/health" }));
+  ok(/Группа бэкендов «api-backends» создаётся: HTTP/.test(bgNew) && /порт 8080/.test(bgNew) && /проверка здоровья \/health/.test(bgNew), "группа бэкендов создана с портом и проверкой: " + lineN(bgNew, 0));
+  ok(/Следующий шаг: маршрут роутера/.test(bgNew) && /потоковый слушатель/.test(bgNew), "сказано, куда эту группу вести");
+  const bgBody = (albState.bgCreated[0] || {}).body || {};
+  ok(bgBody.http && bgBody.http.backends[0].port === "8080" && bgBody.http.backends[0].targetGroups.targetGroupIds[0] === "tg-web", "порт ушёл строкой, группа целей — id: " + JSON.stringify((bgBody.http || {}).backends));
+  ok(bgBody.http.backends[0].healthchecks && bgBody.http.backends[0].healthchecks[0].http.path === "/health" && bgBody.http.backends[0].healthchecks[0].interval === "2s", "проверка ушла путём и интервалом: " + JSON.stringify(bgBody.http.backends[0].healthchecks));
+
+  // Здоровье спрашивают у ПАРЫ «группа бэкендов + группа целей», а облако отдаёт
+  // его ПО ЗОНАМ: у свежей цели часть проверок может ещё не ответить.
+  const bgHealth = plain(await call("ycAlb", { action: "health", lb: "web-lb", targetGroup: "web-targets" }));
+  ok(/Здоровье целей группы «web-targets»/.test(bgHealth), "здоровье отвечено словами: " + lineN(bgHealth, 0));
+  ok(/10\.10\.0\.6/.test(bgHealth) && /ru-central1-b: не отвечает \(не проходит активную проверку\)/.test(bgHealth), "состояние показано ПО ЗОНАМ: " + lineN(bgHealth, 2));
+  ok(/Целей: 2 · здоровых: 1\./.test(bgHealth), "здоровые посчитаны: " + lineN(bgHealth, 3));
+  ok(/только здоровые цели/.test(bgHealth), "сказано, что в маршрут попадут только здоровые");
+  const stCall = albCalls.filter((c) => c.path.indexOf("/targetStates/") >= 0).pop() || {};
+  ok(stCall.path === "/apploadbalancer/v1/loadBalancers/lb-web/targetStates/bg-web/tg-web", "здоровье спрошено у ПАРЫ «бэкенды + цели»: " + stCall.path);
+  const stCalls = albCalls.filter((c) => c.path.indexOf("/targetStates/") >= 0).length;
+  const bgWrongPair = plain(await call("ycAlb", { action: "health", lb: "web-lb", backendGroup: "free-backends", targetGroup: "web-targets" }));
+  ok(/не закреплена за балансировщиком/.test(bgWrongPair) && /закреплено: web-backends/.test(bgWrongPair), "чужая пара отбита до сети: " + lineN(bgWrongPair, 0));
+  ok(albCalls.filter((c) => c.path.indexOf("/targetStates/") >= 0).length === stCalls, "на отказе здоровье в облако не спрашивали");
+
+  // Удаление группы бэкендов: занятую облако не отдаст — стенд называет
+  // держателя словами, а свободная уходит только после согласия человека.
+  const bgOccupied = plain(await call("ycAlb", { action: "backdel", group: "web-backends", confirm: true }));
+  ok(/ещё работает/.test(bgOccupied) && /роутер «web-router»/.test(bgOccupied), "занятая группа назвала держателя: " + lineN(bgOccupied, 0));
+  ok(!albState.bgDeleted.has("bg-web"), "занятую группу не удалили");
+  const bgDelNo = plain(await call("ycAlb", { action: "backdel", group: "free-backends" }));
+  ok(/необратимо/.test(bgDelNo) && /confirm: true/.test(bgDelNo), "удаление группы без согласия назвало последствия и ждёт согласия");
+  ok(!albState.bgDeleted.has("bg-free"), "без согласия группа не удалена");
+  const bgDel = plain(await call("ycAlb", { action: "backdel", group: "free-backends", confirm: true }));
+  ok(/Группа бэкендов «free-backends» удаляется/.test(bgDel) && /настройки балансировки будут потеряны/.test(bgDel), "удаление объяснено: " + lineN(bgDel, 0));
+  ok(albState.bgDeleted.has("bg-free"), "удаление действительно дошло до облака");
+
+  // Состав группы целей меняется адресами: добавить и убрать, а не переписать.
+  const tgAdd = plain(await call("ycAlb", { action: "targetadd", group: "web-targets", ips: ["10.10.0.8"], subnet: "app-subnet" }));
+  ok(/добавлено целей: 1/.test(tgAdd) && /Теперь в ней 3/.test(tgAdd), "цель добавлена и перечитана: " + lineN(tgAdd, 0));
+  const tgRemove = plain(await call("ycAlb", { action: "targetremove", group: "web-targets", ips: ["10.10.0.8"] }));
+  ok(/убрано целей: 1/.test(tgRemove) && /Теперь в ней 2/.test(tgRemove), "цель убрана и перечитана: " + lineN(tgRemove, 0));
+  const tgRemoveBody = JSON.parse((albCalls.filter((c) => /:removeTargets$/.test(c.path)).pop() || {}).body || "{}");
+  ok(tgRemoveBody.targets && tgRemoveBody.targets[0].ipAddress === "10.10.0.8" && tgRemoveBody.targets[0].subnetId === undefined, "при удалении уходит только адрес: " + JSON.stringify(tgRemoveBody.targets));
+
+  // Создание идёт ПО ПОРЯДКУ: группа целей → роутер → балансировщик.
+  const tgNew = plain(await call("ycAlb", { action: "targetnew", name: "web-targets2", ips: ["10.10.0.7"], subnet: "app-subnet" }));
+  ok(/Группа целей «web-targets2» создаётся/.test(tgNew) && /целей 1/.test(tgNew), "группа целей создана: " + lineN(tgNew, 0));
+  ok(/подсеть app-subnet/.test(tgNew) && /Следующий шаг: группа бэкендов/.test(tgNew) && /backnew/.test(tgNew), "подсеть названа, следующий шаг подсказан (группа бэкендов)");
+  const tgCreatedBody = JSON.parse(albState.tgCreated[0] || "{}");
+  ok(tgCreatedBody.targets && tgCreatedBody.targets[0].ipAddress === "10.10.0.7" && tgCreatedBody.targets[0].subnetId === "sub-a", "цель ушла вместе с подсетью: " + JSON.stringify(tgCreatedBody.targets));
+
+  const rtNew = plain(await call("ycAlb", { action: "routernew", name: "web-router2", host: "site.example.com", backendGroup: "web-backends" }));
+  ok(/HTTP-роутер «web-router2» создаётся/.test(rtNew) && /домен site\.example\.com/.test(rtNew) && /путь \/\*/.test(rtNew), "роутер создан и назван: " + lineN(rtNew, 0));
+  const rtCreatedBody = JSON.parse(albState.routerCreated[0] || "{}");
+  ok(rtCreatedBody.virtualHosts[0].authority[0] === "site.example.com" && rtCreatedBody.virtualHosts[0].routes[0].http.route.backendGroupId === "bg-web", "маршрут ведёт в СУЩЕСТВУЮЩУЮ группу бэкендов: " + JSON.stringify(rtCreatedBody.virtualHosts[0].routes[0].http.route));
+
+  const lbNoConfirm = plain(await call("ycAlb", { action: "lbnew", name: "web-lb-2", subnet: "app-subnet", router: "web-router" }));
+  ok(/ценой/.test(lbNoConfirm) && /confirm: true/.test(lbNoConfirm), "создание без согласия назвало цену и ждёт согласия");
+  ok(albState.lbCreated.length === 0, "без согласия балансировщик не создан");
+  const lbNew = plain(await call("ycAlb", { action: "lbnew", name: "web-lb-2", subnet: "app-subnet", router: "web-router", securityGroups: ["web"], confirm: true }));
+  ok(/Балансировщик «web-lb-2» создаётся: слушатель HTTP, порт 80, зона ru-central1-a/.test(lbNew), "балансировщик создан и назван: " + lineN(lbNew, 0));
+  const lbCreatedBody = JSON.parse(albState.lbCreated[0] || "{}");
+  ok(lbCreatedBody.listenerSpecs[0].endpointSpecs[0].addressSpecs[0].externalIpv4AddressSpec, "слушатель ушёл в форме ЗАПРОСА (endpointSpecs/addressSpecs)");
+  ok(lbCreatedBody.listenerSpecs[0].http.handler.httpRouterId === "rt-web", "слушатель смотрит на роутер");
+  ok(lbCreatedBody.allocationPolicy.locations[0].zoneId === "ru-central1-a" && lbCreatedBody.allocationPolicy.locations[0].subnetId === "sub-a", "зона узла взята у подсети");
+  ok(lbCreatedBody.securityGroupIds[0] === "sg-web", "группа безопасности разрешена по имени");
+  ok((lbCreatedBody.listenerSpecs[0].endpointSpecs[0].ports || [])[0] === "80", "порт ушёл строкой, как у облака");
+  ok(/Адрес появится в карточке/.test(lbNew), "сказано, что адрес появится после создания — только тогда DNS");
+
+  const albStop = plain(await call("ycAlb", { action: "lbstop", lb: "web-lb" }));
+  ok(/останавливается/.test(albStop) && /состояние: остановлен/.test(albStop), "остановка названа и состояние перечитано: " + lineN(albStop, 0));
+  ok(albState.status === "STOPPED", "состояние правда изменилось: " + albState.status);
+  ok(/тарифицир/.test(albStop) && /экономит не всё/.test(albStop), "сказано, что остановка экономит не всё");
+  const albStart = plain(await call("ycAlb", { action: "lbstart", lb: "web-lb" }));
+  ok(/запускается/.test(albStart) && /состояние: работает/.test(albStart), "запуск выполнен и перечитан: " + lineN(albStart, 0));
+
+  const albNoDel = plain(await call("ycAlb", { action: "lbdel", lb: "web-lb" }));
+  ok(/необратимо/.test(albNoDel) && /203\.0\.113\.10/.test(albNoDel) && /confirm: true/.test(albNoDel), "удаление без согласия назвало адреса и последствия");
+  ok(albState.lbDeleted.size === 0, "без согласия балансировщик не удалён");
+  const albDel = plain(await call("ycAlb", { action: "lbdel", lb: "web-lb", confirm: true }));
+  ok(/удаляется вместе со слушателями/.test(albDel) && /203\.0\.113\.10/.test(albDel), "удаление выполнено и объяснено: " + lineN(albDel, 0));
+  ok(albState.lbDeleted.has("lb-web"), "удаление действительно дошло до облака");
+  const albGone = plain(await call("ycAlb", { action: "card", lb: "web-lb" }));
+  ok(/не нашёл балансировщик/.test(albGone), "удалённого больше нет: " + lineN(albGone, 0));
+
+  const albBad = albCalls.length;
+  ok(/неизвестное действие ycAlb/.test(plain(await call("ycAlb", { action: "nope" }))), "чужое действие отбито словами");
+  ok(/Не указано имя балансировщика/.test(plain(await call("ycAlb", { action: "lbnew", confirm: true }))), "создание без имени отбито до сети");
+  ok(albCalls.length === albBad, "на этих отказах в облако не ушло ничего");
+  ok(/Порт слушателя/.test(plain(await call("ycAlb", { action: "lbnew", name: "web-lb-3", subnet: "app-subnet", router: "web-router", port: 70000, confirm: true }))), "дурной порт отбит словами");
+
+  // ── Те же действия — из ОКНА (часть 91, заход 2) ───────────────────────
+  // Канал «yc:alb» — второй вход в тот же модуль: окно получает готовые строки,
+  // связи карточки и цену до согласия, а необратимое спрашивает человек.
+  console.log("\n[24] yc:alb: вход в приложение из окна — строки, цена, согласие и здоровье");
+  albState.lbDeleted.clear();
+  albState.status = "ACTIVE";
+  const albHandler = handlers.get("yc:alb");
+  ok(typeof albHandler === "function", "канал yc:alb зарегистрирован настоящим main.js");
+  const callAlb = (args) => albHandler({}, args || {});
+  const uiAlbList = await callAlb({ op: "list" });
+  ok(uiAlbList.ok === true && (uiAlbList.lines || []).length === 1, "список пришёл строками: " + ((uiAlbList.lines || [])[0] || ""));
+  ok(uiAlbList.message === "Балансировщиков: 1.", "окно получило счёт: " + uiAlbList.message);
+  const uiAlbCard = await callAlb({ op: "card", lb: "web-lb" });
+  ok(uiAlbCard.ok === true && (uiAlbCard.lines || []).some((l) => /Слушатели \(1\)/.test(l)), "карточка собрана строками");
+  ok((uiAlbCard.targetGroups || []).length === 1 && (uiAlbCard.backendGroups || []).length === 1, "окно получило связи: целей " + (uiAlbCard.targetGroups || []).length + ", групп бэкендов " + (uiAlbCard.backendGroups || []).length);
+  const uiAlbTargets = await callAlb({ op: "targets" });
+  ok(uiAlbTargets.ok === true && (uiAlbTargets.warnings || []).join(" ").includes("только адрес и подсеть"), "окно предупреждено о том, что знает группа целей");
+  // Группа бэкендов и здоровье — из окна: те же строки, что у модели, плюс
+  // состояние целей ОБЪЕКТАМИ, чтобы виджет мог показать зоны как есть.
+  const uiAlbBacks = await callAlb({ op: "backends" });
+  ok(uiAlbBacks.ok === true && (uiAlbBacks.lines || []).some((l) => /web-backends/.test(l)), "список групп бэкендов пришёл строками");
+  ok((uiAlbBacks.warnings || []).join(" ").includes("ГРУППЕ БЭКЕНДОВ"), "окно предупреждено, где живёт порт целей");
+  const uiAlbHealth = await callAlb({ op: "health", lb: "web-lb", targetGroup: "web-targets" });
+  ok(uiAlbHealth.ok === true && uiAlbHealth.healthy === 1 && (uiAlbHealth.lines || []).some((l) => /здоровых: 1/.test(l)), "здоровье пришло в окно числом и строками");
+  ok((uiAlbHealth.states || []).length === 2 && ((uiAlbHealth.states || [])[1].zones || []).some((z) => z.zoneId === "ru-central1-b" && z.statusHuman === "не отвечает"), "состояния пришли ПО ЗОНАМ, как их отдаёт облако");
+  const uiAlbBackNew = await callAlb({ op: "backnew", name: "ui-backends", targetGroup: "web-targets", port: 9000 });
+  ok(uiAlbBackNew.ok === true && /ui-backends/.test(uiAlbBackNew.message || ""), "создание группы бэкендов из окна прошло: " + String(uiAlbBackNew.message || "").slice(0, 90));
+  ok((uiAlbBackNew.warnings || []).join(" ").includes("Проверки здоровья не заданы"), "окно предупреждено: без проверки облако считает цель здоровой всегда");
+  const uiAlbBackDelNo = await callAlb({ op: "backdel", group: "ui-backends" });
+  ok(uiAlbBackDelNo.ok === false && uiAlbBackDelNo.needsConfirm === true && /необратимо/.test(uiAlbBackDelNo.error || ""), "удаление группы из окна ждёт согласия человека");
+  const uiAlbBackDel = await callAlb({ op: "backdel", group: "ui-backends", confirm: true });
+  ok(uiAlbBackDel.ok === true && /удаляется/.test(uiAlbBackDel.message || ""), "с согласием группа удалена: " + String(uiAlbBackDel.message || "").slice(0, 90));
+  const uiAlbNew = await callAlb({ op: "lbnew", name: "web-lb-4", subnet: "app-subnet", router: "web-router" });
+  ok(uiAlbNew.ok === false && uiAlbNew.needsConfirm === true, "создание из окна спросило человека, а не отказало");
+  ok((uiAlbNew.lines || []).some((l) => /Слушатель: http · порт 80/.test(l)), "вопрос назвал слушателя и порт: " + JSON.stringify((uiAlbNew.lines || [])[1] || ""));
+  const uiAlbNoDel = await callAlb({ op: "lbdel", lb: "web-lb" });
+  ok(uiAlbNoDel.ok === false && uiAlbNoDel.needsConfirm === true && /203\.0\.113\.10/.test(uiAlbNoDel.error || ""), "удаление из окна назвало адреса и ждёт согласия");
+  const uiAlbRef = albCalls.length;
+  const uiAlbCreated = await callAlb({ op: "lbnew", name: "web-lb-4", subnet: "app-subnet", router: "web-router", confirm: true });
+  ok(uiAlbCreated.ok === true && /слушатель HTTP, порт 80/.test(uiAlbCreated.message || ""), "с согласием создание прошло: " + String(uiAlbCreated.message || "").slice(0, 90));
+  ok(albCalls.length > uiAlbRef, "и действительно ушло в облако");
+  const uiAlbNoAuth = await callAlb({ op: "nope" });
+  ok(uiAlbNoAuth.ok === false && /Неизвестное действие/.test(uiAlbNoAuth.error || ""), "чужое действие отбито словами");
 
   srv.close();
   clearTimeout(watchdog);

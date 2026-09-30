@@ -7,9 +7,9 @@
    Balancer — это четыре связанных ресурса, и путать их нельзя:
 
      • ГРУППА БЭКЕНДОВ (backendGroups) — куда ведут маршруты: набор из групп
-       целей с проверками здоровья. В этой части только ЧИТАЕТСЯ (список), чтобы
-       роутер не ссылался на выдуманный id: создание групп бэкендов — отдельный
-       заход с настройками проверок;
+       целей с проверками здоровья. Именно здесь живут порт целей и проверки
+       здоровья: создаётся группа видом (http/grpc/stream), а удаляется только
+       когда на неё никто не смотрит (маршрут роутера или слушатель-поток);
      • ГРУППА ЦЕЛЕЙ (targetGroups) — САМ СПИСОК МАШИН: адрес (ipAddress) и
        подсеть (subnetId). Цели добавляются и убираются отдельными операциями
        (`addTargets`/`removeTargets`) — «изменить состав» здесь отсутствует;
@@ -36,13 +36,16 @@
      DELETE /httpRouters/{id}
      GET    /backendGroups?folderId=…                   группы бэкендов (список)
      GET    /backendGroups/{id}                         группа бэкендов (за ней — её группы целей)
+     POST   /backendGroups                              создание (вид, порт целей и проверки)
+     DELETE /backendGroups/{id}                         удаление (занятую облако отклонит)
+     GET    /loadBalancers/{id}/targetStates/{bg}/{tg}  здоровье целей (по зонам)
 
    ЗДОРОВЬЕ ЦЕЛЕЙ в ответах балансировщика и группы целей НЕ приходит: его отдаёт
    только LoadBalancer.GetTargetStates, и спрашивать его надо связкой «группа
-   бэкендов + группа целей». Это вернётся вместе с созданием групп бэкендов (там
-   же живут проверки здоровья) — пока карточка показывает адреса целей, а не их
-   состояние. У балансировщика НЕТ и защиты от удаления: такого поля в справочнике
-   нет вовсе.
+   бэкендов + группа целей» — пару ищут У БАЛАНСИРОВЩИКА (слушатель-поток или
+   маршрут роутера), а состояние приходит ПО ЗОНАМ (status.zoneStatuses), а не
+   одной строкой. У балансировщика НЕТ и защиты от удаления: такого поля в
+   справочнике нет вовсе.
 
    Что важно и не потерять при правке:
 
@@ -57,6 +60,9 @@
      • РОУТЕР БЕЗ ГРУППЫ БЭКЕНДОВ НЕ ИМЕЕТ СМЫСЛА: маршрут ведёт в
        backendGroupId. Модуль проверяет группу бэкендов ДО запроса — иначе
        человек получил бы роутер, который ничего не отдаёт.
+     • ЗАНЯТУЮ ГРУППУ БЭКЕНДОВ ОБЛАКО УДАЛЯТЬ ОТКАЖЕТСЯ: на неё смотрят
+       маршрут роутера или слушатель-поток. Модуль читает и роутеры, и
+       балансировщики ДО сети и называет, кто именно держит группу.
      • ГРУППА ЦЕЛЕЙ ЗНАЕТ ТОЛЬКО АДРЕС И ПОДСЕТЬ. Ни порта, ни пути, ни
        протокола здесь нет: порт говорит группа бэкендов, путь — роутер.
      • БАЛАНСИРОВЩИК ПЛАТНЫЙ и тарифицируется за час (ресурсные единицы плюс
@@ -73,6 +79,10 @@ const ALB_HOST = "https://alb.api.cloud.yandex.net";
 const ALB_BASE = "/apploadbalancer/v1";
 
 const PORT_DEFAULT = 80;
+const BACKEND_NAME_DEFAULT = "main";
+const HEALTH_TIMEOUT = "1s";
+const HEALTH_INTERVAL = "2s";
+const HEALTH_THRESHOLD = "2";
 const LISTENER_NAME_DEFAULT = "web";
 const ROUTE_NAME_DEFAULT = "main";
 const PATH_PREFIX_DEFAULT = "/";
@@ -301,6 +311,61 @@ function routerInfo(r) {
   };
 }
 
+// Группа бэкендов: ОДИН вид из трёх (stream, http, grpc), и бэкенды лежат
+// ВНУТРИ него (stream.backends, http.backends, grpc.backends) — поля backends на
+// верхнем уровне у группы нет. Каждый бэкенд несёт порт ЦЕЛЕЙ, группы целей и
+// проверки здоровья — ровно то, чего нет ни в группе целей, ни у балансировщика.
+function backendGroupInfo(b) {
+  const o = b || {};
+  const kind = o.stream ? "stream" : o.http ? "http" : o.grpc ? "grpc" : "";
+  const spec = o[kind] || {};
+  const backends = (spec.backends || []).map((x) => ({
+    name: one(x && x.name),
+    port: one(x && x.port),
+    weight: one(x && x.backendWeight),
+    targetGroupIds: ((x && x.targetGroups && x.targetGroups.targetGroupIds) || []).map(one).filter(Boolean),
+    healthcheckCount: ((x && x.healthchecks) || []).length,
+    storageBucket: one(x && x.storageBucket && x.storageBucket.bucket),
+  }));
+  const tgIds = [];
+  backends.forEach((x) => x.targetGroupIds.forEach((id) => { if (tgIds.indexOf(id) < 0) tgIds.push(id); }));
+  return {
+    id: one(o.id),
+    name: one(o.name),
+    folderId: one(o.folderId),
+    description: one(o.description),
+    createdAt: one(o.createdAt),
+    age: humanUptime(o.createdAt),
+    kind: kind,
+    kindHuman: kind === "http" ? "HTTP" : kind === "grpc" ? "gRPC" : kind === "stream" ? "поток TCP" : "вид не назван",
+    backends: backends,
+    backendCount: backends.length,
+    targetGroupIds: tgIds,
+    healthcheckCount: backends.reduce((n, x) => n + x.healthcheckCount, 0),
+  };
+}
+
+// Здоровье цели: в ответе targetStates оно приходит ПО ЗОНАМ
+// (status.zoneStatuses), а не одной строкой со статусом.
+function targetStateInfo(st) {
+  const o = st || {};
+  const t = o.target || {};
+  const zones = ((o.status && o.status.zoneStatuses) || []).map((z) => ({
+    zoneId: one(z && z.zoneId),
+    status: one(z && z.status),
+    statusHuman: targetStatusHuman(z && z.status),
+    failedActiveHc: !!(z && z.failedActiveHc),
+  }));
+  return {
+    ipAddress: one(t.ipAddress),
+    subnetId: one(t.subnetId),
+    external: t.externalAddress === true,
+    privateOnly: t.privateIpv4Address === true,
+    zones: zones,
+    healthy: zones.length > 0 && zones.every((z) => z.status.toUpperCase() === "HEALTHY"),
+  };
+}
+
 // Одна строка балансировщика — на список, карточку, канал и инструмент.
 function lbLine(lb) {
   const bits = [];
@@ -339,6 +404,24 @@ function tgLine(tg) {
   const bits = ["• " + tg.name, "целей: " + tg.targetCount];
   if (tg.age) bits.push("возраст " + tg.age);
   return bits.join(" · ") + (tg.id ? "\n    id " + tg.id : "");
+}
+
+function backendGroupLine(bg) {
+  const bits = ["• " + bg.name, bg.kindHuman, "бэкендов: " + bg.backendCount];
+  if (bg.targetGroupIds.length) bits.push("группы целей: " + bg.targetGroupIds.join(", "));
+  if (bg.healthcheckCount) bits.push("проверок здоровья: " + bg.healthcheckCount);
+  if (bg.age) bits.push("возраст " + bg.age);
+  return bits.join(" · ") + (bg.id ? "\n    id " + bg.id : "");
+}
+
+// Строка здоровья цели: состояния ПО ЗОНАМ (у цели их может быть несколько).
+function targetStateLine(s) {
+  const where = s.zones.length
+    ? s.zones
+        .map((z) => (z.zoneId ? z.zoneId + ": " : "") + (z.statusHuman || "—") + (z.failedActiveHc ? " (не проходит активную проверку)" : ""))
+        .join(" · ")
+    : "состояний нет: у группы бэкендов не заданы проверки здоровья или облако ещё не ответило";
+  return "• " + s.ipAddress + (s.subnetId ? " (подсеть " + s.subnetId + ")" : "") + " — " + where;
 }
 
 function routerLine(r) {
@@ -470,9 +553,8 @@ function createYcAlb(deps) {
     return list.find((r) => r.id === q) || list.find((r) => r.name === q) || null;
   }
 
-  // Группы бэкендов — только чтение: маршрут роутера обязан вести в СУЩЕСТВУЮЩУЮ
-  // группу, иначе роутер создался бы «в никуда». Сами группы бэкендов (с
-  // проверками здоровья и балансировкой) — отдельный заход.
+  // Группы бэкендов: маршрут роутера обязан вести в СУЩЕСТВУЮЩУЮ группу, иначе
+  // роутер создался бы «в никуда».
   async function backendGroups(oauthToken, folderId) {
     const folder = checkFolder(folderId);
     const j = await alb(
@@ -482,23 +564,15 @@ function createYcAlb(deps) {
       undefined,
       25000
     );
-    return (Array.isArray(j && j.backendGroups) ? j.backendGroups : []).map((b) => ({
-      id: one(b && b.id),
-      name: one(b && b.name),
-      // Бэкенды лежат ВНУТРИ вида группы: stream.backends, http.backends или
-      // grpc.backends — поля backends на верхнем уровне у группы нет.
-      backendCount:
-        ((b && b.stream && b.stream.backends) || []).length +
-        ((b && b.http && b.http.backends) || []).length +
-        ((b && b.grpc && b.grpc.backends) || []).length,
-    }));
+    return (Array.isArray(j && j.backendGroups) ? j.backendGroups : []).map(backendGroupInfo);
   }
 
-  // Группа бэкендов по id — нужна карточке: только в ней лежат id групп целей.
+  // Группа бэкендов по id — нужна карточке и здоровью: только в ней лежат id
+  // групп целей и проверки здоровья.
   async function backendGroup(oauthToken, id) {
     const bgId = one(id);
     if (!bgId) throw new Error("Не указан id группы бэкендов.");
-    return alb(oauthToken, "GET", ALB_BASE + "/backendGroups/" + encodeURIComponent(bgId), undefined, 25000);
+    return backendGroupInfo(await alb(oauthToken, "GET", ALB_BASE + "/backendGroups/" + encodeURIComponent(bgId), undefined, 25000));
   }
 
   async function findBackendGroup(oauthToken, folderId, ref) {
@@ -534,15 +608,9 @@ function createYcAlb(deps) {
     const tgIds = [];
     for (const b of boundBackends.slice(0, 5)) {
       const full = await backendGroup(oauthToken, b.id).catch(() => null);
-      const lists = [full && full.stream && full.stream.backends, full && full.http && full.http.backends, full && full.grpc && full.grpc.backends];
-      lists.forEach((items) =>
-        (items || []).forEach((x) => {
-          const ids = (x && x.targetGroups && x.targetGroups.targetGroupIds) || [];
-          ids.map(one).filter(Boolean).forEach((id) => {
-            if (tgIds.indexOf(id) < 0) tgIds.push(id);
-          });
-        })
-      );
+      ((full && full.targetGroupIds) || []).forEach((id) => {
+        if (tgIds.indexOf(id) < 0) tgIds.push(id);
+      });
     }
     const used = tgs.filter((g) => tgIds.indexOf(g.id) >= 0);
     const listeners = [];
@@ -671,6 +739,203 @@ function createYcAlb(deps) {
     };
   }
 
+  // ── Группа бэкендов: создание и удаление ──────────────────────────────────
+  async function createBackendGroup(oauthToken, opts) {
+    const o = opts || {};
+    const folderId = checkFolder(o.folderId);
+    const name = checkName(o.name, "группы бэкендов");
+    const kind = one(o.kind || o.type || "http").toLowerCase();
+    if (["http", "grpc", "stream"].indexOf(kind) < 0) {
+      throw new Error("Группа бэкендов бывает http, grpc или stream (дано: " + (o.kind || o.type) + "): вид задаёт и порт, и проверки.");
+    }
+
+    // Группа бэкендов без группы целей никуда не ведёт — проверяется ДО сети.
+    const tgRef = one(o.targetGroup || o.targetGroupId || o.group);
+    const tg = await findTargetGroup(oauthToken, folderId, tgRef);
+    if (!tg) {
+      const list = await targetGroups(oauthToken, folderId);
+      throw new Error(
+        "Группе бэкендов нужна группа целей: " + (tgRef ? "«" + tgRef + "» не нашёл" : "не указана") + "." +
+          (list.length ? " В каталоге: " + list.map((g) => g.name).join(", ") + "." : " Групп целей нет — сначала создай: действие «Создать группу целей» (targetnew).")
+      );
+    }
+
+    // Порт здесь — порт, который слушают ЦЕЛИ. У потока его не угадать (у базы
+    // он 6432, у брокера свой), поэтому с потока порт спрашивают явно.
+    const portGiven = o.port != null && o.port !== "";
+    if (kind === "stream" && !portGiven) {
+      throw new Error("У потока (stream) порт не угадывается: назови port — это порт, который слушают ЦЕЛИ.");
+    }
+    const port = checkPort(o.port);
+    const backendName = checkName(o.backendName || BACKEND_NAME_DEFAULT, "бэкенда");
+    const backend = { name: backendName, port: String(port), targetGroups: { targetGroupIds: [tg.id] } };
+
+    const healthPath = one(o.healthPath || o.healthCheckPath);
+    const healthService = one(o.healthService);
+    const healthchecks = [];
+    if (kind === "http" && healthPath) {
+      healthchecks.push({ timeout: HEALTH_TIMEOUT, interval: HEALTH_INTERVAL, healthyThreshold: HEALTH_THRESHOLD, unhealthyThreshold: HEALTH_THRESHOLD, http: { path: healthPath } });
+    } else if (kind === "grpc" && healthService) {
+      healthchecks.push({ timeout: HEALTH_TIMEOUT, interval: HEALTH_INTERVAL, healthyThreshold: HEALTH_THRESHOLD, unhealthyThreshold: HEALTH_THRESHOLD, grpc: { serviceName: healthService } });
+    }
+    if (healthchecks.length) backend.healthchecks = healthchecks;
+
+    const body = { folderId: folderId, name: name, description: one(o.description) };
+    body[kind] = { backends: [backend] };
+    const j = await alb(oauthToken, "POST", ALB_BASE + "/backendGroups", body, 30000);
+    const op = await run(oauthToken, j, 120000);
+    const id = one(op && op.metadata && op.metadata.backendGroupId) || one(op && op.response && op.response.id) || "";
+    const created = id ? await backendGroup(oauthToken, id).catch(() => null) : await findBackendGroup(oauthToken, folderId, name).catch(() => null);
+
+    const warnings = [];
+    if (!healthchecks.length && kind !== "stream") {
+      warnings.push("Проверки здоровья не заданы: облако будет считать цель здоровой всегда — упавшая машина останется в ротации. Путь проверки задаётся полем healthPath (например, \"/\").");
+    }
+    if (kind === "stream") {
+      warnings.push("Проверки здоровья потока здесь не задаются: они требуют пары «запрос-ответ» (send/receive) и настраиваются в консоли. Поток без проверок падения машины не заметит.");
+    }
+    if (kind === "http" && healthService && !healthPath) {
+      warnings.push("healthService — это проверка gRPC: у HTTP проверка задаётся путём (healthPath), поэтому проверка не включена.");
+    }
+    if (!portGiven && kind !== "stream") {
+      warnings.push("Порт не назван — взят " + PORT_DEFAULT + ": это порт, который слушают ЦЕЛИ (машины), а не балансировщик. У базы и брокера он свой.");
+    }
+    warnings.push("Дальше: маршрут роутера (routernew, backendGroup) или потоковый слушатель балансировщика (lbnew, listener: \"stream\").");
+    return {
+      group: created,
+      groupId: (created && created.id) || id,
+      operationId: one(j && j.id),
+      message:
+        "Группа бэкендов «" + name + "» создаётся: " +
+        (kind === "http" ? "HTTP" : kind === "grpc" ? "gRPC" : "поток TCP") +
+        ", бэкенд «" + backendName + "» — порт " + port + ", группа целей «" + tg.name + "»" +
+        (healthchecks.length ? ", проверка здоровья " + (healthPath || healthService) : "") + ".",
+      warnings: warnings,
+    };
+  }
+
+  async function removeBackendGroup(oauthToken, opts) {
+    const o = opts || {};
+    const folderId = checkFolder(o.folderId);
+    const found = o.group && o.group.id ? o.group : await findBackendGroup(oauthToken, folderId, o.group || o.id || o.name);
+    if (!found) throw new Error("Не нашёл группу бэкендов «" + one(o.group || o.id || o.name) + "».");
+    const bg = found.kind ? found : await backendGroup(oauthToken, found.id);
+
+    // Занятую группу облако удалять откажется: на неё смотрят маршрут роутера
+    // или слушатель-поток. Читаем и то и другое ДО сети и называем виновников.
+    const [routers, lbs] = await Promise.all([
+      httpRouters(oauthToken, folderId),
+      loadBalancers(oauthToken, folderId),
+    ]);
+    const holders = [];
+    routers.forEach((r) => {
+      if (r.hosts.some((h) => h.routes.some((rt) => rt.backendGroupId === bg.id))) holders.push("роутер «" + r.name + "»");
+    });
+    lbs.forEach((l) => {
+      if (l.listeners.some((x) => x.backendGroupId === bg.id)) holders.push("слушатель балансировщика «" + l.name + "»");
+    });
+    if (holders.length) {
+      throw new Error(
+        "Группа бэкендов «" + bg.name + "» ещё работает: на неё смотрят " + holders.join(" и ") +
+          ". Облако откажет удалять занятую группу — сначала переключи или удали то, что на неё смотрит, и повтори."
+      );
+    }
+
+    const j = await alb(oauthToken, "DELETE", ALB_BASE + "/backendGroups/" + encodeURIComponent(bg.id), undefined, 40000);
+    await run(oauthToken, j, 120000);
+    return {
+      changed: true,
+      groupId: bg.id,
+      message: "Группа бэкендов «" + bg.name + "» удаляется: проверки здоровья и настройки балансировки будут потеряны.",
+      warnings: [
+        "Группы целей, машины и роутеры не трогаются: удаляется только связка «какие цели и как проверять».",
+        "Маршрут, который вёл в эту группу, отвечать перестанет — если такой был, слушатель потеряет ответ.",
+      ],
+    };
+  }
+
+  // ── Здоровье целей ────────────────────────────────────────────────────────
+  // Здоровье спрашивают у ПАРЫ «группа бэкендов + группа целей», а пару ищут у
+  // балансировщика: ни у него, ни у роутера ссылки на группу целей нет.
+  async function targetStates(oauthToken, opts) {
+    const o = opts || {};
+    const folderId = checkFolder(o.folderId);
+    const lbRef = one(o.lb || o.loadBalancer || o.loadBalancerId || o.id);
+    const lb = o.lb && o.lb.id ? o.lb : await findLoadBalancer(oauthToken, folderId, lbRef);
+    if (!lb) throw new Error("Не нашёл балансировщик «" + lbRef + "» в каталоге. Список — действие list.");
+    const tgRef = one(o.targetGroup || o.targetGroupId || o.group || o.target);
+    const tg = o.targetGroup && o.targetGroup.id ? o.targetGroup : await findTargetGroup(oauthToken, folderId, tgRef);
+    if (!tg) throw new Error("Не нашёл группу целей «" + tgRef + "» в каталоге. Список — действие targets.");
+
+    const c = await card(oauthToken, folderId, lb.id);
+    const bound = (c && c.backendGroups) || [];
+    const bgRef = one(o.backendGroup || o.backendGroupId);
+    let bg = null;
+    if (bgRef) {
+      bg = bound.find((b) => b.id === bgRef) || bound.find((b) => b.name === bgRef) || null;
+      if (!bg) {
+        throw new Error(
+          "Группа бэкендов «" + bgRef + "» не закреплена за балансировщиком «" + lb.name + "»: здоровье спрашивают только у той пары, которая работает, а пару задаёт слушатель-поток или маршрут роутера." +
+            (bound.length ? " У «" + lb.name + "» закреплено: " + bound.map((b) => b.name).join(", ") + "." : " Закреплённых групп бэкендов у него нет.")
+        );
+      }
+    } else if (bound.length === 1) {
+      bg = bound[0];
+    } else if (bound.length > 1) {
+      throw new Error(
+        "У балансировщика «" + lb.name + "» групп бэкендов больше одной (" + bound.map((b) => b.name).join(", ") +
+          "): назови backendGroup — здоровье спрашивают у конкретной пары."
+      );
+    } else {
+      throw new Error(
+        "У балансировщика «" + lb.name + "» нет закреплённых групп бэкендов: здоровье спрашивают у пары «группа бэкендов + группа целей», а пару задаёт слушатель-поток или маршрут роутера."
+      );
+    }
+
+    const full = await backendGroup(oauthToken, bg.id);
+    if (full.targetGroupIds.indexOf(tg.id) < 0) {
+      throw new Error(
+        "Группа бэкендов «" + bg.name + "» не ссылается на группу целей «" + tg.name + "»: здоровье спрашивают только у той пары, что соединена на самом деле." +
+          (full.targetGroupIds.length ? " В её бэкендах: " + full.targetGroupIds.join(", ") + "." : " В её бэкендах групп целей нет вовсе.")
+      );
+    }
+
+    const j = await alb(
+      oauthToken,
+      "GET",
+      ALB_BASE + "/loadBalancers/" + encodeURIComponent(lb.id) + "/targetStates/" + encodeURIComponent(bg.id) + "/" + encodeURIComponent(tg.id),
+      undefined,
+      25000
+    );
+    const states = (Array.isArray(j && j.targetStates) ? j.targetStates : []).map(targetStateInfo);
+    const healthyCount = states.filter((s) => s.healthy).length;
+    const lines = ["Здоровье целей группы «" + tg.name + "» (группа бэкендов «" + bg.name + "», балансировщик «" + lb.name + "»):"];
+    if (!states.length) lines.push("Целей нет: добавь адреса действием «Добавить цели» (targetadd), иначе вести некуда.");
+    else for (const s of states) lines.push("  " + targetStateLine(s));
+    if (states.length) lines.push("Целей: " + states.length + " · здоровых: " + healthyCount + ".");
+
+    const warnings = [];
+    if (!full.healthcheckCount) {
+      warnings.push("У группы бэкендов «" + bg.name + "» не заданы проверки здоровья: облако считает здоровой КАЖДУЮ цель — упавшая машина останется в ротации.");
+    }
+    if (states.some((s) => s.zones.some((z) => z.status.toUpperCase() === "TIMEOUT"))) {
+      warnings.push("Часть проверок ещё не ответила («проверка не успела ответить»): у свежей цели это обычное дело — повтори через минуту.");
+    }
+    if (states.length && healthyCount < states.length) {
+      warnings.push("В маршрут попадут только здоровые цели: проверь машины, порт целей и путь проверки в группе бэкендов.");
+    }
+    return {
+      lb: lb,
+      backendGroup: bg,
+      targetGroup: tg,
+      states: states,
+      healthyCount: healthyCount,
+      lines: lines,
+      message: "Здоровье целей «" + tg.name + "»: целей " + states.length + ", здоровых " + healthyCount + ".",
+      warnings: warnings,
+    };
+  }
+
   // ── Создание HTTP-роутера ─────────────────────────────────────────────────
   async function createHttpRouter(oauthToken, opts) {
     const o = opts || {};
@@ -685,8 +950,8 @@ function createYcAlb(deps) {
       const list = await backendGroups(oauthToken, folderId);
       throw new Error(
         "Маршрут ведёт в группу бэкендов, а её нет: " + (ref ? "«" + ref + "» не нашёл" : "не указана") + "." +
-          (list.length ? " В каталоге: " + list.map((b) => b.name).join(", ") + "." : " Групп бэкендов в каталоге нет вовсе — их создают в консоли (или в следующем заходе), а маршрут без них не имеет смысла.") +
-          " Подсказка: группу бэкендов создают из группы целей и слушателя — action \"backends\" покажет, что уже есть."
+          (list.length ? " В каталоге: " + list.map((b) => b.name).join(", ") + "." : " Групп бэкендов в каталоге нет вовсе — их создаёт действие «Создать группу бэкендов» (backnew), а маршрут без них не имеет смысла.") +
+          " Подсказка: группу бэкендов создают из группы целей — action \"backends\" покажет, что уже есть."
       );
     }
 
@@ -999,6 +1264,9 @@ function createYcAlb(deps) {
     backendGroups: backendGroups,
     backendGroup: backendGroup,
     findBackendGroup: findBackendGroup,
+    createBackendGroup: createBackendGroup,
+    removeBackendGroup: removeBackendGroup,
+    targetStates: targetStates,
     createLoadBalancer: createLoadBalancer,
     createTargetGroup: createTargetGroup,
     changeTargets: changeTargets,
@@ -1012,6 +1280,8 @@ function createYcAlb(deps) {
     targetLine: targetLine,
     tgLine: tgLine,
     routerLine: routerLine,
+    backendGroupLine: backendGroupLine,
+    targetStateLine: targetStateLine,
     statusHuman: statusHuman,
     targetStatusHuman: targetStatusHuman,
   };
@@ -1032,4 +1302,8 @@ module.exports = {
   targetLine: targetLine,
   tgLine: tgLine,
   routerLine: routerLine,
+  backendGroupInfo: backendGroupInfo,
+  backendGroupLine: backendGroupLine,
+  targetStateInfo: targetStateInfo,
+  targetStateLine: targetStateLine,
 };

@@ -16,8 +16,12 @@
      • балансировщик — адреса, зоны и СЛУШАТЕЛИ: HTTP на порт, HTTPS с
        сертификатом или поток TCP. Слушатель ссылается ЛИБО на роутер, ЛИБО на
        группу бэкендов, и смешивать HTTP с TCP в одном TLS-слушателе нельзя;
-     • группа бэкендов — куда ведут маршруты: здесь только ЧИТАЕТСЯ, потому что
-       роутер обязан ссылаться на СУЩЕСТВУЮЩУЮ группу.
+     • группа бэкендов — куда ведут маршруты: здесь живут ПОРТ целей и проверки
+       здоровья, поэтому роутер обязан ссылаться на СУЩЕСТВУЮЩУЮ группу, а
+       занятую группу облако удалять отклонит — модуль называет виновных ДО сети;
+     • здоровье цели (здорова/не отвечает) отдаёт отдельный метод облака, и оно
+       приходит ПО ЗОНАМ (status.zoneStatuses): спрашивают его у пары «группа
+       бэкендов + группа целей», а пару ищут у балансировщика.
 
    Что здесь проверяется прежде всего (и почему):
      • АДРЕС БАЛАНСИРОВЩИКА — ЭТО АДРЕСА ЕГО СЛУШАТЕЛЕЙ. В ответе облака
@@ -105,9 +109,9 @@ const ycConsole = require(path.join(ROOT, "src", "yc-console.js"));
 // слушателей нет). На них видно и разбор ответа, и отказы до сети.
 function startAlbStub() {
   const calls = [];
-  const created = { lb: [], tg: [], router: [], targets: [] };
+  const created = { lb: [], tg: [], router: [], targets: [], bg: [] };
   const deleted = new Set();
-  const status = { "alb-web": "ACTIVE", "alb-https": "STOPPED", "alb-busy": "CREATING" };
+  const status = { "alb-web": "ACTIVE", "alb-https": "STOPPED", "alb-busy": "CREATING", "alb-stream": "ACTIVE" };
   const listeners = {
     "alb-web": [
       {
@@ -124,10 +128,19 @@ function startAlbStub() {
       },
     ],
     "alb-busy": [],
+    // Потоковый слушатель держит группу бэкендов «free-backends»: без такой
+    // связи проверка «занятую группу не удаляют» не проверилась бы.
+    "alb-stream": [
+      {
+        name: "tcp",
+        endpoints: [{ addresses: [{ externalIpv4Address: { address: "203.0.113.12" } }], ports: ["5432"] }],
+        stream: { handler: { backendGroupId: "bg-free" } },
+      },
+    ],
   };
   const lbBase = (id) => ({
     id: id,
-    name: id === "alb-web" ? "web-lb" : id === "alb-https" ? "https-lb" : "busy-lb",
+    name: id === "alb-web" ? "web-lb" : id === "alb-https" ? "https-lb" : id === "alb-stream" ? "stream-lb" : "busy-lb",
     folderId: "folder-1",
     description: id === "alb-web" ? "витрина" : "",
     createdAt: "2026-08-02T10:00:00Z",
@@ -186,6 +199,7 @@ function startAlbStub() {
         const id = url.split("/").pop();
         if (id === "op-tg-new") return json({ id: id, done: true, metadata: { targetGroupId: "tg-new" } });
         if (id === "op-router-new") return json({ id: id, done: true, metadata: { httpRouterId: "router-new" } });
+        if (id === "op-bg-new") return json({ id: id, done: true, metadata: { backendGroupId: "bg-new" } });
         if (id === "op-lb-new") return json({ id: id, done: true, metadata: { loadBalancerId: "alb-new" } });
         return json({ id: id, done: true });
       }
@@ -204,6 +218,22 @@ function startAlbStub() {
       }
       if (url.indexOf("/certificate-manager/v1/certificates") >= 0) {
         return json({ certificates: [{ id: "cert-1", name: "site-cert", status: "ISSUED" }, { id: "cert-2", name: "old-cert", status: "VALIDATING" }] });
+      }
+
+      // Здоровье целей: у пути свой обработчик, и он стоит ДО балансировщиков —
+      // иначе список балансировщиков перехватил бы /loadBalancers/…/targetStates/….
+      if (url.indexOf("/targetStates/") >= 0 && req.method === "GET") {
+        // Здоровье приходит ПО ЗОНАМ (status.zoneStatuses) — как в облаке.
+        if (/\/tg-empty$/.test(url)) return json({ targetStates: [] });
+        return json({
+          targetStates: [
+            { status: { zoneStatuses: [{ zoneId: "ru-central1-a", status: "HEALTHY" }] }, target: { ipAddress: "10.10.0.5", subnetId: "sub-1" } },
+            {
+              status: { zoneStatuses: [{ zoneId: "ru-central1-a", status: "TIMEOUT" }, { zoneId: "ru-central1-b", status: "UNHEALTHY", failedActiveHc: true }] },
+              target: { ipAddress: "10.10.0.6" },
+            },
+          ],
+        });
       }
 
       // ── Балансировщики ──
@@ -299,8 +329,17 @@ function startAlbStub() {
         }
       }
 
-      // ── Группы бэкендов (только чтение) ──
+      // ── Группы бэкендов: чтение, создание, удаление ──
       if (url.indexOf("/apploadbalancer/v1/backendGroups") === 0) {
+        if (req.method === "POST" && /\/backendGroups(\?|$)/.test(url)) {
+          created.bg.push(JSON.parse(raw || "{}"));
+          return json({ id: "op-bg-new", done: false });
+        }
+        const del = url.match(/\/backendGroups\/([^/?]+)$/);
+        if (del && req.method === "DELETE") {
+          deleted.add(del[1]);
+          return json({ id: "op-del", done: false });
+        }
         const one = url.match(/\/backendGroups\/([^/?]+)(\?|$)/);
         if (one && req.method === "GET" && one[1] !== "backendGroups") {
           if (one[1] === "bg-web") {
@@ -308,16 +347,27 @@ function startAlbStub() {
               id: "bg-web",
               name: "web-backends",
               folderId: "folder-1",
-              http: { backends: [{ name: "web", port: "8080", targetGroups: { targetGroupIds: ["tg-web"] } }] },
+              http: { backends: [{ name: "web", port: "8080", targetGroups: { targetGroupIds: ["tg-web"] }, healthchecks: [{ timeout: "1s", interval: "2s", http: { path: "/" } }] }] },
             });
+          }
+          if (one[1] === "bg-free") {
+            return json({ id: "bg-free", name: "free-backends", folderId: "folder-1", stream: { backends: [{ name: "tcp", port: "5432", targetGroups: { targetGroupIds: ["tg-empty"] } }] } });
+          }
+          if (one[1] === "bg-idle") {
+            return json({ id: "bg-idle", name: "idle-backends", folderId: "folder-1", http: { backends: [{ name: "idle", port: "80", targetGroups: { targetGroupIds: ["tg-new"] } }] } });
+          }
+          if (one[1] === "bg-new") {
+            return json({ id: "bg-new", name: "created-backends", folderId: "folder-1", http: { backends: [{ name: "main", port: "8080", targetGroups: { targetGroupIds: ["tg-web"] } }] } });
           }
           return json({ message: "backend group not found" }, 404);
         }
         if (req.method === "GET") {
           return json({
             backendGroups: [
-              { id: "bg-web", name: "web-backends", folderId: "folder-1", http: { backends: [{ name: "web" }] } },
+              { id: "bg-web", name: "web-backends", folderId: "folder-1", http: { backends: [{ name: "web", port: "8080", targetGroups: { targetGroupIds: ["tg-web"] } }] } },
               { id: "bg-empty", name: "empty-backends", folderId: "folder-1", stream: { backends: [] } },
+              { id: "bg-free", name: "free-backends", folderId: "folder-1", stream: { backends: [{ name: "tcp", targetGroups: { targetGroupIds: ["tg-empty"] } }] } },
+              { id: "bg-idle", name: "idle-backends", folderId: "folder-1", http: { backends: [{ name: "idle", targetGroups: { targetGroupIds: ["tg-new"] } }] } },
             ],
           });
         }
@@ -339,6 +389,7 @@ function startAlbStub() {
           created.tg.length = 0;
           created.router.length = 0;
           created.targets.length = 0;
+          created.bg.length = 0;
           deleted.clear();
         },
         base: "http://127.0.0.1:" + server.address().port,
@@ -559,7 +610,7 @@ const section = (src, channel) => {
   await test("ycAlb: список уходит каталогом и размером страницы, а карточка собирает связи", async () => {
     const before = stub.calls.length;
     const list = await alb.loadBalancers("oauth-1", "folder-1");
-    assert.strictEqual(list.length, 3, "балансировщиков не три: " + list.length);
+    assert.strictEqual(list.length, 4, "балансировщиков не четыре: " + list.length);
     const req = callsTo(stub, "/apploadbalancer/v1/loadBalancers?").slice(-1)[0];
     assert.ok(req.url.indexOf("folderId=folder-1") >= 0, "каталог не передан: " + req.url);
     assert.ok(req.url.indexOf("pageSize=1000") >= 0, "размер страницы не передан: " + req.url);
@@ -600,8 +651,9 @@ const section = (src, channel) => {
     assert.strictEqual((await alb.findHttpRouter("oauth-1", "folder-1", "api-router")).id, "router-2");
 
     const backends = await alb.backendGroups("oauth-1", "folder-1");
-    assert.deepStrictEqual(backends.map((b) => b.id), ["bg-web", "bg-empty"]);
+    assert.deepStrictEqual(backends.map((b) => b.id), ["bg-web", "bg-empty", "bg-free", "bg-idle"]);
     assert.strictEqual(backends[0].backendCount, 1, "число бэкендов не посчитано");
+    assert.strictEqual(backends[0].kind, "http", "вид группы не разобран");
     assert.strictEqual((await alb.findBackendGroup("oauth-1", "folder-1", "web-backends")).id, "bg-web");
   });
 
@@ -615,6 +667,143 @@ const section = (src, channel) => {
     await assert.rejects(() => alb.targetGroup("oauth-1", ""), /id группы целей/);
     await assert.rejects(() => alb.backendGroup("oauth-1", ""), /id группы бэкендов/);
     assert.strictEqual(stub.calls.length, before, "запрос ушёл, хотя каталога/id нет");
+  });
+
+  console.log("\n[2x] Группа бэкендов: создание, удаление и здоровье целей");
+
+  await test("ycAlb: группа бэкендов разбирается целиком — вид, бэкенды, порт и группы целей", async () => {
+    const list = await alb.backendGroups("oauth-1", "folder-1");
+    const web = list.find((b) => b.id === "bg-web");
+    assert.strictEqual(web.kind, "http", "вид группы не разобран: " + web.kind);
+    assert.strictEqual(web.kindHuman, "HTTP");
+    assert.strictEqual(web.backends.length, 1);
+    assert.strictEqual(web.backends[0].port, "8080", "порт целей не разобран");
+    assert.deepStrictEqual(web.targetGroupIds, ["tg-web"], "группы целей бэкенда не собраны");
+    const webFull = await alb.backendGroup("oauth-1", "bg-web");
+    assert.strictEqual(webFull.healthcheckCount, 1, "проверки здоровья не посчитаны");
+    const line = alb.backendGroupLine(web);
+    assert.ok(/web-backends/.test(line) && /HTTP/.test(line) && /группы целей: tg-web/.test(line), line);
+    const single = await alb.backendGroup("oauth-1", "bg-free");
+    assert.strictEqual(single.kind, "stream", "одиночное чтение не разобрано");
+    assert.deepStrictEqual(single.targetGroupIds, ["tg-empty"]);
+    assert.strictEqual(single.healthcheckCount, 0, "у потока проверок нет — счётчик обязан быть нулевым");
+  });
+
+  await test("ycAlb: группа бэкендов создаётся из группы целей — вид, порт и проверка уходят телом", async () => {
+    stub.created.bg.length = 0;
+    const r = await alb.createBackendGroup("oauth-1", {
+      folderId: "folder-1",
+      name: "web-backends-2",
+      kind: "http",
+      targetGroup: "web-targets",
+      port: 8080,
+      healthPath: "/health",
+    });
+    assert.strictEqual(stub.created.bg.length, 1, "тело создания не ушло");
+    const body = stub.created.bg[0];
+    assert.strictEqual(body.folderId, "folder-1");
+    assert.strictEqual(body.name, "web-backends-2");
+    assert.ok(body.http && body.http.backends, "вид группы не собран: " + JSON.stringify(body));
+    assert.strictEqual(body.stream, undefined, "у HTTP-группы появился второй вид");
+    const backend = body.http.backends[0];
+    assert.strictEqual(backend.name, "main");
+    assert.strictEqual(backend.port, "8080");
+    assert.deepStrictEqual(backend.targetGroups.targetGroupIds, ["tg-web"], "группа целей не разрешена в id");
+    const hc = backend.healthchecks[0] || {};
+    assert.ok(hc.http && hc.http.path === "/health", "проверка здоровья не собрана: " + JSON.stringify(hc));
+    assert.ok(hc.timeout && hc.interval, "у проверки нет обязательных timeout и interval — облако её не примет");
+    assert.strictEqual(r.groupId, "bg-new", "id готовой группы не достали из ответа операции");
+    assert.ok(/web-backends-2/.test(r.message) && /порт 8080/.test(r.message) && /web-targets/.test(r.message), r.message);
+    assert.ok(!r.warnings.some((w) => /Проверки здоровья не заданы/.test(w)), "проверка задана, а предупреждение осталось");
+    assert.ok(r.warnings.some((w) => /routernew/.test(w)), "не сказано, что делать дальше: " + r.warnings.join(" | "));
+  });
+
+  await test("ycAlb: без проверок и без порта группа создаётся, но об этом говорят вслух", async () => {
+    stub.created.bg.length = 0;
+    const r = await alb.createBackendGroup("oauth-1", { folderId: "folder-1", name: "bare-backends", targetGroup: "tg-web" });
+    const backend = stub.created.bg[0].http.backends[0];
+    assert.strictEqual(backend.port, "80", "порт по умолчанию не тот");
+    assert.strictEqual(backend.healthchecks, undefined, "проверки появились, хотя их не просили");
+    assert.ok(r.warnings.some((w) => /Проверки здоровья не заданы/.test(w)), "о выключенных проверках не сказано: " + r.warnings.join(" | "));
+    assert.ok(r.warnings.some((w) => /взят 80/.test(w) && /слушают ЦЕЛИ/.test(w)), "не сказано, чей это порт: " + r.warnings.join(" | "));
+  });
+
+  await test("ycAlb: у потока порт не угадывается, а кривые данные отбиваются ДО сети", async () => {
+    const before = stub.calls.length;
+    await assert.rejects(() => alb.createBackendGroup("oauth-1", { folderId: "folder-1", name: "tcp-bg", kind: "stream", targetGroup: "tg-web" }), /порт не угадывается/);
+    await assert.rejects(() => alb.createBackendGroup("oauth-1", { folderId: "folder-1", name: "1bg", targetGroup: "tg-web" }), /облако не примет/);
+    await assert.rejects(() => alb.createBackendGroup("oauth-1", { folderId: "folder-1", name: "bg-x", kind: "udp", targetGroup: "tg-web" }), /http, grpc или stream/);
+    await assert.rejects(() => alb.createBackendGroup("oauth-1", { folderId: "folder-1", name: "bg-x", targetGroup: "нет-такой" }), /нужна группа целей/);
+    await assert.rejects(() => alb.createBackendGroup("oauth-1", { folderId: "", name: "bg-x", targetGroup: "tg-web" }), /каталог/);
+    const paid = stub.calls.slice(before).filter((c) => c.method === "POST" || c.method === "DELETE");
+    assert.deepStrictEqual(paid.map((c) => c.url), [], "запись ушла, хотя данные негодные");
+  });
+
+  await test("ycAlb: здоровье цели приходит ПО ЗОНАМ и говорит, сколько целей здорово", async () => {
+    const before = callsTo(stub, "/targetStates/").length;
+    const r = await alb.targetStates("oauth-1", { folderId: "folder-1", lb: "web-lb", targetGroup: "web-targets" });
+    assert.strictEqual(callsTo(stub, "/targetStates/").length, before + 1, "запрос здоровья не ушёл");
+    const reqCall = callsTo(stub, "/targetStates/").slice(-1)[0];
+    assert.strictEqual(reqCall.url, "/apploadbalancer/v1/loadBalancers/alb-web/targetStates/bg-web/tg-web", "не тот путь здоровья: " + reqCall.url);
+    assert.strictEqual(r.backendGroup.id, "bg-web", "группа бэкендов не найдена от балансировщика");
+    assert.strictEqual(r.states.length, 2);
+    assert.strictEqual(r.states[0].healthy, true);
+    assert.strictEqual(r.states[1].healthy, false, "цель с TIMEOUT и UNHEALTHY названа здоровой");
+    assert.strictEqual(r.healthyCount, 1, "здоровых целей не одна: " + r.healthyCount);
+    assert.ok(r.lines.some((l) => /ru-central1-a: здорова/.test(l)), r.lines.join(" | "));
+    assert.ok(r.lines.some((l) => /ru-central1-b: не отвечает/.test(l) && /не проходит активную проверку/.test(l)), "зона со сломанной проверкой не названа: " + r.lines.join(" | "));
+    assert.ok(r.lines.some((l) => /здоровых: 1/.test(l)), r.lines.join(" | "));
+    assert.ok(r.warnings.some((w) => /проверка не успела ответить/.test(w)), "о TIMEOUT не сказано: " + r.warnings.join(" | "));
+    assert.ok(r.warnings.some((w) => /только здоровые цели/.test(w)), "не сказано, куда пойдёт трафик: " + r.warnings.join(" | "));
+    assert.ok(!r.warnings.some((w) => /не заданы проверки здоровья/.test(w)), "у группы есть проверки — предупреждение лишнее");
+  });
+
+  await test("ycAlb: здоровье спрашивают у ПАРЫ — пара ищется у балансировщика, отказ ДО сети", async () => {
+    const before = callsTo(stub, "/targetStates/").length;
+    await assert.rejects(
+      () => alb.targetStates("oauth-1", { folderId: "folder-1", lb: "web-lb", backendGroup: "free-backends", targetGroup: "web-targets" }),
+      (e) => /не закреплена за балансировщиком/.test(e.message) && /web-backends/.test(e.message)
+    );
+    await assert.rejects(
+      () => alb.targetStates("oauth-1", { folderId: "folder-1", lb: "web-lb", targetGroup: "empty-targets" }),
+      (e) => /не ссылается на группу целей/.test(e.message) && /tg-web/.test(e.message)
+    );
+    await assert.rejects(() => alb.targetStates("oauth-1", { folderId: "folder-1", lb: "busy-lb", targetGroup: "web-targets" }), /нет закреплённых групп бэкендов/);
+    await assert.rejects(() => alb.targetStates("oauth-1", { folderId: "folder-1", lb: "нет-такой", targetGroup: "web-targets" }), /Не нашёл балансировщик/);
+    await assert.rejects(() => alb.targetStates("oauth-1", { folderId: "folder-1", lb: "web-lb", targetGroup: "нет-такой" }), /Не нашёл группу целей/);
+    assert.strictEqual(callsTo(stub, "/targetStates/").length, before, "отказ не помешал запросу здоровья");
+  });
+
+  await test("ycAlb: пустая группа целей — честные нули и предупреждение о выключенных проверках", async () => {
+    const streamLb = await alb.findLoadBalancer("oauth-1", "folder-1", "stream-lb");
+    const r = await alb.targetStates("oauth-1", { folderId: "folder-1", lb: streamLb, targetGroup: "empty-targets" });
+    assert.strictEqual(r.backendGroup.id, "bg-free", "единственная закреплённая группа не выбрана сама");
+    assert.strictEqual(r.states.length, 0);
+    assert.strictEqual(r.healthyCount, 0);
+    assert.ok(r.lines.some((l) => /Целей нет/.test(l)), r.lines.join(" | "));
+    assert.ok(r.warnings.some((w) => /не заданы проверки здоровья/.test(w)), "о выключенных проверках не сказано: " + r.warnings.join(" | "));
+  });
+
+  await test("ycAlb: занятую группу бэкендов не удаляют — модуль называет виновных ДО сети", async () => {
+    const before = stub.calls.length;
+    await assert.rejects(
+      () => alb.removeBackendGroup("oauth-1", { folderId: "folder-1", group: "web-backends" }),
+      (e) => /ещё работает/.test(e.message) && /роутер «main-router»/.test(e.message)
+    );
+    await assert.rejects(
+      () => alb.removeBackendGroup("oauth-1", { folderId: "folder-1", group: "free-backends" }),
+      (e) => /ещё работает/.test(e.message) && /слушатель балансировщика «stream-lb»/.test(e.message)
+    );
+    assert.strictEqual(stub.calls.slice(before).filter((c) => c.method === "DELETE").length, 0, "удаление ушло, хотя группа занята");
+    await assert.rejects(() => alb.removeBackendGroup("oauth-1", { folderId: "folder-1", group: "нет-такой" }), /Не нашёл группу бэкендов/);
+  });
+
+  await test("ycAlb: свободная группа бэкендов удаляется по id и говорит, что останется", async () => {
+    const r = await alb.removeBackendGroup("oauth-1", { folderId: "folder-1", group: "idle-backends" });
+    assert.strictEqual(r.changed, true);
+    assert.ok(stub.calls.some((c) => c.method === "DELETE" && c.url === "/apploadbalancer/v1/backendGroups/bg-idle"), "удаление ушло не по id группы");
+    assert.ok(/idle-backends/.test(r.message) && /потеряны/.test(r.message), r.message);
+    assert.ok(r.warnings.some((w) => /не трогаются/.test(w)), "не сказано, что цели и машины остаются: " + r.warnings.join(" | "));
   });
 
   console.log("\n[3] Группа целей: адреса, подсеть и тело запроса");
@@ -898,10 +1087,10 @@ const section = (src, channel) => {
     const ops = arr[1].split(",").map((x) => x.trim().replace(/^"|"$/g, ""));
     assert.deepStrictEqual(
       ops.slice().sort(),
-      ["list", "card", "targets", "routers", "backends", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "lbnew", "lbstart", "lbstop", "lbdel"].sort(),
+      ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "lbnew", "lbstart", "lbstop", "lbdel"].sort(),
       "список действий канала: " + ops.join(", ")
     );
-    for (const part of ["ycAlb.loadBalancers(", "ycAlb.card(", "ycAlb.targetGroups(", "ycAlb.httpRouters(", "ycAlb.backendGroups(", "ycAlb.createTargetGroup(", "ycAlb.changeTargets(", "ycAlb.createHttpRouter(", "ycAlb.createLoadBalancer(", "ycAlb.power(", "ycAlb.remove(", "ycAlb.removeTargetGroup(", "ycAlb.removeRouter(", "ycAlb.lbLine(", "ycAlb.listenerLine(", "ycAlb.targetLine(", "ycAlb.tgLine(", "ycAlb.routerLine("]) {
+    for (const part of ["ycAlb.loadBalancers(", "ycAlb.card(", "ycAlb.targetGroups(", "ycAlb.httpRouters(", "ycAlb.backendGroups(", "ycAlb.backendGroupLine(", "ycAlb.targetStates(", "ycAlb.createTargetGroup(", "ycAlb.changeTargets(", "ycAlb.createHttpRouter(", "ycAlb.createBackendGroup(", "ycAlb.removeBackendGroup(", "ycAlb.createLoadBalancer(", "ycAlb.power(", "ycAlb.remove(", "ycAlb.removeTargetGroup(", "ycAlb.removeRouter(", "ycAlb.lbLine(", "ycAlb.listenerLine(", "ycAlb.targetLine(", "ycAlb.tgLine(", "ycAlb.routerLine("]) {
       assert.ok(body.includes(part), "канал не зовёт " + part);
     }
     assert.ok(/needsConfirm: true/.test(body) && /a\.confirm !== true/.test(body), "канал не спрашивает согласие на платное и необратимое");
@@ -915,7 +1104,7 @@ const section = (src, channel) => {
 
     const list = await call({ op: "list" });
     assert.strictEqual(list.ok, true, "канал отказал на списке: " + (list.error || ""));
-    assert.strictEqual(list.loadBalancers.length, 3);
+    assert.strictEqual(list.loadBalancers.length, 4);
     assert.ok(list.lines.some((l) => /web-lb/.test(l) && /203\.0\.113\.10/.test(l)), "адрес балансировщика не показан: " + list.lines.join(" | "));
     assert.ok(list.warnings.some((w) => /не в работе/.test(w)), "не сказано, что часть балансировщиков не в работе");
 
@@ -928,8 +1117,8 @@ const section = (src, channel) => {
     assert.ok(routers.lines.some((l) => /main-router/.test(l) && /site\.example/.test(l)), routers.lines.join(" | "));
 
     const backends = await call({ op: "backends" });
-    assert.ok(backends.lines.some((l) => /web-backends/.test(l)), backends.lines.join(" | "));
-    assert.ok(backends.warnings.some((w) => /только читаются/.test(w)), "не сказано, что группы бэкендов только читаются");
+    assert.ok(backends.lines.some((l) => /web-backends/.test(l) && /HTTP/.test(l)), backends.lines.join(" | "));
+    assert.ok(backends.warnings.some((w) => /ГРУППЕ БЭКЕНДОВ/.test(w)), "не сказано, где живут порт и проверки здоровья");
 
     const card = await call({ op: "card", lb: "web-lb" });
     assert.strictEqual(card.ok, true, "канал отказал на карточке: " + (card.error || ""));
@@ -947,6 +1136,42 @@ const section = (src, channel) => {
     assert.ok(/Доступно: list, card, targets, routers, backends/.test(unknown.error), "отказ не перечислил действия: " + unknown.error);
     const notFound = await call({ op: "card", lb: "нет-такой" });
     assert.ok(/Не нашёл балансировщик/.test(notFound.error), notFound.error);
+  });
+
+  await test("yc:alb: группа бэкендов и здоровье работают через настоящий канал", async () => {
+    const handlers = new Map();
+    const settings = settingsFor();
+    registerYcIpc(ipcDeps(handlers, settings));
+    const call = (args) => handlers.get("yc:alb")({}, args || {});
+
+    stub.created.bg.length = 0;
+    const made = await call({ op: "backnew", name: "web-backends-9", kind: "http", targetGroup: "web-targets", port: 8080 });
+    assert.strictEqual(made.ok, true, "канал отказал на создании группы бэкендов: " + (made.error || ""));
+    assert.strictEqual(stub.created.bg.length, 1);
+    assert.ok(made.groupId, "id созданной группы не вернулся окну");
+    assert.ok((made.warnings || []).some((w) => /routernew/.test(w)), "канал потерял предупреждения");
+
+    const health = await call({ op: "health", lb: "web-lb", targetGroup: "web-targets" });
+    assert.strictEqual(health.ok, true, "канал отказал на здоровье: " + (health.error || ""));
+    assert.strictEqual(health.healthy, 1);
+    assert.ok(health.lines.some((l) => /здоровых: 1/.test(l)), health.lines.join(" | "));
+
+    const badHealth = await call({ op: "health", lb: "web-lb", targetGroup: "empty-targets" });
+    assert.strictEqual(badHealth.ok, false);
+    assert.ok(/не ссылается на группу целей/.test(badHealth.error), badHealth.error);
+
+    const d = await call({ op: "backdel", group: "web-backends" });
+    assert.strictEqual(d.ok, false);
+    assert.strictEqual(d.needsConfirm, true, "удаление группы бэкендов не спрашивает человека");
+    assert.ok(/необратимо/.test(d.error), d.error);
+    assert.ok((d.lines || []).some((l) => /web-backends/.test(l)), (d.lines || []).join(" | "));
+    assert.ok(!stub.calls.some((c) => c.method === "DELETE" && c.url === "/apploadbalancer/v1/backendGroups/bg-web"), "группа удалена без согласия");
+    const busy = await call({ op: "backdel", group: "web-backends", confirm: true });
+    assert.strictEqual(busy.ok, false, "занятая группа удалена по согласию вопреки проверке");
+    assert.ok(/ещё работает/.test(busy.error), busy.error);
+    const free = await call({ op: "backdel", group: "free-backends", confirm: true });
+    assert.strictEqual(free.ok, false, "группа с потоковым слушателем удалена");
+    assert.ok(/слушатель балансировщика/.test(free.error), free.error);
   });
 
   await test("yc:alb: создание балансировщика без согласия — вопрос с ценой, а не запрос в облако", async () => {
@@ -1002,7 +1227,7 @@ const section = (src, channel) => {
     const targets = await tools.ycAlb({ action: "targets" });
     assert.ok(/ТОЛЬКО адрес и подсеть/.test(targets), "не сказано, что знает группа целей: " + targets);
     const backends = await tools.ycAlb({ action: "backends" });
-    assert.ok(/ТОЛЬКО читаются/.test(backends) && /СУЩЕСТВУЮЩУЮ группу/.test(backends), backends);
+    assert.ok(/ПОРТ целей/.test(backends) && /backnew/.test(backends) && /health/.test(backends), backends);
   });
 
   await test("ycAlb (агент): роутер без группы бэкендов объясняется, а не выдумывается", async () => {
@@ -1042,6 +1267,25 @@ const section = (src, channel) => {
     assert.ok(/убрано целей: 1/.test(removed), removed);
   });
 
+  await test("ycAlb (агент): группу бэкендов можно собрать, а здоровье — спросить", async () => {
+    const tools = buildTools();
+    stub.created.bg.length = 0;
+    const made = await tools.ycAlb({ action: "backnew", name: "web-backends-3", targetGroup: "web-targets", port: 8080 });
+    assert.strictEqual(stub.created.bg.length, 1, "группа не создана инструментом");
+    assert.ok(/порт 8080/.test(made) && /web-targets/.test(made), made);
+    const health = await tools.ycAlb({ action: "health", lb: "web-lb", targetGroup: "web-targets" });
+    assert.ok(/здоровых: 1/.test(health), "здоровье не показано: " + health);
+    assert.ok(/ru-central1-b: не отвечает/.test(health), health);
+    const del = await tools.ycAlb({ action: "backdel", group: "web-backends" });
+    assert.ok(/confirm: true/.test(del) && /необратимо/.test(del), del);
+    const busy = await tools.ycAlb({ action: "backdel", group: "web-backends", confirm: true });
+    assert.ok(/ещё работает/.test(busy) && /main-router/.test(busy), "занятую группу инструмент не защитил: " + busy);
+    const noTg = await tools.ycAlb({ action: "backnew", name: "bg-x", targetGroup: "нет-такой" });
+    assert.ok(/нужна группа целей/.test(noTg) && /web-targets/.test(noTg), noTg);
+    const unknown = await tools.ycAlb({ action: "nope" });
+    assert.ok(/Доступно: list, card, targets, routers, backends, health/.test(unknown), unknown);
+  });
+
   console.log("\n[7x] Интерфейс: семейство действий, плитка полки и связи консоли");
 
   await test("yc-actions: семейство «Application Load Balancer» зовёт канал и помечает платное и опасное", () => {
@@ -1052,7 +1296,7 @@ const section = (src, channel) => {
     const A = ctx.window.YcActions;
     assert.strictEqual(A.CHANNELS.alb, "ycAlb", "семейство смотрит не в тот канал");
     const ids = A.forService("alb");
-    for (const need of ["list", "card", "targets", "routers", "backends", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "lbnew", "lbstart", "lbstop", "lbdel"]) {
+    for (const need of ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "lbnew", "lbstart", "lbstop", "lbdel"]) {
       assert.ok(ids.indexOf(need) >= 0, "в семействе нет действия " + need);
     }
     const create = A.describe("alb", "lbnew");
@@ -1065,6 +1309,16 @@ const section = (src, channel) => {
     assert.strictEqual(A.describe("alb", "targetdel").danger, true, "удаление группы целей не помечено опасным");
     assert.strictEqual(A.describe("alb", "routerdel").danger, true, "удаление роутера не помечено опасным");
     assert.strictEqual(A.describe("alb", "targetnew").paid, false, "группа целей не платная — пометка о плате сбивала бы человека");
+    assert.strictEqual(A.describe("alb", "backdel").danger, true, "удаление группы бэкендов не помечено опасным");
+    assert.strictEqual(A.describe("alb", "backnew").paid, false, "группа бэкендов не платная");
+    const health = A.describe("alb", "health");
+    assert.ok(health.fields.indexOf("backendGroup") >= 0 && health.fields.indexOf("targetGroup") >= 0, "в форме здоровья нет полей пары: " + health.fields.join(", "));
+    const reqHealth = A.request("alb", "health", { lb: "web-lb", backendGroup: "web-backends", targetGroup: "web-targets" }, false);
+    assert.strictEqual(reqHealth.channel, "ycAlb");
+    assert.strictEqual(reqHealth.args.op, "health");
+    assert.strictEqual(reqHealth.args.lb, "web-lb", "балансировщик не ушёл в запрос здоровья");
+    assert.strictEqual(reqHealth.args.targetGroup, "web-targets", "группа целей не ушла в запрос здоровья");
+    assert.strictEqual(reqHealth.args.backendGroup, "web-backends", "группа бэкендов не ушла в запрос здоровья");
     const req = A.request("alb", "lbdel", { lb: "web-lb" }, true);
     assert.strictEqual(req.channel, "ycAlb");
     assert.strictEqual(req.args.op, "lbdel");
@@ -1108,12 +1362,13 @@ const section = (src, channel) => {
   await test("ycAlb: схема, группа «облако», промпт и права знают инструмент", () => {
     const at = SCHEMAS_SRC.indexOf('name: "ycAlb"');
     assert.ok(at > 0, "нет схемы инструмента в tool-schemas");
-    const schema = SCHEMAS_SRC.slice(at, at + 5600);
-    for (const part of ["action", "lb", "group", "router", "name", "ips", "subnet", "listener", "port", "certificate", "backendGroup", "host", "pathPrefix", "address", "securityGroups", "confirm", 'required: ["action"]']) {
+    const schema = SCHEMAS_SRC.slice(at, at + 7400);
+    for (const part of ["action", "lb", "group", "router", "name", "ips", "subnet", "listener", "port", "certificate", "backendGroup", "targetGroup", "kind", "healthPath", "host", "pathPrefix", "address", "securityGroups", "confirm", 'required: ["action"]']) {
       assert.ok(schema.includes(part), "в схеме нет " + part);
     }
     assert.ok(/ЧЕТЫРЕ разных ресурса/.test(schema), "схема не объясняет, что ресурсов четыре");
-    assert.ok(/ТОЛЬКО ЧТЕНИЕ/.test(schema), "схема молчит о том, что группы бэкендов только читаются");
+    assert.ok(/ПОРТ целей и проверки здоровья/.test(schema), "схема молчит о порте целей и проверках здоровья");
+    assert.ok(/action health/.test(schema), "схема не знает про здоровье целей");
     assert.ok(/confirm: true/.test(schema) && /ПЛАТНЫЙ/.test(schema), "схема молчит про цену и согласие");
     const groupAt = CORE_SRC.indexOf('id: "cloud"');
     const group = CORE_SRC.slice(groupAt, groupAt + 2200);
@@ -1135,6 +1390,8 @@ const section = (src, channel) => {
     assert.ok(/СУЩЕСТВУЮЩАЯ группа бэкендов/.test(GUIDE_SRC), "в yc.md не сказано, что роутеру нужна существующая группа бэкендов");
     assert.ok(/платит БАЛАНСИРОВЩИК/.test(GUIDE_SRC), "в yc.md нет правила про цену");
     assert.ok(/адреса его СЛУШАТЕЛЕЙ/.test(GUIDE_SRC), "в yc.md не сказано, откуда берётся адрес");
+    assert.ok(/ПО ЗОНАМ/.test(GUIDE_SRC), "в yc.md не сказано, что здоровье приходит по зонам");
+    assert.ok(/backnew/.test(GUIDE_SRC) && /backdel/.test(GUIDE_SRC) && /`health`/.test(GUIDE_SRC), "в yc.md нет новых действий группы бэкендов");
   });
 
   await test("ycAlb: набор стоит в цепочке npm test — иначе это не набор", () => {
