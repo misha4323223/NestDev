@@ -170,7 +170,15 @@ const albState = { lbCreated: [], lbDeleted: new Set(), tgCreated: [], tgDeleted
   // здесь меняются — иначе правку (:addListener, :removeListener, PATCH) нечем
   // было бы проверить: стенд должен перечитываться как настоящее облако.
   name: "web-lb", description: "", securityGroupIds: ["sg-web"],
-  listeners: [{ name: "web", endpoints: [{ addresses: [{ externalIpv4Address: { address: "203.0.113.10" } }], ports: ["80"] }], http: { handler: { httpRouterId: "rt-web" } } }] };
+  listeners: [{ name: "web", endpoints: [{ addresses: [{ externalIpv4Address: { address: "203.0.113.10" } }], ports: ["80"] }], http: { handler: { httpRouterId: "rt-web" } } }],
+  // Часть 91, заход 6: роутер и группа бэкендов тоже изменяемые — правка идёт
+  // ЗАМЕНОЙ вложенного списка (virtualHosts / backends), и без этого «облако
+  // применило» проверить было бы нечем.
+  routerName: "web-router", routerDescription: "",
+  routerHosts: [{ name: "main", authority: ["site.example.com"], routes: [{ name: "main", http: { match: { path: { prefixMatch: "/" } }, route: { backendGroupId: "bg-web" } } }] }],
+  routerPatches: [], bgPatches: [],
+  bgName: "web-backends",
+  bgBackends: [{ name: "web", port: "8080", targetGroups: { targetGroupIds: ["tg-web"] }, healthchecks: [{ timeout: "1s", interval: "2s", http: { path: "/" } }] }] };
 // Правка слушателя (:updateListener): тело — updateMask + listenerSpec, а сам
 // слушатель опознаётся ПО ИМЕНИ (переименовать его нельзя). Стенд повторяет
 // поведение облака: названное в маске берётся из тела, НЕназванное остаётся
@@ -211,12 +219,12 @@ const albTgBody = (id, name, targets) => ({
   targets: (targets || albState.targets).map((ip) => ({ ipAddress: ip, subnetId: "sub-a" })),
 });
 const albRouterBody = () => ({
-  id: "rt-web", name: "web-router", folderId: "f1", createdAt: "2026-08-02T11:00:00Z",
-  virtualHosts: [{ name: "main", authority: ["site.example.com"], routes: [{ name: "main", http: { match: { path: { prefixMatch: "/" } }, route: { backendGroupId: "bg-web" } } }] }],
+  id: "rt-web", name: albState.routerName, folderId: "f1", description: albState.routerDescription, createdAt: "2026-08-02T11:00:00Z",
+  virtualHosts: albState.routerHosts,
 });
 // Группа бэкендов: ПОРТ целей и проверки здоровья живут именно здесь.
-const albBackendBody = () => ({ id: "bg-web", name: "web-backends", folderId: "f1", createdAt: "2026-08-02T12:00:00Z",
-  http: { backends: [{ name: "web", port: "8080", targetGroups: { targetGroupIds: ["tg-web"] }, healthchecks: [{ timeout: "1s", interval: "2s", http: { path: "/" } }] }] } });
+const albBackendBody = () => ({ id: "bg-web", name: albState.bgName, folderId: "f1", createdAt: "2026-08-02T12:00:00Z",
+  http: { backends: albState.bgBackends } });
 // Свободная группа бэкендов: на неё никто не смотрит — её и удалим, а занятая
 // (та, в которую ведёт маршрут роутера) обязана отбиться словами.
 const albFreeBackendBody = () => ({ id: "bg-free", name: "free-backends", folderId: "f1", createdAt: "2026-08-02T13:00:00Z",
@@ -674,6 +682,23 @@ function startFakeYc() {
           if (fields.indexOf("description") >= 0) albState.description = albSent.description || "";
           if (fields.indexOf("security_group_ids") >= 0) albState.securityGroupIds = albSent.securityGroupIds || [];
           return json({ id: "op-alb-patch", done: false });
+        }
+        // Правка роутера и группы бэкендов приходит ЗАМЕНОЙ вложенного списка:
+        // облако не умеет «поменять путь» или «поменять порт» отдельным методом.
+        if (req.method === "PATCH" && p === "/apploadbalancer/v1/httpRouters/rt-web") {
+          albState.routerPatches.push(albSent);
+          const rtFields = String(albSent.updateMask || "").split(",").map((s) => s.trim());
+          if (rtFields.indexOf("name") >= 0) albState.routerName = albSent.name;
+          if (rtFields.indexOf("description") >= 0) albState.routerDescription = albSent.description || "";
+          if (rtFields.indexOf("virtual_hosts") >= 0) albState.routerHosts = albSent.virtualHosts || [];
+          return json({ id: "op-alb-rtpatch", done: false });
+        }
+        if (req.method === "PATCH" && p === "/apploadbalancer/v1/backendGroups/bg-web") {
+          albState.bgPatches.push(albSent);
+          const bgFields = String(albSent.updateMask || "").split(",").map((s) => s.trim());
+          if (bgFields.indexOf("name") >= 0) albState.bgName = albSent.name;
+          if (bgFields.indexOf("http") >= 0) albState.bgBackends = (albSent.http || {}).backends || [];
+          return json({ id: "op-alb-bgpatch", done: false });
         }
         if (req.method === "DELETE") {
           if (/\/loadBalancers\//.test(p)) { albState.lbDeleted.add("lb-web"); return json({ id: "op-alb-lbdel", done: false }); }
@@ -1732,6 +1757,79 @@ watchdog.unref();
   ok(/listenerupd/.test(uiAlbNoLupd.error || ""), "список действий канала знает правку слушателя: " + String(uiAlbNoLupd.error || "").slice(0, 160));
   const uiLupdTool = plain(await call("ycAlb", { action: "listenerupd", lb: "web-lb-edge", listenerName: uiSniName, port: 9443 }));
   ok(/:updateListener/.test(uiLupdTool) && /маской полей/.test(uiLupdTool), "инструмент правит слушателя тем же методом: " + uiLupdTool.slice(0, 160));
+
+  // ── Правка роутера и группы бэкендов (часть 91, заход 6) ────────────────
+  // Облако не умеет «поменять путь» или «поменять порт» отдельным методом: у
+  // роутера список виртуальных хостов (вместе с маршрутами) и у группы список
+  // бэкендов принимаются ТОЛЬКО ЗАМЕНОЙ целиком. Поэтому правка читает текущий
+  // список, меняет в нём названное и возвращает его обратно: чего не назвали —
+  // остаётся прежним, а чужие маршруты и бэкенды не теряются.
+  const uiRtUpd = await callAlb({ op: "routerupd", router: "web-router", routeName: "main", pathPrefix: "/api", host: "api.example.com" });
+  ok(uiRtUpd.ok === true && /обновляется: путь \/api\*, домен api\.example\.com/.test(uiRtUpd.message || ""), "правка роутера из окна: " + String(uiRtUpd.message || "").slice(0, 140));
+  const rtPatchCall = albCalls.filter((c) => c.method === "PATCH" && /\/httpRouters\/rt-web$/.test(c.path)).pop() || {};
+  const rtPatch = (() => { try { return JSON.parse(rtPatchCall.body || "{}"); } catch { return {}; } })();
+  ok(rtPatch.updateMask === "virtual_hosts", "правка роутера ушла списком хостов: " + rtPatch.updateMask);
+  ok(rtPatch.name === undefined && rtPatch.description === undefined, "в теле оказалось то, чего не меняли: " + Object.keys(rtPatch).join(","));
+  ok(rtPatch.virtualHosts && rtPatch.virtualHosts[0].routes[0].http.match.path.prefixMatch === "/api", "новый путь ушёл в маршрут: " + JSON.stringify((rtPatch.virtualHosts || [])[0] || {}).slice(0, 160));
+  ok(rtPatch.virtualHosts[0].authority[0] === "api.example.com" && rtPatch.virtualHosts[0].routes[0].http.route.backendGroupId === "bg-web", "домен заменён, а маршрут остался в той же группе: " + JSON.stringify(rtPatch.virtualHosts[0]).slice(0, 200));
+  ok(!JSON.stringify(rtPatch).includes('"id"'), "служебные поля обратно не ушли — сервис на них отвечает отказом");
+  ok((uiRtUpd.warnings || []).join(" ").includes("ЦЕЛИКОМ"), "окно предупреждено, что список хостов ЗАМЕНЯЕТСЯ целиком: " + (uiRtUpd.warnings || []).join(" | "));
+  ok((uiRtUpd.warnings || []).join(" ").includes("Порядок маршрутов"), "окно предупреждено про порядок маршрутов");
+  const uiRtCard = await callAlb({ op: "card", lb: "web-lb-edge" });
+  ok((uiRtCard.lines || []).some((l) => /api\.example\.com/.test(l) && /путь \/api/.test(l)), "маршрут перечитан после правки (иначе правка не подтвердилась бы): " + (uiRtCard.lines || []).join(" | "));
+
+  const uiBgUpd = await callAlb({ op: "backupd", group: "web-backends", port: 3000 });
+  ok(uiBgUpd.ok === true && /обновляется: порт 3000/.test(uiBgUpd.message || ""), "правка группы бэкендов из окна: " + String(uiBgUpd.message || "").slice(0, 140));
+  const bgPatchCall = albCalls.filter((c) => c.method === "PATCH" && /\/backendGroups\/bg-web$/.test(c.path)).pop() || {};
+  const bgPatch = (() => { try { return JSON.parse(bgPatchCall.body || "{}"); } catch { return {}; } })();
+  ok(bgPatch.updateMask === "http", "правка группы ушла ИМЕНЕМ ВИДА, а не полем внутри бэкенда: " + bgPatch.updateMask);
+  ok(bgPatch.http && bgPatch.http.backends[0].port === "3000", "новый порт целей ушёл строкой: " + JSON.stringify((bgPatch.http || {}).backends || []).slice(0, 160));
+  ok(bgPatch.http.backends[0].healthchecks && bgPatch.http.backends[0].healthchecks[0].http.path === "/", "проверка здоровья потерялась при правке порта: " + JSON.stringify(bgPatch.http.backends[0].healthchecks || []));
+  ok(bgPatch.http.backends[0].targetGroups.targetGroupIds[0] === "tg-web", "группа целей потерялась при правке порта");
+  ok((uiBgUpd.warnings || []).join(" ").includes("Порт 3000 — это порт, который слушают ЦЕЛИ"), "окно предупреждено, ЧЕЙ это порт: " + (uiBgUpd.warnings || []).join(" | "));
+  ok((uiBgUpd.warnings || []).join(" ").includes("ЦЕЛИКОМ"), "окно предупреждено, что список бэкендов ЗАМЕНЯЕТСЯ целиком");
+  const uiBgList = await callAlb({ op: "backends" });
+  ok((uiBgList.lines || []).some((l) => /web-backends/.test(l)), "список групп бэкендов перечитан: " + (uiBgList.lines || []).join(" | "));
+
+  // Порт — не единственное: проверку здоровья задают путём (HTTP) или службой
+  // (gRPC), а убрать её можно только словами: без проверок облако считает цель
+  // здоровой ВСЕГДА, и упавшая машина останется в ротации.
+  const uiBgHealth = await callAlb({ op: "backupd", group: "web-backends", healthPath: "/health" });
+  ok(uiBgHealth.ok === true && /проверка здоровья HTTP \/health/.test(uiBgHealth.message || ""), "проверка здоровья поправлена: " + String(uiBgHealth.message || "").slice(0, 140));
+  const healthPatch = (() => { try { return JSON.parse((albCalls.filter((c) => c.method === "PATCH" && /\/backendGroups\/bg-web$/.test(c.path)).pop() || {}).body || "{}"); } catch { return {}; } })();
+  ok(healthPatch.http.backends[0].healthchecks[0].http.path === "/health", "новый путь проверки ушёл: " + JSON.stringify(healthPatch.http.backends[0].healthchecks || []));
+  const uiBgOff = await callAlb({ op: "backupd", group: "web-backends", noHealthCheck: true });
+  ok(uiBgOff.ok === true && (uiBgOff.warnings || []).join(" ").includes("здоровой ВСЕГДА"), "удаление проверок предупреждает о ротации: " + (uiBgOff.warnings || []).join(" | "));
+  const uiBgOffList = await callAlb({ op: "backends" });
+  ok(!(uiBgOffList.lines || []).some((l) => /web-backends/.test(l) && /проверок здоровья/.test(l)), "проверки здоровья правда убраны: " + (uiBgOffList.lines || []).join(" | "));
+
+  // Переименование — отдельной маской: список бэкендов при этом НЕ переписывается.
+  const uiBgName = await callAlb({ op: "backupd", group: "bg-web", newName: "edge-backends" });
+  ok(uiBgName.ok === true && /новое имя «edge-backends»/.test(uiBgName.message || ""), "группа переименована: " + String(uiBgName.message || "").slice(0, 120));
+  const namePatch = (() => { try { return JSON.parse((albCalls.filter((c) => c.method === "PATCH" && /\/backendGroups\/bg-web$/.test(c.path)).pop() || {}).body || "{}"); } catch { return {}; } })();
+  ok(namePatch.updateMask === "name" && namePatch.http === undefined, "переименование не понесло список бэкендов: " + namePatch.updateMask);
+
+  // Отказы до сети: чужой маршрут, правка без полей и маршрут в потоковую группу.
+  const albWrites = () => albCalls.filter((c) => c.method === "POST" || c.method === "PATCH" || c.method === "DELETE").length;
+  const uiRtRef = albWrites();
+  ok(/нет маршрута «nope»/.test((await callAlb({ op: "routerupd", router: "web-router", routeName: "nope", pathPrefix: "/x" })).error || ""), "чужой маршрут отбит словами со списком того, что есть");
+  ok(/Нечего менять/.test((await callAlb({ op: "routerupd", router: "web-router" })).error || ""), "правка роутера без полей отбита до сети");
+  ok(/Нечего менять/.test((await callAlb({ op: "backupd", group: "edge-backends" })).error || ""), "правка группы без полей отбита до сети");
+  ok(/Не нашёл HTTP-роутер/.test((await callAlb({ op: "routerupd", router: "нет-такого", pathPrefix: "/x" })).error || ""), "чужой роутер отбит до сети");
+  ok(albWrites() === uiRtRef, "на отказах в облако не ушло ничего: " + (albWrites() - uiRtRef));
+  // Потоковой группе в маршрут хода нет: HTTP-маршрут ведёт только в HTTP-группу.
+  await callAlb({ op: "backnew", name: "stream-backends", kind: "stream", targetGroup: "web-targets", port: 1521 });
+  ok(/только в HTTP-группу/.test((await callAlb({ op: "routerupd", router: "web-router", routeName: "main", backendGroup: "stream-backends" })).error || ""), "маршрут в потоковую группу отбит до сети");
+  ok(albWrites() === uiRtRef + 1, "маршрут в потоковую группу всё-таки ушёл бы в облако: " + (albWrites() - uiRtRef - 1));
+  const uiAlbNoUpd = await callAlb({ op: "nope" });
+  ok(/routerupd/.test(uiAlbNoUpd.error || "") && /backupd/.test(uiAlbNoUpd.error || ""), "список действий канала знает правку роутера и группы: " + String(uiAlbNoUpd.error || "").slice(0, 200));
+
+  const uiRtTool = plain(await call("ycAlb", { action: "routerupd", router: "web-router", routeName: "main", pathExact: "/v2" }));
+  ok(/обновляется: точный путь \/v2/.test(uiRtTool), "инструмент правит маршрут тем же действием: " + uiRtTool.slice(0, 160));
+  ok(/PATCH с маской/.test(uiRtTool) && /слушатели/.test(uiRtTool), "инструмент сказал, каким методом правит: " + uiRtTool.slice(0, 200));
+  const uiBgTool = plain(await call("ycAlb", { action: "backupd", group: "edge-backends", port: 9090 }));
+  ok(/обновляется: порт 9090/.test(uiBgTool) && /ЦЕЛИКОМ/.test(uiBgTool), "инструмент правит группу тем же действием: " + uiBgTool.slice(0, 200));
+  ok(/Порт слушателя/.test(uiBgTool), "инструмент сказал, что порт слушателя этим не меняется: " + uiBgTool.slice(0, 200));
 
   srv.close();
   clearTimeout(watchdog);

@@ -589,7 +589,7 @@ function createCloudTools(deps) {
         if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
         if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud — балансировщик и его группы целей живут в каталоге.";
         const action = String(args.action || "list").trim().toLowerCase();
-        const ALL = ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"];
+        const ALL = ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerupd", "routerdel", "backnew", "backupd", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"];
         if (ALL.indexOf(action) === -1) return "Ошибка: неизвестное действие ycAlb «" + action + "». Доступно: " + ALL.join(", ") + ".";
         const ref = String(args.lb || args.id || args.name || "").trim();
         try {
@@ -716,6 +716,25 @@ function createCloudTools(deps) {
             const r = await ycAlb.removeRouter(cfg.oauth, { folderId: cfg.folderId, router: r0 });
             return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "");
           }
+          if (action === "routerupd") {
+            // Правка роутера идёт со списком виртуальных хостов ЦЕЛИКОМ: облако
+            // заменяет его, а не дополняет — модуль прочитал текущий и вернул
+            // обратно с одним изменённым местом.
+            const r = await ycAlb.updateHttpRouter(cfg.oauth, {
+              folderId: cfg.folderId,
+              router: args.router || args.id || args.name,
+              newName: args.newName || args.rename,
+              description: args.description != null && String(args.description).trim() !== "" ? String(args.description).trim() : undefined,
+              vhost: args.vhost || args.virtualHost,
+              host: args.host != null ? args.host : args.authority,
+              routeName: args.routeName || args.route,
+              pathPrefix: args.pathPrefix != null || args.prefix != null ? args.pathPrefix || args.prefix : undefined,
+              pathExact: args.pathExact,
+              backendGroup: args.backendGroup || args.backendGroupId,
+            });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "") +
+              "\nВ маске ушло только названное (" + (r.fields || []).join(", ") + "): обновление это PATCH с маской, а не пересоздание — слушатели, которые смотрят на роутер, остаются на месте.";
+          }
           if (action === "backnew") {
             const r = await ycAlb.createBackendGroup(cfg.oauth, {
               folderId: cfg.folderId,
@@ -739,6 +758,25 @@ function createCloudTools(deps) {
             }
             const r = await ycAlb.removeBackendGroup(cfg.oauth, { folderId: cfg.folderId, group: g });
             return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "");
+          }
+          if (action === "backupd") {
+            // Порт, который слушают ЦЕЛИ, и проверки здоровья лежат В БЭКЕНДЕ, а
+            // список бэкендов у группы меняется только целиком — поэтому правка
+            // идёт заменой списка («прочитал — изменил — записал»).
+            const r = await ycAlb.updateBackendGroup(cfg.oauth, {
+              folderId: cfg.folderId,
+              group: args.group || args.backendGroup || args.id || args.name,
+              newName: args.newName || args.rename,
+              description: args.description != null && String(args.description).trim() !== "" ? String(args.description).trim() : undefined,
+              backend: args.backend || args.backendName,
+              port: args.port,
+              healthPath: args.healthPath || args.healthCheckPath,
+              healthService: args.healthService,
+              noHealthCheck: args.noHealthCheck === true || args.dropHealthCheck === true,
+              targetGroup: args.targetGroup || args.targetGroupId,
+            });
+            return r.message + ((r.warnings || []).length ? "\n" + r.warnings.join("\n") : "") +
+              "\nПравка ушла списком бэкендов ЦЕЛИКОМ (" + (r.fields || []).join(", ") + "): облако принимает его только заменой, поэтому остальные бэкенды вернулись в том виде, как их отдало облако. Порт слушателя балансировщика этим не меняется.";
           }
           if (action === "listeneradd") {
             const r = await ycAlb.addListener(cfg.oauth, {

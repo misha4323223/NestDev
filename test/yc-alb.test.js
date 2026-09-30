@@ -130,11 +130,11 @@ const ycConsole = require(path.join(ROOT, "src", "yc-console.js"));
 // облаке, чтобы проверять правку настоящими запросами.
 function startAlbStub() {
   const calls = [];
-  const created = { lb: [], tg: [], router: [], targets: [], bg: [], listenerOps: [], lbPatches: [] };
+  const created = { lb: [], tg: [], router: [], targets: [], bg: [], listenerOps: [], lbPatches: [], routerPatches: [], bgPatches: [] };
   const deleted = new Set();
   // «Облако приняло, но не сделало» — так бывает при нехватке прав (alb.editor):
   // модуль обязан заметить это перечитыванием, а не показать успех.
-  const flags = { dropAdd: false, dropRemove: false, dropUpdate: false, dropPatch: false };
+  const flags = { dropAdd: false, dropRemove: false, dropUpdate: false, dropPatch: false, dropRouterPatch: false, dropBackendPatch: false };
   const status = { "alb-web": "ACTIVE", "alb-https": "STOPPED", "alb-busy": "CREATING", "alb-stream": "ACTIVE" };
   // Имя, описание и группы безопасности — изменяемые: правка (lbupdate) обязана
   // быть видна следующему чтению, иначе проверка «применилось ли» ничего не значит.
@@ -234,6 +234,64 @@ function startAlbStub() {
       ],
     },
     "router-2": { id: "router-2", name: "api-router", folderId: "folder-1", createdAt: "2026-08-02T09:50:00Z", virtualHosts: [] },
+    // Роутер с ДВУМЯ хостами и разными маршрутами: без него не проверить, что
+    // правка маршрута без имени хоста/маршрута отказывает словами, а не правит
+    // первый попавшийся. Маршруты ведут в bg-new — группу, которую не держит ни
+    // один тест «занятой группы».
+    "router-3": {
+      id: "router-3",
+      name: "shop-router",
+      folderId: "folder-1",
+      createdAt: "2026-08-02T09:55:00Z",
+      virtualHosts: [
+        {
+          name: "shop",
+          authority: ["shop.example", "www.shop.example"],
+          routes: [{ name: "grpc-main", grpc: { match: { fqmn: { prefixMatch: "/" } }, route: { backendGroupId: "bg-new" } } }],
+        },
+        {
+          name: "api",
+          authority: ["api.example"],
+          routes: [
+            { name: "api", http: { match: { path: { prefixMatch: "/api" } }, route: { backendGroupId: "bg-new" } } },
+            { name: "api-admin", http: { match: { path: { prefixMatch: "/admin" } }, route: { backendGroupId: "bg-new" } } },
+          ],
+        },
+      ],
+    },
+  };
+  // Группы бэкендов — изменяемые: правка (backupd) обязана быть видна следующему
+  // чтению, иначе проверка «применилось ли» ничего не значит. Порт, проверки
+  // здоровья и группы целей живут В БЭКЕНДЕ, а сам список меняется целиком.
+  const bgs = {
+    "bg-web": {
+      id: "bg-web",
+      name: "web-backends",
+      folderId: "folder-1",
+      http: {
+        backends: [
+          {
+            name: "web",
+            port: "8080",
+            targetGroups: { targetGroupIds: ["tg-web"] },
+            healthchecks: [{ timeout: "1s", interval: "2s", http: { path: "/" } }],
+          },
+        ],
+      },
+    },
+    "bg-empty": { id: "bg-empty", name: "empty-backends", folderId: "folder-1", stream: { backends: [] } },
+    "bg-free": {
+      id: "bg-free",
+      name: "free-backends",
+      folderId: "folder-1",
+      stream: { backends: [{ name: "tcp", port: "5432", targetGroups: { targetGroupIds: ["tg-empty"] } }] },
+    },
+    "bg-idle": {
+      id: "bg-idle",
+      name: "idle-backends",
+      folderId: "folder-1",
+      http: { backends: [{ name: "idle", port: "80", targetGroups: { targetGroupIds: ["tg-new"] } }] },
+    },
   };
 
   const server = http.createServer((req, res) => {
@@ -424,10 +482,30 @@ function startAlbStub() {
           created.router.push(JSON.parse(raw || "{}"));
           return json({ id: "op-router-new", done: false });
         }
+        const patch = url.match(/\/httpRouters\/([^/?]+)$/);
+        if (patch && req.method === "PATCH") {
+          const body = JSON.parse(raw || "{}");
+          created.routerPatches.push({ router: patch[1], body: body });
+          const r = routers[patch[1]];
+          // Маска: названное меняется, НЕназванное остаётся прежним — так же, как
+          // у настоящего облака.
+          if (r && !flags.dropRouterPatch) {
+            const fields = String(body.updateMask || "").split(",").map((x) => x.trim());
+            if (fields.indexOf("name") >= 0) r.name = body.name;
+            if (fields.indexOf("description") >= 0) r.description = body.description || "";
+            if (fields.indexOf("virtual_hosts") >= 0) r.virtualHosts = body.virtualHosts || [];
+          }
+          return json({ id: "op-router-patch", done: false });
+        }
         const del = url.match(/\/httpRouters\/([^/?]+)$/);
         if (del && req.method === "DELETE") {
           deleted.add(del[1]);
           return json({ id: "op-del", done: false });
+        }
+        const single = url.match(/\/httpRouters\/([^/?]+)(\?|$)/);
+        if (single && req.method === "GET" && single[1] !== "httpRouters") {
+          if (routers[single[1]]) return json(routers[single[1]]);
+          return json({ message: "http router not found" }, 404);
         }
         if (req.method === "GET") {
           const list = Object.keys(routers).map((k) => routers[k]);
@@ -452,36 +530,31 @@ function startAlbStub() {
           deleted.add(del[1]);
           return json({ id: "op-del", done: false });
         }
+        const patch = url.match(/\/backendGroups\/([^/?]+)$/);
+        if (patch && req.method === "PATCH") {
+          const body = JSON.parse(raw || "{}");
+          created.bgPatches.push({ group: patch[1], body: body });
+          const g = bgs[patch[1]];
+          // Список бэкендов приходит ЦЕЛИКОМ (его нельзя дополнить): маска
+          // называет имя вида, а не поле внутри бэкенда.
+          if (g && !flags.dropBackendPatch) {
+            const fields = String(body.updateMask || "").split(",").map((x) => x.trim());
+            if (fields.indexOf("name") >= 0) g.name = body.name;
+            if (fields.indexOf("description") >= 0) g.description = body.description || "";
+            ["http", "stream", "grpc"].forEach((k) => { if (fields.indexOf(k) >= 0) g[k] = body[k]; });
+          }
+          return json({ id: "op-bg-patch", done: false });
+        }
         const one = url.match(/\/backendGroups\/([^/?]+)(\?|$)/);
         if (one && req.method === "GET" && one[1] !== "backendGroups") {
-          if (one[1] === "bg-web") {
-            return json({
-              id: "bg-web",
-              name: "web-backends",
-              folderId: "folder-1",
-              http: { backends: [{ name: "web", port: "8080", targetGroups: { targetGroupIds: ["tg-web"] }, healthchecks: [{ timeout: "1s", interval: "2s", http: { path: "/" } }] }] },
-            });
-          }
-          if (one[1] === "bg-free") {
-            return json({ id: "bg-free", name: "free-backends", folderId: "folder-1", stream: { backends: [{ name: "tcp", port: "5432", targetGroups: { targetGroupIds: ["tg-empty"] } }] } });
-          }
-          if (one[1] === "bg-idle") {
-            return json({ id: "bg-idle", name: "idle-backends", folderId: "folder-1", http: { backends: [{ name: "idle", port: "80", targetGroups: { targetGroupIds: ["tg-new"] } }] } });
-          }
+          if (bgs[one[1]]) return json(bgs[one[1]]);
           if (one[1] === "bg-new") {
             return json({ id: "bg-new", name: "created-backends", folderId: "folder-1", http: { backends: [{ name: "main", port: "8080", targetGroups: { targetGroupIds: ["tg-web"] } }] } });
           }
           return json({ message: "backend group not found" }, 404);
         }
         if (req.method === "GET") {
-          return json({
-            backendGroups: [
-              { id: "bg-web", name: "web-backends", folderId: "folder-1", http: { backends: [{ name: "web", port: "8080", targetGroups: { targetGroupIds: ["tg-web"] } }] } },
-              { id: "bg-empty", name: "empty-backends", folderId: "folder-1", stream: { backends: [] } },
-              { id: "bg-free", name: "free-backends", folderId: "folder-1", stream: { backends: [{ name: "tcp", targetGroups: { targetGroupIds: ["tg-empty"] } }] } },
-              { id: "bg-idle", name: "idle-backends", folderId: "folder-1", http: { backends: [{ name: "idle", targetGroups: { targetGroupIds: ["tg-new"] } }] } },
-            ],
-          });
+          return json({ backendGroups: Object.keys(bgs).map((k) => bgs[k]) });
         }
       }
       return json({});
@@ -505,6 +578,8 @@ function startAlbStub() {
           created.bg.length = 0;
           created.listenerOps.length = 0;
           created.lbPatches.length = 0;
+          created.routerPatches.length = 0;
+          created.bgPatches.length = 0;
           deleted.clear();
         },
         base: "http://127.0.0.1:" + server.address().port,
@@ -594,7 +669,7 @@ function ipcDeps(handlers, settings) {
 }
 
 const callsTo = (stub, part) => stub.calls.filter((c) => c.url.indexOf(part) >= 0);
-const writes = (stub) => stub.calls.filter((c) => c.method === "POST" || c.method === "DELETE");
+const writes = (stub) => stub.calls.filter((c) => c.method === "POST" || c.method === "DELETE" || c.method === "PATCH");
 const section = (src, channel) => {
   const at = src.indexOf('ipcMain.handle("' + channel + '"');
   assert.ok(at > 0, "нет канала " + channel);
@@ -1227,10 +1302,10 @@ const section = (src, channel) => {
     const ops = arr[1].split(",").map((x) => x.trim().replace(/^"|"$/g, ""));
     assert.deepStrictEqual(
       ops.slice().sort(),
-      ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"].sort(),
+      ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerupd", "routerdel", "backnew", "backupd", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"].sort(),
       "список действий канала: " + ops.join(", ")
     );
-    for (const part of ["ycAlb.loadBalancers(", "ycAlb.card(", "ycAlb.targetGroups(", "ycAlb.httpRouters(", "ycAlb.backendGroups(", "ycAlb.backendGroupLine(", "ycAlb.targetStates(", "ycAlb.createTargetGroup(", "ycAlb.changeTargets(", "ycAlb.createHttpRouter(", "ycAlb.createBackendGroup(", "ycAlb.removeBackendGroup(", "ycAlb.createLoadBalancer(", "ycAlb.power(", "ycAlb.remove(", "ycAlb.removeTargetGroup(", "ycAlb.removeRouter(", "ycAlb.lbLine(", "ycAlb.listenerLine(", "ycAlb.targetLine(", "ycAlb.tgLine(", "ycAlb.routerLine(", "ycAlb.addListener(", "ycAlb.updateListener(", "ycAlb.removeListener(", "ycAlb.updateLoadBalancer(", "ycAlb.certLine("]) {
+    for (const part of ["ycAlb.loadBalancers(", "ycAlb.card(", "ycAlb.targetGroups(", "ycAlb.httpRouters(", "ycAlb.backendGroups(", "ycAlb.backendGroupLine(", "ycAlb.targetStates(", "ycAlb.createTargetGroup(", "ycAlb.changeTargets(", "ycAlb.createHttpRouter(", "ycAlb.createBackendGroup(", "ycAlb.removeBackendGroup(", "ycAlb.createLoadBalancer(", "ycAlb.power(", "ycAlb.remove(", "ycAlb.removeTargetGroup(", "ycAlb.removeRouter(", "ycAlb.lbLine(", "ycAlb.listenerLine(", "ycAlb.targetLine(", "ycAlb.tgLine(", "ycAlb.routerLine(", "ycAlb.addListener(", "ycAlb.updateListener(", "ycAlb.removeListener(", "ycAlb.updateLoadBalancer(", "ycAlb.updateHttpRouter(", "ycAlb.updateBackendGroup(", "ycAlb.certLine("]) {
       assert.ok(body.includes(part), "канал не зовёт " + part);
     }
     assert.ok(/needsConfirm: true/.test(body) && /a\.confirm !== true/.test(body), "канал не спрашивает согласие на платное и необратимое");
@@ -1991,6 +2066,304 @@ const section = (src, channel) => {
     }
     const sniReq = A.request("alb", "listenerupd", { lb: "web-lb", listenerName: "web", sni: "shop.example.com=shop-cert" }, false);
     assert.strictEqual(sniReq.args.sni, "shop.example.com=shop-cert", "домены SNI не ушли строкой");
+  });
+
+  console.log("\n[11] Правка роутера и группы бэкендов: вложенный список заменяется целиком");
+
+  await test("ycAlb: обратная запись списка не возвращает служебные поля (id, status)", () => {
+    // Служебные поля в ответе есть, а в запросе на них сервис отвечает отказом —
+    // тот же урок, что у правил групп безопасности VPC.
+    const cleaned = albMod.writableDeep({ id: "r-1", status: "ACTIVE", nested: [{ id: "h-1", name: "main", routes: [{ id: "rt-1", name: "main", http: { match: { path: { prefixMatch: "/" } } } }] }] });
+    assert.deepStrictEqual(cleaned, { nested: [{ name: "main", routes: [{ name: "main", http: { match: { path: { prefixMatch: "/" } } } }] }] }, JSON.stringify(cleaned));
+  });
+
+  await test("ycAlb: правка маршрута уходит списком хостов и подтверждается перечитыванием", async () => {
+    stub.reset();
+    const r = await alb.updateHttpRouter("oauth-1", {
+      folderId: "folder-1",
+      router: "main-router",
+      routeName: "main",
+      pathPrefix: "/api",
+      backendGroup: "idle-backends",
+    });
+    assert.strictEqual(stub.created.routerPatches.length, 1, "правка роутера не ушла");
+    const sent = stub.created.routerPatches[0];
+    assert.strictEqual(sent.router, "router-1", "правка ушла не по id роутера");
+    const body = sent.body;
+    assert.strictEqual(body.updateMask, "virtual_hosts", "маска не та: " + body.updateMask);
+    assert.strictEqual(body.name, undefined, "в теле оказалось имя, которого никто не менял");
+    assert.ok(!JSON.stringify(body).includes('"id"'), "в облако вернулось поле id — сервис на него отвечает отказом");
+    assert.strictEqual(body.virtualHosts.length, 1, "вернулся не весь список хостов: " + body.virtualHosts.length);
+    const host = body.virtualHosts[0];
+    assert.strictEqual(host.name, "main", "имя хоста потерялось");
+    assert.deepStrictEqual(host.authority, ["site.example"], "домен хоста потерялся");
+    assert.strictEqual(host.routes.length, 1, "чужие маршруты потерялись");
+    assert.strictEqual(host.routes[0].http.match.path.prefixMatch, "/api", "новый путь не ушёл");
+    assert.strictEqual(host.routes[0].http.route.backendGroupId, "bg-idle", "маршрут ведёт не в новую группу");
+    assert.deepStrictEqual(r.fields, ["virtual_hosts"]);
+    assert.ok(/путь \/api\*/.test(r.message) && /idle-backends/.test(r.message), r.message);
+    assert.ok(r.warnings.some((w) => /ЦЕЛИКОМ/.test(w)), "не сказано, что список хостов уходит целиком: " + r.warnings.join(" | "));
+    assert.ok(r.warnings.some((w) => /Порядок маршрутов/.test(w)), "не сказано про порядок маршрутов: " + r.warnings.join(" | "));
+    // Правка обязана быть видна СЛЕДУЮЩЕМУ чтению: иначе "применилось" ничего не значит.
+    const after = await alb.findHttpRouter("oauth-1", "folder-1", "main-router");
+    assert.strictEqual(after.hosts[0].routes[0].pathPrefix, "/api", "перечитывание не видит новый путь");
+    assert.strictEqual(after.hosts[0].routes[0].backendGroupId, "bg-idle", "перечитывание не видит новый маршрут");
+    assert.deepStrictEqual(after.hosts[0].authority, ["site.example"], "домен хоста пострадал при правке пути");
+  });
+
+  await test("ycAlb: переименование роутера и точный путь — маской, без перезаписи хостов", async () => {
+    stub.reset();
+    const r = await alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "router-2", newName: "api-router-2", description: "API витрины" });
+    const body = stub.created.routerPatches[0].body;
+    assert.strictEqual(body.updateMask, "name,description", "маска не та: " + body.updateMask);
+    assert.strictEqual(body.virtualHosts, undefined, "список хостов ушёл, хотя его никто не трогал");
+    assert.ok(/новое имя «api-router-2»/.test(r.message), r.message);
+    const after = await alb.findHttpRouter("oauth-1", "folder-1", "api-router-2");
+    assert.strictEqual(after.name, "api-router-2", "переименование не применилось");
+    // Точный путь задаётся вместо префикса — и виден в перечитывании.
+    const exact = await alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "main-router", pathExact: "/healthz" });
+    assert.ok(/точный путь \/healthz/.test(exact.message), exact.message);
+    const one = await alb.findHttpRouter("oauth-1", "folder-1", "main-router");
+    assert.strictEqual(one.hosts[0].routes[0].pathExact, "/healthz", "точный путь не применился");
+    assert.strictEqual(one.hosts[0].routes[0].pathPrefix, "", "префикс остался рядом с точным путём");
+  });
+
+  await test("ycAlb: правка роутера отказывает ДО сети — чужой маршрут, несколько хостов, gRPC", async () => {
+    const before = writes(stub).length;
+    // Два виртуальных хоста: без имени хоста непонятно, чей маршрут правим.
+    await assert.rejects(
+      () => alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "shop-router", pathPrefix: "/x" }),
+      (e) => /несколько виртуальных хостов/.test(e.message) && /shop/.test(e.message) && /api/.test(e.message)
+    );
+    // В хосте два маршрута: нужен route.
+    await assert.rejects(
+      () => alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "shop-router", vhost: "api", pathPrefix: "/x" }),
+      (e) => /назови route/.test(e.message) && /api-admin/.test(e.message)
+    );
+    await assert.rejects(
+      () => alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "shop-router", vhost: "api", routeName: "nope", pathPrefix: "/x" }),
+      (e) => /нет маршрута «nope»/.test(e.message) && /маршрут здесь не создаётся/.test(e.message)
+    );
+    // gRPC-маршрут устроен иначе: путь у него — fqmn.
+    await assert.rejects(
+      () => alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "shop-router", vhost: "shop", routeName: "grpc-main", pathPrefix: "/x" }),
+      (e) => /gRPC/.test(e.message) && /fqmn/.test(e.message)
+    );
+    // Роутер без хостов: маршрутов тоже нет — и это отказ ДО сети.
+    await assert.rejects(
+      () => alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "router-2", pathPrefix: "/x" }),
+      /нет ни одного виртуального хоста/
+    );
+    // Маршрут ведёт только в HTTP-группу, а группа обязана существовать.
+    await assert.rejects(
+      () => alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "shop-router", vhost: "api", routeName: "api", backendGroup: "free-backends" }),
+      (e) => /только в HTTP-группу/.test(e.message) && /поток TCP/.test(e.message)
+    );
+    await assert.rejects(
+      () => alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "shop-router", vhost: "api", routeName: "api", backendGroup: "bg-dream" }),
+      (e) => /Не нашёл группу бэкендов/.test(e.message) && /web-backends/.test(e.message)
+    );
+    // Нечего менять — это не успех, а ответ словами: и в облако не идём.
+    const same = await alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "main-router", host: "site.example" });
+    assert.strictEqual(same.changed, false, "пустая правка отчиталась как изменение");
+    assert.ok(/менять нечего/.test(same.message), same.message);
+    await assert.rejects(() => alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "main-router" }), /Нечего менять/);
+    // Каталог и имя роутера проверяются тоже до сети.
+    await assert.rejects(() => alb.updateHttpRouter("oauth-1", { router: "main-router", pathPrefix: "/x" }), /каталог/);
+    await assert.rejects(() => alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "main-router", pathPrefix: "api" }), /должен начинаться со слэша/);
+    await assert.rejects(() => alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "main-router", pathPrefix: "" }), /путь не может быть пустым/);
+    await assert.rejects(() => alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "main-router", newName: "Плохое Имя", pathPrefix: "/x" }), /облако не примет/);
+    await assert.rejects(() => alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "нет-такого", pathPrefix: "/x" }), /Не нашёл HTTP-роутер/);
+    assert.strictEqual(writes(stub).length, before, "отказ не помешал запросу в облако");
+  });
+
+  await test("ycAlb: правка группы меняет порт, сохраняя проверки здоровья и остальные настройки", async () => {
+    stub.reset();
+    const r = await alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "web-backends", port: 3000 });
+    assert.strictEqual(stub.created.bgPatches.length, 1, "правка группы не ушла");
+    const sent = stub.created.bgPatches[0];
+    assert.strictEqual(sent.group, "bg-web", "правка ушла не по id группы");
+    const body = sent.body;
+    // Маска называет ИМЯ ВИДА, а не поле внутри бэкенда: список меняется целиком.
+    assert.strictEqual(body.updateMask, "http", "маска не та: " + body.updateMask);
+    assert.strictEqual(body.http.backends.length, 1, "вернулся не весь список бэкендов");
+    assert.strictEqual(body.http.backends[0].port, "3000", "новый порт не ушёл");
+    assert.ok(body.http.backends[0].healthchecks && body.http.backends[0].healthchecks.length, "проверка здоровья потерялась при правке порта");
+    assert.deepStrictEqual(body.http.backends[0].targetGroups.targetGroupIds, ["tg-web"], "группа целей потерялась");
+    assert.ok(!JSON.stringify(body).includes('"id"'), "в облако вернулось поле id");
+    assert.deepStrictEqual(r.fields, ["http"]);
+    assert.ok(/порт 3000/.test(r.message), r.message);
+    assert.ok(r.warnings.some((w) => /Порт 3000 — это порт, который слушают ЦЕЛИ/.test(w)), r.warnings.join(" | "));
+    assert.ok(r.warnings.some((w) => /ЦЕЛИКОМ/.test(w)), "не сказано, что список бэкендов уходит целиком");
+    const after = await alb.backendGroup("oauth-1", "bg-web");
+    assert.strictEqual(after.backends[0].port, "3000", "перечитывание не видит новый порт");
+    assert.strictEqual(after.backends[0].healthcheckCount, 1, "проверка здоровья пропала после правки порта");
+  });
+
+  await test("ycAlb: проверка здоровья, группа целей и переименование группы — без перезаписи списка", async () => {
+    stub.reset();
+    const path = await alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "web-backends", healthPath: "/health" });
+    const health = stub.created.bgPatches.slice(-1)[0].body.http.backends[0].healthchecks[0];
+    assert.strictEqual(health.http.path, "/health", "путь проверки не ушёл");
+    assert.ok(/проверка здоровья HTTP \/health/.test(path.message), path.message);
+    assert.strictEqual((await alb.backendGroup("oauth-1", "bg-web")).backends[0].healthcheckCount, 1, "проверка здоровья не применилась");
+
+    const tg = await alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "web-backends", targetGroup: "empty-targets" });
+    assert.deepStrictEqual(stub.created.bgPatches.slice(-1)[0].body.http.backends[0].targetGroups.targetGroupIds, ["tg-empty"]);
+    assert.ok(tg.warnings.some((w) => /уйдёт в пустоту/.test(w)), tg.warnings.join(" | "));
+    assert.deepStrictEqual((await alb.backendGroup("oauth-1", "bg-web")).backends[0].targetGroupIds, ["tg-empty"], "новая группа целей не применилась");
+
+    const off = await alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "web-backends", noHealthCheck: true });
+    assert.strictEqual(stub.created.bgPatches.slice(-1)[0].body.http.backends[0].healthchecks, undefined, "проверки здоровья остались");
+    assert.ok(/здоровой ВСЕГДА/.test(off.warnings.join(" | ")), off.warnings.join(" | "));
+    assert.strictEqual((await alb.backendGroup("oauth-1", "bg-web")).backends[0].healthcheckCount, 0, "проверки здоровья не убрались");
+
+    // Имя и описание — ОТДЕЛЬНОЙ маской: список бэкендов при этом не переписывается.
+    const renamed = await alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "bg-web", newName: "web-backends-2", description: "витрина" });
+    const body = stub.created.bgPatches.slice(-1)[0].body;
+    assert.strictEqual(body.updateMask, "name,description", "маска не та: " + body.updateMask);
+    assert.strictEqual(body.http, undefined, "список бэкендов ушёл, хотя его не трогали");
+    assert.ok(/новое имя «web-backends-2»/.test(renamed.message), renamed.message);
+    assert.strictEqual((await alb.backendGroup("oauth-1", "bg-web")).name, "web-backends-2", "переименование не применилось");
+  });
+
+  await test("ycAlb: правка группы отказывает ДО сети — пустая группа, вид проверки, порт и бэкенд", async () => {
+    const before = writes(stub).length;
+    await assert.rejects(() => alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "bg-web" }), /Нечего менять/);
+    await assert.rejects(
+      () => alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "bg-web", port: 70000 }),
+      /1 до 65535/
+    );
+    // У группы без бэкендов порт и проверки править не в чем: они живут В БЭКЕНДЕ.
+    await assert.rejects(
+      () => alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "empty-backends", port: 80 }),
+      (e) => /нет ни одного бэкенда/.test(e.message) && /backnew/.test(e.message)
+    );
+    await assert.rejects(() => alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "web-backends-2", backend: "nope", port: 80 }), /нет бэкенда «nope»/);
+    // Проверка бывает своя у каждого вида: путь — у HTTP, служба — у gRPC.
+    await assert.rejects(
+      () => alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "free-backends", healthPath: "/ok" }),
+      (e) => /проверка HTTP/.test(e.message) && /поток TCP/.test(e.message)
+    );
+    await assert.rejects(() => alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "web-backends-2", healthService: "svc" }), /проверка gRPC/);
+    await assert.rejects(() => alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "web-backends-2", healthPath: "/ok", healthService: "svc" }), /ОДНО/);
+    await assert.rejects(() => alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "web-backends-2", healthPath: "/ok", noHealthCheck: true }), /Нельзя одновременно/);
+    await assert.rejects(() => alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "web-backends-2", port: 80, targetGroup: "нет-такой" }), /Не нашёл группу целей/);
+    await assert.rejects(() => alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "нет-такой", port: 80 }), /Не нашёл группу бэкендов/);
+    await assert.rejects(() => alb.updateBackendGroup("oauth-1", { group: "bg-web", port: 80 }), /каталог/);
+    assert.strictEqual(writes(stub).length, before, "отказ не помешал запросу в облако");
+  });
+
+  await test("ycAlb: молчаливая правка роутера и группы — ошибка со словами про alb.editor", async () => {
+    stub.flags.dropRouterPatch = true;
+    await assert.rejects(
+      () => alb.updateHttpRouter("oauth-1", { folderId: "folder-1", router: "main-router", pathPrefix: "/quiet" }),
+      (e) => /не применилась/.test(e.message) && /путь/.test(e.message) && /alb\.editor/.test(e.message)
+    );
+    stub.flags.dropRouterPatch = false;
+    stub.flags.dropBackendPatch = true;
+    await assert.rejects(
+      () => alb.updateBackendGroup("oauth-1", { folderId: "folder-1", group: "bg-idle", port: 9090 }),
+      (e) => /не применилась/.test(e.message) && /порт бэкенда/.test(e.message) && /alb\.editor/.test(e.message)
+    );
+    stub.flags.dropBackendPatch = false;
+  });
+
+  await test("yc:alb и ycAlb: правка роутера и группы идёт через настоящий канал и инструмент", async () => {
+    const handlers = new Map();
+    registerYcIpc(ipcDeps(handlers, settingsFor()));
+    const call = (args) => handlers.get("yc:alb")({}, args || {});
+
+    stub.created.routerPatches.length = 0;
+    const router = await call({ op: "routerupd", router: "main-router", routeName: "main", pathPrefix: "/shop", host: "shop.example" });
+    assert.strictEqual(router.ok, true, "канал отказал на правке роутера: " + (router.error || ""));
+    const rbody = stub.created.routerPatches.slice(-1)[0].body;
+    assert.strictEqual(rbody.updateMask, "virtual_hosts");
+    assert.deepStrictEqual(rbody.virtualHosts[0].authority, ["shop.example"], "новый домен не ушёл");
+    assert.ok((router.lines || []).some((l) => /путь \/shop\*/.test(l) && /домен shop\.example/.test(l)), (router.lines || []).join(" | "));
+    // Маршрут без имени в хосте с двумя маршрутами канал не угадывает.
+    const vague = await call({ op: "routerupd", router: "shop-router", vhost: "api", pathPrefix: "/x" });
+    assert.strictEqual(vague.ok, false, "канал угадал маршрут вместо отказа");
+    assert.ok(/назови route/.test(vague.error), vague.error);
+
+    stub.created.bgPatches.length = 0;
+    const group = await call({ op: "backupd", group: "idle-backends", port: 9090, healthPath: "/health" });
+    assert.strictEqual(group.ok, true, "канал отказал на правке группы: " + (group.error || ""));
+    const gbody = stub.created.bgPatches.slice(-1)[0].body;
+    assert.strictEqual(gbody.updateMask, "http");
+    assert.strictEqual(gbody.http.backends[0].port, "9090");
+    assert.strictEqual(gbody.http.backends[0].healthchecks[0].http.path, "/health");
+    assert.ok((group.lines || []).some((l) => /порт 9090/.test(l) && /\/health/.test(l)), (group.lines || []).join(" | "));
+    // Правка — не удаление: согласие не спрашивают.
+    assert.strictEqual(group.needsConfirm, undefined, "правка группы спросила согласие");
+
+    const tools = buildTools();
+    stub.created.routerPatches.length = 0;
+    const text = await tools.ycAlb({ action: "routerupd", router: "main-router", vhost: "main", routeName: "main", host: "new.example" });
+    assert.strictEqual(stub.created.routerPatches.length, 1, "инструмент не донёс правку роутера");
+    assert.ok(/PATCH с маской/.test(text), "инструмент не сказал, каким методом правит: " + text);
+    assert.ok(/слушатели/.test(text), text);
+    stub.created.bgPatches.length = 0;
+    const gtext = await tools.ycAlb({ action: "backupd", group: "idle-backends", noHealthCheck: true });
+    assert.strictEqual(stub.created.bgPatches.length, 1, "инструмент не донёс правку группы");
+    assert.ok(/ЦЕЛИКОМ/.test(gtext) && /Порт слушателя/.test(gtext), gtext);
+  });
+
+  await test("ycAlb: схема, справочник и промпт знают правку роутера и группы", () => {
+    const at = SCHEMAS_SRC.indexOf('name: "ycAlb"');
+    const schema = SCHEMAS_SRC.slice(at, SCHEMAS_SRC.indexOf('name: "ycVpc"', at));
+    for (const part of ["routerupd", "backupd", "routeName", "vhost", "noHealthCheck", "healthService"]) {
+      assert.ok(schema.includes(part), "в схеме нет " + part);
+    }
+    assert.ok(/ЗАМЕНА ВЛОЖЕННОГО СПИСКА/.test(schema), "схема не объясняет замену вложенного списка");
+    assert.ok(/routerupd/.test(GUIDE_SRC) && /backupd/.test(GUIDE_SRC), "справочник yc.md не знает правку");
+    assert.ok(/routeName/.test(GUIDE_SRC) && /noHealthCheck/.test(GUIDE_SRC), "справочник не объясняет поля правки");
+    assert.ok(/ТОЛЬКО ЗАМЕНОЙ/.test(GUIDE_SRC), "справочник не говорит, что список меняется только заменой");
+    assert.ok(/routerupd/.test(PROMPTS_SRC) && /backupd/.test(PROMPTS_SRC), "промпт не называет действия правки");
+    const line = PROMPTS_SRC.split("\n").find((l) => l.startsWith("Доступные инструменты:")) || "";
+    assert.ok(/ycAlb/.test(line), "инструмента нет в списке для модели");
+  });
+
+  await test("yc-actions: у правки роутера и группы свои формы, и пустое поле не уходит в облако", () => {
+    const ctx = { window: {}, document: undefined, navigator: {}, console: console };
+    ctx.window.window = ctx.window;
+    vm.createContext(ctx);
+    vm.runInContext(ACTIONS_SRC, ctx, { filename: "yc-actions.js" });
+    const A = ctx.window.YcActions;
+
+    const router = A.describe("alb", "routerupd");
+    for (const field of ["routeName", "vhost", "host", "pathPrefix", "pathExact", "backendGroup", "newName", "description"]) {
+      assert.ok(router.fields.indexOf(field) >= 0, "в форме правки роутера нет поля " + field + ": " + router.fields.join(", "));
+    }
+    assert.strictEqual(A.actionsFor("alb").find((x) => x.id === "routerupd").target.key, "router", "у правки роутера нет цели-роутера");
+    assert.strictEqual(router.danger, false, "правка роутера — не удаление");
+    assert.strictEqual(router.confirmArg, "", "правка роутера не спрашивает согласие");
+
+    const group = A.describe("alb", "backupd");
+    for (const field of ["port", "healthPath", "healthService", "noHealthCheck", "targetGroup", "backend", "newName", "description"]) {
+      assert.ok(group.fields.indexOf(field) >= 0, "в форме правки группы нет поля " + field + ": " + group.fields.join(", "));
+    }
+    assert.strictEqual(A.actionsFor("alb").find((x) => x.id === "backupd").target.key, "group", "у правки группы нет цели-группы");
+    assert.strictEqual(group.confirmArg, "", "правка группы не спрашивает согласие");
+
+    const req = A.request("alb", "routerupd", { router: "main-router", routeName: "main", pathPrefix: "/api", vhost: "" }, false);
+    assert.strictEqual(req.args.op, "routerupd");
+    assert.strictEqual(req.args.router, "main-router");
+    assert.strictEqual(req.args.pathPrefix, "/api");
+    assert.strictEqual(req.args.vhost, undefined, "пустое поле ушло в запрос — модуль счёл бы это сменой настройки");
+    assert.strictEqual(req.args.host, undefined, "пустой домен ушёл в запрос");
+    assert.strictEqual(req.args.confirm, undefined, "лишний confirm у правки роутера");
+
+    const greq = A.request("alb", "backupd", { group: "web-backends", port: "3000", healthPath: "", noHealthCheck: true }, false);
+    assert.strictEqual(greq.args.group, "web-backends");
+    assert.strictEqual(greq.args.port, 3000, "порт не число");
+    assert.strictEqual(greq.args.healthPath, undefined, "пустая проверка ушла в запрос");
+    assert.strictEqual(greq.args.noHealthCheck, true, "галочка «убрать проверки» не ушла");
+    const off = A.request("alb", "backupd", { group: "web-backends", port: "3000", noHealthCheck: false }, false);
+    assert.strictEqual(off.args.noHealthCheck, false, "снятая галочка ушла не значением");
+
+    const ops = A.forService("alb");
+    assert.ok(ops.indexOf("routerupd") >= 0 && ops.indexOf("backupd") >= 0, "правки нет в списке действий семейства: " + ops.join(", "));
   });
 
   stub.server.close();

@@ -357,6 +357,36 @@ ${STUBS}
           warnings: ["Адрес 203.0.113.10 освободится, если его не слушает другой слушатель: домен, который на него смотрел, перестанет открываться — сначала поставь запись на новый адрес."],
           message: "Слушатель убран." };
       }
+      // Правка роутера и группы бэкендов (заход 6): облако не умеет «поменять
+      // путь» или «поменять порт» отдельно — вложенный список (virtualHosts у
+      // роутера, backends у группы) принимается ТОЛЬКО ЗАМЕНОЙ целиком, поэтому
+      // действие читает текущий список, меняет в нём названное и возвращает
+      // обратно, а чего не назвали — остаётся прежним.
+      if (a.op === "routerupd") {
+        const what = [];
+        if (a.pathExact) what.push("точный путь " + a.pathExact);
+        else if (a.pathPrefix) what.push("путь " + a.pathPrefix + "*");
+        if (a.backendGroup) what.push("группа бэкендов «" + a.backendGroup + "»");
+        if (a.host != null) what.push(a.host ? "домен " + a.host : "домен убран (хост отвечает на любой)");
+        return { ok: true, changed: true, routerId: "rt-web", fields: ["virtual_hosts"],
+          lines: ["HTTP-роутер «" + a.router + "» обновляется" + (a.newName ? ", новое имя «" + a.newName + "»" : "") + (what.length ? ": " + what.join(", ") : " (настройки применены заново)") + "."],
+          warnings: ["Список виртуальных хостов уходит ЦЕЛИКОМ: облако принимает его только заменой, поэтому остальные маршруты и хосты вернулись в том виде, как их отдало облако.",
+            "Порядок маршрутов важен: облако берёт ПЕРВОЕ совпавшее правило, поэтому общий путь (/) должен стоять НИЖЕ частных."],
+          message: "HTTP-роутер обновляется." };
+      }
+      if (a.op === "backupd") {
+        const what = [];
+        if (a.port) what.push("порт " + a.port);
+        if (a.healthPath) what.push("проверка здоровья HTTP " + a.healthPath);
+        if (a.healthService) what.push("проверка здоровья gRPC " + a.healthService);
+        if (a.noHealthCheck) what.push("проверки здоровья убраны");
+        if (a.targetGroup) what.push("группа целей «" + a.targetGroup + "»");
+        return { ok: true, changed: true, groupId: "bg1", fields: ["http"],
+          lines: ["Группа бэкендов «" + a.group + "» обновляется" + (a.newName ? ", новое имя «" + a.newName + "»" : "") + (what.length ? ": " + what.join(", ") : " (настройки применены заново)") + "."],
+          warnings: ["Список бэкендов уходит ЦЕЛИКОМ: облако принимает его только заменой, поэтому остальные бэкенды вернулись в том виде, как их отдало облако.",
+            "Порт — это порт, который слушают ЦЕЛИ (машины), а не балансировщик: если там слушают другой, вход начнёт отдавать 502. Порт слушателя балансировщика этим не меняется."],
+          message: "Группа бэкендов обновляется." };
+      }
       if (a.op === "lbupdate") {
         return { ok: true, changed: true, lb: { id: "lb1", name: a.newName || a.lb }, fields: ["name", "description", "security_group_ids"],
           lines: ["Балансировщик «" + a.lb + "» обновляется: имя, описание, группы безопасности."],
@@ -1251,7 +1281,7 @@ fs.writeFileSync(SHOT, PAGE, "utf8");
       return { btn: !!btn, title: title, listed: listed, called: !!sent, text: document.getElementById("yc-act-out").textContent };
     });
     ok(albTile.btn && /Application Load Balancer/.test(albTile.title || ""), "у плитки «Балансировщики» есть кнопка действий", JSON.stringify({ btn: albTile.btn, title: albTile.title }));
-    ok(albTile.listed.length === 22, "в семействе двадцать два действия: " + albTile.listed.length);
+    ok(albTile.listed.length === 24, "в семействе двадцать четыре действия: " + albTile.listed.length);
     ok(
       albTile.listed.some((t) => /Добавить слушателя/.test(t)) && albTile.listed.some((t) => /Править слушателя/.test(t)) && albTile.listed.some((t) => /Убрать слушателя/.test(t)) && albTile.listed.some((t) => /Правка балансировщика/.test(t)),
       "список называет правку слушателей и балансировщика: " + albTile.listed.join(", ")
@@ -1569,6 +1599,85 @@ fs.writeFileSync(SHOT, PAGE, "utf8");
     });
     ok(albListenerUpdLabels.labels.some((l) => /^Какой слушатель правим \*/.test(l)), "имя слушателя в форме правки помечено обязательным: " + albListenerUpdLabels.labels.join(" | "));
     ok(albListenerUpdLabels.labels.some((l) => /оставить прежний/.test(l)) && albListenerUpdLabels.labels.some((l) => /пусто — прежний/.test(l)), "форма правки говорит, что пустое значит «оставить прежнее»: " + albListenerUpdLabels.labels.join(" | "));
+
+    // Правка роутера и группы бэкендов (заход 6): в форме подписано, что пустое
+    // значит «оставить прежнее», а ответ говорит, что вложенный список уходит
+    // ЦЕЛИКОМ — иначе «поменял путь» выглядело бы безобиднее, чем есть.
+    const albRouterUpdLabels = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Править роутер/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      return { labels: [...form.querySelectorAll(".yc-act-label")].map((x) => x.textContent),
+        // «Пусто — прежнее» у половины полей сказано ПОДСКАЗКОЙ в поле, а не
+        // подписью: без неё человек не знает, что пустое поле ничего не сотрёт.
+        hints: [...form.querySelectorAll(".yc-act-field input, .yc-act-field select, .yc-act-field textarea")].map((x) => x.placeholder || "") };
+    });
+    for (const part of ["Роутер (имя или id) *", "Имя маршрута", "Имя виртуального хоста", "Домен хоста", "Путь (префикс)", "Новая группа бэкендов", "Новое имя роутера"]) {
+      ok(albRouterUpdLabels.labels.some((l) => l.indexOf(part) >= 0), "в форме правки роутера нет поля «" + part + "»: " + albRouterUpdLabels.labels.join(" | "));
+    }
+    ok(albRouterUpdLabels.hints.some((h) => /пусто — оставить прежний/.test(h)) && albRouterUpdLabels.hints.some((h) => /пусто — прежняя/.test(h)), "форма правки роутера говорит, что пустое значит «оставить прежнее»: " + albRouterUpdLabels.hints.join(" | "));
+    ok(albRouterUpdLabels.labels.some((l) => /пусто — не менять/.test(l)), "пустой домен подписан словами: " + albRouterUpdLabels.labels.join(" | "));
+
+    const albRouterUpdRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Роутер/.test(label)) input.value = "web-router";
+        if (/^Имя маршрута/.test(label)) input.value = "main";
+        if (/^Путь \(префикс\)/.test(label)) input.value = "/api";
+        if (/^Домен хоста/.test(label)) input.value = "api.example.com";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "routerupd").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(albRouterUpdRun.args && albRouterUpdRun.args.router === "web-router" && albRouterUpdRun.args.routeName === "main" && albRouterUpdRun.args.pathPrefix === "/api", "форма правки роутера собрала маршрут и путь", JSON.stringify(albRouterUpdRun.args));
+    ok(albRouterUpdRun.args && albRouterUpdRun.args.pathExact === undefined && albRouterUpdRun.args.backendGroup === undefined && albRouterUpdRun.args.confirm === undefined, "пустые поля правки роутера в запрос не ушли", JSON.stringify(albRouterUpdRun.args));
+    ok(/обновляется: путь \/api\*, домен api\.example\.com/.test(albRouterUpdRun.text), "ответ назвал правку маршрута и домена", albRouterUpdRun.text.slice(0, 300));
+    ok(/Список виртуальных хостов уходит ЦЕЛИКОМ/.test(albRouterUpdRun.text), "панель предупредила, что список хостов ЗАМЕНЯЕТСЯ целиком", albRouterUpdRun.text.slice(0, 400));
+
+    const albBackUpdLabels = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Правка группы бэкендов/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      return { labels: [...form.querySelectorAll(".yc-act-label")].map((x) => x.textContent) };
+    });
+    for (const part of ["Группа бэкендов (имя или id) *", "Порт целей", "Путь проверки здоровья (http)", "Служба проверки (grpc)", "Убрать проверки здоровья", "Новая группа целей", "Какой бэкенд правим"]) {
+      ok(albBackUpdLabels.labels.some((l) => l.indexOf(part) >= 0), "в форме правки группы бэкендов нет поля «" + part + "»: " + albBackUpdLabels.labels.join(" | "));
+    }
+
+    const albBackUpdRun = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Группа бэкендов/.test(label)) input.value = "web-backends";
+        if (/^Порт целей/.test(label)) input.value = "3000";
+        if (/^Путь проверки здоровья/.test(label)) input.value = "/health";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycAlb" && c[1].op === "backupd").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(albBackUpdRun.args && albBackUpdRun.args.group === "web-backends" && albBackUpdRun.args.port === 3000 && albBackUpdRun.args.healthPath === "/health", "форма правки группы собрала порт и проверку", JSON.stringify(albBackUpdRun.args));
+    ok(albBackUpdRun.args && albBackUpdRun.args.noHealthCheck === false && albBackUpdRun.args.healthService === undefined, "снятая галочка ушла значением, а пустая проверка — нет", JSON.stringify(albBackUpdRun.args));
+    ok(/обновляется: порт 3000, проверка здоровья HTTP \/health/.test(albBackUpdRun.text), "ответ назвал порт и проверку здоровья", albBackUpdRun.text.slice(0, 300));
+    ok(/Список бэкендов уходит ЦЕЛИКОМ/.test(albBackUpdRun.text) && /Порт — это порт, который слушают ЦЕЛИ/.test(albBackUpdRun.text), "панель предупредила, что список бэкендов ЗАМЕНЯЕТСЯ целиком, а порт — ЦЕЛЕЙ", albBackUpdRun.text.slice(0, 400));
 
   } finally {
     await browser.close();

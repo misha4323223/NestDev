@@ -2085,7 +2085,7 @@ ipcMain.handle("yc:alb", async (_e, args) => {
   if (!ycAlb) return { ok: false, error: "Модуль Application Load Balancer не подключён к приложению (src/yc-alb.js)." };
   if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках (Настройки → «☁️ Yandex Cloud»)." };
   if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
-  const ALL = ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"];
+  const ALL = ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerupd", "routerdel", "backnew", "backupd", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"];
   if (ALL.indexOf(op) === -1) return { ok: false, error: "Неизвестное действие Application Load Balancer: " + op + ". Доступно: " + ALL.join(", ") + "." };
   const ref = String(a.lb || a.id || a.name || "").trim();
   const missingLb = { ok: false, error: "Не нашёл балансировщик «" + ref + "» в каталоге. Список — действие list." };
@@ -2277,6 +2277,41 @@ ipcMain.handle("yc:alb", async (_e, args) => {
         description: a.description,
       });
       return { ok: true, changed: true, backendGroup: r.group, groupId: r.groupId, operationId: r.operationId, lines: [r.message], warnings: r.warnings || [], message: r.message };
+    }
+    if (op === "routerupd") {
+      // Правка роутера уходит со списком виртуальных хостов ЦЕЛИКОМ: облако
+      // принимает этот список только заменой, поэтому модуль читает текущий и
+      // возвращает его обратно с одним изменённым местом.
+      const r = await ycAlb.updateHttpRouter(cfg.oauth, {
+        folderId: cfg.folderId,
+        router: a.router || a.id || a.name,
+        newName: a.newName || a.rename,
+        description: a.description != null && String(a.description).trim() !== "" ? String(a.description).trim() : undefined,
+        vhost: a.vhost || a.virtualHost,
+        host: a.host != null ? a.host : a.authority,
+        routeName: a.routeName || a.route,
+        pathPrefix: a.pathPrefix != null || a.prefix != null ? a.pathPrefix || a.prefix : undefined,
+        pathExact: a.pathExact,
+        backendGroup: a.backendGroup || a.backendGroupId,
+      });
+      return { ok: true, changed: r.changed, router: r.router, routerId: r.routerId, fields: r.fields, operationId: r.operationId, lines: [r.message], warnings: r.warnings || [], message: r.message };
+    }
+    if (op === "backupd") {
+      // Порт и проверки здоровья живут В бэкенде, а список бэкендов меняется
+      // только целиком — поэтому правка тоже идёт заменой списка.
+      const r = await ycAlb.updateBackendGroup(cfg.oauth, {
+        folderId: cfg.folderId,
+        group: a.group || a.backendGroup || a.id || a.name,
+        newName: a.newName || a.rename,
+        description: a.description != null && String(a.description).trim() !== "" ? String(a.description).trim() : undefined,
+        backend: a.backend || a.backendName,
+        port: a.port,
+        healthPath: a.healthPath || a.healthCheckPath,
+        healthService: a.healthService,
+        noHealthCheck: a.noHealthCheck === true || a.dropHealthCheck === true,
+        targetGroup: a.targetGroup || a.targetGroupId,
+      });
+      return { ok: true, changed: r.changed, backendGroup: r.group, groupId: r.groupId, fields: r.fields, operationId: r.operationId, lines: [r.message], warnings: r.warnings || [], message: r.message };
     }
     if (op === "backdel") {
       const g = await ycAlb.findBackendGroup(cfg.oauth, cfg.folderId, a.group || a.backendGroup || a.id || a.name);

@@ -81,7 +81,7 @@
     clickhouse: ["list", "presets", "card", "create", "hosts", "databases", "users", "logs", "operations", "start", "stop", "delete"],
     dns: ["zones", "card", "records", "add", "delete"],
     instanceGroups: ["list", "card", "instances", "operations", "create", "start", "stop", "delete"],
-    alb: ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerdel", "backnew", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"],
+    alb: ["list", "card", "targets", "routers", "backends", "health", "targetnew", "targetadd", "targetremove", "targetdel", "routernew", "routerupd", "routerdel", "backnew", "backupd", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"],
   };
 
   const FAMILIES = {
@@ -592,7 +592,33 @@
           fld("pathPrefix", "Путь (префикс)", { value: "/" }),
           fld("backendGroup", "Группа бэкендов (имя или id)", { required: true, placeholder: "web-backends", hint: "Маршрут обязан вести в существующую группу — список в действии «Группы бэкендов»." }),
         ] },
+      // Правка роутера и группы бэкендов идёт заменой ВЛОЖЕННОГО списка (облако
+      // не умеет «поменять порт» или «поменять путь»): модуль читает текущий
+      // список, меняет в нём одно место и возвращает целиком — поэтому в полях
+      // прямо написано, что пустое значит «оставить прежнее».
+      { id: "routerupd", ru: "✎ Править роутер: имя, домен, путь, маршрут", op: "routerupd", view: "lines", target: target("Роутер (имя или id)", "router"),
+        fields: [
+          fld("routeName", "Имя маршрута", { placeholder: "пусто — если в хосте он один", hint: "Имена маршрутов видны в карточке балансировщика и в действии «HTTP-роутеры»." }),
+          fld("vhost", "Имя виртуального хоста", { placeholder: "пусто — если хост один", hint: "Новый маршрут здесь не создаётся: облако принимает список хостов только заменой." }),
+          fld("host", "Домен хоста (пусто — не менять, «нет» — убрать)", { placeholder: "site.example.com", hint: "Это заголовок Host: без домена хост отвечает на ЛЮБОЙ. Сертификат задаёт слушатель." }),
+          fld("pathPrefix", "Путь (префикс)", { placeholder: "пусто — оставить прежний" }),
+          fld("pathExact", "Точный путь", { placeholder: "пусто — оставить префикс" }),
+          fld("backendGroup", "Новая группа бэкендов", { placeholder: "пусто — прежняя", hint: "Маршрут ведёт только в группу вида http." }),
+          fld("newName", "Новое имя роутера", { placeholder: "пусто — имя не меняется" }),
+          fld("description", "Описание", { placeholder: "пусто — не меняется" }),
+        ] },
       { id: "routerdel", ru: "🗑 Удалить HTTP-роутер", op: "routerdel", view: "lines", danger: true, confirmArg: "confirm", target: target("Роутер (имя или id)", "router") },
+      { id: "backupd", ru: "✎ Правка группы бэкендов: порт целей и проверки", op: "backupd", view: "lines", target: target("Группа бэкендов (имя или id)", "group"),
+        fields: [
+          fld("port", "Порт целей (пусто — прежний)", { type: "number", hint: "Это порт, который слушают МАШИНЫ, а не балансировщик: если там слушают другой порт, вход начнёт отдавать 502." }),
+          fld("healthPath", "Путь проверки здоровья (http)", { placeholder: "пусто — прежняя" }),
+          fld("healthService", "Служба проверки (grpc)", { placeholder: "для gRPC-группы" }),
+          fld("noHealthCheck", "Убрать проверки здоровья", { type: "check", hint: "Без проверок облако считает цель здоровой ВСЕГДА — упавшая машина останется в ротации." }),
+          fld("targetGroup", "Новая группа целей", { placeholder: "пусто — прежняя" }),
+          fld("backend", "Какой бэкенд правим", { placeholder: "пусто — все бэкенды группы" }),
+          fld("newName", "Новое имя группы", { placeholder: "пусто — имя не меняется" }),
+          fld("description", "Описание", { placeholder: "пусто — не меняется" }),
+        ] },
       { id: "lbnew", ru: "＋ Создать балансировщик (платно)", op: "lbnew", view: "lines", paid: true, confirmArg: "confirm",
         fields: [
           fld("name", "Имя балансировщика", { required: true, placeholder: "web-lb" }),

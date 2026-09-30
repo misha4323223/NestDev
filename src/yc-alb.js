@@ -37,10 +37,12 @@
      DELETE /targetGroups/{id}
      GET    /httpRouters?folderId=…                     роутеры
      POST   /httpRouters                                создание
+     PATCH  /httpRouters/{id}                           правка (имя, описание, виртуальные хосты и маршруты)
      DELETE /httpRouters/{id}
      GET    /backendGroups?folderId=…                   группы бэкендов (список)
      GET    /backendGroups/{id}                         группа бэкендов (за ней — её группы целей)
      POST   /backendGroups                              создание (вид, порт целей и проверки)
+     PATCH  /backendGroups/{id}                         правка (имя, описание, бэкенды)
      DELETE /backendGroups/{id}                         удаление (занятую облако отклонит)
      GET    /loadBalancers/{id}/targetStates/{bg}/{tg}  здоровье целей (по зонам)
 
@@ -86,6 +88,19 @@
        список { name, serverNames[], handler } со СВОИМ сертификатом у каждого
        (у TLS-обработчика максимум ОДИН сертификат). Все обработчики одного
        слушателя обязаны быть ОДНОГО типа (HTTP или поток): смешивать нельзя.
+     • У РОУТЕРА И ГРУППЫ БЭКЕНДОВ ВЛОЖЕННЫЕ СПИСКИ ТОЖЕ ЗАМЕНЯЮТСЯ ЦЕЛИКОМ:
+       virtualHosts[] (вместе с routes[]) у роутера и backends[] у группы приходят
+       в PATCH как НОВЫЙ список, а не как добавка. Поэтому правка пути, хоста,
+       порта целей или проверки здоровья идёт по схеме «прочитал — изменил —
+       записал»: облако отдаёт текущий список, модуль меняет в нём ОДНО место и
+       возвращает весь список обратно с маской (для роутера — virtual_hosts, для
+       группы — имя её вида: http/stream/grpc). Отдельного «поменять порт» у
+       облака нет вовсе. Служебные поля (id, status) обратно НЕ уходят: сервис
+       отвечает на них отказом — тот же урок, что у правил групп безопасности.
+     • ПЕРЕИМЕНОВАТЬ НЕЛЬЗЯ ТОЛЬКО СЛУШАТЕЛЯ: у :updateListener нет поля
+       «новое имя». У роутера, группы бэкендов и группы целей поле name в PATCH
+       есть, но имя обязано быть УНИКАЛЬНЫМ в каталоге, поэтому занятое имя
+       отбивается ДО сети.
      • РОУТЕР БЕЗ ГРУППЫ БЭКЕНДОВ НЕ ИМЕЕТ СМЫСЛА: маршрут ведёт в
        backendGroupId. Модуль проверяет группу бэкендов ДО запроса — иначе
        человек получил бы роутер, который ничего не отдаёт.
@@ -174,6 +189,36 @@ const LB_FIELD_RU = {
 
 // Поле вида в listenerSpec и в маске правки: у слушателя вид ровно один.
 const KIND_FIELD = { http: "http", https: "tls", stream: "stream" };
+
+// Поля роутера и группы бэкендов, которые правят updateHttpRouter и
+// updateBackendGroup, — словами для ответа.
+const ROUTER_FIELD_RU = {
+  name: "имя",
+  description: "описание",
+  virtual_hosts: "виртуальные хосты и маршруты",
+};
+const GROUP_FIELD_RU = {
+  name: "имя",
+  description: "описание",
+  http: "бэкенды (HTTP)",
+  stream: "бэкенды (поток TCP)",
+  grpc: "бэкенды (gRPC)",
+};
+
+// Обратная запись списка: облако отдаёт служебные поля (id, status), а на запрос
+// с ними отвечает отказом — тот же урок, что у правил групп безопасности VPC
+// (yc-vpc.js). Чистим их на ЛЮБОЙ глубине и НЕ трогаем поля, которых не знаем:
+// список возвращается в том виде, как его отдало облако.
+function writableDeep(v) {
+  if (Array.isArray(v)) return v.map((x) => writableDeep(x));
+  if (!v || typeof v !== "object") return v;
+  const out = {};
+  Object.keys(v).forEach((k) => {
+    if (k === "id" || k === "status") return;
+    out[k] = writableDeep(v[k]);
+  });
+  return out;
+}
 
 // Имя домена для SNI: только строчные латинские буквы, цифры, дефис и точка,
 // звёздочка — только в начале (*.example.com).
@@ -1910,6 +1955,389 @@ function createYcAlb(deps) {
     };
   }
 
+  // ── Правка роутера и группы бэкендов ──────────────────────────────────────
+  // У обоих вложенные списки ЗАМЕНЯЮТСЯ ЦЕЛИКОМ: virtualHosts[] (вместе с
+  // routes[]) у роутера и backends[] у группы. Отдельного «поменять порт» или
+  // «поменять путь» у облака нет вовсе, поэтому правка идёт по схеме «прочитал —
+  // изменил — записал»: облако отдаёт текущий список, модуль меняет в нём ОДНО
+  // место и возвращает ВЕСЬ список обратно с маской (для роутера virtual_hosts,
+  // для группы — имя её вида). Иначе правка одного порта стёрла бы соседние
+  // бэкенды и маршруты. Служебные поля (id, status) обратно не уходят: на них
+  // сервис отвечает отказом — тот же урок, что у правил групп безопасности.
+  async function updateHttpRouter(oauthToken, opts) {
+    const o = opts || {};
+    const folderId = checkFolder(o.folderId);
+    const ref = one(o.router || o.id || o.name);
+    const found = await findHttpRouter(oauthToken, folderId, ref);
+    if (!found) {
+      const list = await httpRouters(oauthToken, folderId);
+      throw new Error(
+        "Не нашёл HTTP-роутер «" + ref + "»." +
+          (list.length ? " В каталоге: " + list.map((r) => r.name).join(", ") + "." : " Роутеров нет — создай: действие routernew.")
+      );
+    }
+    const raw = await alb(oauthToken, "GET", ALB_BASE + "/httpRouters/" + encodeURIComponent(found.id), undefined, 25000);
+    const hosts = (raw && raw.virtualHosts) || [];
+
+    const newName = one(o.newName || o.rename);
+    if (newName) checkName(newName, "HTTP-роутера");
+    const descriptionGiven = o.description != null && one(o.description) !== "";
+    const vhostRef = one(o.vhost || o.virtualHost);
+    const hostGiven = o.host != null ? one(o.host) : null;
+    const routeRef = one(o.routeName || o.route);
+    const pathPrefixGiven = o.pathPrefix != null || o.prefix != null;
+    const pathPrefix = one(o.pathPrefix || o.prefix);
+    const pathExact = one(o.pathExact);
+    const bgRef = one(o.backendGroup || o.backendGroupId);
+    const routeEdit = vhostRef !== "" || hostGiven != null || routeRef !== "" || pathPrefixGiven || pathExact !== "" || bgRef !== "";
+
+    if (!newName && !descriptionGiven && !routeEdit) {
+      throw new Error(
+        "Нечего менять: назови newName (имя роутера), description или правку маршрута — pathPrefix/pathExact (путь), backendGroup (куда ведёт), host (домен виртуального хоста)."
+      );
+    }
+
+    const warnings = [];
+    const what = [];
+    let vhost = null;
+    let route = null;
+    if (routeEdit) {
+      if (!hosts.length) {
+        throw new Error(
+          "У роутера «" + found.name + "» нет ни одного виртуального хоста: маршрутов тоже нет, и править нечего. Сначала создай роутер с маршрутом (routernew) — облако не даёт роутеру без хостов."
+        );
+      }
+      if (vhostRef) {
+        vhost = hosts.find((h) => one(h && h.name) === vhostRef) || null;
+        if (!vhost) {
+          throw new Error(
+            "У роутера «" + found.name + "» нет виртуального хоста «" + vhostRef + "». Что есть: " + hosts.map((h) => one(h && h.name)).filter(Boolean).join(", ") + "."
+          );
+        }
+      } else if (hosts.length === 1) {
+        vhost = hosts[0];
+      } else {
+        throw new Error(
+          "У роутера «" + found.name + "» несколько виртуальных хостов: назови vhost (имя хоста-виртуального сервера), чтобы было понятно, чей маршрут правим. Что есть: " +
+            hosts.map((h) => one(h && h.name) + (h && h.authority && h.authority.length ? " (" + h.authority.join(", ") + ")" : "")).join(", ") + "."
+        );
+      }
+
+      const routes = (vhost && vhost.routes) || [];
+      if (routeRef) {
+        route = routes.find((rt) => one(rt && rt.name) === routeRef) || null;
+        if (!route) {
+          throw new Error(
+            "В хосте «" + one(vhost && vhost.name) + "» роутера «" + found.name + "» нет маршрута «" + routeRef + "»." +
+              (routes.length ? " Что есть: " + routes.map((rt) => one(rt && rt.name)).join(", ") + "." : " Маршрутов нет вовсе.") +
+              " Новый маршрут здесь не создаётся: облако принимает список хостов только заменой — создай роутер с нужным маршрутом (routernew)."
+          );
+        }
+      } else if (routes.length === 1) {
+        route = routes[0];
+      } else {
+        throw new Error(
+          "В хосте «" + one(vhost && vhost.name) + "» " + routes.length + " маршрута(ов): назови route (имя маршрута)." +
+            (routes.length ? " Что есть: " + routes.map((rt) => one(rt && rt.name)).join(", ") + "." : "")
+        );
+      }
+
+      // Маршрут правим только HTTP: gRPC-маршрут устроен иначе (fqmn вместо пути).
+      if (!route.http) {
+        throw new Error(
+          "Маршрут «" + one(route.name) + "» — " + (route.grpc ? "gRPC" : "без вида (http/grpc не назван)") + ": путь и точное совпадение у него задаются полем fqmn, а не path. Править такой маршрут здесь нельзя."
+        );
+      }
+      route.http.match = route.http.match || {};
+      if (pathExact) {
+        if (route.http.match.path && route.http.match.path.exactMatch !== pathExact) {
+          route.http.match.path = { exactMatch: pathExact };
+          what.push("точный путь " + pathExact);
+        }
+      } else if (pathPrefixGiven) {
+        if (!pathPrefix) throw new Error("Пустой pathPrefix: путь не может быть пустым — общий путь это «/».");
+        if (pathPrefix.charAt(0) !== "/") throw new Error("Путь «" + pathPrefix + "» облако не примет: он должен начинаться со слэша, например /api.");
+        if (!route.http.match.path || route.http.match.path.prefixMatch !== pathPrefix) {
+          route.http.match.path = { prefixMatch: pathPrefix };
+          what.push("путь " + pathPrefix + "*");
+        }
+      }
+      if (bgRef) {
+        const bg = await findBackendGroup(oauthToken, folderId, bgRef);
+        if (!bg) {
+          const list = await backendGroups(oauthToken, folderId);
+          throw new Error(
+            "Не нашёл группу бэкендов «" + bgRef + "» для маршрута." +
+              (list.length ? " В каталоге: " + list.map((b) => b.name).join(", ") + "." : " Групп бэкендов нет — создай: действие backnew.")
+          );
+        }
+        if (bg.kind && bg.kind !== "http") {
+          throw new Error(
+            "Группа бэкендов «" + bg.name + "» — " + bg.kindHuman + ", а HTTP-маршрут ведёт только в HTTP-группу: облако такой роутер не примет."
+          );
+        }
+        route.http.route = route.http.route || {};
+        if (route.http.route.backendGroupId !== bg.id) {
+          route.http.route.backendGroupId = bg.id;
+          what.push("группа бэкендов «" + bg.name + "»");
+        }
+      }
+      if (hostGiven != null) {
+        const authority = hostGiven ? hostGiven.split(",").map((x) => one(x)).filter(Boolean) : [];
+        const nowAuthority = (vhost.authority || []).join(",");
+        if (authority.join(",") !== nowAuthority) {
+          vhost.authority = authority;
+          what.push(authority.length ? "домен " + authority.join(", ") : "домен убран (хост отвечает на любой)");
+        }
+      }
+    }
+
+    const mask = [];
+    if (newName && newName !== found.name) mask.push("name");
+    if (descriptionGiven) mask.push("description");
+    if (routeEdit && what.length) mask.push("virtual_hosts");
+    if (!mask.length) {
+      return { changed: false, router: await httpRouters(oauthToken, folderId).then((rs) => rs.find((r) => r.id === found.id) || found), fields: [], message: "У роутера «" + found.name + "» всё уже так, как просят: менять нечего.", warnings: [] };
+    }
+
+    const body = { updateMask: mask.join(",") };
+    // Список хостов уходит ТОЛЬКО когда его правят: лишнее поле в теле — это
+    // повод перечитать ответ облака дважды и поверить не в то.
+    if (mask.indexOf("virtual_hosts") >= 0) body.virtualHosts = writableDeep(hosts);
+    if (mask.indexOf("name") >= 0) body.name = newName;
+    if (mask.indexOf("description") >= 0) body.description = one(o.description);
+    const j = await alb(oauthToken, "PATCH", ALB_BASE + "/httpRouters/" + encodeURIComponent(found.id), body, 40000);
+    await run(oauthToken, j, 240000);
+
+    // Правка обязана подтвердиться ПЕРЕЧИТЫВАНИЕМ: облако может ответить
+    // «сделано» и ничего не сделать (права, отброшенное значение).
+    const afterRaw = await alb(oauthToken, "GET", ALB_BASE + "/httpRouters/" + encodeURIComponent(found.id), undefined, 25000).catch(() => null);
+    const bad = [];
+    if (afterRaw && mask.indexOf("name") >= 0 && one(afterRaw.name) !== newName) bad.push("имя (" + (one(afterRaw.name) || "не названо") + ")");
+    if (afterRaw && routeEdit && what.length) {
+      const hv = ((afterRaw.virtualHosts) || []).find((h) => one(h && h.name) === one(vhost && vhost.name)) || null;
+      const rr = hv ? ((hv.routes) || []).find((rt) => one(rt && rt.name) === one(route && route.name)) || null : null;
+      if (!rr) bad.push("маршрут «" + one(route && route.name) + "»");
+      else {
+        const p = (rr.http && rr.http.match && rr.http.match.path) || {};
+        if (pathExact && p.exactMatch !== pathExact) bad.push("точный путь");
+        if (pathPrefixGiven && !pathExact && p.prefixMatch !== pathPrefix) bad.push("путь");
+        if (bgRef && one(rr.http && rr.http.route && rr.http.route.backendGroupId) !== one(route.http && route.http.route && route.http.route.backendGroupId)) bad.push("группа бэкендов маршрута");
+        if (hostGiven != null && (hv.authority || []).join(",") !== (vhost.authority || []).join(",")) bad.push("домен хоста");
+      }
+    }
+    if (bad.length) {
+      throw new Error("Правка роутера «" + found.name + "» не применилась: " + bad.join(", ") + ". Нужна роль alb.editor (или admin) — проверь права и повтори.");
+    }
+
+    if (mask.indexOf("virtual_hosts") >= 0) {
+      warnings.push(
+        "Список виртуальных хостов уходит ЦЕЛИКОМ: облако принимает его только заменой, поэтому остальные маршруты и хосты вернулись в том виде, как их отдало облако."
+      );
+      warnings.push(
+        "Порядок маршрутов важен: облако берёт ПЕРВОЕ совпавшее правило, поэтому общий путь (/) должен стоять НИЖЕ частных."
+      );
+      warnings.push(
+        "Роутер не пересоздать, пока на него смотрит слушатель: правку увидят СРАЗУ все слушатели, которые на него смотрят (HTTP и HTTPS)."
+      );
+    }
+    if (mask.indexOf("name") >= 0) {
+      warnings.push("Имя роутера обязано быть уникальным в каталоге: «" + newName + "» занято — облако откажет. Слушатели ссылаются на роутер ПО id, поэтому переименование вход не закроет.");
+    }
+    const after = afterRaw ? routerInfo(afterRaw) : (await httpRouters(oauthToken, folderId).catch(() => [])).find((r) => r.id === found.id) || found;
+    return {
+      changed: true,
+      router: after,
+      routerId: found.id,
+      fields: mask,
+      operationId: one(j && j.id),
+      message:
+        "HTTP-роутер «" + found.name + "» обновляется" +
+        (newName && newName !== found.name ? ", новое имя «" + newName + "»" : "") +
+        (what.length ? ": " + what.join(", ") : " (настройки применены заново)") + ".",
+      warnings: warnings,
+    };
+  }
+
+  // ── Правка группы бэкендов ────────────────────────────────────────────────
+  // Именно здесь живут ПОРТ, который слушают ЦЕЛИ, и ПРОВЕРКИ ЗДОРОВЬЯ, по
+  // которым облако решает, пускать ли машину в ротацию. Отдельного метода
+  // «поменять порт» у облака нет: список бэкендов меняется ТОЛЬКО целиком, а
+  // значит правка — это «прочитал — изменил — записал». Маска при этом называет
+  // имя вида (http/stream/grpc), а не поле внутри бэкенда.
+  async function updateBackendGroup(oauthToken, opts) {
+    const o = opts || {};
+    const folderId = checkFolder(o.folderId);
+    const ref = one(o.group || o.backendGroup || o.id || o.name);
+    const found = await findBackendGroup(oauthToken, folderId, ref);
+    if (!found) {
+      const list = await backendGroups(oauthToken, folderId);
+      throw new Error(
+        "Не нашёл группу бэкендов «" + ref + "»." +
+          (list.length ? " В каталоге: " + list.map((b) => b.name).join(", ") + "." : " Групп бэкендов нет — создай: действие backnew.")
+      );
+    }
+    const bg = found.kind ? found : await backendGroup(oauthToken, found.id);
+    const kind = bg.kind;
+    if (!kind) {
+      throw new Error("У группы бэкендов «" + bg.name + "» не назван вид (http/stream/grpc): без него непонятно, какой список бэкендов править.");
+    }
+    const raw = await alb(oauthToken, "GET", ALB_BASE + "/backendGroups/" + encodeURIComponent(bg.id), undefined, 25000);
+    const block = writableDeep((raw && raw[kind]) || {});
+    const backends = block.backends || [];
+
+    const newName = one(o.newName || o.rename);
+    if (newName) checkName(newName, "группы бэкендов");
+    const descriptionGiven = o.description != null && one(o.description) !== "";
+    const backendRef = one(o.backend || o.backendName);
+    const portGiven = o.port != null && String(o.port).trim() !== "";
+    const port = portGiven ? checkPort(o.port) : null;
+    const healthPath = one(o.healthPath || o.healthCheckPath);
+    const healthService = one(o.healthService);
+    const dropHealth = o.noHealthCheck === true || o.dropHealthCheck === true;
+    const tgRef = one(o.targetGroup || o.targetGroupId);
+
+    if (healthPath && healthService) throw new Error("Назови что-то ОДНО: healthPath — проверка HTTP, healthService — проверка gRPC.");
+    if (healthPath && kind !== "http") throw new Error("healthPath — это проверка HTTP (GET по пути), а группа «" + bg.name + "» вида " + bg.kindHuman + ". Для gRPC-группы проверка задаётся healthService.");
+    if (healthService && kind !== "grpc") throw new Error("healthService — это проверка gRPC, а группа «" + bg.name + "» вида " + bg.kindHuman + ". Для HTTP-группы проверка задаётся healthPath.");
+    if ((healthPath || healthService) && dropHealth) throw new Error("Нельзя одновременно задать проверку здоровья и убрать её: или healthPath/healthService, или noHealthCheck.");
+    if (!newName && !descriptionGiven && !portGiven && !healthPath && !healthService && !dropHealth && !tgRef) {
+      throw new Error(
+        "Нечего менять: назови newName (имя группы), description, port (порт, который слушают ЦЕЛИ), healthPath/healthService (проверка здоровья), targetGroup или noHealthCheck (убрать проверки)."
+      );
+    }
+
+    const needBackends = portGiven || healthPath || healthService || dropHealth || !!tgRef;
+    if (needBackends && !backends.length) {
+      throw new Error(
+        "У группы бэкендов «" + bg.name + "» нет ни одного бэкенда: порт и проверки живут В бэкенде, а не в группе. Такую группу правят созданием заново (backnew)."
+      );
+    }
+
+    let tg = null;
+    if (tgRef) {
+      tg = await findTargetGroup(oauthToken, folderId, tgRef);
+      if (!tg) {
+        const list = await targetGroups(oauthToken, folderId);
+        throw new Error(
+          "Не нашёл группу целей «" + tgRef + "»." +
+            (list.length ? " В каталоге: " + list.map((g) => g.name).join(", ") + "." : " Групп целей нет — создай: действие targetnew.")
+        );
+      }
+    }
+
+    const targets = backendRef ? backends.filter((b) => one(b && b.name) === backendRef) : backends;
+    if (backendRef && !targets.length) {
+      throw new Error(
+        "В группе бэкендов «" + bg.name + "» нет бэкенда «" + backendRef + "». Что есть: " + backends.map((b) => one(b && b.name)).filter(Boolean).join(", ") + "."
+      );
+    }
+
+    const what = [];
+    targets.forEach((b) => {
+      if (portGiven && one(b.port) !== String(port)) {
+        b.port = String(port);
+        what.push((backendRef ? "бэкенд «" + one(b.name) + "»: " : "") + "порт " + port);
+      }
+      if (tgRef) {
+        const ids = (b.targetGroups && b.targetGroups.targetGroupIds) || [];
+        if (ids.length !== 1 || one(ids[0]) !== tg.id) {
+          b.targetGroups = { targetGroupIds: [tg.id] };
+          what.push("группа целей «" + tg.name + "»");
+        }
+      }
+      if (dropHealth && (b.healthchecks || []).length) {
+        delete b.healthchecks;
+        what.push("проверки здоровья убраны");
+      }
+      if (healthPath) {
+        const checks = [{ timeout: HEALTH_TIMEOUT, interval: HEALTH_INTERVAL, healthyThreshold: HEALTH_THRESHOLD, unhealthyThreshold: HEALTH_THRESHOLD, http: { path: healthPath } }];
+        if (JSON.stringify(b.healthchecks || []) !== JSON.stringify(checks)) {
+          b.healthchecks = checks;
+          what.push("проверка здоровья HTTP " + healthPath);
+        }
+      }
+      if (healthService) {
+        const checks = [{ timeout: HEALTH_TIMEOUT, interval: HEALTH_INTERVAL, healthyThreshold: HEALTH_THRESHOLD, unhealthyThreshold: HEALTH_THRESHOLD, grpc: { serviceName: healthService } }];
+        if (JSON.stringify(b.healthchecks || []) !== JSON.stringify(checks)) {
+          b.healthchecks = checks;
+          what.push("проверка здоровья gRPC " + healthService);
+        }
+      }
+    });
+
+    const mask = [];
+    if (newName && newName !== bg.name) mask.push("name");
+    if (descriptionGiven) mask.push("description");
+    if (what.length) mask.push(kind);
+    if (!mask.length) {
+      return { changed: false, group: bg, fields: [], message: "У группы бэкендов «" + bg.name + "» всё уже так, как просят: менять нечего.", warnings: [] };
+    }
+    block.backends = backends;
+    const body = { updateMask: mask.join(",") };
+    if (mask.indexOf("name") >= 0) body.name = newName;
+    if (mask.indexOf("description") >= 0) body.description = one(o.description);
+    if (mask.indexOf(kind) >= 0) body[kind] = block;
+    const j = await alb(oauthToken, "PATCH", ALB_BASE + "/backendGroups/" + encodeURIComponent(bg.id), body, 40000);
+    await run(oauthToken, j, 240000);
+
+    // Подтверждаем ПЕРЕЧИТЫВАНИЕМ: «облако промолчало» — это ошибка со словами
+    // про роль alb.editor, а не успех.
+    const after = await backendGroup(oauthToken, bg.id).catch(() => null);
+    const bad = [];
+    if (after && mask.indexOf("name") >= 0 && after.name !== newName) bad.push("имя (" + (after.name || "не названо") + ")");
+    if (after && what.length) {
+      if (after.backendCount !== backends.length) bad.push("состав бэкендов (" + after.backendCount + ")");
+      const byName = {};
+      after.backends.forEach((b) => { byName[b.name] = b; });
+      targets.forEach((b) => {
+        const got = byName[one(b.name)];
+        if (!got) { bad.push("бэкенд «" + one(b.name) + "»"); return; }
+        if (portGiven && one(got.port) !== String(port)) bad.push("порт бэкенда «" + one(b.name) + "» (" + (got.port || "не назван") + ")");
+        if (tgRef && got.targetGroupIds.join(",") !== tg.id) bad.push("группа целей бэкенда «" + one(b.name) + "»");
+        const wantChecks = healthPath || healthService ? 1 : 0;
+        if ((healthPath || healthService || dropHealth) && got.healthcheckCount !== wantChecks) bad.push("проверки здоровья бэкенда «" + one(b.name) + "» (" + got.healthcheckCount + ")");
+      });
+    }
+    if (bad.length) {
+      throw new Error("Правка группы бэкендов «" + bg.name + "» не применилась: " + bad.join(", ") + ". Нужна роль alb.editor (или admin) — проверь права и повтори.");
+    }
+
+    const warnings = [];
+    if (mask.indexOf(kind) >= 0) {
+      warnings.push(
+        "Список бэкендов уходит ЦЕЛИКОМ: облако принимает его только заменой, поэтому остальные бэкенды и настройки сессий вернулись в том виде, как их отдало облако."
+      );
+    }
+    if (portGiven) {
+      warnings.push(
+        "Порт " + port + " — это порт, который слушают ЦЕЛИ (машины), а не балансировщик: если там слушают другой порт, вход начнёт отдавать 502. Порт слушателя при этом не меняется."
+      );
+    }
+    if (dropHealth) {
+      warnings.push("Проверок здоровья больше нет: облако будет считать цель здоровой ВСЕГДА — упавшая машина останется в ротации.");
+    }
+    if (tgRef) {
+      warnings.push("Новая группа целей должна содержать те же машины и подсети, иначе трафик уйдёт в пустоту: состав целей смотрят действием targets.");
+    }
+    if (mask.indexOf("name") >= 0) {
+      warnings.push("Имя группы бэкендов обязано быть уникальным в каталоге, а маршруты и слушатели ссылаются на неё ПО id — переименование вход не закроет.");
+    }
+
+    return {
+      changed: true,
+      group: after || bg,
+      groupId: bg.id,
+      fields: mask,
+      operationId: one(j && j.id),
+      message:
+        "Группа бэкендов «" + bg.name + "» обновляется" +
+        (newName && newName !== bg.name ? ", новое имя «" + newName + "»" : "") +
+        (what.length ? ": " + what.join(", ") : " (настройки применены заново)") + ".",
+      warnings: warnings,
+    };
+  }
+
   return {
     loadBalancers: loadBalancers,
     loadBalancer: loadBalancer,
@@ -1931,6 +2359,8 @@ function createYcAlb(deps) {
     removeListener: removeListener,
     updateListener: updateListener,
     updateLoadBalancer: updateLoadBalancer,
+    updateHttpRouter: updateHttpRouter,
+    updateBackendGroup: updateBackendGroup,
     certificates: certificates,
     findCertificate: findCertificate,
     createTargetGroup: createTargetGroup,
@@ -1979,4 +2409,7 @@ module.exports = {
   sniNameFor: sniNameFor,
   parseSniHandlers: parseSniHandlers,
   LB_FIELD_RU: LB_FIELD_RU,
+  ROUTER_FIELD_RU: ROUTER_FIELD_RU,
+  GROUP_FIELD_RU: GROUP_FIELD_RU,
+  writableDeep: writableDeep,
 };
