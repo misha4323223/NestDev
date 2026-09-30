@@ -28,6 +28,13 @@ const KNOWN_ENDPOINTS = {
   // их на полку дашборда; без этой строки первый же опрос отвечал «Эндпоинт
   // сервиса «Compute Cloud» не найден» — облако при этом было ни при чём).
   "compute": "https://compute.api.cloud.yandex.net",
+  // Managed-базы (PostgreSQL, MySQL, ClickHouse) — три РАЗНЫХ id одного хоста:
+  // в каталоге эндпоинтов они называются managed-postgresql, managed-mysql и
+  // managed-clickhouse, но все три смотрят на mdb.api.cloud.yandex.net. Без этих
+  // строк первый запрос ждал бы каталог (8 с) на каждую из трёх плиток.
+  "managed-postgresql": "https://mdb.api.cloud.yandex.net",
+  "managed-mysql": "https://mdb.api.cloud.yandex.net",
+  "managed-clickhouse": "https://mdb.api.cloud.yandex.net",
   "resource-manager": "https://resource-manager.api.cloud.yandex.net",
   "operation": "https://operation.api.cloud.yandex.net",
   "serverless-containers": "https://serverless-containers.api.cloud.yandex.net",
@@ -63,6 +70,19 @@ const KNOWN_ENDPOINTS = {
   "vpc": "https://vpc.api.cloud.yandex.net",
   // Postbox — SES-совместимый API (см. auth в SERVICES), не обычный REST каталога.
   "postbox": "https://postbox.cloud.yandex.net",
+  // Яндекс AI (речь, зрение и перевод) — четыре РАЗНЫХ хоста, хотя каталог
+  // эндпоинтов иногда склеивает их в один id. Без строк здесь первый же запрос
+  // ждал бы каталог (8 секунд) и на медленной сети отвечал таймаутом.
+  "translate": "https://translate.api.cloud.yandex.net",
+  "ocr": "https://ocr.api.cloud.yandex.net",
+  "tts": "https://tts.api.cloud.yandex.net",
+  "stt": "https://stt.api.cloud.yandex.net",
+  // Foundation Models (YandexGPT и генерация картинок) — тот же хост, что у
+  // YandexART в renderer/image-tools.js: он и есть AI Studio.
+  "ai": "https://llm.api.cloud.yandex.net",
+  // Monitoring: данные метрик и их метаданные. Отдельный хост от остальных
+  // сервисов каталога, и без строки здесь первый же запрос ждал бы каталог 8 с.
+  "monitoring": "https://monitoring.api.cloud.yandex.net",
 };
 
 let endpointsCache = null; // { serviceId: address }
@@ -341,6 +361,12 @@ const SERVICES = [
   { key: "iam", ru: "Сервисные аккаунты", title: "Identity and Access Management", icon: "🗝️", svc: "iam", listPath: "/iam/v1/serviceAccounts", listKey: "serviceAccounts" },
   { key: "lockbox", ru: "Секреты", title: "Lockbox", icon: "🔒", svc: "lockbox", listPath: "/lockbox/v1/secrets", listKey: "secrets" },
   { key: "ydb", ru: "База YDB", title: "Managed Service for YDB", icon: "🗄️", svc: "ydb", listPath: "/ydb/v1/databases", listKey: "databases" },
+  // Managed-базы — три сервиса одного хоста (mdb.api.cloud.yandex.net). Их
+  // «список» — сами кластеры, поэтому обычный запрос каталога (folderId +
+  // pageSize) подходит без своего правила: это настоящие объекты каталога.
+  { key: "postgresql", ru: "База PostgreSQL", title: "Managed Service for PostgreSQL", icon: "🐘", svc: "managed-postgresql", listPath: "/managed-postgresql/v1/clusters", listKey: "clusters" },
+  { key: "mysql", ru: "База MySQL", title: "Managed Service for MySQL", icon: "🐬", svc: "managed-mysql", listPath: "/managed-mysql/v1/clusters", listKey: "clusters" },
+  { key: "clickhouse", ru: "База ClickHouse", title: "Managed Service for ClickHouse", icon: "🏛️", svc: "managed-clickhouse", listPath: "/managed-clickhouse/v1/clusters", listKey: "clusters" },
   { key: "storage", ru: "Объектное хранилище", title: "Object Storage", icon: "🪣", svc: "storage-api", listPath: "/storage/v1/buckets", listKey: "buckets" },
   { key: "serverlessContainers", ru: "Serverless-контейнеры", title: "Serverless Containers", icon: "☁️", svc: "serverless-containers", listPath: "/containers/v1/containers", listKey: "containers" },
   { key: "cloudFunctions", ru: "Функции", title: "Cloud Functions", icon: "⚡", svc: "serverless-functions", listPath: "/functions/v1/functions", listKey: "functions" },
@@ -349,6 +375,10 @@ const SERVICES = [
   // агента: создание, питание, снимки и метрики — а в окне их не было видно
   // даже списком, то есть человек не знал, что у него вообще есть машины.
   { key: "compute", ru: "Виртуальные машины", title: "Compute Cloud", icon: "🖥️", svc: "compute", listPath: "/compute/v1/instances", listKey: "instances" },
+  // Monitoring — не ресурс, а измеритель: «список» у него — сами метрики
+  // каталога (метаданные), поэтому запрос идёт по своим правилам (query
+  // "monitoring": только folderId, без pageSize, которого сервис не знает).
+  { key: "monitoring", ru: "Метрики", title: "Monitoring", icon: "📈", svc: "monitoring", query: "monitoring", listPath: "/monitoring/v2/metrics", listKey: "metrics" },
 ];
 
 function serviceByKey(key) {
@@ -366,6 +396,11 @@ function serviceHeaders(svcDef, token) {
 // Строка запроса. SES живёт по своим правилам (PageSize вместо folderId/pageSize).
 function serviceQuery(svcDef, folderId) {
   if (svcDef && svcDef.query === "ses") return "?PageSize=100";
+  // Monitoring принимает только folderId: pageSize ему неизвестен, и лишний
+  // параметр превратил бы живую плитку полки в отказ сервиса.
+  if (svcDef && svcDef.query === "monitoring") {
+    return folderId ? "?folderId=" + encodeURIComponent(folderId) : "";
+  }
   const q = folderId ? "folderId=" + encodeURIComponent(folderId) + "&pageSize=1000" : "pageSize=1000";
   return "?" + q;
 }
@@ -1093,6 +1128,79 @@ function normalizeRecordSet(v) {
   };
 }
 
+// ── Помощники DNS: одна правда для агента, окна и карточки зоны ─────────────
+// Зона ищется по тому, как её назвали: id, имя с точкой или без. DNS-имена не
+// различают регистр, поэтому «example.com» и «example.com.» — одна зона.
+function findDnsZone(zones, ref) {
+  const list = Array.isArray(zones) ? zones : [];
+  const raw = String(ref == null ? "" : ref).trim();
+  if (!raw) return null;
+  const byId = list.find((z) => z && String(z.id || "") === raw);
+  if (byId) return byId;
+  const low = raw.replace(/\.$/, "").toLowerCase();
+  return list.find((z) => z && String(z.name || "").replace(/\.$/, "").toLowerCase() === low) || null;
+}
+
+// Строка зоны и строка записи — один формат для агента и для окна: у одной
+// правды не бывает двух написаний, иначе подсказки интерфейса и ответы модели
+// разъедутся на первой же правке.
+function dnsZoneLine(zone) {
+  const z = zone || {};
+  return String(z.name || z.id || "зона") + " — id " + String(z.id || "?");
+}
+function dnsRecordLine(rec) {
+  const r = normalizeRecordSet(rec);
+  return r.type + " " + r.name + " (TTL " + r.ttl + ") → " + (r.data.length ? r.data.join(", ") : "—");
+}
+
+const DNS_TYPES = ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "CAA"];
+
+function isIpv4(v) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(v).trim());
+  return !!m && m.slice(1).every((x) => Number(x) <= 255);
+}
+function isIpv6(v) {
+  const s = String(v).trim();
+  if (s.indexOf(":") < 0) return false;
+  if (!/^[0-9a-fA-F:.]+$/.test(s)) return false;
+  if (s.split("::").length > 2) return false;
+  return s.split(":").filter(Boolean).every((x) => x.length <= 4);
+}
+
+// Проверки записи ДО запроса: problems — то, что облако не примет или что
+// заведомо не сработает; warnings — о чём честно предупредить, но что человек
+// вправе сделать (облако рассудит). Правила не выдуманы: CNAME обязан быть один
+// и не стоит на вершине зоны (там NS и SOA), у MX и SRV первым идёт приоритет,
+// A/AAAA принимают только адрес своего вида, зона отвечает только за свои имена.
+function checkDnsRecord(rec, zoneName) {
+  const r = normalizeRecordSet(rec);
+  const zone = normalizeRecordSet({ name: zoneName }).name;
+  const problems = [];
+  const warnings = [];
+  if (!r.name || r.name === ".") problems.push("У записи нужно имя: вершина зоны — само имя зоны (example.com.), поддомен — www.example.com.");
+  if (!r.type) problems.push("У записи нужен тип: A, AAAA, CNAME, TXT, MX, NS, SRV…");
+  if (!r.data.length) problems.push("У записи нет значений: для A это IP, для CNAME — домен, для TXT — текст.");
+  if (r.type === "CNAME") {
+    if (r.data.length > 1) problems.push("У CNAME может быть только одно значение — имя, куда ведёт запись.");
+    if (zone && r.name === zone) problems.push("CNAME на вершине зоны недопустим: там живут NS- и SOA-записи. Для вершины берут A/AAAA (или ALIAS у регистратора).");
+  }
+  if ((r.type === "A" || r.type === "AAAA") && r.data.length) {
+    for (const v of r.data) {
+      if (r.type === "A" && !isIpv4(v)) problems.push("Значение " + v + " не похоже на адрес IPv4: у A-записи это четыре числа, например 203.0.113.10.");
+      if (r.type === "AAAA" && !isIpv6(v)) problems.push("Значение " + v + " не похоже на адрес IPv6, например 2001:db8::1.");
+    }
+  }
+  if ((r.type === "MX" || r.type === "SRV") && r.data.length) {
+    for (const v of r.data) {
+      if (!/^\d+\s+\S/.test(String(v).trim())) problems.push("У " + r.type + " значение начинается с приоритета: 10 mx.example.com. (у SRV — приоритет, вес, порт и цель).");
+    }
+  }
+  if (r.type && DNS_TYPES.indexOf(r.type) === -1) warnings.push("Тип " + r.type + " не из привычного набора (" + DNS_TYPES.join(", ") + ") — облако может его не принять.");
+  if (zone && r.name && r.name !== zone && r.name.slice(-zone.length) !== zone) warnings.push("Имя не оканчивается на имя зоны " + zone + ": зона отвечает только за свои имена, и такая запись, скорее всего, не сработает.");
+  if (r.type === "TXT") for (const v of r.data) if (String(v).length > 255) warnings.push("Значение TXT длиннее 255 знаков — облако разобьёт его на части, но не все клиенты это понимают.");
+  return { record: r, problems: problems, warnings: warnings };
+}
+
 async function listRecordSets(oauthToken, zoneId) {
   const id = String(zoneId || "").trim();
   if (!id) throw new Error("Не указан id DNS-зоны.");
@@ -1134,13 +1242,14 @@ async function updateRecordSets(oauthToken, zoneId, body) {
 
 // Поставить значения для пары «имя+тип»: есть — заменяем, нет — добавляем.
 async function upsertRecordSet(oauthToken, zoneId, rec) {
-  const want = normalizeRecordSet(rec);
-  if (!want.name || want.name === ".") throw new Error("У записи нужно имя: вершина зоны — само имя зоны (example.com.), поддомен — www.example.com.");
-  if (!want.type) throw new Error("У записи нужен тип: A, AAAA, CNAME, TXT, MX, NS, SRV…");
-  if (!want.data.length) throw new Error("У записи нет значений: для A это IP, для CNAME — домен, для TXT — текст.");
+  // Разбор и проверки — одним местом (checkDnsRecord): их же дёргает окно,
+  // чтобы показать подсказку ДО запроса, а не ответ облака после.
+  const check = checkDnsRecord(rec, "");
+  if (check.problems.length) throw new Error(check.problems.join(" "));
+  const want = check.record;
   const existing = (await listRecordSets(oauthToken, zoneId)).find((r) => r.name === want.name && r.type === want.type) || null;
   await updateRecordSets(oauthToken, zoneId, { deletions: existing ? [existing] : [], additions: [want] });
-  return { name: want.name, type: want.type, ttl: want.ttl, values: want.data.length, replaced: !!existing };
+  return { name: want.name, type: want.type, ttl: want.ttl, values: want.data.length, replaced: !!existing, warnings: check.warnings };
 }
 
 // Удалить ВЕСЬ набор значений пары «имя+тип» (строгий API требует точного
@@ -1671,6 +1780,11 @@ module.exports = {
   listContainerAccessBindings,
   setContainerPublicAccess,
   normalizeRecordSet,
+  findDnsZone,
+  dnsZoneLine,
+  dnsRecordLine,
+  checkDnsRecord,
+  DNS_TYPES,
   listRecordSets,
   updateRecordSets,
   upsertRecordSet,

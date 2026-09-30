@@ -63,9 +63,12 @@ const plain = (v) => JSON.parse(JSON.stringify(v));
 const yandex = require(path.join(ROOT, "src", "yandex-cloud.js"));
 const ycConsoleMain = require(path.join(ROOT, "src", "yc-console.js"));
 const { createCloudTools } = require(path.join(ROOT, "src", "agent-tools-cloud.js"));
+const { registerYcIpc } = require(path.join(ROOT, "src", "yc-ipc.js"));
 
+const ACTIONS_SRC = read("src", "renderer", "yc-actions.js");
 const IPC_SRC = read("src", "yc-ipc.js");
 const PRELOAD_SRC = read("src", "preload.js");
+const SMOKE_SRC = read("test", "smoke", "03-cloud.js");
 const CONSOLE_UI_SRC = read("src", "renderer", "yc-console.js");
 const CONSOLE_CSS = read("src", "renderer", "yc-console.css");
 const SCHEMAS_SRC = read("src", "renderer", "tool-schemas.js");
@@ -98,6 +101,10 @@ function startDnsStub() {
       };
       if (url.indexOf("/iam/v1/tokens") >= 0) {
         return json({ iamToken: "iam-test", expiresAt: new Date(Date.now() + 3600e3).toISOString() });
+      }
+      // Список зон каталога — его спрашивают и канал плитки (yc:dns), и агент.
+      if (url.split("?")[0] === "/dns/v1/zones") {
+        return json({ zones: [{ id: "dns-zone-1", name: "example.com.", createdAt: "2026-08-01T10:00:00Z" }] });
       }
       if (url.indexOf(":getRecordSets") >= 0) return json({ recordSets: plain(zone.recordSets) });
       if (url.indexOf(":updateRecordSets") >= 0) {
@@ -196,6 +203,41 @@ function buildTools(over, settingsOver) {
 (async () => {
   const stub = await startDnsStub();
   process.env.AI_AGENT_YC_BASE = stub.base;
+
+  // ── Канал «yc:dns» через НАСТОЯЩИЙ registerYcIpc: окно подменено, всё
+  // остальное — как в приложении (облако смотрит на стенд выше).
+  function settingsFor(over) {
+    return Object.assign(
+      { yandexOauthToken: "oauth-1", ycCloudId: "cloud-1", ycFolderId: "folder-1", ycFolderName: "prod" },
+      over || {}
+    );
+  }
+  function buildIpc(settings) {
+    const handlers = new Map();
+    registerYcIpc({
+      ipcMain: { handle: (ch, fn) => handlers.set(ch, fn) },
+      yandexCloud: yandex,
+      ycConsole: {}, ycCosts: {}, ycVpc: {}, ycCompute: {}, ycIam: {}, ycFunctions: {},
+      ycBilling: {}, ycCdn: {}, ycMonitoring: {}, ycAi: {}, ycMdb: {},
+      fs: fs, path: path, resolvePath: (p) => String(p), agentWorkDir: () => ROOT,
+      loadSettings: () => settings, saveSettings: () => {},
+      svc: {
+        YANDEX_OAUTH_URL: "https://oauth.yandex.ru/authorize",
+        ycConfig: () => ({
+          oauth: String(settings.yandexOauthToken || ""),
+          cloudId: settings.ycCloudId || "",
+          folderId: settings.ycFolderId || "",
+          folderName: settings.ycFolderName || "",
+          allowCreate: false, allowDelete: false, allowUpdate: false, allowPublic: false,
+        }),
+        ycRequireAuth: () => {},
+        readYcLogsText: async () => "",
+        ycCliStatus: () => ({}),
+        ycCliInstall: async () => ({}),
+      },
+    });
+    return { call: (args) => handlers.get("yc:dns")({}, args || {}) };
+  }
 
   console.log("\n[1] Запись приводится к тому виду, который ждёт API");
 
@@ -406,6 +448,116 @@ function buildTools(over, settingsOver) {
     assert.ok(/БЕЗ точки/.test(GUIDE_SRC) && /С точкой/.test(GUIDE_SRC), "в yc.md не сказано про точку в имени записи");
     assert.ok(/разрешения «создавать ресурсы»|«создавать ресурсы»/.test(GUIDE_SRC), "в yc.md не сказано про разрешения");
     assert.ok(/расходится от минуты до часов/.test(GUIDE_SRC), "в yc.md нет предупреждения про распространение DNS");
+  });
+
+  console.log("\n[3.1] Плитка действий: семейство dns, проверки записи и канал yc:dns");
+
+  await test("ycDns: проверки записи ловят кривой адрес и говорят, что стоит предупредить", async () => {
+    const apex = yandex.checkDnsRecord({ name: "example.com.", type: "CNAME", value: "host.example.net." }, "example.com.");
+    assert.ok(apex.problems.some((p) => /вершине зоны/.test(p)), "CNAME на вершине не отбит: " + JSON.stringify(apex.problems));
+    const multi = yandex.checkDnsRecord({ name: "www.example.com.", type: "CNAME", value: ["a.example.net.", "b.example.net."] }, "example.com.");
+    assert.ok(multi.problems.some((p) => /только одно значение/.test(p)), "CNAME с двумя значениями не отбит");
+    const badA = yandex.checkDnsRecord({ name: "www.example.com.", type: "A", value: "пример" }, "example.com.");
+    assert.ok(badA.problems.some((p) => /IPv4/.test(p)), "кривой адрес A не отбит: " + JSON.stringify(badA.problems));
+    const badMx = yandex.checkDnsRecord({ name: "example.com.", type: "MX", value: "mx.yandex.net." }, "example.com.");
+    assert.ok(badMx.problems.some((p) => /приоритета/.test(p)), "MX без приоритета не отбит");
+    const odd = yandex.checkDnsRecord({ name: "www.example.com.", type: "WIDGET", value: "да" }, "example.com.");
+    assert.deepStrictEqual(plain(odd.problems), [], "незнакомый тип отбит, хотя облако могло его принять");
+    assert.ok(odd.warnings.some((w) => /не из привычного набора/.test(w)), "незнакомый тип не предупреждён: " + JSON.stringify(odd.warnings));
+    const outside = yandex.checkDnsRecord({ name: "www.other.net.", type: "A", value: "203.0.113.10" }, "example.com.");
+    assert.ok(outside.warnings.some((w) => /не оканчивается/.test(w)), "чужое имя зоны не предупреждено");
+    // Та же проверка стоит и в самом upsertRecordSet: запись в облако не уходит.
+    stub.calls.length = 0;
+    const thrown = await yandex.upsertRecordSet("oauth-1", "dns-zone-1", { name: "www.example.com.", type: "A", value: "привет" }).then(() => null, (e) => e);
+    assert.ok(thrown && /IPv4/.test(thrown.message), "upsert не проверил адрес: " + (thrown && thrown.message));
+    assert.strictEqual(stub.calls.filter((c) => c.url.indexOf(":updateRecordSets") >= 0).length, 0, "запрос ушёл на запись, которую API не примет");
+  });
+
+  await test("yc:dns: канал отвечает зонами и записями, а запись ставит с двумя значениями", async () => {
+    const env = buildIpc(settingsFor());
+    const zones = await env.call({ op: "zones" });
+    assert.strictEqual(zones.ok, true, "зоны не пришли: " + JSON.stringify(zones));
+    assert.ok(zones.lines.some((l) => /example\.com\. — id dns-zone-1/.test(l)), "зона не названа строкой: " + JSON.stringify(zones.lines));
+    assert.ok(zones.zones && zones.zones.length === 1, "канал не отдал зоны окну");
+
+    stub.calls.length = 0;
+    const added = await env.call({ op: "add", zone: "example.com", name: "panel.example.com", type: "A", ttl: 120, values: "203.0.113.7, 203.0.113.8" });
+    assert.strictEqual(added.ok, true, "запись не поставлена: " + JSON.stringify(added));
+    const body = JSON.parse(stub.calls.find((c) => c.url.indexOf(":updateRecordSets") >= 0).body);
+    assert.deepStrictEqual(plain(body.additions[0].data), ["203.0.113.7", "203.0.113.8"], "значения через запятую уехали не двумя: " + JSON.stringify(body.additions));
+    assert.strictEqual(added.record.values, 2, "канал не сказал, сколько значений ушло");
+    assert.ok(/от минуты до часов/.test((added.warnings || []).join(" ")), "не сказано про распространение DNS");
+    assert.ok(/panel\.example\.com\./.test(added.lines[0]), "строка ответа не называет запись: " + added.lines[0]);
+
+    const records = await env.call({ op: "records", zone: "example.com." });
+    assert.ok(records.lines.some((l) => /A panel\.example\.com\. \(TTL 120\) → 203\.0\.113\.7, 203\.0\.113\.8/.test(l)), "запись не видно в списке: " + JSON.stringify(records.lines.slice(0, 4)));
+    const card = await env.call({ op: "card", zone: "dns-zone-1" });
+    assert.ok(card.lines.some((l) => /Создана: 2026-08-01/.test(l)) && /Записей: /.test(card.lines.join(" ")), "карточка зоны не собрана: " + JSON.stringify(card.lines));
+  });
+
+  await test("yc:dns: удаление сначала называет запись, а снимает только по согласию", async () => {
+    const env = buildIpc(settingsFor());
+    stub.calls.length = 0;
+    const ask = await env.call({ op: "delete", zone: "example.com.", name: "panel.example.com.", type: "A" });
+    assert.strictEqual(ask.ok, false, "удаление прошло без согласия");
+    assert.strictEqual(ask.needsConfirm, true, "канал не спросил согласие: " + JSON.stringify(ask));
+    assert.ok(/перестать открываться|приходить/.test(ask.error), "не сказано, что перестанет работать");
+    assert.ok(/panel\.example\.com\./.test(ask.lines.join(" ")), "согласие не показывает саму запись");
+    assert.strictEqual(stub.calls.filter((c) => c.url.indexOf(":updateRecordSets") >= 0).length, 0, "запрос ушёл до согласия");
+
+    const gone = await env.call({ op: "delete", zone: "example.com.", name: "panel.example.com.", type: "A", confirm: true });
+    assert.strictEqual(gone.ok, true, "запись не удалена: " + JSON.stringify(gone));
+    assert.ok(/удалена/.test(gone.lines.join(" ")), "ответ об удалении не назван");
+    assert.ok(!stub.zone.recordSets.some((r) => r.name === "panel.example.com."), "запись осталась в зоне");
+  });
+
+  await test("yc:dns: CNAME на вершине и чужое действие отбиваются словами", async () => {
+    const env = buildIpc(settingsFor());
+    stub.calls.length = 0;
+    const apex = await env.call({ op: "add", zone: "example.com.", name: "example.com.", type: "CNAME", values: "host.example.net." });
+    assert.strictEqual(apex.ok, false, "CNAME на вершине принят");
+    assert.ok(/вершине зоны/.test(apex.error), "вершина не объяснена: " + apex.error);
+    assert.strictEqual(stub.calls.filter((c) => c.url.indexOf(":updateRecordSets") >= 0).length, 0, "запрос ушёл с CNAME на вершине");
+
+    const bad = await env.call({ op: "стирай" });
+    assert.ok(/Доступно: zones, card, records, add, delete/.test(bad.error), "чужое действие не перечисляет доступные: " + bad.error);
+
+    const noFolder = buildIpc(settingsFor({ ycFolderId: "" }));
+    const nowhere = await noFolder.call({ op: "zones" });
+    assert.ok(/каталог/.test(nowhere.error), "без каталога нет честного ответа: " + nowhere.error);
+  });
+
+  await test("семейство dns: пять действий, подписи и опасное удаление", () => {
+    const vm = require("vm");
+    const ctx = { window: {}, document: undefined, navigator: {}, console: console };
+    ctx.window.window = ctx.window;
+    vm.createContext(ctx);
+    vm.runInContext(ACTIONS_SRC, ctx, { filename: "yc-actions.js" });
+    const A = ctx.window.YcActions;
+    assert.strictEqual(A.CHANNELS.dns, "ycDns", "семейство dns смотрит не в тот канал");
+    assert.deepStrictEqual(Array.from(A.OPS.dns).sort(), ["add", "card", "delete", "records", "zones"], "список действий dns разошёлся");
+    for (const need of ["zones", "records", "card", "add", "delete"]) {
+      assert.ok(A.forService("dns").indexOf(need) >= 0, "у семейства нет действия " + need);
+    }
+    const add = A.describe("dns", "add");
+    assert.strictEqual(add.paid, false, "постановка записи помечена платной, хотя она бесплатна");
+    // Зона — ЦЕЛЬ формы (приходит из карточки или заполняется руками), а не
+    // обычное поле: так же устроены машина, аккаунт и функция.
+    const addAction = A.actionsFor("dns").find((a) => a.id === "add");
+    assert.strictEqual(addAction.target && addAction.target.key, "zone", "у формы добавления нет цели-зоны");
+    for (const f of ["name", "type", "ttl", "values"]) {
+      assert.ok(add.fields.indexOf(f) >= 0, "в форме добавления нет поля " + f);
+    }
+    const del = A.describe("dns", "delete");
+    assert.strictEqual(del.danger, true, "удаление записи не помечено опасным");
+    assert.strictEqual(del.confirmArg, "confirm", "удаление просит согласие не тем полем");
+    const req = A.request("dns", "add", { zone: "example.com.", name: "www.example.com.", type: "A", ttl: 600, values: "203.0.113.10" }, false);
+    assert.strictEqual(req.args.zone, "example.com.", "зона не ушла в запрос");
+    assert.strictEqual(req.args.confirm, undefined, "у постановки появилось согласие");
+    const asked = A.request("dns", "delete", { zone: "example.com.", name: "www.example.com.", type: "A" }, true);
+    assert.strictEqual(asked.args.confirm, true, "согласие на удаление не ушло");
+    assert.ok(PRELOAD_SRC.includes('ycDns: (args) => ipcRenderer.invoke("yc:dns", args || {})'), "preload не пробрасывает yc:dns");
+    assert.ok(SMOKE_SRC.includes('"yc:dns"'), "сторож каналов не знает yc:dns");
   });
 
   await test("ycDns: набор стоит в цепочке npm test — иначе это не набор", () => {

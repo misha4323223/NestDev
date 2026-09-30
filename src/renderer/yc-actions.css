@@ -164,6 +164,17 @@
   padding: 6px 7px;
 }
 
+/* ── Речь Яндекс AI: плеер прямо в ответе (звук пришёл содержимым) ────────── */
+#sp-cloud .yc-act-audio { margin-top: 8px; }
+#sp-cloud .yc-act-audio-voice {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  word-break: break-all;
+  margin-bottom: 4px;
+}
+#sp-cloud .yc-act-audio audio { width: 100%; height: 34px; }
+
 /* ── Журнал сделанного (без секретов — только подписи) ─────────────────── */
 #sp-cloud .yc-act-log { display: flex; flex-direction: column; gap: 3px; }
 #sp-cloud .yc-act-log-title {

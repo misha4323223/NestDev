@@ -107,11 +107,42 @@ const RELATIONS = {
     { key: "objects", title: "Объекты", icon: "🗂", listKey: "objects", s3: true,
       attempts: [{ path: (c) => "/" + enc(c.name) + "?list-type=2&max-keys=1000" }] },
   ],
+  // Monitoring — не ресурс, а измеритель: связанных ресурсов у него нет (связи
+  // строятся только между объектами каталога), но на полке он живёт наравне со
+  // всеми — иначе консоль и дашборд видели бы разные наборы сервисов.
+  monitoring: [],
   ydb: [
     // Вторая связь НЕ через консольный API: таблицы отдаёт HTTP Document API
     // САМОЙ базы (адрес — в её же documentApiEndpoint). Поэтому у связи свой
     // путь запроса — см. ветку rel.docApi в relationList.
     { key: "tables", title: "Таблицы", icon: "📋", listKey: "tables", docApi: true, attempts: [] },
+  ],
+  // Managed-базы: всё вокруг кластера — хосты (роли, зоны, здоровье), базы и
+  // пользователи. Паролей здесь нет и быть не может: облако их в чтении не
+  // отдаёт вовсе. Три базы отличаются только сегментом пути.
+  postgresql: [
+    { key: "hosts", title: "Хосты", icon: "🖥", listKey: "hosts",
+      attempts: [{ path: (c) => "/managed-postgresql/v1/clusters/" + enc(c.id) + "/hosts" }] },
+    { key: "databases", title: "Базы", icon: "🗄", listKey: "databases",
+      attempts: [{ path: (c) => "/managed-postgresql/v1/clusters/" + enc(c.id) + "/databases" }] },
+    { key: "users", title: "Пользователи", icon: "👤", listKey: "users",
+      attempts: [{ path: (c) => "/managed-postgresql/v1/clusters/" + enc(c.id) + "/users" }] },
+  ],
+  mysql: [
+    { key: "hosts", title: "Хосты", icon: "🖥", listKey: "hosts",
+      attempts: [{ path: (c) => "/managed-mysql/v1/clusters/" + enc(c.id) + "/hosts" }] },
+    { key: "databases", title: "Базы", icon: "🗄", listKey: "databases",
+      attempts: [{ path: (c) => "/managed-mysql/v1/clusters/" + enc(c.id) + "/databases" }] },
+    { key: "users", title: "Пользователи", icon: "👤", listKey: "users",
+      attempts: [{ path: (c) => "/managed-mysql/v1/clusters/" + enc(c.id) + "/users" }] },
+  ],
+  clickhouse: [
+    { key: "hosts", title: "Хосты", icon: "🖥", listKey: "hosts",
+      attempts: [{ path: (c) => "/managed-clickhouse/v1/clusters/" + enc(c.id) + "/hosts" }] },
+    { key: "databases", title: "Базы", icon: "🗄", listKey: "databases",
+      attempts: [{ path: (c) => "/managed-clickhouse/v1/clusters/" + enc(c.id) + "/databases" }] },
+    { key: "users", title: "Пользователи", icon: "👤", listKey: "users",
+      attempts: [{ path: (c) => "/managed-clickhouse/v1/clusters/" + enc(c.id) + "/users" }] },
   ],
 };
 
@@ -131,6 +162,9 @@ const DETAIL_PATHS = {
   serverlessContainers: (c) => "/containers/v1/containers/" + enc(c.id),
   cloudFunctions: (c) => "/functions/v1/functions/" + enc(c.id),
   compute: (c) => "/compute/v1/instances/" + enc(c.id),
+  postgresql: (c) => "/managed-postgresql/v1/clusters/" + enc(c.id),
+  mysql: (c) => "/managed-mysql/v1/clusters/" + enc(c.id),
+  clickhouse: (c) => "/managed-clickhouse/v1/clusters/" + enc(c.id),
 };
 
 // Эндпоинт сервиса для запросов консоли. Совпадает с SERVICES из yandex-cloud.js.
@@ -140,6 +174,7 @@ const SERVICE_ENDPOINT = {
   cdn: "cdn",
   dns: "dns",
   logging: "logging",
+  monitoring: "monitoring",
   containerRegistry: "container-registry",
   iam: "iam",
   lockbox: "lockbox",
@@ -150,6 +185,9 @@ const SERVICE_ENDPOINT = {
   compute: "compute",
   storage: "storage-api",
   postbox: "postbox",
+  postgresql: "managed-postgresql",
+  mysql: "managed-mysql",
+  clickhouse: "managed-clickhouse",
 };
 
 function enc(v) {
@@ -175,6 +213,15 @@ const FIELD_LABELS = {
   folderId: "Каталог",
   cloudId: "Облако",
   labels: "Метки",
+  diskSize: "Размер диска",
+  diskTypeId: "Тип диска",
+  resourcePresetId: "Класс хоста",
+  deletionProtection: "Защита от удаления",
+  environment: "Окружение",
+  health: "Здоровье",
+  autofailover: "Отказоустойчивость",
+  securityGroupIds: "Группы безопасности",
+  hostGroupIds: "Группы хостов",
   url: "Адрес",
   image: "Образ",
   resources: "Ресурсы",
@@ -295,7 +342,7 @@ function humanSec(n) {
 }
 
 const TIME_KEYS = new Set(["createdAt", "updatedAt", "expiresAt", "deletedAt", "lastUsedAt", "startedAt", "finishedAt", "lastModified"]);
-const BYTE_KEYS = new Set(["size", "storageSize", "used"]);
+const BYTE_KEYS = new Set(["size", "storageSize", "used", "diskSize"]);
 const SEC_KEYS = new Set(["timeout", "executionTimeout", "ttl", "duration"]);
 
 // Значение поля → строка для карточки. Сложное уходит как есть (в интерфейсе
@@ -401,6 +448,15 @@ const RELATION_COLUMNS = {
   "dns:recordSets": ["name", "type", "ttl", "data"],
   "storage:objects": ["key", "size", "lastModified"],
   "ydb:tables": ["name"],
+  "postgresql:hosts": ["name", "zoneId", "role", "health"],
+  "mysql:hosts": ["name", "zoneId", "role", "health"],
+  "clickhouse:hosts": ["name", "zoneId", "shardName", "health"],
+  "postgresql:databases": ["name", "owner"],
+  "mysql:databases": ["name", "owner"],
+  "clickhouse:databases": ["name"],
+  "postgresql:users": ["name", "connLimit"],
+  "mysql:users": ["name", "connLimit"],
+  "clickhouse:users": ["name", "authMethod"],
 };
 
 // Таблица для интерфейса: колонки + уже отформатированные строки. Форматирование
@@ -678,6 +734,7 @@ const SERVICE_TITLES = {
   certificateManager: "Certificate Manager",
   apiGateway: "API Gateway",
   cdn: "Cloud CDN",
+  monitoring: "Monitoring",
   ydb: "Managed Service for YDB",
   lockbox: "Lockbox",
   logging: "Cloud Logging",
@@ -687,6 +744,9 @@ const SERVICE_TITLES = {
   cloudFunctions: "Cloud Functions",
   storage: "Object Storage",
   postbox: "Cloud Postbox",
+  postgresql: "Managed Service for PostgreSQL",
+  mysql: "Managed Service for MySQL",
+  clickhouse: "Managed Service for ClickHouse",
 };
 
 function labelService(key) {

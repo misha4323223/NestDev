@@ -42,6 +42,21 @@
     // Certificate Manager и Cloud CDN лежат в одном модуле (src/yc-cdn.js).
     certificateManager: "ycCdn",
     billing: "ycBilling",
+    // Monitoring: метрики каталога. Тела запросов — в src/yc-monitoring.js;
+    // канал — «yc:monitoring» в src/yc-ipc.js.
+    monitoring: "ycMonitoring",
+    // Яндекс AI: перевод, текст со снимка и речь. Тела запросов — в src/yc-ai.js
+    // (тот же модуль, что у агента), канал — «yc:ai» в src/yc-ipc.js.
+    ai: "ycAi",
+    // Managed-базы: PostgreSQL, MySQL и ClickHouse — один канал на три базы
+    // (у них один API, mdb.api.cloud.yandex.net): база выбирается полем engine,
+    // которое подставляет семейство (FAMILIES[...].fixed), а не поле формы.
+    postgresql: "ycMdb",
+    mysql: "ycMdb",
+    clickhouse: "ycMdb",
+    // DNS-зоны и записи: записи умели агент и карточка зоны, а у плитки действий
+    // не было вовсе. Канал один на зоны и записи: они живут вместе.
+    dns: "ycDns",
   };
 
   // Допустимые действия каждого канала. Сверяется с отказами в src/yc-ipc.js.
@@ -52,6 +67,12 @@
     cloudFunctions: ["list", "card", "versions", "runtimes", "create", "update", "deploy", "invoke", "tag", "untag", "delversion", "delete", "public", "private", "access"],
     cdn: ["overview", "certs", "cert", "certnew", "certimport", "certupdate", "certdel", "cdn", "cdnlist", "cdninfo", "cdncreate", "cdnupdate", "cdnpurge", "cdndel", "origins", "origincreate", "originupdate", "origindel"],
     billing: ["overview", "accounts", "account", "budgets", "price", "services", "leaks"],
+    monitoring: ["overview", "names", "metrics"],
+    ai: ["translate", "languages", "detect", "ocr", "voices", "speak", "listen"],
+    postgresql: ["list", "presets", "card", "create", "hosts", "databases", "users", "logs", "operations", "start", "stop", "delete"],
+    mysql: ["list", "presets", "card", "create", "hosts", "databases", "users", "logs", "operations", "start", "stop", "delete"],
+    clickhouse: ["list", "presets", "card", "create", "hosts", "databases", "users", "logs", "operations", "start", "stop", "delete"],
+    dns: ["zones", "card", "records", "add", "delete"],
   };
 
   const FAMILIES = {
@@ -62,7 +83,64 @@
     cdn: { title: "Сертификаты и CDN", ru: "ресурс" },
     certificateManager: { title: "Сертификаты", ru: "сертификат" },
     billing: { title: "Деньги в облаке", ru: "аккаунт" },
+    monitoring: { title: "Monitoring", ru: "метрика" },
+    // «Запрос», а не «ресурс»: у Яндекс AI нет объектов каталога — платят за сам
+    // запрос к сервису, и подпись обязана говорить об этом прямо.
+    ai: { title: "Яндекс AI", ru: "запрос" },
+    // Managed-базы: три семейства (у каждой базы своя плитка), но один канал.
+    // `fixed` — это то, чем формы трёх баз отличаются друг от друга: поле
+    // engine подставляется самим семейством, чтобы не спрашивать человека
+    // «какая это база», когда он уже нажал кнопку в конкретной плитке.
+    postgresql: { title: "PostgreSQL", ru: "кластер", fixed: { engine: "postgresql" } },
+    mysql: { title: "MySQL", ru: "кластер", fixed: { engine: "mysql" } },
+    clickhouse: { title: "ClickHouse", ru: "кластер", fixed: { engine: "clickhouse" } },
+    dns: { title: "DNS-зоны", ru: "запись" },
   };
+
+  // Действия управляемой базы. Одна форма на три базы: набор полей у PostgreSQL,
+  // MySQL и ClickHouse одинаков, различаются только версии и типы логов
+  // (у ClickHouse явного списка версий в справочнике API нет — её называют
+  // вручную). Пароль пользователя при создании генерируется на стороне модуля и
+  // показывается ОДИН раз — поэтому у действия стоит secretLabel.
+  function dbActions(engine) {
+    const versions = { postgresql: ["11", "12", "13", "14", "15", "16", "17", "18"], mysql: ["5.7", "8.0", "8.4"], clickhouse: [] }[engine] || [];
+    const logTypes = { postgresql: ["POSTGRESQL", "POOLER", "REPACK"], mysql: ["MYSQL", "POOLER"], clickhouse: ["CLICKHOUSE", "KEEPER"] }[engine] || [];
+    const needCluster = target("Кластер (имя или id)", "cluster");
+    const presetOptions = from(engine, "presets", (r) => (r.presets || []).map((p) => p.id), { engine: engine });
+    return [
+      { id: "list", ru: "Кластеры", op: "list", view: "lines" },
+      { id: "presets", ru: "Классы хостов (ядра и память)", op: "presets", view: "lines" },
+      { id: "card", ru: "Карточка: состояние, хосты, подключение", op: "card", view: "lines", target: needCluster },
+      { id: "create", ru: "＋ Создать кластер (платно)", op: "create", view: "lines", paid: true, confirmArg: "confirm",
+        secretLabel: "Пароль пользователя базы — показывается один раз",
+        fields: [
+          fld("name", "Имя кластера", { required: true, placeholder: "db-1" }),
+          versions.length
+            ? fld("version", "Версия базы", { required: true, type: "select", options: versions, value: versions[versions.length - 1] })
+            : fld("version", "Версия базы", { required: true, placeholder: "например 24.8" }),
+          fld("preset", "Класс хоста", { required: true, hint: "s2.micro — самый маленький; список — действием «Классы хостов»", options: presetOptions }),
+          fld("subnet", "Подсеть", { required: true, hint: "Сеть определится по подсети; подсеть и зона — одной зоны", options: from("vpc", "subnets", (r) => (r.subnets || []).map((s) => s.name)) }),
+          fld("diskGb", "Диск, ГБ", { type: "number", value: "20" }),
+          fld("diskType", "Тип диска", { type: "select", options: ["network-ssd", "network-hdd"], value: "network-ssd" }),
+          fld("zone", "Зона", { value: "ru-central1-a", hint: "Подсеть должна быть в этой же зоне" }),
+          fld("user", "Пользователь базы", { value: "admin" }),
+          fld("database", "Имя базы", { value: "db1" }),
+          fld("publicIp", "Публичный адрес хосту", { type: "check" }),
+        ] },
+      { id: "hosts", ru: "Хосты (роли, зоны, адреса)", op: "hosts", view: "lines", target: needCluster },
+      { id: "databases", ru: "Базы", op: "databases", view: "lines", target: needCluster },
+      { id: "users", ru: "Пользователи и доступ", op: "users", view: "lines", target: needCluster },
+      { id: "logs", ru: "Логи за период", op: "logs", view: "lines", target: needCluster,
+        fields: [
+          fld("minutes", "За сколько минут", { type: "number", value: "60" }),
+          fld("serviceType", "Тип логов", { type: "select", options: logTypes }),
+        ] },
+      { id: "operations", ru: "История операций", op: "operations", view: "lines", target: needCluster },
+      { id: "start", ru: "▶ Запустить", op: "start", view: "lines", target: needCluster },
+      { id: "stop", ru: "■ Остановить (экономит деньги)", op: "stop", view: "lines", target: needCluster },
+      { id: "delete", ru: "🗑 Удалить кластер", op: "delete", view: "lines", danger: true, confirmArg: "confirm", target: needCluster },
+    ];
+  }
 
   // ── Поля форм ─────────────────────────────────────────────────────────────
   function fld(key, label, extra) {
@@ -73,7 +151,7 @@
   }
   // Подсказки-варианты берутся у облака (наборы, подсети, зоны, языки). Не
   // пришли — поле остаётся обычным текстом: действие всё равно выполнимо.
-  const from = (channel, op, pick) => ({ channel: channel, op: op, pick: pick });
+  const from = (channel, op, pick, args) => ({ channel: channel, op: op, pick: pick, args: args || null });
 
   const ACTIONS = {
     // ── Виртуальные машины ──
@@ -298,6 +376,103 @@
       { id: "price", ru: "Цена по слову", op: "price", view: "lines", fields: [fld("query", "Что искать", { required: true, placeholder: "быстрый диск" })] },
       { id: "services", ru: "Услуги в каталоге цен", op: "services", view: "objectList", of: (r) => r.services, cols: ["id", "name"] },
     ],
+
+    // ── Monitoring: метрики ──
+    // Показываем то, что облако измеряет само. Кнопки «создать алерт» здесь НЕТ
+    // намеренно: публичный справочник API у Monitoring знает только данные метрик
+    // и их метаданные, отдельного REST для алертов у облака нет — а кнопка, за
+    // которой ничего нет, хуже её отсутствия.
+    monitoring: [
+      { id: "overview", ru: "Что вообще измеряется", op: "overview", view: "lines" },
+      { id: "names", ru: "Метрики ресурса (селектор)", op: "names", view: "lines",
+        fields: [
+          fld("service", "Сервис (метка service)", { placeholder: "compute" }),
+          fld("resource", "Ресурс (метка resource_id)", { placeholder: "идентификатор ресурса" }),
+        ] },
+      { id: "metrics", ru: "Данные метрики за период", op: "metrics", view: "lines",
+        fields: [
+          fld("metric", "Имя метрики (латиницей)", { required: true, placeholder: "cpu_usage" }),
+          fld("service", "Сервис (метка service)", { placeholder: "compute" }),
+          fld("resource", "Ресурс (метка resource_id)", { placeholder: "идентификатор ресурса" }),
+          fld("minutes", "За сколько минут", { type: "number", placeholder: "60" }),
+          fld("aggregation", "Прореживание: AVG / MAX / MIN / SUM / LAST / COUNT", { placeholder: "AVG" }),
+          fld("maxPoints", "Сколько точек оставить", { type: "number", placeholder: "30" }),
+        ] },
+    ],
+
+    // ── Яндекс AI: перевод, снимок и речь ──
+    // Четыре сервиса в одном семействе, потому что задача у них одна: превратить
+    // одно в другое. Платит каждый ЗАПРОС, а не ресурс, поэтому действия не
+    // просят согласия (`confirm`) — но четыре из них помечены платными, и ответ
+    // честно называет тариф.
+    // «Несколько сразу» — суть этих сервисов и потому встроено в формы: targets
+    // (языки), files (снимки), voices (голоса) принимают списки через запятую или
+    // по одному значению в строке.
+    ai: [
+      { id: "languages", ru: "Языки перевода", op: "languages", view: "lines" },
+      { id: "voices", ru: "Голоса SpeechKit", op: "voices", view: "lines" },
+      { id: "detect", ru: "Язык текста", op: "detect", view: "lines",
+        fields: [fld("text", "Текст", { type: "textarea", required: true, placeholder: "Вставь отрывок на неизвестном языке" })] },
+      { id: "translate", ru: "Перевести (можно на несколько языков сразу)", op: "translate", view: "lines", paid: true,
+        fields: [
+          fld("text", "Текст", { type: "textarea", required: true, placeholder: "Что перевести" }),
+          fld("targets", "Языки перевода (через запятую)", { required: true, placeholder: "en, de, zh" }),
+          fld("source", "Язык исходного текста (если знаешь)", { placeholder: "ru" }),
+        ] },
+      { id: "ocr", ru: "Снимок или PDF → текст (распознать)", op: "ocr", view: "lines", paid: true,
+        fields: [
+          fld("files", "Пути к файлам (по одному в строке)", { type: "textarea", required: true, placeholder: "C:\\снимки\\договор.png" }),
+          fld("langs", "Языки на снимке (через запятую)", { placeholder: "ru, en" }),
+          fld("model", "Модель распознавания", { type: "select", options: ["page", "page-column-sort", "handwritten", "table", "markdown", "mathmarkdown"], value: "page" }),
+        ] },
+      { id: "speak", ru: "Озвучить текст (можно несколькими голосами)", op: "speak", view: "lines", paid: true,
+        fields: [
+          fld("text", "Текст", { type: "textarea", required: true, placeholder: "Что сказать" }),
+          fld("voices", "Голоса (через запятую)", { placeholder: "alena, filipp — пусто = alena" }),
+          fld("format", "Формат звука", { type: "select", options: ["mp3", "oggopus", "wav", "lpcm"], value: "mp3" }),
+          fld("lang", "Язык голоса", { value: "ru-RU" }),
+          fld("speed", "Скорость (0.1–3.0)", { placeholder: "1.0" }),
+          fld("emotion", "Эмоция (только для русских голосов)", { placeholder: "neutral / good / evil" }),
+        ] },
+      { id: "listen", ru: "Запись → текст (расшифровать)", op: "listen", view: "lines", paid: true,
+        fields: [
+          fld("file", "Путь к записи", { required: true, placeholder: "C:\\записи\\голос.ogg" }),
+          fld("lang", "Язык записи", { value: "ru-RU" }),
+          fld("format", "Формат звука", { type: "select", options: ["oggopus", "mp3", "lpcm"], value: "oggopus" }),
+          fld("topic", "Тема (general — короткая команда, deferred — длинная речь)", { placeholder: "general" }),
+        ] },
+    ],
+
+    // ── Managed-базы: PostgreSQL, MySQL и ClickHouse ──
+    // Три семейства в трёх плитках, но один канал и одна форма: набор действий
+    // у баз одинаков (список, классы, карточка, создание, хосты, базы,
+    // пользователи, логи, операции, питание, удаление).
+    postgresql: dbActions("postgresql"),
+    mysql: dbActions("mysql"),
+    clickhouse: dbActions("clickhouse"),
+
+    // ── DNS-зоны и записи ──
+    // Записи в Cloud DNS живут парами «имя+тип»: пара — это один НАБОР значений,
+    // поэтому кнопка одна, «добавить или заменить»: что именно случилось, скажет
+    // ответ. Удаление необратимо для тех, кто на запись смотрит (домен, сайт,
+    // почта), поэтому оно опасное и спрашивает дважды — окно и облако.
+    dns: [
+      { id: "zones", ru: "Зоны и записи", op: "zones", view: "lines" },
+      { id: "records", ru: "Записи зоны", op: "records", view: "lines", target: target("Зона (имя или id)", "zone") },
+      { id: "card", ru: "Карточка зоны", op: "card", view: "lines", target: target("Зона (имя или id)", "zone") },
+      { id: "add", ru: "＋ Добавить или заменить запись", op: "add", view: "lines", target: target("Зона (имя или id)", "zone"),
+        fields: [
+          fld("name", "Имя записи (FQDN с точкой)", { required: true, placeholder: "www.example.com." }),
+          fld("type", "Тип", { type: "select", options: ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "CAA"], value: "A" }),
+          fld("ttl", "TTL, секунд", { type: "number", value: "600" }),
+          fld("values", "Значения (через запятую)", { type: "textarea", required: true, placeholder: "203.0.113.10", hint: "У A — адрес, у CNAME — домен с точкой, у MX — «приоритет домен.», у TXT — сам текст." }),
+        ] },
+      { id: "delete", ru: "🗑 Удалить запись", op: "delete", view: "lines", danger: true, confirmArg: "confirm", target: target("Зона (имя или id)", "zone"),
+        fields: [
+          fld("name", "Имя записи (FQDN с точкой)", { required: true, placeholder: "www.example.com." }),
+          fld("type", "Тип", { type: "select", options: ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "CAA"], value: "A" }),
+        ] },
+    ],
   };
 
   // ── Вид результата ────────────────────────────────────────────────────────
@@ -411,7 +586,10 @@
     const channel = CHANNELS[service];
     if (!channel) return null;
     const v = values || {};
-    const args = { op: action.op };
+    // Постоянные аргументы семейства: у Managed-баз это engine (у PostgreSQL,
+    // MySQL и ClickHouse один канал, и различает их только он).
+    const fam = FAMILIES[service] || {};
+    const args = Object.assign({ op: action.op }, fam.fixed || {});
     for (const f of fieldsFor(action)) {
       const raw = v[f.key];
       if (raw === undefined || raw === null || raw === "") continue;
@@ -429,7 +607,7 @@
   function summarize(service, id, result) {
     const action = findAction(service, id);
     const r = result || {};
-    if (!action) return { ok: false, lines: ["Неизвестное действие."], warn: [], secret: "", secretLabel: "" };
+    if (!action) return { ok: false, lines: ["Неизвестное действие."], warn: [], secret: "", secretLabel: "", audios: [] };
     if (r.ok === false) {
       // Цена и предупреждения — не ошибка, а вопрос: показываем их вместе с
       // подсказкой «нажми ещё раз», иначе платное кажется сломанным.
@@ -441,6 +619,7 @@
         warn: (r.warnings || []).slice(0, 6),
         secret: "",
         secretLabel: "",
+        audios: [],
       };
     }
     const view = VIEWS[action.view] || VIEWS.lines;
@@ -454,7 +633,10 @@
     // вставляют в машину, личный ключ сохраняют. Показываем оба: иначе человек
     // унёс бы только секрет и не смог войти.
     if (r.publicKey) lines.unshift("Публичный ключ (вставляй в машину): " + r.publicKey);
-    return { ok: true, needsConfirm: false, lines: lines, warn: warn, secret: secret, secretLabel: secretLabel };
+    // Синтезированная речь приходит СОДЕРЖИМЫМ (base64): её проигрывает окно,
+    // а не внешний плеер — иначе «озвучить» заканчивалось бы поиском файла.
+    const audios = (Array.isArray(r.audios) ? r.audios : []).filter((x) => x && x.base64);
+    return { ok: true, needsConfirm: false, lines: lines, warn: warn, secret: secret, secretLabel: secretLabel, audios: audios };
   }
 
   // ── Рисование ─────────────────────────────────────────────────────────────
@@ -642,7 +824,7 @@
         dl.id = listId;
         input.setAttribute("list", listId);
         form.appendChild(dl);
-        callApi(CHANNELS[f.options.channel] || CHANNELS[state.service], { op: f.options.op }).then((r) => {
+        callApi(CHANNELS[f.options.channel] || CHANNELS[state.service], Object.assign({ op: f.options.op }, f.options.args || {})).then((r) => {
           if (!r || r.ok === false) return;
           let opts = [];
           try {
@@ -799,6 +981,20 @@
       const row = el("div", "yc-act-actionsrow");
       row.appendChild(go);
       out.appendChild(row);
+    }
+
+    // Речь — слышимая, а не только написанная: канал вернул её содержимым,
+    // поэтому плеер живёт здесь же, в ответе. Файл при этом тоже записан (его
+    // путь — в строке выше), так что забрать запись потом можно.
+    for (const au of sum.audios || []) {
+      const wrap = el("div", "yc-act-audio");
+      wrap.appendChild(el("div", "yc-act-audio-voice", "🔊 " + (au.voice || "голос") + (au.path ? " · " + au.path : "")));
+      const player = document.createElement("audio");
+      player.controls = true;
+      player.preload = "none";
+      player.src = "data:" + (au.mime || "audio/mpeg") + ";base64," + au.base64;
+      wrap.appendChild(player);
+      out.appendChild(wrap);
     }
   }
 

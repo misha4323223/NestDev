@@ -1084,7 +1084,10 @@ const urlOf = (c) => String(c.url).split("?")[0];
   await test("ycCdn: канал, мост, схема, группа, промпт, политика и справочник согласованы", () => {
     assert.ok(IPC_SRC.indexOf('ipcMain.handle("yc:cdn"') >= 0, "нет канала yc:cdn");
     assert.ok(!MAIN_SRC.includes('ipcMain.handle("yc:cdn"'), "канал остался в main.js");
-    assert.ok(/ycCdn, loadSettings, saveSettings, svc: ycService/.test(MAIN_SRC), "модуль не передан в мост каналов");
+    // Соседей по списку не сверяем: у каждого нового модуля свой порядок, и копия
+    // всего перечня ломала бы страж от чужой части. Важно, что ycCdn идёт в мост
+    // каналов и что мост по-прежнему получает svc (служебный слой).
+    assert.ok(/ycCdn,[\s\S]{0,200}?saveSettings, svc: ycService/.test(MAIN_SRC), "модуль не передан в мост каналов");
     assert.ok(MAIN_SRC.indexOf("createYcCdn({") >= 0, "модуль не собран в main.js");
     assert.ok(PRELOAD_SRC.indexOf('yc:cdn') >= 0 && /ycCdn: \(args\)/.test(PRELOAD_SRC), "нет моста окна для ycCdn");
     assert.ok(SCHEMAS_SRC.indexOf('name: "ycCdn"') >= 0, "нет схемы ycCdn");
@@ -1099,7 +1102,7 @@ const urlOf = (c) => String(c.url).split("?")[0];
     assert.ok(/HTTPS-сайт из бакета/.test(GUIDE_SRC), "в справочнике нет раздела про HTTPS-сайт");
     // Сторож smoke: канал в списке, счёт каналов, инструмент и место набора в цепочке.
     assert.ok(SMOKE_SRC.indexOf('"yc:billing", "yc:cdn"') >= 0, "сторож не знает канал yc:cdn");
-    assert.ok(/каналов в мосте должно быть 27/.test(SMOKE_SRC), "сторож не пересчитал каналы");
+    assert.ok(/каналов в мосте должно быть 31/.test(SMOKE_SRC), "сторож не пересчитал каналы");
     assert.ok(/["']ycCdn["']/.test(SMOKE_SRC), "сторож не знает инструмент ycCdn");
     assert.ok(String(PKG.scripts.test || "").indexOf("test/yc-cdn.test.js") >= 0, "набора нет в цепочке npm test");
   });

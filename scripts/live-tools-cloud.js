@@ -41,6 +41,23 @@
      [12] ycDb: база YDB — таблицы и записи через её Document API: операция идёт
          ЗАГОЛОВКОМ X-Amz-Target, значения — типизированные ({ S }, { N }),
          адрес берётся у самой базы, разрешения стоят перед сетью.
+     [13] ycAi: Яндекс AI — перевод на НЕСКОЛЬКО языков сразу (несколько запросов),
+         текст со снимка, речь туда (голоса → файлы) и обратно (расшифровка) —
+         у каждого сервиса своя форма запроса, а у синтеза речи ответ ЗВУКОМ.
+     [14] ycMonitor: Monitoring — плитка полки видит метрики каталога, метаданные
+         и данные уходят РАЗНЫМИ формами (GET со строкой и POST с прореживанием),
+         сводка считает точки без пропусков, а без каталога запросов нет вовсе.
+     [15] yc:ai: канал ОКНА — тот же модуль, что у агента: перевод пачкой, снимок,
+         речь (файлы на диске И содержимое для плеера) и отказы словами;
+     [16] ycMdb: Managed-базы — три базы ходят по СВОИМ путям одного хоста,
+         карточка даёт адрес ХОСТА-мастера, у ClickHouse ДРУГОЕ тело создания
+         (класс внутри config.clickhouse, adminPassword), а платное и необратимое
+         без согласия не уходит в облако вовсе;
+     [17] yc:mdb: канал ОКНА — три базы в одном канале (база выбирается полем
+         engine), needsConfirm вместо отказа и пароль отдельным полем secret;
+     [18] yc:dns: канал ОКНА — зоны каталога, записи зоны, постановка записи
+         значениями через запятую и согласие на удаление (CNAME на вершине
+         отбивается ДО сети).
 
    Ничего в репозитории приложения не пишется: всё в temp-папках. */
 
@@ -103,6 +120,21 @@ const deletedObjects = [];
 // облаке — отдельного сервера для базы не нужно.
 const docCalls = [];
 const dbTables = new Map();
+// Запросы Яндекс AI (перевод, зрение, речь): на них держится проверка «на
+// несколько языков ушло несколько запросов», «синтез речи ушёл ФОРМОЙ», «текст
+// со снимка прочитан» — то есть каждая из ЧЕТЫРЁХ разных форм запроса.
+const aiCalls = [];
+// Запросы Monitoring: на них держится проверка «данные ушли телом с прореживанием,
+// а метаданные — строкой», и что полка видит метрики каталога.
+const monCalls = [];
+// Запросы Managed-баз (PostgreSQL, MySQL, ClickHouse): три базы ходят по ОДНОМУ
+// хосту и различаются сегментом пути, поэтому на них держатся проверки «ушло в
+// ту базу», «тело создания по правилам сервиса» и «на отказе не ушло ничего».
+const mdbCalls = [];
+// Состояние подменённого кластера: после :stop он обязан перечитаться как
+// STOPPED — иначе проверка «питание действительно меняет состояние» ничего не
+// значит.
+const mdbState = { status: "RUNNING", deleted: new Set() };
 let fakeYcBase = "";
 function startFakeYc() {
   return http.createServer((req, res) => {
@@ -268,6 +300,110 @@ function startFakeYc() {
         }
         return xml('<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>', 404);
       }
+      // ── Monitoring: метрики каталога ─────────────────────────────────────
+      // Данные метрик идут POST-ом с телом (query + интервал + прореживание),
+      // метаданные — GET-ом со строкой. Две РАЗНЫЕ формы одного сервиса: та же
+      // болезнь, что у Яндекс AI, и проверяется она здесь так же.
+      if (/^\/monitoring\/v2\//.test(p)) {
+        monCalls.push({ method: req.method, path: p, search: u.search || "", body: body });
+        if (p === "/monitoring/v2/data/read") {
+          let b = {};
+          try { b = body ? JSON.parse(body) : {}; } catch { b = {}; }
+          if (/нет-такой/.test(b.query || "")) return json({ metrics: [] });
+          return json({
+            metrics: [{
+              name: "cpu_usage",
+              labels: { service: "compute", resource_id: "epd1" },
+              type: "DGAUGE",
+              timeseries: { timestamps: [1, 2, 3, 4], doubleValues: [1, null, 3, 5] },
+            }],
+          });
+        }
+        if (p === "/monitoring/v2/metrics") {
+          return json({
+            metrics: [
+              { name: "cpu_usage", labels: { service: "compute", resource_id: "epd1" }, type: "DGAUGE" },
+              { name: "cpu_usage", labels: { service: "compute", resource_id: "epd2" }, type: "DGAUGE" },
+              { name: "disk_read_bytes", labels: { service: "compute", resource_id: "epd1" }, type: "RATE" },
+            ],
+          });
+        }
+      }
+      // ── Яндекс AI: перевод, зрение и речь ────────────────────────────────
+      // У четырёх сервисов ЧЕТЫРЕ разные формы: JSON у перевода и зрения, форма у
+      // синтеза речи, а ответ синтеза — ЗВУК, а не JSON. Именно поэтому у него
+      // свой ответ: клиент, который ждёт JSON, сломается именно здесь.
+      if (/^\/translate\/v2\/|^\/ocr\/v1\/|^\/speech\/v1\/|^\/tts\/v3\/voices/.test(p)) {
+        aiCalls.push({
+          method: req.method, path: p, search: u.search || "",
+          auth: String(req.headers.authorization || ""), folder: String(req.headers["x-folder-id"] || ""),
+          contentType: String(req.headers["content-type"] || ""), body: body,
+        });
+        if (p === "/translate/v2/translate") {
+          let b = {};
+          try { b = body ? JSON.parse(body) : {}; } catch { b = {}; }
+          return json({ translations: (b.texts || []).map((t) => ({ text: "[" + b.targetLanguageCode + "] " + t, detectedLanguageCode: "ru" })) });
+        }
+        if (p === "/translate/v2/languages") return json({ languages: [{ code: "ru", name: "Русский" }, { code: "en", name: "English" }] });
+        if (p === "/ocr/v1/recognizeText") return json({ result: { textAnnotation: { fullText: "СЧЁТ № 17\nИТОГО 4 200 ₽" } } });
+        if (p === "/tts/v3/voices") return json({ voices: [{ id: "alena", name: "Алёна", languages: ["ru-RU"] }, { id: "filipp", name: "Филипп", languages: ["ru-RU"] }] });
+        if (p === "/speech/v1/tts:synthesize") {
+          const audio = Buffer.alloc(2048, 7);
+          res.writeHead(200, { "Content-Type": "audio/mpeg", "Content-Length": String(audio.length) });
+          return res.end(audio);      }
+      if (p === "/speech/v1/stt:recognize") return json({ result: "включи свет на кухне" });
+      }
+      // ── Managed-базы: PostgreSQL, MySQL и ClickHouse ─────────────────────
+      // Сеть VPC нужна здесь ровно за одним полем — networkId подсети: без него
+      // кластер не создать, и модуль ищет его сам.
+      if (p === "/vpc/v1/subnets") {
+        return json({ subnets: [{ id: "sub-a", name: "app-subnet", networkId: "net-1", zoneId: "ru-central1-a", v4CidrBlocks: ["10.10.0.0/24"] }] });
+      }
+      if (/^\/managed-(postgresql|mysql|clickhouse)\/v1\//.test(p)) {
+        const engine = p.split("/")[1].replace("managed-", "");
+        mdbCalls.push({ engine: engine, method: req.method, path: p, search: u.search || "", body: body });
+        if (/\/resourcePresets$/.test(p)) {
+          return json({ resourcePresets: [{ id: "s2.micro", cores: "2", memory: "8589934592", zoneIds: ["ru-central1-a"], diskTypeIds: ["network-ssd"] }] });
+        }
+        if (/\/clusters$/.test(p) && req.method === "POST") {
+          return json({ id: "op-mdb-create", metadata: { clusterId: engine + "-new" } });
+        }
+        if (/\/clusters$/.test(p)) {
+          const version = engine === "clickhouse" ? "24.8" : engine === "mysql" ? "8.0" : "16";
+          const res = { resourcePresetId: "s2.micro", diskSize: "21474836480", diskTypeId: "network-ssd" };
+          // У ClickHouse класс и диск лежат ВНУТРИ config.clickhouse — то же
+          // отличие, что и в настоящем API.
+          const config = engine === "clickhouse" ? { version: version, clickhouse: { resources: res } } : { version: version, resources: res };
+          return json({
+            clusters: [{
+              id: engine + "-1", name: engine === "clickhouse" ? "analytics" : "db-main", folderId: "f1",
+              createdAt: "2026-08-01T10:00:00Z", environment: "PRODUCTION", status: mdbState.status, health: "ALIVE",
+              networkId: "net-1", config: config,
+            }],
+          });
+        }
+        if (/:logs$/.test(p)) {
+          return json({ logs: [{ timestamp: "2026-09-30T10:00:00Z", message: { message: "FATAL: no pg_hba.conf entry" } }] });
+        }
+        if (/:stop$/.test(p)) { mdbState.status = "STOPPED"; return json({ id: "op-mdb-stop" }); }
+        if (/:start$/.test(p)) { mdbState.status = "RUNNING"; return json({ id: "op-mdb-start" }); }
+        if (req.method === "DELETE") { mdbState.deleted.add(p.split("/clusters/")[1]); return json({ id: "op-mdb-del" }); }
+        if (/\/hosts$/.test(p)) {
+          const h = engine === "postgresql" ? "rc1a-pg" : engine === "mysql" ? "rc1a-my" : "rc1a-ch";
+          return json({ hosts: [{ name: h + "-1.mdb.yandexcloud.net", clusterId: engine + "-1", zoneId: "ru-central1-a", role: "MASTER", health: "ALIVE" }] });
+        }
+        if (/\/databases$/.test(p)) return json({ databases: [{ name: engine === "clickhouse" ? "default" : "db1", owner: "admin" }] });
+        if (/\/users$/.test(p)) return json({ users: [{ name: "admin", permissions: [{ databaseName: "db1" }] }] });
+        if (/\/operations$/.test(p)) return json({ operations: [{ id: "op-1", description: "Create cluster", createdAt: "2026-08-01T09:00:00Z", done: true }] });
+        // Удалённый кластер больше не находится — по этому и видно, что удаление
+        // правда выполнено, а не «операция запущена».
+        if (mdbState.deleted.has(p.split("/clusters/")[1])) return json({ message: "Cluster not found" }, 404);
+        // Карточка кластера и всё остальное: одна форма на три базы.
+        return json({
+          id: engine + "-1", name: "db-main", folderId: "f1", status: mdbState.status, health: "ALIVE",
+          config: { version: "16", resources: { resourcePresetId: "s2.micro", diskSize: "21474836480", diskTypeId: "network-ssd" } },
+        });
+      }
       // Прочие сервисы каталога: пустой список — этого достаточно для сводки.
       return json({});
     });
@@ -394,9 +530,9 @@ watchdog.unref();
 
   console.log("\n[2] инструменты облака отвечают через настоящий реестр");
   const tools = seenWiring.tools || {};
-  const cloudNames = ["ycStatus", "ycList", "ycCreate", "ycCosts", "ycDelete", "ycDeploy", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycDb", "ycLogs", "ycInstall"];
+  const cloudNames = ["ycStatus", "ycList", "ycCreate", "ycCosts", "ycDelete", "ycDeploy", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycDb", "ycAi", "ycMonitor", "ycMdb", "ycLogs", "ycInstall"];
   const missing = cloudNames.filter((n) => typeof tools[n] !== "function");
-  ok(missing.length === 0, "все четырнадцать на месте" + (missing.length ? ": нет " + missing.join(", ") : ""));
+  ok(missing.length === 0, "все семнадцать на месте" + (missing.length ? ": нет " + missing.join(", ") : ""));
   const unknown = await call("ycContainer", { action: "overview" });
   ok(!/неизвестный инструмент/.test(plain(unknown)), "реестр знает ycContainer: " + plain(unknown).slice(0, 60));
 
@@ -613,6 +749,266 @@ watchdog.unref();
   const dropped = plain(await call("ycDb", { action: "drop", table: "pets" }));
   ok(/🗑 Таблица удалена/.test(dropped), "таблица удалена вместе с записями: " + lineN(dropped, 0));
   ok(dbTables.size === 0, "таблица снесена и в самом облаке: осталось " + dbTables.size);
+
+  console.log("\n[13] ycAi: перевод, текст со снимка и речь Яндекс AI");
+  const langs = plain(await call("ycAi", { action: "languages" }));
+  ok(/Русский/.test(langs) && /targets/.test(langs), "языки перевода пришли из облака: " + lineN(langs, 1));
+
+  const trBefore = aiCalls.filter((c) => c.path === "/translate/v2/translate").length;
+  const translated = plain(await call("ycAi", { action: "translate", texts: ["Привет", "Пока"], targets: ["en", "de"] }));
+  const trAfter = aiCalls.filter((c) => c.path === "/translate/v2/translate").length;
+  ok(trAfter - trBefore === 2, "на два языка ушло два запроса (ушло " + (trAfter - trBefore) + ")");
+  ok(/языков 2/.test(translated) && /\[EN\] Привет/.test(translated) && /\[DE\] Пока/.test(translated), "перевод показан по языкам: " + lineN(translated, 1));
+  const tCall = aiCalls.filter((c) => c.path === "/translate/v2/translate").pop() || {};
+  ok(tCall.contentType.indexOf("application/json") >= 0 && /^Bearer /.test(tCall.auth) && tCall.folder === "f1", "перевод ушёл JSON-ом с IAM-токеном и каталогом");
+
+  // Картинка — НАСТОЯЩИЙ файл в рабочей папке прогона: путь проверяется до чтения.
+  fs.writeFileSync(path.join(work, "scan.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]));
+  const ocr = plain(await call("ycAi", { action: "ocr", file: "scan.png" }));
+  ok(/СЧЁТ № 17/.test(ocr), "текст со снимка прочитан: " + lineN(ocr, 2));
+  ok(aiCalls.some((c) => c.path === "/ocr/v1/recognizeText" && /"mimeType":"image\/png"/.test(c.body)), "тип снимка определён по расширению и ушёл телом");
+  fs.writeFileSync(path.join(work, "док.docx"), Buffer.from([1, 2, 3]));
+  ok(/не понял тип файла/.test(plain(await call("ycAi", { action: "ocr", file: "док.docx" }))), "чужой формат отвергнут до запроса");
+
+  // Речь: файлы появляются на диске, а в облако уходит ФОРМА (не JSON).
+  const spoke = plain(await call("ycAi", { action: "speak", text: "Счёт на четыре тысячи двести рублей готов", voices: ["alena", "filipp"] }));
+  const made = spoke.split("\n").filter((l) => /^• /.test(l));
+  ok(made.length === 2, "на два голоса — два файла озвучки (получилось " + made.length + ")");
+  const speechCall = aiCalls.filter((c) => c.path === "/speech/v1/tts:synthesize").pop() || {};
+  ok(speechCall.contentType.indexOf("x-www-form-urlencoded") >= 0 && /voice=filipp/.test(speechCall.body), "синтез речи ушёл ФОРМОЙ с выбранным голосом");
+  const spokenFile = made.length ? made[0].split("→")[1].trim().split(" ")[0] : "";
+  ok(!!spokenFile && fs.existsSync(spokenFile) && fs.statSync(spokenFile).size === 2048, "звук от облака лёг на диск целиком: " + spokenFile);
+
+  fs.writeFileSync(path.join(work, "voice.ogg"), Buffer.from([1, 2, 3, 4]));
+  const heard = plain(await call("ycAi", { action: "listen", file: "voice.ogg" }));
+  ok(/включи свет на кухне/.test(heard), "запись расшифрована: " + lineN(heard, 2));
+  const sttCall = aiCalls.filter((c) => c.path === "/speech/v1/stt:recognize").pop() || {};
+  ok(/format=oggopus/.test(sttCall.search) && /topic=general/.test(sttCall.search), "распознавание ушло строкой параметров (" + sttCall.search + ")");
+
+  // Разрешений инструмент не спрашивает (это запросы, а не ресурсы каталога), но
+  // каталог и токен обязательны — и отказ обязан быть словами и ДО сети.
+  const aiBefore = aiCalls.length;
+  writeSettings({ ycFolderId: "" });
+  ok(/выбери каталог/.test(plain(await call("ycAi", { action: "translate", text: "Привет", target: "en" }))), "без каталога — отказ словами");
+  ok(aiCalls.length === aiBefore, "на отказе без каталога в облако не ушло ничего");
+  writeSettings();
+  ok(/неизвестное действие ycAi/.test(plain(await call("ycAi", { action: "стирай" }))), "чужое действие отвергнуто словами");
+
+  console.log("\n[14] ycMonitor: метрики каталога");
+  const monList = plain(await call("ycList", { service: "monitoring" }));
+  ok(/Monitoring/.test(monList) && /всего 3/.test(monList) && /cpu_usage/.test(monList), "плитка полки видит метрики каталога: " + lineN(monList, 0));
+  ok(/^folderId=f1/.test(((monCalls.find((c) => c.path === "/monitoring/v2/metrics") || {}).search || "").replace("?", "")), "метаданные запрошены только с каталогом: " + ((monCalls.find((c) => c.path === "/monitoring/v2/metrics") || {}).search || "нет"));
+
+  const monOverview = plain(await call("ycMonitor", { action: "overview" }));
+  ok(/cpu_usage/.test(monOverview) && /Метрик-имён: 2/.test(monOverview), "имена метрик показаны: " + lineN(monOverview, 1));
+  ok(/консоли Monitoring/.test(monOverview), "ответ честно говорит, что алерта по API нет");
+
+  const monNames = plain(await call("ycMonitor", { action: "names", service: "compute", resource: "epd1" }));
+  const namesCall = monCalls.filter((c) => c.path === "/monitoring/v2/metrics").pop() || {};
+  ok(/selectors=service%3D%22compute%22/.test(namesCall.search) && /resource_id%3D%22epd1%22/.test(namesCall.search), "селектор собран и ушёл строкой: " + namesCall.search);
+  ok(/cpu_usage/.test(monNames), "метрики ресурса показаны: " + lineN(monNames, 1));
+
+  const monData = plain(await call("ycMonitor", { action: "metrics", metric: "cpu_usage", service: "compute", resource: "epd1", minutes: 30, maxPoints: 20 }));
+  const dataCall = monCalls.filter((c) => c.path === "/monitoring/v2/data/read").pop() || {};
+  let dataBody = {};
+  try { dataBody = JSON.parse(dataCall.body || "{}"); } catch { dataBody = {}; }
+  ok(dataCall.method === "POST" && /folderId=f1/.test(dataCall.search), "данные ушли POST-ом с каталогом в строке");
+  ok(dataBody.query === 'cpu_usage{service="compute", resource_id="epd1"}', "запрос собран из метрики и меток: " + dataBody.query);
+  ok(dataBody.downsampling && dataBody.downsampling.maxPoints === "20" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(dataBody.fromTime), "прореживание и время ушли телом: " + JSON.stringify(dataBody.downsampling));
+  ok(/в среднем 3/.test(monData) && /точек: 3/.test(monData), "сводка считает настоящие точки без пропуска: " + lineN(monData, 1));
+
+  const monEmpty = plain(await call("ycMonitor", { action: "metrics", metric: "нет-такой", service: "compute" }));
+  ok(/данных за 60 мин нет/.test(monEmpty), "пустой ряд объяснён словами, а не ошибкой");
+
+  const monBefore = monCalls.length;
+  writeSettings({ ycFolderId: "" });
+  ok(/выбери каталог/.test(plain(await call("ycMonitor", { action: "overview" }))), "без каталога — отказ словами");
+  ok(monCalls.length === monBefore, "на отказе без каталога в облако не ушло ничего");
+  writeSettings();
+
+  // ── Канал ОКНА (часть 87) ──────────────────────────────────────────────
+  // Инструмент агента и канал интерфейса — разные входы в ОДИН модуль, и
+  // проверять их надо разными путями: агент зовёт инструмент, а окно — канал
+  // «yc:ai» через настоящий registerYcIpc (в этом прогоне main.js собран
+  // целиком, подменён только electron, поэтому ipcMain у нас перехвачен).
+  console.log("\n[15] yc:ai: канал окна — перевод, снимок, речь и отказы");
+  const aiHandler = handlers.get("yc:ai");
+  ok(typeof aiHandler === "function", "канал yc:ai зарегистрирован настоящим main.js");
+  const callAi = (args) => aiHandler({}, args || {});
+
+  const uiTrBefore = aiCalls.filter((c) => c.path === "/translate/v2/translate").length;
+  const uiTr = await callAi({ op: "translate", text: "Привет", targets: "en, de" });
+  const uiTrAfter = aiCalls.filter((c) => c.path === "/translate/v2/translate").length;
+  ok(uiTr.ok === true && uiTrAfter - uiTrBefore === 2, "перевод из окна ушёл пачкой на два языка (ушло " + (uiTrAfter - uiTrBefore) + ")");
+  ok((uiTr.lines || []).join("\n").includes("[EN] Привет") && /2 языка — это 2 запроса/.test(uiTr.message || ""), "ответ окна назван по-русски: " + (uiTr.message || ""));
+  ok((uiTr.warnings || []).join(" ").includes("платный"), "о тарифе сказано ДО счёта");
+
+  // Снимок: путь от рабочей папки, тип по расширению (модулем), содержимое — base64.
+  fs.writeFileSync(path.join(work, "чек.png"), Buffer.from("PNG-LIVE"));
+  const uiOcr = await callAi({ op: "ocr", files: "чек.png", langs: "ru, en" });
+  ok(uiOcr.ok === true && /СЧЁТ № 17/.test((uiOcr.lines || []).join("\n")), "снимок из окна распознан: " + lineN((uiOcr.lines || []).join("\n"), 1));
+  ok(aiCalls.some((c) => c.path === "/ocr/v1/recognizeText" && c.body.includes("image/png")), "тип файла определён модулем (mimeForExt), а не угадан");
+
+  // Речь: файлы на диске И содержимое для плеера — окно играет само.
+  const uiSp = await callAi({ op: "speak", text: "Готово", voices: "alena, filipp" });
+  ok(uiSp.ok === true && (uiSp.files || []).length === 2, "озвучка двумя голосами: файлов " + (uiSp.files || []).length);
+  ok((uiSp.audios || []).length === 2 && Buffer.from(uiSp.audios[0].base64, "base64").length === 2048, "звук вернулся в окно содержимым (2048 байт)");
+  ok((uiSp.files || []).every((f) => fs.existsSync(f.path)), "файлы речи лежат на диске: " + ((uiSp.files || [])[0] || {}).path);
+
+  fs.writeFileSync(path.join(work, "команда.ogg"), Buffer.from([1, 2, 3, 4]));
+  const uiLs = await callAi({ op: "listen", file: "команда.ogg" });
+  ok(uiLs.ok === true && /включи свет на кухне/.test(uiLs.text || ""), "запись из окна расшифрована: " + (uiLs.text || ""));
+
+  // Отказы — до сети: чужой файл и чужое действие. Канал отвечает словами, а не бросает.
+  const uiBefore = aiCalls.length;
+  const uiMiss = await callAi({ op: "ocr", files: "нет.png" });
+  ok(uiMiss.ok === false && /Проверь путь/.test(uiMiss.error || ""), "чужого файла нет — отказ словами: " + (uiMiss.error || ""));
+  const uiBad = await callAi({ op: "стирай" });
+  ok(uiBad.ok === false && /Доступно: translate, languages, detect, ocr, voices, speak, listen/.test(uiBad.error || ""), "чужое действие отвергнуто со списком");
+  ok(aiCalls.length === uiBefore, "на отказах в облако не ушло ничего");
+
+  // ── Managed-базы (часть 88) ─────────────────────────────────────────────
+  // Три базы — ОДИН инструмент, потому что у них один API: меняется только
+  // сегмент пути. Именно это и проверяется: ушло ли в НУЖНУЮ базу, собрано ли
+  // тело по правилам сервиса (у ClickHouse оно другое) и не уходит ли в облако
+  // платное без согласия.
+  console.log("\n[16] ycMdb: Managed-базы — список, карточка, создание и отказы");
+  mdbCalls.length = 0;
+  const dbOverview = plain(await call("ycMdb", { action: "overview" }));
+  ok(/PostgreSQL — 1 кластер/.test(dbOverview) && /MySQL — 1 кластер/.test(dbOverview) && /ClickHouse — 1 кластер/.test(dbOverview), "три базы показаны сразу: " + lineN(dbOverview, 1));
+  ok(/Всего кластеров: 3/.test(dbOverview), "счёт кластеров назван: " + lineN(dbOverview, 4));
+  ok(/тарифицируется почасово/.test(dbOverview) && /confirm: true/.test(dbOverview), "о цене создания сказано ДО вызова");
+  ok(/резервные копии/.test(dbOverview), "сказано, что и остановленный кластер не бесплатен");
+  ok(mdbCalls.some((c) => c.path === "/managed-postgresql/v1/clusters") && mdbCalls.some((c) => c.path === "/managed-mysql/v1/clusters") && mdbCalls.some((c) => c.path === "/managed-clickhouse/v1/clusters"), "каждая база опрошена по своему пути");
+  ok(/^\?folderId=f1&pageSize=1000$/.test((mdbCalls.find((c) => c.engine === "postgresql") || {}).search || ""), "каталог ушёл строкой: " + ((mdbCalls.find((c) => c.engine === "postgresql") || {}).search || "нет"));
+
+  const dbCard = plain(await call("ycMdb", { action: "card", engine: "postgresql", cluster: "db-main" }));
+  ok(/rc1a-pg-1\.mdb\.yandexcloud\.net/.test(dbCard) && /port=6432/.test(dbCard), "карточка даёт адрес ХОСТА и порт пулера: " + lineN(dbCard, 4));
+  const chCard = plain(await call("ycMdb", { action: "card", engine: "clickhouse", cluster: "analytics" }));
+  ok(/24\.8/.test(chCard) && /--port 9440 --secure/.test(chCard), "у ClickHouse адрес собран по-своему: " + lineN(chCard, 4));
+
+  const dbUsers = plain(await call("ycMdb", { action: "users", engine: "postgresql", cluster: "db-main" }));
+  ok(/admin/.test(dbUsers) && /пароли облако в чтении не отдаёт/i.test(dbUsers), "про пароли сказано честно: " + lineN(dbUsers, 1));
+
+  const dbLogs = plain(await call("ycMdb", { action: "logs", engine: "postgresql", cluster: "db-main", minutes: 30, serviceType: "postgresql" }));
+  const logCall = mdbCalls.filter((c) => /:logs$/.test(c.path)).pop() || {};
+  const logQuery = decodeURIComponent(logCall.search || "");
+  ok(/^\?fromTime=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z&toTime=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/.test(logQuery) && /serviceType=POSTGRESQL/.test(logQuery), "логи запрошены с временем без миллисекунд: " + logQuery);
+  ok(/no pg_hba/.test(dbLogs), "запись лога прочитана: " + lineN(dbLogs, 1));
+
+  // Питание: на работающем кластере start — это ответ, а не запрос; stop уходит и
+  // состояние ПЕРЕЧИТЫВАЕТСЯ (в подменённом облаке оно правда меняется).
+  const powerBefore = mdbCalls.filter((c) => /:start$/.test(c.path)).length;
+  const dbStart = plain(await call("ycMdb", { action: "start", engine: "postgresql", cluster: "db-main" }));
+  ok(/уже работает/.test(dbStart), "«уже работает» — это ответ, а не ошибка: " + lineN(dbStart, 0));
+  ok(mdbCalls.filter((c) => /:start$/.test(c.path)).length === powerBefore, "на «уже работает» запрос питания не ушёл");
+  const dbStop = plain(await call("ycMdb", { action: "stop", engine: "postgresql", cluster: "db-main" }));
+  ok(/останавливается/.test(dbStop) && /состояние: остановлен/.test(dbStop), "питание выполнено и состояние прочитано заново: " + lineN(dbStop, 0));
+  ok(/диск и резервные копии/.test(dbStop), "сказано, что остановка не делает кластер бесплатным");
+
+  // Создание и удаление: без согласия — ни одного запроса.
+  const createBefore = mdbCalls.filter((c) => c.method === "POST" && c.path === "/managed-postgresql/v1/clusters").length;
+  const dbCreateAsk = plain(await call("ycMdb", { action: "create", engine: "postgresql", name: "db-2", version: "16", preset: "s2.micro", subnet: "app-subnet" }));
+  ok(/ПЛАТНОЕ/.test(dbCreateAsk) && /confirm: true/.test(dbCreateAsk), "создание без согласия — вопрос, а не отказ: " + lineN(dbCreateAsk, 0));
+  ok(mdbCalls.filter((c) => c.method === "POST" && c.path === "/managed-postgresql/v1/clusters").length === createBefore, "кластер создался БЕЗ согласия");
+
+  const dbCreate = plain(await call("ycMdb", { action: "create", engine: "postgresql", name: "db-2", version: "16", preset: "s2.micro", subnet: "app-subnet", user: "app", database: "appdb", confirm: true }));
+  const pgMade = mdbCalls.filter((c) => c.method === "POST" && c.path === "/managed-postgresql/v1/clusters").pop() || {};
+  let madeBody = {};
+  try { madeBody = JSON.parse(pgMade.body || "{}"); } catch { madeBody = {}; }
+  ok(madeBody.name === "db-2" && madeBody.networkId === "net-1", "сеть найдена МОДУЛЕМ по подсети: " + madeBody.networkId);
+  ok(madeBody.configSpec && madeBody.configSpec.version === "16" && madeBody.configSpec.resources.resourcePresetId === "s2.micro", "версия и класс ушли телом: " + JSON.stringify(madeBody.configSpec && madeBody.configSpec.resources));
+  ok(madeBody.databaseSpecs[0].name === "appdb" && madeBody.databaseSpecs[0].owner === "app", "база и её владелец создаются вместе с кластером");
+  ok(String(madeBody.userSpecs[0].password || "").length >= 8 && dbCreate.includes(madeBody.userSpecs[0].password), "пароль показан один раз и тот же, что уехал в облако");
+  ok(/ОДИН раз/.test(dbCreate), "сказано, что пароль больше не покажут");
+
+  // ClickHouse: ДРУГОЕ тело — класс ВНУТРИ config.clickhouse и adminPassword.
+  const chCreate = plain(await call("ycMdb", { action: "create", engine: "clickhouse", name: "ch-2", version: "24.8", preset: "s2.micro", subnet: "app-subnet", confirm: true }));
+  const chMade = mdbCalls.filter((c) => c.method === "POST" && c.path === "/managed-clickhouse/v1/clusters").pop() || {};
+  let chBody = {};
+  try { chBody = JSON.parse(chMade.body || "{}"); } catch { chBody = {}; }
+  ok(chBody.configSpec && chBody.configSpec.clickhouse && chBody.configSpec.clickhouse.resources.resourcePresetId === "s2.micro", "у ClickHouse класс ушёл в config.clickhouse: " + JSON.stringify(chBody.configSpec));
+  ok(chBody.configSpec.resources === undefined && String(chBody.configSpec.adminPassword || "").length >= 8, "у ClickHouse нет configSpec.resources, но есть adminPassword");
+  ok(chCreate.includes(chBody.configSpec.adminPassword), "пароль администратора ClickHouse показан один раз");
+
+  const delBefore = mdbCalls.filter((c) => c.method === "DELETE").length;
+  const delAsk = plain(await call("ycMdb", { action: "delete", engine: "postgresql", cluster: "db-main" }));
+  ok(/НЕОБРАТИМО/.test(delAsk) && /РЕЗЕРВНЫЕ КОПИИ/.test(delAsk), "об необратимости сказано прямо: " + lineN(delAsk, 0));
+  ok(mdbCalls.filter((c) => c.method === "DELETE").length === delBefore, "кластер удалён БЕЗ согласия");
+
+  // ── Канал ОКНА (часть 88): те же три базы, но через yc:mdb ─────────────
+  console.log("\n[17] yc:mdb: канал окна — три базы, согласие и секрет");
+  const mdbHandler = handlers.get("yc:mdb");
+  ok(typeof mdbHandler === "function", "канал yc:mdb зарегистрирован настоящим main.js");
+  const callMdb = (args) => mdbHandler({}, args || {});
+
+  const uiList = await callMdb({ op: "list", engine: "mysql" });
+  ok(uiList.ok === true && /db-main/.test((uiList.lines || []).join("\n")), "канал читает кластеры своей базы: " + lineN((uiList.lines || []).join("\n"), 0));
+  const uiCard = await callMdb({ op: "card", engine: "mysql", cluster: "db-main" });
+  ok(uiCard.ok === true && uiCard.connection && /--port 3306/.test(uiCard.connection.line || ""), "канал отдаёт строку подключения: " + ((uiCard.connection || {}).line || "—"));
+
+  const uiNeed = await callMdb({ op: "create", engine: "postgresql", name: "db-3", version: "16", preset: "s2.micro", subnet: "app-subnet" });
+  ok(uiNeed.ok === false && uiNeed.needsConfirm === true, "окно получает needsConfirm, а не отказ");
+  const uiMade = await callMdb({ op: "create", engine: "postgresql", name: "db-3", version: "16", preset: "s2.micro", subnet: "app-subnet", confirm: true });
+  ok(uiMade.ok === true && typeof uiMade.secret === "string" && uiMade.secret.length >= 8, "пароль ушёл окну ОТДЕЛЬНЫМ полем secret");
+  ok(/Пароль базы/.test(uiMade.secretLabel || ""), "окно знает, чей это пароль: " + uiMade.secretLabel);
+
+  const uiDelNeed = await callMdb({ op: "delete", engine: "postgresql", cluster: "db-main" });
+  ok(uiDelNeed.ok === false && uiDelNeed.needsConfirm === true && /НЕОБРАТИМО/.test(uiDelNeed.error || ""), "удаление из окна тоже спросит согласие");
+  const uiDel = await callMdb({ op: "delete", engine: "postgresql", cluster: "db-main", confirm: true });
+  ok(uiDel.ok === true && uiDel.deleted === true, "удаление по согласию выполнено: " + (uiDel.message || ""));
+
+  // Отказы: чужое действие и отсутствие каталога — до сети.
+  const mdbBefore = mdbCalls.length;
+  const uiBadOp = await callMdb({ op: "vacuum" });
+  ok(uiBadOp.ok === false && /Доступно: list, card, hosts, databases, users, logs, operations, presets, start, stop, create, delete/.test(uiBadOp.error || ""), "чужое действие отвергнуто со списком");
+  writeSettings({ ycFolderId: "" });
+  const uiNoFolder = await callMdb({ op: "list", engine: "postgresql" });
+  ok(uiNoFolder.ok === false && /Не выбран каталог/.test(uiNoFolder.error || ""), "без каталога — отказ словами");
+  writeSettings();
+  ok(mdbCalls.length === mdbBefore, "на отказах в облако не ушло ничего");
+
+  // ── DNS-зоны и записи из окна (часть 89) ────────────────────────────────
+  // Записи DNS умели агент и карточка зоны, а у плитки действий не было. Канал
+  // «yc:dns» собран на ТЕХ ЖЕ функциях yandex-cloud.js, что и они: проверяем,
+  // что он видит зоны, ставит запись значениями через запятую, а удаление
+  // спрашивает согласие (и показывает саму запись до него).
+  console.log("\n[18] yc:dns: канал окна — зоны, запись и согласие на удаление");
+  const dnsHandler = handlers.get("yc:dns");
+  ok(typeof dnsHandler === "function", "канал yc:dns зарегистрирован настоящим main.js");
+  const callDns = (args) => dnsHandler({}, args || {});
+
+  const uiZones = await callDns({ op: "zones" });
+  ok(uiZones.ok === true && /test-zone — id z1/.test((uiZones.lines || []).join("\n")), "зоны каталога пришли строками: " + lineN((uiZones.lines || []).join("\n"), 0));
+  ok((uiZones.zones || []).length === 2, "окно получило и сам список зон (для подсказок формы)");
+
+  const uiRecs = await callDns({ op: "records", zone: "test-zone" });
+  ok(uiRecs.ok === true && /A www\.test-zone\. \(TTL 600\) → 203\.0\.113\.10/.test((uiRecs.lines || []).join("\n")), "записи зоны прочитаны: " + lineN((uiRecs.lines || []).join("\n"), 1));
+
+  dnsUpdates.length = 0;
+  const uiAdd = await callDns({ op: "add", zone: "test-zone", name: "api.test-zone", type: "A", ttl: 120, values: "203.0.113.11, 203.0.113.12" });
+  const uiAddBody = JSON.parse(dnsUpdates.pop() || "{}");
+  ok(uiAdd.ok === true && uiAddBody.additions && uiAddBody.additions[0].name === "api.test-zone." && uiAddBody.additions[0].data.length === 2, "запись ушла additions с двумя значениями: " + JSON.stringify(uiAddBody.additions && uiAddBody.additions[0]));
+  ok(/203\.0\.113\.11, 203\.0\.113\.12/.test((uiAdd.lines || []).join("\n")), "ответ окна называет оба значения");
+  ok((uiAdd.warnings || []).join(" ").includes("от минуты до часов"), "сказано, что DNS расходится не сразу");
+
+  const uiApex = await callDns({ op: "add", zone: "test-zone.", name: "test-zone.", type: "CNAME", values: "host.example.net." });
+  ok(uiApex.ok === false && /вершине зоны/.test(uiApex.error || ""), "CNAME на вершине отбит до сети: " + (uiApex.error || "").slice(0, 80));
+
+  const uiAsk = await callDns({ op: "delete", zone: "test-zone", name: "www.test-zone.", type: "A" });
+  ok(uiAsk.ok === false && uiAsk.needsConfirm === true && /перестать открываться/.test(uiAsk.error || ""), "удаление без согласия объясняет последствия");
+  ok(/A www\.test-zone\./.test((uiAsk.lines || []).join("\n")), "перед удалением показана сама запись: " + lineN((uiAsk.lines || []).join("\n"), 0));
+  dnsUpdates.length = 0;
+  const uiDnsDel = await callDns({ op: "delete", zone: "test-zone", name: "www.test-zone.", type: "A", confirm: true });
+  const uiDnsDelBody = JSON.parse(dnsUpdates.pop() || "{}");
+  ok(uiDnsDel.ok === true && uiDnsDelBody.deletions && uiDnsDelBody.deletions[0].name === "www.test-zone." && (uiDnsDelBody.additions || []).length === 0, "удаление убрало ровно найденную запись");
+
+  const uiDnsBad = await callDns({ op: "стирай" });
+  ok(uiDnsBad.ok === false && /Доступно: zones, card, records, add, delete/.test(uiDnsBad.error || ""), "чужое действие отвергнуто со списком");
+  writeSettings({ ycFolderId: "" });
+  const uiDnsNoFolder = await callDns({ op: "zones" });
+  ok(uiDnsNoFolder.ok === false && /Не выбран каталог/.test(uiDnsNoFolder.error || ""), "без каталога — отказ словами");
+  writeSettings();
 
   srv.close();
   clearTimeout(watchdog);

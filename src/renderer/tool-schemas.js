@@ -2439,6 +2439,96 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "ycMonitor",
+      description:
+        "Yandex Cloud Monitoring: метрики каталога — что вообще измеряется и что показывают сами цифры. action: overview (метаданные каталога: имена метрик, их типы и МЕТКИ) | names (метрики конкретного ресурса по метке service + resource_id) | metrics (данные метрики за период). Имена метрик и их метки у облака меняются от сервиса к сервису, поэтому сначала overview или names, а не метрика по памяти: у машины это cpu_usage, у другого сервиса — своё. Сборка запроса — metric + service + resource: получится cpu_usage{service=\"compute\", resource_id=\"…\"}; можно задать готовый query целиком. minutes — за сколько минут (по умолчанию 60), aggregation — чем прореживать (AVG по умолчанию, ещё MAX/MIN/SUM/LAST/COUNT), maxPoints — сколько точек оставить (по умолчанию 30; облако требует больше 10), gapFilling — что с пропусками (NULL/NONE/PREVIOUS). Ответ — сводка по ряду: среднее, максимум, последнее и число точек, а не сырые точки. ВАЖНО: порог с уведомлением (алерт) этим инструментом поставить НЕЛЬЗЯ — публичного REST для алертов у облака нет, они настраиваются в консоли Monitoring; не выдумывай такое действие. Разрешений не требует (только чтение).",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "overview | names | metrics" },
+          metric: { type: "string", description: "Имя метрики латиницей, например cpu_usage (для action metrics; что есть — покажет overview)" },
+          query: { type: "string", description: "Готовый запрос Monitoring целиком, например cpu_usage{service=\"compute\", resource_id=\"epd…\"} (необязательно: вместо него можно задать metric + service + resource)" },
+          service: { type: "string", description: "Метка service: compute, serverless-functions, serverless-containers и т.д." },
+          resource: { type: "string", description: "Метка resource_id — идентификатор ресурса (виден в ycList/карточке)" },
+          minutes: { type: "integer", description: "За сколько минут читать данные (по умолчанию 60)" },
+          aggregation: { type: "string", description: "Прореживание: AVG | MAX | MIN | SUM | LAST | COUNT (по умолчанию AVG)" },
+          maxPoints: { type: "integer", description: "Сколько точек оставить (по умолчанию 30, минимум 11)" },
+          gapFilling: { type: "string", description: "Заполнение пропусков: NULL | NONE | PREVIOUS" },
+          limit: { type: "integer", description: "Сколько имён метрик показать (по умолчанию 200)" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "ycMdb",
+      description:
+        "Yandex Cloud: управляемые базы (Managed Service for PostgreSQL, MySQL и ClickHouse) — посмотреть кластеры, карточку с хостами и строкой подключения, базы и пользователей, логи, историю операций, классы хостов, включить-выключить, создать и удалить кластер. База задаётся ПОЛЕМ engine: postgresql (а также «postgres», «pg», «постгрес»), mysql, clickhouse. action: overview (кластеры: без engine — сразу все три базы) | card (карточка: состояние, ресурсы, хосты, готовая строка подключения) | hosts (хосты: зоны, роли MASTER/REPLICA, здоровье) | databases (базы) | users (пользователи и их доступ; паролей в чтении нет и быть не может) | logs (записи за minutes минут, serviceType — тип логов сервиса) | operations (история операций: что делалось и чем кончилось) | presets (классы хостов: ядра, память, зоны — список отдаёт само облако) | start | stop (питание) | create | delete. ЧТО ЗНАТЬ: (1) адрес подключения — это ИМЯ ХОСТА (вида c-…rw.mdb.yandexcloud.net), а не кластера: точки входа у кластера нет, поэтому строку подключения собирает card по хосту-мастеру; (2) для PostgreSQL порт подключения 6432 (пулер), MySQL 3306, ClickHouse 9440; (3) ПАРОЛЬ пользователя облако отдаёт РОВНО ОДИН РАЗ — в ответ на create; второй раз его не покажет ни список, ни консоль, поэтому сохрани его в хранилище секретов (ycSecret); (4) СОЗДАНИЕ ПЛАТНОЕ и требует полей name, version, preset и subnet: класс тарифицируется почасово и круглосуточно, а точную цену за час показывает каталог облака — ycBilling { action: \"price\", query: \"PostgreSQL\" }; назови ориентир пользователю и получи согласие ДО вызова с confirm: true; (5) stop экономит деньги за вычисления, но диск и РЕЗЕРВНЫЕ КОПИИ тарифицируются и у остановленного кластера; (6) УДАЛЕНИЕ необратимо и забирает резервные копии вместе с кластером, поэтому требует confirm: true после согласия, а при включённой защите от удаления (deletionProtection) облако откажет — сначала сними защиту в консоли. Требуемые чекбоксы разрешений: create — «Разрешить агенту создавать ресурсы», start/stop — «Разрешить агенту менять контейнеры и правила сети», delete — «Разрешить агенту удалять ресурсы».",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "overview | card | hosts | databases | users | logs | operations | presets | start | stop | create | delete" },
+          engine: { type: "string", description: "База: postgresql | mysql | clickhouse (понимает также postgres, pg, постгрес). Без него overview показывает все три" },
+          cluster: { type: "string", description: "Имя или id кластера (для card, hosts, databases, users, logs, operations, start, stop, delete)" },
+          name: { type: "string", description: "Имя НОВОГО кластера (для create): строчные латинские буквы, цифры и дефис" },
+          version: { type: "string", description: "Версия базы (для create): PostgreSQL — 11…18, MySQL — 5.7/8.0/8.4, ClickHouse — например 24.8" },
+          preset: { type: "string", description: "Класс хоста (для create) — id из action presets, например s2.micro" },
+          diskGb: { type: "integer", description: "Размер диска в ГБ (для create; по умолчанию 20, у ClickHouse 32)" },
+          diskType: { type: "string", description: "Тип диска (для create): network-ssd (по умолчанию) или network-hdd (дешевле)" },
+          zone: { type: "string", description: "Зона хоста (для create; по умолчанию ru-central1-a). Подсеть должна быть в этой же зоне" },
+          subnet: { type: "string", description: "Имя или id подсети (для create) — сеть определится по ней; список: ycVpc { action: \"subnets\" }" },
+          user: { type: "string", description: "Имя пользователя базы (для create; по умолчанию admin)" },
+          database: { type: "string", description: "Имя базы (для create; по умолчанию db1, у ClickHouse default)" },
+          userPassword: { type: "string", description: "Пароль пользователя (необязательно: без него сгенерирую стойкий и покажу один раз)" },
+          publicIp: { type: "boolean", description: "Для create: true — выдать хосту публичный адрес (нужен, чтобы подключаться из интернета)" },
+          minutes: { type: "integer", description: "За сколько минут читать логи (по умолчанию 60)" },
+          serviceType: { type: "string", description: "Тип логов: PostgreSQL — POSTGRESQL/POOLER/REPACK, MySQL — MYSQL/POOLER, ClickHouse — CLICKHOUSE/KEEPER" },
+          limit: { type: "integer", description: "Сколько записей логов или операций показать (по умолчанию 100 и 15)" },
+          confirm: { type: "boolean", description: "Подтверждение пользователя для create и delete — без него не выполняется" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "ycAi",
+      description:
+        "Яндекс AI (тот же токен Yandex Cloud, отдельного ключа API не нужно): перевод, текст с картинки и речь. action: translate (перевести) | languages (языки перевода) | ocr (текст со снимка или PDF) | voices (голоса SpeechKit) | speak (текст в звук) | listen (звук в текст). ПРИНИМАЕТ СПИСКИ: targets — несколько языков сразу (перевести на en, de, fr одним вызовом), texts — несколько строк, files — несколько картинок, voices — несколько голосов. Когда что: скриншот или скан → ocr (модель page — обычный текст, handwritten — рукописный, table — таблицы; langs — языки, по умолчанию ru и en); чужой текст или подпись на картинке → translate (source можно не указывать — облако определит язык само); «озвучь» → speak (файлы ложатся в рабочую папку агента, послушать — openPath); «расшифруй запись» → listen (ogg/opus, mp3, lpcm; файл до 1 МБ, примерно минута речи). Картинка — до 10 МБ; lpcm требует sampleRateHertz; эмоции good/evil понимают только русские голоса. Все четыре сервиса ПЛАТНЫЕ по запросу (SpeechKit — по длине звука), а каждый целевой язык перевода — отдельный запрос, поэтому переводи пачкой, а не по языку за раз. Разрешений не требует, но speak пишет файл на диск.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "translate | languages | ocr | voices | speak | listen" },
+          text: { type: "string", description: "Текст: что перевести (translate), озвучить (speak)" },
+          texts: { type: "array", items: { type: "string" }, description: "Несколько строк для перевода сразу (необязательно)" },
+          target: { type: "string", description: "Язык перевода: ru, en, de, zh… (для translate)" },
+          targets: { type: "array", items: { type: "string" }, description: "Несколько языков перевода сразу — каждый станет отдельным запросом" },
+          source: { type: "string", description: "Язык источника (необязательно: без него облако определит язык само)" },
+          file: { type: "string", description: "Путь к файлу от рабочей папки: картинка для ocr, запись для listen" },
+          files: { type: "array", items: { type: "string" }, description: "Несколько картинок для распознавания сразу" },
+          langs: { type: "array", items: { type: "string" }, description: "Языки текста на картинке (по умолчанию ru, en)" },
+          model: { type: "string", description: "Модель Vision: page | handwritten | table | markdown | mathmarkdown | page-column-sort" },
+          mimeType: { type: "string", description: "Тип файла (обычно виден по расширению: jpg, png, bmp, tiff, pdf)" },
+          voice: { type: "string", description: "Голос SpeechKit: alena, filipp, ermil, jane, omazh, zahar, madirus… (список: action voices)" },
+          voices: { type: "array", items: { type: "string" }, description: "Несколько голосов сразу — на каждый будет свой файл" },
+          lang: { type: "string", description: "Язык речи для speak и listen (по умолчанию ru-RU)" },
+          format: { type: "string", description: "Формат звука: speak — mp3 (по умолчанию) | oggopus | lpcm | wav; listen — oggopus | mp3 | lpcm" },
+          speed: { type: "number", description: "Скорость речи speak: 0.1–3.0 (по умолчанию 1.0)" },
+          emotion: { type: "string", description: "Эмоция голоса speak: good | evil | neutral (только русские голоса)" },
+          out: { type: "string", description: "Куда сохранить звук (необязательно: по умолчанию — рабочая папка агента)" },
+          topic: { type: "string", description: "Тема распознавания listen: general (короткие команды) | deferred (длинная речь)" },
+          sampleRateHertz: { type: "integer", description: "Частота дискретизации (нужна для lpcm, например 48000)" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "ycVpc",
       description:
         "Yandex Cloud: сеть VPC — подсети, группы безопасности и статические адреса. action: list (общая картина: сети, подсети, группы, адреса и предупреждение о простаивающих) | subnets (подсети: зона, диапазон, сеть) | addsubnet (создать подсеть) | delsubnet (удалить подсеть) | groups (группы безопасности с их правилами) | addgroup (создать группу) | delgroup (удалить группу) | addrule (добавить правило в группу) | delrule (убрать правило) | addresses (статические адреса: привязан или простаивает) | reserve (закрепить статический адрес) | release (освободить адрес). Подсеть живёт В ОДНОЙ ЗОНЕ и требует диапазон: name, network (имя или id сети), zone (ru-central1-a), cidr (10.10.0.0/24) — без cidr подберу свободный диапазон и скажу, какой выбрал. Правило: group, direction (ingress — вход, egress — выход), protocol (tcp/udp/icmp/any), port (22 или \"8000-8010\"; у icmp и any портов нет), cidr (203.0.113.10/32) или sourceGroup (группа-источник). Что нужно для виртуальной машины: подсеть + группа безопасности + правило на порт 22 ТОЛЬКО с адреса пользователя (/32), а не с 0.0.0.0/0 — правило 0.0.0.0/0 пускает к машине кого угодно. addsubnet/addgroup/reserve требуют чекбокса «Разрешить агенту создавать ресурсы», addrule/delrule — «Разрешить агенту менять контейнеры и правила сети», delsubnet/delgroup/release — «Разрешить агенту удалять ресурсы». Статический адрес платный и тарифицируется даже простаивающим, а освобождённый IP вернуть нельзя — не закрепляй адрес «про запас».",

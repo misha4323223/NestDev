@@ -1093,6 +1093,42 @@ const ycIam = createYcIam({
   serviceError: yandexCloud.serviceError,
   isNetworkError: yandexCloud.isNetworkError,
 });
+// Яндекс AI: перевод, текст со снимка и речь (SpeechKit) — своим модулем (чистый
+// Node, как остальные yc-*). Авторизация та же: OAuth → IAM, поэтому второго
+// секрета (ключа API) человеку заводить не нужно.
+const { createYcAi } = require("./yc-ai.js");
+const ycAi = createYcAi({
+  fetchJson: yandexCloud._fetchJson,
+  endpoint: yandexCloud.endpoint,
+  getIamToken: yandexCloud.getIamToken,
+  serviceError: yandexCloud.serviceError,
+  isNetworkError: yandexCloud.isNetworkError,
+});
+// Monitoring: метрики каталога — данные (MetricsData) и метаданные (MetricsMeta).
+// В публичном справочнике API у Monitoring ТОЛЬКО эти два ресурса: публичного REST
+// для алертов у облака нет, и кнопку «создать алерт» поэтому не рисуем.
+const { createYcMonitoring } = require("./yc-monitoring.js");
+const ycMonitoring = createYcMonitoring({
+  fetchJson: yandexCloud._fetchJson,
+  endpoint: yandexCloud.endpoint,
+  getIamToken: yandexCloud.getIamToken,
+  serviceError: yandexCloud.serviceError,
+  isNetworkError: yandexCloud.isNetworkError,
+});
+// Managed-базы (PostgreSQL, MySQL, ClickHouse) — своим модулем (чистый Node, как
+// остальные yc-*). Три базы в одном модуле, потому что у них один хост и один
+// набор методов (mdb.api.cloud.yandex.net): в запросе меняется только сегмент
+// пути. waitOperation нужен питанию и удалению: создание и удаление кластера
+// идёт минутами, и без ожидания операция осталась бы без ответа.
+const { createYcMdb } = require("./yc-mdb.js");
+const ycMdb = createYcMdb({
+  fetchJson: yandexCloud._fetchJson,
+  endpoint: yandexCloud.endpoint,
+  getIamToken: yandexCloud.getIamToken,
+  waitOperation: yandexCloud.waitOperation,
+  serviceError: yandexCloud.serviceError,
+  isNetworkError: yandexCloud.isNetworkError,
+});
 const ycService = createYcService({ app, path, net, secrets, yandexCloud, ycCli, ycLogs, ycEnsurePath, loadSettings });
 const {
   ycConfig,
@@ -1106,7 +1142,10 @@ const {
   ycCliStatus,
   ycCliInstall,
 } = ycService;
-registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, loadSettings, saveSettings, svc: ycService });
+// ycAi — тот же экземпляр модуля, что у агента (один кэш IAM-токена); fs, path,
+// resolvePath и agentWorkDir нужны каналу «yc:ai»: снимки и записи он читает с
+// диска, а синтезированную речь кладёт в рабочую папку агента.
+registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, fs, path, resolvePath, agentWorkDir, loadSettings, saveSettings, svc: ycService });
 
 // Память диалогов: каналы дневника памяток и запись самой памятки при сжатии контекста
 // (её кладёт прогон через onMemo). Собирается ПОСЛЕ путей-и-git и миссий: зеркало
@@ -1358,6 +1397,9 @@ const { executeTool } = createToolRegistry({
   ycFunctions,
   ycBilling,
   ycCdn,
+  ycAi,
+  ycMonitoring,
+  ycMdb,
   readYcLogsText,
 
   ycCliStatus,

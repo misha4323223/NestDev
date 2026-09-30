@@ -19,7 +19,7 @@
    каналов когда-то расползлись по оболочке. Тела запросов живут в модулях, здесь — выбор действия и отказ. */
 
 function registerYcIpc(deps) {
-  const { ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, loadSettings, saveSettings, svc } = deps;
+  const { ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, loadSettings, saveSettings, svc, fs, path: nodePath, resolvePath, agentWorkDir } = deps;
   const {
     YANDEX_OAUTH_URL,
     ycConfig,
@@ -1386,6 +1386,565 @@ ipcMain.handle("yc:cdn", async (_e, args) => {
     return { ok: false, error: (e && e.message) || String(e) };
   }
 });
+
+// ── Monitoring: метрики каталога ────────────────────────────────────────────
+// Публичный справочник API у Monitoring знает ДВА ресурса — данные метрик
+// (MetricsData) и их метаданные (MetricsMeta). Алертов в нём нет: следить за
+// порогом из приложения пока нечем, и кнопки «создать алерт» здесь поэтому тоже
+// нет — обещать то, за чем ничего нет, хуже, чем не обещать.
+ipcMain.handle("yc:monitoring", async (_e, args) => {
+  const cfg = ycConfig();
+  const a = args || {};
+  const op = String(a.op || a.action || "overview").trim().toLowerCase();
+  if (!ycMonitoring) return { ok: false, error: "Модуль метрик не подключён к приложению (src/yc-monitoring.js)." };
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках (Настройки → «☁️ Yandex Cloud»)." };
+  if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
+  try {
+    const resource = a.resource || a.resourceId || a.id || "";
+    if (op === "overview" || op === "names") {
+      const selectors = op === "names" ? ycMonitoring.selectorFor({ service: a.service, resource_id: resource }) : String(a.selectors || "");
+      const r = await ycMonitoring.listMetrics(cfg.oauth, { folderId: cfg.folderId, selectors: selectors, limit: a.limit });
+      const lines = ycMonitoring.linesNames(r);
+      return {
+        ok: true,
+        names: r.names,
+        total: r.total,
+        namesTotal: r.namesTotal,
+        selectors: r.selectors,
+        lines: lines.length
+          ? lines
+          : ["Метрик не нашлось." + (selectors ? " По селектору " + selectors + "." : " В каталоге нет ни одной метрики — облако наполняет их, только когда ресурсы что-то делают.")],
+        message: "Метрик-имён: " + r.namesTotal + ", рядов (имя + набор меток): " + r.total + ".",
+      };
+    }
+    if (op === "metrics") {
+      const query = String(a.query || "").trim() || ycMonitoring.queryFor(a.metric, { service: a.service, resource_id: resource });
+      const rows = await ycMonitoring.readMetrics(cfg.oauth, {
+        folderId: cfg.folderId,
+        query: query,
+        minutes: a.minutes,
+        maxPoints: a.maxPoints,
+        aggregation: a.aggregation,
+        gapFilling: a.gapFilling,
+      });
+      const minutes = Number(a.minutes) > 0 ? Number(a.minutes) : 60;
+      return {
+        ok: true,
+        metrics: rows,
+        query: query,
+        minutes: minutes,
+        lines: ycMonitoring.linesMetrics(rows, { minutes: minutes }),
+        message: "Метрик прочитано: " + rows.filter((r) => !r.error && r.summary && r.summary.count).length + " из " + rows.length + ".",
+      };
+    }
+    return {
+      ok: false,
+      error: "Неизвестное действие метрик: " + op + ". Доступно: overview, names, metrics.",
+    };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
+// ── Яндекс AI из интерфейса: перевод, снимок и речь ─────────────────────────
+// Тела запросов живут в src/yc-ai.js — ТОМ ЖЕ модуле, что у агента: сервис один,
+// а окно и модель лишь два его вызывающих. Здесь выбор действия, разбор списков
+// (несколько языков, снимков, голосов), чтение и запись файлов и отказы. Звук
+// возвращается ЕЩЁ И СОДЕРЖИМЫМ (base64): синтез отдаёт речь телом ответа, и без
+// этого послушать её из окна было бы нечем — а «озвучить» без «послушать» это
+// половина действия. Токен и каталог те же, что у всего облака: отдельного ключа
+// API человеку заводить не нужно (он бы стал вторым секретом ради тех же служб).
+ipcMain.handle("yc:ai", async (_e, args) => {
+  const cfg = ycConfig();
+  const a = args || {};
+  const op = String(a.op || a.action || "languages").trim().toLowerCase();
+  if (!ycAi) return { ok: false, error: "Модуль Яндекс AI не подключён к приложению (src/yc-ai.js)." };
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках (Настройки → «☁️ Yandex Cloud»)." };
+  if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
+  // Списки в форме пишут строкой: «en, de», по одному в строке или через «;» —
+  // разбираем все три способа, чтобы человеку не пришлось угадывать формат.
+  const asList = (v) => String(v == null ? "" : v).split(/[,\n;]+/).map((s) => s.trim()).filter(Boolean);
+  const kb = (n) => (n >= 1048576 ? Math.round((n / 1048576) * 10) / 10 + " МБ" : Math.max(1, Math.round(n / 1024)) + " КБ");
+  // Русская форма счётного слова: «2 языка», а не «2 языков» — сообщение об
+  // ошибке читают люди, и кривой счёт в нём выглядит как поломка.
+  const plural = (n, one, few, many) => {
+    const n10 = n % 10;
+    const n100 = n % 100;
+    if (n10 === 1 && n100 !== 11) return one;
+    if (n10 >= 2 && n10 <= 4 && (n100 < 12 || n100 > 14)) return few;
+    return many;
+  };
+  // Файлы читаются только там, где есть доступ к диску (окно на ПК): мост
+  // телефона канал не открывает, а проверка стоит ДО попытки чтения.
+  const withFiles = !!(fs && nodePath && typeof resolvePath === "function" && typeof agentWorkDir === "function");
+  try {
+    // ── Справочники (не тарифицируются) ──
+    if (op === "languages") {
+      const langs = await ycAi.listLanguages(cfg.oauth, cfg.folderId);
+      if (!langs.length) {
+        return { ok: true, languages: [], lines: ["Облако не отдало список языков перевода (пустой ответ) — проверь каталог и токен."], message: "Языков: 0." };
+      }
+      const show = langs.slice(0, 80);
+      return {
+        ok: true,
+        languages: langs,
+        lines: show.map((l) => l.code + " — " + l.name).concat(langs.length > show.length ? ["…и ещё " + (langs.length - show.length) + ": код языка можно вписать и вручную."] : []),
+        message: "Языков перевода: " + langs.length + ".",
+        warnings: ["Перевод платный: каждый целевой язык — отдельный запрос к облаку."],
+      };
+    }
+    if (op === "voices") {
+      const r = await ycAi.listVoices(cfg.oauth, cfg.folderId);
+      return {
+        ok: true,
+        voices: r.voices,
+        lines: r.voices.map((v) => v.id + (v.lang ? " — " + v.lang : "") + (v.who && v.who !== v.id ? " · " + v.who : "")),
+        message: "Голоса " + (r.fromCloud ? "из облака" : "проверенные: облако список не отдало") + ": " + r.voices.length + ".",
+        warnings: ["Синтез речи платный: тарифицируется по длине звука, каждый голос — отдельный запрос."],
+      };
+    }
+    // ── Язык текста ──
+    if (op === "detect") {
+      const text = String(a.text || "").trim();
+      if (!text) return { ok: false, error: "Впиши текст — облако определит его язык." };
+      const lang = await ycAi.detectLanguage(cfg.oauth, { texts: [text], folderId: cfg.folderId });
+      return {
+        ok: true,
+        language: lang,
+        lines: [lang ? "Язык текста: " + lang + " (" + text.length + " символов)" : "Облако не назвало язык — попробуй более длинный отрывок текста."],
+        message: lang ? "Язык определён: " + lang + "." : "Язык не определён.",
+      };
+    }
+    // ── Перевод ──
+    if (op === "translate") {
+      const text = String(a.text || "").trim();
+      if (!text) return { ok: false, error: "Впиши текст для перевода." };
+      const targets = asList(a.targets || a.target).map((t) => t.toUpperCase());
+      if (!targets.length) return { ok: false, error: "Укажи языки перевода: en, de, zh — можно несколько сразу (через запятую)." };
+      const source = String(a.source || "").trim();
+      const list = await ycAi.translate(cfg.oauth, { texts: [text], targets: targets, source: source, folderId: cfg.folderId });
+      const lines = [];
+      for (const o of list) {
+        lines.push("→ " + o.language + (o.detected ? " (переведено с " + o.detected + ")" : ""));
+        for (const t of o.translations) lines.push("   " + (t || "—"));
+      }
+      return {
+        ok: true,
+        translations: list.map((o) => ({ language: o.language, text: o.translations[0] || "" })),
+        lines: lines,
+        message: "Переведено на " + list.length + " " + plural(list.length, "язык", "языка", "языков") + (list.length > 1 ? " — это " + list.length + " запроса" : "") + ".",
+        warnings: ["Перевод платный: каждый целевой язык облако считает отдельным запросом."],
+      };
+    }
+    // ── Текст со снимка (Vision OCR) ──
+    if (op === "ocr") {
+      const files = asList(a.files || a.file);
+      if (!files.length) return { ok: false, error: "Впиши путь к снимку или PDF (несколько — по одному в строке)." };
+      if (!withFiles) return { ok: false, error: "Чтение файлов работает в приложении на ПК." };
+      const langs = asList(a.langs || a.languageCodes);
+      const model = String(a.model || "page").trim().toLowerCase();
+      const parts = [];
+      for (const f of files) {
+        const p = resolvePath(f, loadSettings());
+        if (!fs.existsSync(p) || !fs.statSync(p).isFile()) return { ok: false, error: "Файла «" + f + "» нет. Проверь путь: " + p };
+        const size = fs.statSync(p).size;
+        // Vision принимает до 10 МБ на снимок: отказ ДО запроса понятнее, чем
+        // ответ сервиса «файл слишком большой» после отправки.
+        if (size > 10 * 1048576) return { ok: false, error: "Файл «" + f + "» — " + kb(size) + ", а распознавание принимает до 10 МБ." };
+        const mimeType = ycAi.mimeForExt(nodePath.extname(p));
+        if (!mimeType) return { ok: false, error: "Не понял тип файла «" + f + "» («" + (nodePath.extname(p) || "без расширения") + "»). Vision принимает jpg, jpeg, png, bmp, tiff, pdf." };
+        const r = await ycAi.recognizeText(cfg.oauth, { content: fs.readFileSync(p).toString("base64"), mimeType: mimeType, languageCodes: langs, model: model, folderId: cfg.folderId });
+        parts.push({ file: f, mimeType: mimeType, size: size, text: r.text || "" });
+      }
+      const lines = [];
+      for (const part of parts) {
+        lines.push("── " + part.file + " · " + part.mimeType + " · " + kb(part.size));
+        if (part.text) lines.push(part.text.length > 4000 ? part.text.slice(0, 4000) + "… (всего " + part.text.length + " символов)" : part.text);
+        else lines.push("(текста не нашлось — проверь языки; для рукописного подойдёт модель handwritten)");
+      }
+      return {
+        ok: true,
+        texts: parts,
+        lines: lines,
+        message: "Распознано файлов: " + parts.length + " · модель " + model + (langs.length ? " · языки " + langs.join(", ") : ""),
+        warnings: ["Vision платный: тарифицируется по объёму картинки."],
+      };
+    }
+    // ── Речь из текста (SpeechKit) ──
+    if (op === "speak") {
+      const text = String(a.text || "").trim();
+      if (!text) return { ok: false, error: "Впиши текст, который озвучить." };
+      if (!withFiles) return { ok: false, error: "Запись файлов работает в приложении на ПК." };
+      const want = asList(a.voices || a.voice);
+      if (!want.length) want.push("alena");
+      const format = String(a.format || "mp3").trim().toLowerCase();
+      const lang = String(a.lang || "ru-RU").trim();
+      const ext = format === "oggopus" ? "ogg" : format;
+      const outDir = agentWorkDir(loadSettings());
+      fs.mkdirSync(outDir, { recursive: true });
+      const made = [];
+      let inlined = 0; // сколько звука уже отдано окну содержимым
+      for (const voice of want) {
+        const r = await ycAi.synthesize(cfg.oauth, { text: text, voice: voice, lang: lang, format: format, speed: a.speed, emotion: a.emotion, sampleRateHertz: a.sampleRateHertz, folderId: cfg.folderId });
+        const p = nodePath.join(outDir, "ai-speech-" + String(voice).replace(/[^\w.-]/g, "") + "-" + Date.now() + "." + ext);
+        fs.writeFileSync(p, r.audio);
+        // Проигрывание прямо в окне: содержимое отдаём, пока звука немного
+        // (6 МБ) — длинную речь слушают файлом, и об этом честно сказано строкой.
+        const inline = r.audio.length + inlined <= 6 * 1048576;
+        if (inline) inlined += r.audio.length;
+        made.push({
+          voice: voice,
+          path: p,
+          size: r.audio.length,
+          mime: r.contentType || (format === "mp3" ? "audio/mpeg" : format === "wav" ? "audio/wav" : format === "oggopus" ? "audio/ogg" : "audio/l16"),
+          base64: inline ? r.audio.toString("base64") : "",
+        });
+      }
+      return {
+        ok: true,
+        audios: made.filter((m) => m.base64),
+        files: made,
+        lines: made.map((m) => "🔊 " + m.voice + " → " + m.path + " (" + kb(m.size) + ")" + (m.base64 ? "" : " — слушай файлом")),
+        message: "Речь готова: " + made.length + " " + plural(made.length, "файл", "файла", "файлов") + ", " + text.length + " символов текста (" + lang + ", " + format + ").",
+        warnings: ["SpeechKit платный: тарифицируется по длине звука, каждый голос — отдельный запрос."],
+      };
+    }
+    // ── Текст из записи ──
+    if (op === "listen") {
+      const file = String(a.file || "").trim();
+      if (!file) return { ok: false, error: "Впиши путь к записи (ogg/opus, mp3 или lpcm)." };
+      if (!withFiles) return { ok: false, error: "Чтение файлов работает в приложении на ПК." };
+      const p = resolvePath(file, loadSettings());
+      if (!fs.existsSync(p) || !fs.statSync(p).isFile()) return { ok: false, error: "Файла «" + file + "» нет. Проверь путь: " + p };
+      const size = fs.statSync(p).size;
+      // Синхронное распознавание берёт короткое аудио (до ~1 МБ): отказ до
+      // отправки честнее ответа «файл слишком большой» после подъёма всего звука.
+      if (size > 1048576) return { ok: false, error: "Запись «" + file + "» — " + kb(size) + ", а распознавание одним запросом принимает до 1 МБ (примерно минута сжатой речи)." };
+      const byExt = { ogg: "oggopus", opus: "oggopus", oga: "oggopus", mp3: "mp3", pcm: "lpcm", raw: "lpcm", lpcm: "lpcm" };
+      const format = String(a.format || byExt[nodePath.extname(p).replace(".", "").toLowerCase()] || "oggopus").trim().toLowerCase();
+      const r = await ycAi.recognizeSpeech(cfg.oauth, { audio: fs.readFileSync(p), lang: a.lang, format: format, sampleRateHertz: a.sampleRateHertz, topic: a.topic, folderId: cfg.folderId });
+      return {
+        ok: true,
+        text: r.text,
+        lines: [r.text || "Речь распознана, а текста нет — возможно, в записи тишина или шум. Проверь формат и язык.", "── " + file + " · " + kb(size) + " · " + format + " · " + (a.lang || "ru-RU")],
+        message: r.text ? "Распознано символов: " + r.text.length + "." : "Текста в записи не нашлось.",
+        warnings: ["SpeechKit платный: тарифицируется по длине звука."],
+      };
+    }
+    return { ok: false, error: "Неизвестное действие Яндекс AI: " + op + ". Доступно: translate, languages, detect, ocr, voices, speak, listen." };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
+// ── Managed-базы из интерфейса: PostgreSQL, MySQL и ClickHouse ──────────────
+// Три базы — ОДИН канал, потому что у них один API (mdb.api.cloud.yandex.net):
+// в запросе меняется только сегмент пути, и три почти одинаковых канала
+// повторяли бы одно и то же трижды. Тела запросов живут в src/yc-mdb.js — ТОМ ЖЕ
+// модуле, что у агента: база одна, а окно и модель лишь два её вызывающих.
+//
+// Пароль пользователя облако отдаёт РОВНО ОДИН РАЗ — в ответ на создание
+// кластера. Поэтому create возвращает его полем secret (окно показывает его
+// отдельной рамкой «сохрани сейчас»), а чтение паролей не отдаёт вовсе и не
+// притворяется, что «скрывает» их: в списках пользователей только имена.
+ipcMain.handle("yc:mdb", async (_e, args) => {
+  const cfg = ycConfig();
+  const a = args || {};
+  const op = String(a.op || a.action || "list").trim().toLowerCase();
+  if (!ycMdb) return { ok: false, error: "Модуль Managed-баз не подключён к приложению (src/yc-mdb.js)." };
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках (Настройки → «☁️ Yandex Cloud»)." };
+  if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
+  // Список действий проверяется ДО обращения к облаку: чужое действие должно
+  // получить отказ со списком, а не непонятную ошибку разбора базы.
+  const ALL = ["list", "card", "hosts", "databases", "users", "logs", "operations", "presets", "start", "stop", "create", "delete"];
+  if (ALL.indexOf(op) === -1) return { ok: false, error: "Неизвестное действие Managed-баз: " + op + ". Доступно: " + ALL.join(", ") + "." };
+  const engine = String(a.engine || "").trim().toLowerCase();
+  const eng = ycMdb.engineOf(engine);
+  const ref = a.cluster || a.clusterId || a.id || a.name || "";
+  const noCluster = { ok: false, error: "Не нашёл кластер «" + ref + "» в каталоге. Список — действие «Кластеры»." };
+  try {
+    if (op === "list") {
+      const list = await ycMdb.clusters(cfg.oauth, engine, cfg.folderId);
+      return {
+        ok: true,
+        engine: engine,
+        engineRu: eng ? eng.ru : engine,
+        clusters: list,
+        lines: list.length
+          ? list.map((c) => ycMdb.clusterLine(c, engine))
+          : ["Кластеров " + (eng ? eng.ru : engine) + " в каталоге нет. Создать — кнопкой «＋ Создать кластер» (это платно: класс тарифицируется по часам)."],
+        message: "Кластеров: " + list.length + ".",
+        warnings: list.some((c) => String(c.status).toUpperCase() === "STOPPED")
+          ? ["Остановленный кластер дешевле, но не бесплатен: диск и резервные копии тарифицируются и у него."]
+          : [],
+      };
+    }
+    if (op === "card") {
+      const r = await ycMdb.cardLines(cfg.oauth, engine, ref, { folderId: cfg.folderId, database: a.database, user: a.user });
+      return {
+        ok: true,
+        engine: engine,
+        cluster: r.cluster,
+        hosts: r.hosts,
+        connection: r.connection,
+        lines: r.lines,
+        message: "Кластер «" + r.cluster.name + "»: " + r.cluster.statusHuman + ".",
+      };
+    }
+    if (op === "presets") {
+      const list = await ycMdb.presets(cfg.oauth, engine);
+      return {
+        ok: true,
+        engine: engine,
+        presets: list,
+        lines: list.length
+          ? list.map((p) => p.id + " — " + (p.cores || "?") + " vCPU, " + (p.memoryHuman || "?") + (p.zoneIds.length ? " · зоны: " + p.zoneIds.join(", ") : ""))
+          : ["Облако не отдало список классов хостов."],
+        message: "Классов: " + list.length + ".",
+      };
+    }
+    if (op === "create") {
+      // Платный и необратимый шаг: без явного согласия показываем, что будет
+      // создано, и просим подтвердить. Цена — почасовая, её точную цифру даёт
+      // каталог цен облака (действие «Цена по слову» в «Деньгах»).
+      if (a.confirm !== true) {
+        return {
+          ok: false,
+          needsConfirm: true,
+          error:
+            "Создание кластера " + (eng ? eng.ru : engine) + " — платное и необратимое решение: класс «" + (a.preset || "?") + "» и диск " +
+            (Number(a.diskGb) > 0 ? Number(a.diskGb) : "по умолчанию") + " ГБ тарифицируются почасово, а точную цену за час покажет каталог облака " +
+            "(в «Деньгах» действие «Цена по слову»). Проверь имя, каталог и подсеть, затем подтверди.",
+          lines: [
+            "Будет создан кластер «" + (a.name || "?") + "» в каталоге «" + (cfg.folderName || cfg.folderId) + "».",
+            "Версия: " + (a.version || "?") + " · класс: " + (a.preset || "?") + " · диск: " + (Number(a.diskGb) > 0 ? Number(a.diskGb) + " ГБ" : "по умолчанию") + " · зона: " + (a.zone || ycMdb.ZONE_DEFAULT) + ".",
+            "Пароль пользователя будет сгенерирован и показан ОДИН раз — сохрани его в хранилище секретов.",
+          ],
+        };
+      }
+      const r = await ycMdb.create(cfg.oauth, engine, {
+        folderId: cfg.folderId,
+        name: a.name,
+        version: a.version,
+        preset: a.preset,
+        diskGb: a.diskGb,
+        diskType: a.diskType,
+        zone: a.zone,
+        subnet: a.subnet,
+        networkId: a.networkId,
+        user: a.user,
+        userPassword: a.userPassword,
+        database: a.database,
+        publicIp: a.publicIp,
+      });
+      return {
+        ok: true,
+        changed: r.changed,
+        cluster: r.cluster,
+        clusterId: r.clusterId,
+        operationId: r.operationId,
+        secret: r.secret,
+        secretLabel: r.secretLabel,
+        lines: [r.message],
+        warnings: r.warnings || [],
+        message: r.message,
+      };
+    }
+    // Всё остальное работает с конкретным кластером: находим его по имени или id.
+    const cl = await ycMdb.findCluster(cfg.oauth, engine, cfg.folderId, ref);
+    if (!cl && op !== "delete") return noCluster;
+    if (op === "hosts") {
+      const list = await ycMdb.hosts(cfg.oauth, engine, cl.id);
+      return {
+        ok: true,
+        hosts: list,
+        lines: list.length ? list.map((h) => ycMdb.hostLine(h)) : ["Хостов не видно — это странно для кластера: проверь состояние (карточка кластера)."],
+        message: "Хостов: " + list.length + ".",
+      };
+    }
+    if (op === "databases") {
+      const list = await ycMdb.databases(cfg.oauth, engine, cl.id);
+      return {
+        ok: true,
+        databases: list,
+        lines: list.length ? list.map((d) => d.name + (d.owner ? " — владелец " + d.owner : "")) : ["Баз не видно: у кластера есть только служебные."],
+        message: "Баз: " + list.length + ".",
+      };
+    }
+    if (op === "users") {
+      const list = await ycMdb.users(cfg.oauth, engine, cl.id);
+      return {
+        ok: true,
+        users: list,
+        lines: list.length
+          ? list.map((u) => u.name + (u.permissions.length ? " — доступ: " + u.permissions.join(", ") : ""))
+          : ["Пользователей нет — в такую базу некому войти."],
+        message: "Пользователей: " + list.length + ".",
+        warnings: ["Пароли облако в чтении не отдаёт: видеть их нельзя ни здесь, ни в консоли. Забыт пароль — его меняют, а не «смотрят»."],
+      };
+    }
+    if (op === "logs") {
+      const r = await ycMdb.logs(cfg.oauth, engine, cl.id, { minutes: a.minutes, serviceType: a.serviceType, limit: a.limit });
+      const lines = r.rows.length
+        ? r.rows.map((x) => (x.timestamp ? String(x.timestamp).replace("T", " ").slice(0, 19) + "  " : "") + x.text)
+        : ["За " + r.minutes + " мин записей нет — это не ошибка, а тишина в логе."];
+      return { ok: true, logs: r.rows, minutes: r.minutes, lines: lines, message: "Записей: " + r.rows.length + " за " + r.minutes + " мин." };
+    }
+    if (op === "operations") {
+      const list = await ycMdb.operations(cfg.oauth, engine, cl.id, { limit: a.limit });
+      return {
+        ok: true,
+        operations: list,
+        lines: list.length
+          ? list.map((o) => (o.done ? "✓ " : "⏳ ") + String(o.createdAt || "").replace("T", " ").slice(0, 19) + " — " + (o.description || o.metadataType || o.id) + (o.error ? " · ошибка: " + o.error : ""))
+          : ["Операций у кластера не видно."],
+        message: "Операций: " + list.length + ".",
+      };
+    }
+    if (op === "start" || op === "stop") {
+      const r = await ycMdb.power(cfg.oauth, engine, op, cl, {});
+      return {
+        ok: true,
+        changed: r.changed,
+        action: r.action || op,
+        cluster: r.cluster,
+        operationId: r.operationId,
+        lines: [r.message],
+        warnings: r.warnings || [],
+        message: r.message,
+      };
+    }
+    if (op === "delete") {
+      if (a.confirm !== true) {
+        const target = cl || (await ycMdb.findCluster(cfg.oauth, engine, cfg.folderId, ref));
+        if (!target) return noCluster;
+        return {
+          ok: false,
+          needsConfirm: true,
+          error:
+            "Удаление кластера «" + target.name + "» НЕОБРАТИМО: вместе с кластером уйдут его базы и резервные копии — восстановить данные будет не из чего. " +
+            "Если данные ещё нужны, сначала сделай копию.",
+          lines: ["Кластер: " + target.name + " · " + (eng ? eng.ru : engine) + " " + (target.version || "?") + " · состояние: " + target.statusHuman + (target.deletionProtection ? " · ВКЛЮЧЕНА защита от удаления" : "")],
+        };
+      }
+      const target = cl || (await ycMdb.findCluster(cfg.oauth, engine, cfg.folderId, ref));
+      if (!target) return noCluster;
+      const r = await ycMdb.remove(cfg.oauth, engine, { clusterId: target.id });
+      return {
+        ok: true,
+        deleted: r.deleted,
+        cluster: r.cluster,
+        operationId: r.operationId,
+        lines: [r.message],
+        warnings: r.warnings || [],
+        message: r.message,
+      };
+    }
+    return { ok: false, error: "Неизвестное действие Managed-баз: " + op + ". Доступно: " + ALL.join(", ") + "." };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
+// ── DNS-зоны и записи из интерфейса ─────────────────────────────────────────
+// Записи DNS умели уже двое — агент (ycDns) и форма карточки зоны, — а у плитки
+// действий не было вовсе: список зон, постановка и снятие записи прямо из окна
+// были недоступны. Канал собран на ТЕХ ЖЕ функциях yandex-cloud.js, что у
+// агента и карточки: строгость Cloud DNS (нельзя удалить несуществующее и
+// добавить поверх существующей пары «имя+тип») разобрана там, а здесь — выбор
+// действия, подтверждение и ответ словами. Разрешения агента (allowCreate и
+// allowDelete) не спрашиваются: галочки ограничивают МОДЕЛЬ, а здесь действует
+// человек в своём окне — так же, как у записи из карточки зоны.
+ipcMain.handle("yc:dns", async (_e, args) => {
+  const cfg = ycConfig();
+  const a = args || {};
+  const op = String(a.op || a.action || "zones").trim().toLowerCase();
+  const ALL = ["zones", "card", "records", "add", "delete"];
+  if (ALL.indexOf(op) === -1) return { ok: false, error: "Неизвестное действие DNS: " + op + ". Доступно: " + ALL.join(", ") + "." };
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках (Настройки → «☁️ Yandex Cloud»)." };
+  if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
+  try {
+    const list = (await yandexCloud.listService(cfg.oauth, cfg.folderId, yandexCloud.serviceByKey("dns"))).items || [];
+    if (op === "zones") {
+      return {
+        ok: true,
+        zones: list,
+        lines: list.length
+          ? list.map((z) => yandexCloud.dnsZoneLine(z))
+          : ["DNS-зон в каталоге «" + (cfg.folderName || cfg.folderId) + "» нет. Создать зону: кнопкой «＋ Создать» у плитки «DNS-зоны» (имя — домен без точки)."],
+        message: "Зон: " + list.length + ".",
+      };
+    }
+    const ref = String(a.zone || a.zoneId || a.id || "").trim();
+    const zone = yandexCloud.findDnsZone(list, ref);
+    if (!zone) {
+      return {
+        ok: false,
+        error: "Не нашёл зону «" + ref + "»." + (list.length ? " В каталоге: " + list.map((z) => yandexCloud.dnsZoneLine(z)).join("; ") + "." : " Зон в каталоге нет."),
+      };
+    }
+    const who = "Зона «" + zone.name + "» (" + zone.id + ")";
+    if (op === "card") {
+      const sets = await yandexCloud.listRecordSets(cfg.oauth, zone.id);
+      const lines = [who, "Записей: " + sets.length + "."];
+      if (zone.createdAt) lines.push("Создана: " + String(zone.createdAt).replace("T", " ").slice(0, 19) + ".");
+      if (zone.description) lines.push("Описание: " + zone.description + ".");
+      return { ok: true, zone: zone, records: sets.length, lines: lines, message: who };
+    }
+    if (op === "records") {
+      const sets = await yandexCloud.listRecordSets(cfg.oauth, zone.id);
+      const lines = [who];
+      if (!sets.length) lines.push("Записей нет — в зоне только служебные NS, и API их не показывает.");
+      else for (const r of sets) lines.push(yandexCloud.dnsRecordLine(r));
+      return { ok: true, zone: zone, records: sets, lines: lines, message: "Записей: " + sets.length + "." };
+    }
+    if (op === "add") {
+      // Значения человек пишет строкой в форме окна и пачкой в карточке: и
+      // запятые, и уже готовый массив принимаем одинаково — иначе «1.1.1.1,
+      // 2.2.2.2» уехало бы одной строкой и стало одним значением.
+      const rawValues = a.values != null ? a.values : a.value != null ? a.value : a.data;
+      const vals = Array.isArray(rawValues) ? rawValues : String(rawValues == null ? "" : rawValues).split(",").map((s) => s.trim()).filter(Boolean);
+      const check = yandexCloud.checkDnsRecord({ name: a.name, type: a.type, ttl: a.ttl, data: vals }, zone.name);
+      if (check.problems.length) return { ok: false, error: check.problems.join(" ") };
+      const r = await yandexCloud.upsertRecordSet(cfg.oauth, zone.id, { name: a.name, type: a.type, ttl: a.ttl, data: vals });
+      return {
+        ok: true,
+        zone: zone,
+        record: { name: r.name, type: r.type, ttl: r.ttl, values: r.values },
+        lines: [(r.replaced ? "♻ Запись заменена: " : "✅ Запись добавлена: ") + yandexCloud.dnsRecordLine(check.record), who],
+        warnings: (r.warnings || []).concat(["Обновление DNS в интернете занимает от минуты до часов — сразу после добавления запись может ещё не отвечать."]),
+        message: r.replaced ? "Запись заменена." : "Запись добавлена.",
+      };
+    }
+    // Удаление: сначала называем, что именно перестанет отвечать, и просим
+    // согласие — у человека остаётся шанс сохранить значения (они в строке).
+    const wantName = yandexCloud.normalizeRecordSet({ name: a.name }).name;
+    const wantType = String(a.type || "").trim().toUpperCase();
+    if (!wantName || !wantType) return { ok: false, error: "Для удаления нужны имя и тип записи: имя — FQDN с точкой (www.example.com.), тип — например A." };
+    if (a.confirm !== true) {
+      const existing = (await yandexCloud.listRecordSets(cfg.oauth, zone.id)).find((r) => r.name === wantName && r.type === wantType) || null;
+      if (!existing) return { ok: false, error: "В зоне нет записи " + wantName + " " + wantType + " — удалять нечего." };
+      return {
+        ok: false,
+        needsConfirm: true,
+        error: "Удаление остановит всё, что на эту запись смотрит: домен или сайт может перестать открываться, а почта — приходить. Значения перед удалением видно, вернуть запись можно, но вручную и заново.",
+        lines: ["Запись: " + yandexCloud.dnsRecordLine(existing), who],
+      };
+    }
+    const del = await yandexCloud.deleteRecordSet(cfg.oauth, zone.id, { name: a.name, type: a.type });
+    return {
+      ok: true,
+      deleted: true,
+      zone: zone,
+      record: { name: del.name, type: del.type, values: del.values },
+      lines: ["🗑 Запись удалена: " + del.type + " " + del.name + " (значений было " + del.values + ")", who],
+      message: "Запись удалена.",
+    };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
 
 }
 

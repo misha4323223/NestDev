@@ -98,6 +98,16 @@ const FAMILY_CHANNEL = {
   cdn: "yc:cdn",
   certificateManager: "yc:cdn",
   billing: "yc:billing",
+  monitoring: "yc:monitoring",
+  ai: "yc:ai",
+  // Managed-базы: три семейства (своя плитка у каждой базы), но ОДИН канал —
+  // у PostgreSQL, MySQL и ClickHouse один API, и различает их поле engine.
+  postgresql: "yc:mdb",
+  mysql: "yc:mdb",
+  clickhouse: "yc:mdb",
+  // DNS-зоны и записи: записи умели агент и карточка зоны, а у плитки действий
+  // не было — у сервиса появился свой канал, как у остальных.
+  dns: "yc:dns",
 };
 
 function section(channel) {
@@ -109,9 +119,16 @@ function section(channel) {
 }
 
 function allowedOps(channel) {
-  const m = section(channel).match(/Доступно:\s*([^"]+?)\./);
-  assert.ok(m, "в канале " + channel + " нет списка доступных действий («Доступно: …»)");
-  return m[1].split(",").map((x) => x.trim()).filter(Boolean);
+  const sec = section(channel);
+  const m = sec.match(/Доступно:\s*([^"]+?)\./);
+  if (m) return m[1].split(",").map((x) => x.trim()).filter(Boolean);
+  // Канал, у которого список действий печатается СБОРКОЙ из массива
+  // (`ALL.join(", ")`), строки для разбора не даёт — и это лучше, чем копия
+  // списка в тексте: читаем сам массив, он и есть список допустимых действий.
+  const arr = sec.match(/const ALL = \[([^\]]+)\];/);
+  assert.ok(arr, "в канале " + channel + " нет списка доступных действий («Доступно: …»)");
+  assert.ok(/Доступно:\s*" \+ ALL\.join\(", "\)/.test(sec), "отказ канала " + channel + " не называет действия из ALL");
+  return arr[1].split(",").map((x) => x.trim().replace(/^"|"$/g, "")).filter(Boolean);
 }
 
 function confirmArgs(channel) {
@@ -119,6 +136,9 @@ function confirmArgs(channel) {
   const out = [];
   if (/a\.confirmed\s*!==\s*true/.test(s)) out.push("confirmed");
   if (/a\.confirm\s*===\s*true/.test(s)) out.push("confirm");
+  // У части каналов проверка написана от обратного («без согласия — отказ»):
+  // для семейств, где согласие нужно почти всегда, так читается понятнее.
+  if (/a\.confirm\s*!==\s*true/.test(s) && out.indexOf("confirm") < 0) out.push("confirm");
   return out;
 }
 
@@ -181,8 +201,8 @@ function main() {
         // аргумент. Список ниже — не копия таблицы, а следствие: он проверяет,
         // что пометки не потерялись у тех действий, где за них платят или где
         // отменить уже нельзя.
-        const mustPay = ["compute:create", "compute:snapshot", "compute:restoredisk", "vpc:reserve", "cdn:cdncreate", "certificateManager:cdncreate"];
-        const mustDanger = ["compute:delete", "compute:delsnapshot", "vpc:delsubnet", "vpc:delgroup", "vpc:delrule", "vpc:release", "iam:delete", "iam:revoke", "iam:delkey", "cloudFunctions:delete", "cloudFunctions:delversion", "cloudFunctions:public", "cdn:cdndel", "certificateManager:certdel"];
+        const mustPay = ["compute:create", "compute:snapshot", "compute:restoredisk", "vpc:reserve", "cdn:cdncreate", "certificateManager:cdncreate", "postgresql:create", "mysql:create", "clickhouse:create"];
+        const mustDanger = ["compute:delete", "compute:delsnapshot", "vpc:delsubnet", "vpc:delgroup", "vpc:delrule", "vpc:release", "iam:delete", "iam:revoke", "iam:delkey", "cloudFunctions:delete", "cloudFunctions:delversion", "cloudFunctions:public", "cdn:cdndel", "certificateManager:certdel", "postgresql:delete", "mysql:delete", "clickhouse:delete", "dns:delete"];
         const problems = [];
         const seen = new Set();
         for (const service of Object.keys(A.ACTIONS)) {

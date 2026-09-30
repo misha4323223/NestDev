@@ -189,6 +189,16 @@ contextBridge.exposeInMainWorld("api", {
   ycBilling: (args) => ipcRenderer.invoke("yc:billing", args || {}),
   // Сертификаты и CDN: HTTPS-сайт на своём домене (сертификат + CDN-ресурс).
   ycCdn: (args) => ipcRenderer.invoke("yc:cdn", args || {}),
+  ycMonitoring: (args) => ipcRenderer.invoke("yc:monitoring", args || {}),
+  // Яндекс AI: перевод, текст со снимка и речь — тем же токеном облака.
+  ycAi: (args) => ipcRenderer.invoke("yc:ai", args || {}),
+  // Managed-базы: PostgreSQL, MySQL и ClickHouse — один канал на три базы
+  // (у них один API), база выбирается полем engine.
+  ycMdb: (args) => ipcRenderer.invoke("yc:mdb", args || {}),
+  // DNS-зоны и записи: у сервиса был агент и форма в карточке зоны, а действий
+  // у плитки — не было. Канал один («yc:dns») и зовёт ТЕ ЖЕ функции Cloud DNS,
+  // что агент и карточка: строгость API разобрана в src/yandex-cloud.js.
+  ycDns: (args) => ipcRenderer.invoke("yc:dns", args || {}),
   ycCosts: (serviceKey, params) => ipcRenderer.invoke("yc:costs", serviceKey, params || {}),
   ycCreate: (serviceKey, name, opts) => ipcRenderer.invoke("yc:create", serviceKey, name, opts || {}),
   ycDelete: (serviceKey, resourceId) => ipcRenderer.invoke("yc:delete", serviceKey, resourceId),

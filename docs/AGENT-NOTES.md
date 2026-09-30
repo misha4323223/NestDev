@@ -22,6 +22,11 @@
 
 | № | О чём | Полный текст | Строк |
 |---:|---|---|---:|
+| 89 | DNS-записи зон: проверка записи ДО сети (CNAME на вершине, адреса, приоритеты) и действия окна — канал `yc:dns`, семейство в таблице действий и живая панель | [`notes/chast-89-dns-zapisi-zon-proverka-do-seti-i-deystviya-okna.md`](notes/chast-89-dns-zapisi-zon-proverka-do-seti-i-deystviya-okna.md) | 84 |
+| 88 | Managed-базы: PostgreSQL, MySQL и ClickHouse — один модуль и канал на три базы, инструмент `ycMdb`, три плитки с действиями, ценой до согласия и паролем в отдельной рамке | [`notes/chast-88-upravlyaemye-bazy-postgresql-mysql-clickhouse.md`](notes/chast-88-upravlyaemye-bazy-postgresql-mysql-clickhouse.md) | 86 |
+| 87 | Яндекс AI в интерфейсе: канал `yc:ai`, семь действий с формами, чип панели и плеер для речи в ответе | [`notes/chast-87-yandeks-ai-v-interfeise-konsoli.md`](notes/chast-87-yandeks-ai-v-interfeise-konsoli.md) | 74 |
+| 86 | Monitoring: метрики каталога — данные и метаданные, инструмент, канал и плитка на полке (публичного REST для алертов у облака нет) | [`notes/chast-86-monitoring-metriki-i-alerty.md`](notes/chast-86-monitoring-metriki-i-alerty.md) | 87 |
+| 85 | Яндекс AI: перевод, речь и текст со снимка — четыре сервиса одним инструментом, списки языков/голосов/файлов | [`notes/chast-85-yandeks-ai-rech-zrenie-i-perevod.md`](notes/chast-85-yandeks-ai-rech-zrenie-i-perevod.md) | 82 |
 | 84 | живые прогоны на Windows: клон в собственный путь, молча упавший шаг «окно» и константа размера снимка | [`notes/chast-84-tri-padeniya-zhivyih-progonov-na-windows.md`](notes/chast-84-tri-padeniya-zhivyih-progonov-na-windows.md) | 68 |
 | 83 | живой прогон консоли щёлкает по тому, что человек видит — и нашёл потерянные русские имена сервисов | [`notes/chast-83-progon-konsoli-yc-ischet-to-chto-chelovek-vidit.md`](notes/chast-83-progon-konsoli-yc-ischet-to-chto-chelovek-vidit.md) | 84 |
 | 82 | визитка — бюджет по знакам (код снова виден), а устаревшая проверка прогона стала поведенческой | [`notes/chast-82-vizitka-uzhata-do-znakov-a-proverka-stala-povedencheskoy.md`](notes/chast-82-vizitka-uzhata-do-znakov-a-proverka-stala-povedencheskoy.md) | 70 |
