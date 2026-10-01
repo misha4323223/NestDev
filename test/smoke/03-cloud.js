@@ -478,7 +478,11 @@ async function testYandexCloud() {
     assert.ok(/внутренним API/i.test(full) && /Cloud Logging/.test(full), "в промпте не сказано, что логи идут внутренним API");
     const logsDef = core.TOOL_DEFINITIONS.find((d) => d.function && d.function.name === "ycLogs");
     assert.ok(/внутренним API/.test(logsDef.function.description), "описание ycLogs не обновлено");
-    assert.deepStrictEqual(logsDef.function.parameters.required, ["id"], "id должен быть единственным обязательным");
+    // Обязательных полей нет: действие (logs/groups/group/createGroup/…) само
+    // решает, что ему нужно (id — для чтения, name — для создания). Требовать id
+    // на создание группы значило бы звать создание с выдуманным id.
+    assert.deepStrictEqual(logsDef.function.parameters.required, [], "у ycLogs не должно быть обязательных полей");
+    assert.ok(/createGroup/.test(logsDef.function.description), "описание ycLogs не знает действий по группам");
     const installDef = core.TOOL_DEFINITIONS.find((d) => d.function && d.function.name === "ycInstall");
     assert.ok(/userData\/bin/.test(installDef.function.description), "описание ycInstall без папки установки");
     const preload = fs.readFileSync(path.join(ROOT, "src", "preload.js"), "utf8");
@@ -1474,7 +1478,9 @@ async function testYcSplit() {
       "yc:status", "yc:setToken", "yc:folders", "yc:setFolder", "yc:setPermissions",
       "yc:logout", "yc:console:overview", "yc:console:list", "yc:console:rollback", "yc:console:secretVersion", "yc:console:dnsRecord", "yc:console:registryImage", "yc:console:storageObject", "yc:console:bucketAccess",
       "yc:resources", "yc:costs", "yc:create", "yc:delete", "yc:logs",
-      "yc:cliStatus", "yc:installCli",      "yc:vpc", "yc:compute", "yc:iam", "yc:functions", "yc:billing", "yc:cdn", "yc:ai", "yc:mdb", "yc:ig", "yc:alb", "yc:dns",
+      "yc:cliStatus", "yc:installCli",      "yc:vpc", "yc:compute", "yc:iam", "yc:functions", "yc:billing", "yc:cdn", "yc:ai", "yc:mdb", "yc:ig", "yc:alb", "yc:dns", "yc:container",
+      // Заходы 9–12 части 91: таблицы базы YDB, файлы бакета, группы логов и API-шлюз в окне.
+      "yc:db", "yc:storage", "yc:logGroups", "yc:apigw",
     ];
     for (const ch of channels) {
       assert.ok(!main.includes('ipcMain.handle("' + ch + '"'), "канал остался в main.js: " + ch);
@@ -1490,7 +1496,7 @@ async function testYcSplit() {
     assert.ok(main.includes('require("./yc-service.js")') && main.includes('require("./yc-ipc.js")'), "main.js не подключает вынесенные модули");
     assert.ok(/registerYcIpc\(\{ ipcMain/.test(main), "IPC-мост не регистрируется");
     const found = [...ipcSrc.matchAll(/ipcMain\.handle\("(yc:[^"]+)"/g)].map((m) => m[1]);
-    assert.strictEqual(found.length, 33, "каналов в мосте должно быть 33 (yc:deploy остаётся мостом деплоя): " + found.length);
+    assert.strictEqual(found.length, 38, "каналов в мосте должно быть 38 (yc:deploy остаётся мостом деплоя): " + found.length);
   });
 
   await test("Yandex Cloud: служебный слой работает сам, без main.js", () => {

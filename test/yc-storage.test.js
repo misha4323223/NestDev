@@ -76,6 +76,8 @@ const plain = (v) => JSON.parse(JSON.stringify(v));
 const yandex = require(path.join(ROOT, "src", "yandex-cloud.js"));
 const ycConsoleMain = require(path.join(ROOT, "src", "yc-console.js"));
 const { createCloudTools } = require(path.join(ROOT, "src", "agent-tools-cloud.js"));
+const { createYcService } = require(path.join(ROOT, "src", "yc-service.js"));
+const { registerYcIpc } = require(path.join(ROOT, "src", "yc-ipc.js"));
 
 const YC_SRC = read("src", "yandex-cloud.js");
 const IPC_SRC = read("src", "yc-ipc.js");
@@ -822,6 +824,146 @@ function buildTools(over, settingsOver) {
 
   await test("ycStorage: набор стоит в цепочке npm test — иначе это не набор", () => {
     assert.ok(String(PKG.scripts.test || "").indexOf("test/yc-storage.test.js") >= 0, "набора нет в цепочке npm test");
+  });
+
+  // ── Канал окна: файлы бакета (часть 91, заход 10) ───────────────────────────
+  // Самый дорогой разрыв из оставшихся: бакет создаётся «для файлов и статики»,
+  // а положить в него файл из окна было нечем — объекты умел только агент.
+  // Канал собираем с НАСТОЯЩИМ yandex-cloud.js (его адрес уведён на стенд) и
+  // настоящим ycConfig: иначе проверялась бы не проводка, а её выдумка.
+  console.log("\n[4] Канал окна: yc:storage зовёт тот же S3-код, что и агент");
+
+  function storageChannel(settingsOver) {
+    const handlers = new Map();
+    const ipcMain = { handle: (ch, fn) => handlers.set(ch, fn), on: () => {} };
+    const settings = Object.assign(
+      { workingDir: work, yandexOauthToken: "oauth-1", ycCloudId: "cloud-1", ycFolderId: "f1", ycFolderName: "prod" },
+      settingsOver || {}
+    );
+    const svc = createYcService({
+      app: { getPath: () => work },
+      path,
+      net: {},
+      secrets: {},
+      yandexCloud: yandex,
+      ycCli: {},
+      ycLogs: {},
+      ycEnsurePath: () => {},
+      loadSettings: () => settings,
+    });
+    registerYcIpc({
+      ipcMain,
+      yandexCloud: yandex,
+      loadSettings: () => settings,
+      saveSettings: () => {},
+      svc,
+      fs,
+      path,
+      resolvePath: (p) => (path.isAbsolute(String(p)) ? String(p) : path.join(work, String(p))),
+      agentWorkDir: () => work,
+    });
+    assert.ok(handlers.has("yc:storage"), "канал yc:storage не зарегистрирован");
+    return (args) => handlers.get("yc:storage")(null, args);
+  }
+
+  await test("yc:storage: баки, объекты, загрузка файла, скачивание и ДВУХШАГОВЫЕ опасные", async () => {
+    stub.reset();
+    yandex.resetIamCache();
+    fs.writeFileSync(path.join(work, "upload.html"), "<h1>загружено из окна</h1>", "utf8");
+    const call = storageChannel();
+
+    const list = await call({ op: "list" });
+    assert.ok(list.ok && list.lines.join(" ").indexOf("site-bucket") >= 0, "список бакетов не показал бакет: " + JSON.stringify(list).slice(0, 200));
+
+    const objs = await call({ op: "objects", bucket: "site-bucket" });
+    assert.ok(objs.ok && /index\.html/.test(objs.lines.join(" ")), "объекты бакета не показаны: " + JSON.stringify(objs).slice(0, 200));
+
+    // Загрузка: без согласия канал ОТКАЗЫВАЕТ, файл читает только после него.
+    const upNo = await call({ op: "upload", bucket: "site-bucket", file: "upload.html", key: "site/upload.html" });
+    assert.strictEqual(upNo.ok, false, "файл загружен без согласия");
+    assert.strictEqual(upNo.needsConfirm, true, "нет требования согласия на загрузку");
+    assert.ok(/объём/.test(upNo.error), "в вопросе нет причины (оплата за объём): " + upNo.error);
+    stub.calls.length = 0;
+    const up = await call({ op: "upload", bucket: "site-bucket", file: "upload.html", key: "site/upload.html", confirmed: true });
+    assert.ok(up.ok && up.changed, "файл не загружен: " + JSON.stringify(up).slice(0, 200));
+    const put = stub.calls.find((c) => c.method === "PUT");
+    assert.ok(put && put.url.indexOf("/site-bucket/site/upload.html") >= 0, "загрузка ушла не по тому ключу: " + (put && put.url));
+    assert.strictEqual(put.body, "<h1>загружено из окна</h1>", "в облако ушло не то содержимое: " + put.body);
+    assert.strictEqual(put.headers["content-type"], "text/html; charset=utf-8", "тип содержимого не поставлен по расширению");
+
+    // Скачивание: в указанное место кладутся НАСТОЯЩИЕ байты.
+    const to = path.join(work, "out", "download.txt");
+    const down = await call({ op: "download", bucket: "site-bucket", key: "download.txt", to: to });
+    assert.ok(down.ok, "объект не скачан: " + JSON.stringify(down).slice(0, 200));
+    assert.strictEqual(fs.readFileSync(to, "utf8"), "файл из облака", "скачано не то содержимое");
+
+    // Ссылка на объект: у закрытого бакета сказано про 403, а не обещана рабочая ссылка.
+    const url = await call({ op: "url", bucket: "site-bucket", key: "index.html" });
+    assert.ok(url.ok && url.url === "https://storage.yandexcloud.net/site-bucket/index.html", "открытый адрес собран неверно: " + JSON.stringify(url).slice(0, 160));
+    assert.strictEqual(url.public, false, "закрытый бакет выдан за публичный");
+    assert.ok(/403/.test(url.lines.join(" ")), "не сказано, что ссылка закрытого бакета вернёт 403");
+
+    // Публичность — двухшаговая и опасная.
+    const pubNo = await call({ op: "public", bucket: "site-bucket" });
+    assert.strictEqual(pubNo.ok, false, "бакет открыт без согласия");
+    assert.strictEqual(pubNo.needsConfirm, true, "нет требования согласия на открытие бакета");
+    assert.ok(/ПОИСКОВИК/i.test(pubNo.error), "в вопросе не сказано про поисковики: " + pubNo.error);
+    const pub = await call({ op: "public", bucket: "site-bucket", confirmed: true });
+    assert.ok(pub.ok && pub.flags.read === true, "бакет не открыт с согласием: " + JSON.stringify(pub).slice(0, 200));
+    const back = await call({ op: "private", bucket: "site-bucket" });
+    assert.ok(back.ok && back.flags.read === false, "бакет не закрыт обратно: " + JSON.stringify(back).slice(0, 200));
+
+    // Удаление объекта — тоже двухшаговое.
+    const delNo = await call({ op: "delete", bucket: "site-bucket", key: "index.html" });
+    assert.strictEqual(delNo.ok, false, "объект удалён без согласия");
+    assert.strictEqual(delNo.needsConfirm, true, "нет требования согласия на удаление объекта");
+    const del = await call({ op: "delete", bucket: "site-bucket", key: "index.html", confirmed: true });
+    assert.ok(del.ok && del.deleted, "объект не удалён с согласием");
+    assert.ok(!stub.state.objects.some((o) => o.key === "index.html"), "объект остался в бакете");
+  });
+
+  await test("yc:storage: отказы честные — чужое действие, нет бакета, нет ключа, нет файла", async () => {
+    const call = storageChannel();
+    const bad = await call({ op: "стереть" });
+    assert.strictEqual(bad.ok, false, "чужое действие выполнено");
+    assert.ok(/Доступно: list, objects, upload, download, delete, url, access, public, private\./.test(bad.error), "отказ не назвал действия: " + bad.error);
+
+    const noBucket = await call({ op: "objects", bucket: "нет-такого" });
+    assert.ok(/Не нашёл бакет/.test(noBucket.error), "чужой бакет не назван: " + noBucket.error);
+
+    const noKey = await call({ op: "download", bucket: "site-bucket" });
+    assert.ok(/Укажи key/.test(noKey.error), "скачивание без ключа не отвергнуто: " + noKey.error);
+
+    const noFile = await call({ op: "upload", bucket: "site-bucket", file: "нет-такого.html", key: "x.html", confirmed: true });
+    assert.ok(/нет/.test(noFile.error), "отсутствующий файл не объяснён: " + noFile.error);
+
+    const nothing = await call({ op: "upload", bucket: "site-bucket", key: "x.html", confirmed: true });
+    assert.ok(/нужен либо файл/.test(nothing.error), "загрузка без файла и без содержимого не отвергнута: " + nothing.error);
+  });
+
+  await test("yc:storage: без подключения и без каталога отвечает честно", async () => {
+    const off = await storageChannel({ yandexOauthToken: "" })({ op: "list" });
+    assert.ok(/не подключён/.test(off.error), "нет ответа про подключение: " + off.error);
+    const noFolder = await storageChannel({ ycFolderId: "" })({ op: "list" });
+    assert.ok(/каталог/.test(noFolder.error), "нет ответа про каталог: " + noFolder.error);
+  });
+
+  await test("yc:storage: канал, мост, семейство действий и файловые диалоги на месте", () => {
+    assert.ok(IPC_SRC.includes('ipcMain.handle("yc:storage"'), "канал yc:storage не найден");
+    assert.ok(PRELOAD_SRC.includes('ycStorage: (args) => ipcRenderer.invoke("yc:storage", args || {})'), "preload не пробрасывает yc:storage");
+    assert.ok(PRELOAD_SRC.includes('pickCloudFile: (args) => ipcRenderer.invoke("cloud:pickFile", args || {})'), "preload не знает выбор файла");
+    assert.ok(PRELOAD_SRC.includes('pickCloudSave: (args) => ipcRenderer.invoke("cloud:pickSave", args || {})'), "preload не знает место сохранения");
+    const actions = read("src", "renderer", "yc-actions.js");
+    assert.ok(/storage: "ycStorage"/.test(actions), "в действиях нет семейства storage");
+    assert.ok(/storage: \["list", "objects", "upload", "download", "delete", "url", "access", "public", "private"\]/.test(actions), "список действий окна разошёлся с каналом");
+    assert.ok(/pickApi: "pickCloudFile"/.test(actions) && /pickApi: "pickCloudSave"/.test(actions), "в формах нет выбора файла и места сохранения");
+    // Галочки в настройках ограничивают МОДЕЛЬ, а не человека в своём окне.
+    const from = IPC_SRC.indexOf('// ── Object Storage: файлы бакета из окна');
+    assert.ok(from > 0, "канал файлов бакета не подписан");
+    const handler = IPC_SRC.slice(from, IPC_SRC.indexOf("// ── База YDB", from));
+    assert.ok(handler.indexOf("allowCreate") === -1 && handler.indexOf("allowDelete") === -1, "человек в своём окне ограничен галочками агента");
+    assert.ok(!/require\(/.test(read("src", "cloud-files-ipc.js")), "модуль диалогов что-то подтягивает сам");
+    assert.ok(read("src", "main.js").includes('require("./cloud-files-ipc.js")'), "main.js не собирает модуль диалогов файла");
   });
 
   stub.server.close();

@@ -803,7 +803,7 @@ const writeCalls = (calls) => calls.filter((c) => c.method !== "GET" && c.url.in
   await test("ycBilling: сторож smoke знает канал, а набор стоит в цепочке npm test", () => {
     const smoke = require(path.join(__dirname, "smoke", "source.js")); // текст всего набора smoke (часть 81)
     assert.ok(smoke.includes('"yc:functions", "yc:billing"'), "сторож не знает канал yc:billing");
-    assert.ok(/каналов в мосте должно быть 33/.test(smoke), "сторож не пересчитал каналы");
+    assert.ok(/каналов в мосте должно быть 38/.test(smoke), "сторож не пересчитал каналы");
     assert.ok(/["']ycBilling["']/.test(smoke), "сторож не знает инструмент ycBilling");
     assert.ok(String(PKG.scripts.test || "").indexOf("test/yc-billing.test.js") >= 0, "набора нет в цепочке npm test");
   });

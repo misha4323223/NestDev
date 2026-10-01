@@ -29,6 +29,8 @@
    createYcService, createYcCosts и createYcLogs).
 */
 
+const ycYql = require("./yc-yql.js"); // YQL (SQL) по gRPC — вторая половина YDB
+
 // Запасной адрес управляющего API YDB, если discovery не ответил.
 const YDB_API_FALLBACK = "https://ydb.api.cloud.yandex.net";
 
@@ -44,6 +46,8 @@ function createYcDb(deps) {
     hostOf,
     serviceError,
     isNetworkError,
+    // gRPC Ydb.Query подменяется только проверками: в приложении его нет.
+    grpcCall,
   } = deps;
 
   async function ydbApiBase() {
@@ -293,6 +297,28 @@ function createYcDb(deps) {
     return { table: name };
   }
 
+  // ── YQL (SQL): обычные таблицы и любые запросы ────────────────────────────
+  // Вторая половина YDB и совсем другой протокол: Document API — это HTTP и
+  // DynamoDB, а обычные таблицы и запросы к ним живут только по gRPC
+  // (Ydb.Query.V1.QueryService). Протокол (сессии, поток частей, разбор типов и
+  // значений) лежит в src/yc-yql.js; здесь — адрес базы и IAM-токен.
+  async function yql(oauthToken, db, opts) {
+    const o = opts || {};
+    const target = ycYql.grpcTargetOf(db && db.endpoint);
+    if (!target) {
+      throw new Error("У базы YDB нет gRPC-адреса (endpoint). Обычно это значит, что база ещё создаётся — подожди минуту и повтори (ycList service ydb).");
+    }
+    const token = await getIamToken(oauthToken);
+    return ycYql.runYql({
+      origin: target.origin,
+      database: target.database,
+      iamToken: token,
+      query: o.query,
+      timeoutMs: o.timeoutMs,
+      grpcCall: o.grpcCall || grpcCall,
+    });
+  }
+
   return {
     documentApiEndpointFor,
     toAttrValue,
@@ -310,6 +336,12 @@ function createYcDb(deps) {
     scanDocumentTable,
     deleteDocumentItem,
     deleteDocumentTable,
+    yql,
+    // Помощники YQL наружу — чтобы канал и инструмент не заводили своих копий
+    // (опасность запроса и печать наборов обязаны быть одни на всех).
+    queryKind: ycYql.queryKind,
+    formatSets: ycYql.formatSets,
+    grpcTargetOf: ycYql.grpcTargetOf,
   };
 }
 

@@ -818,6 +818,42 @@ async function setContainerPublicAccess(oauthToken, containerId) {
   return { ok: true, already: false, bindings: after };
 }
 
+// Закрыть контейнер от интернета: снять привязку роли invoker с «всех
+// пользователей». Зеркало setContainerPublicAccess (delta REMOVE): чужие роли на
+// контейнере остаются на месте, снимаем ТОЛЬКО ту привязку, которую ставит
+// «public». Если привязки нет — это не ошибка: контейнер уже закрыт.
+async function unsetContainerPublicAccess(oauthToken, containerId) {
+  const id = String(containerId || "").trim();
+  if (!id) throw new Error("Не указан id контейнера.");
+  const before = await listContainerAccessBindings(oauthToken, id);
+  if (!hasPublicInvoker(before)) return { ok: true, already: true, bindings: before };
+  const token = await getIamToken(oauthToken);
+  const base = await scBase(oauthToken);
+  const j = await fetchJson(base + "/containers/v1/containers/" + encodeURIComponent(id) + ":updateAccessBindings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+    body: JSON.stringify({
+      accessBindingDeltas: [
+        { action: "REMOVE", accessBinding: { roleId: CONTAINER_INVOKER_ROLE, subject: PUBLIC_INVOKER_SUBJECT } },
+      ],
+    }),
+  }, 30000);
+  await waitOperation(oauthToken, j && j.id, 120000);
+  // Проверяем результат, а не факт отправки: без снятия привязки контейнер
+  // остался бы открытым, и узнать об этом лучше здесь.
+  const after = await listContainerAccessBindings(oauthToken, id);
+  if (hasPublicInvoker(after)) {
+    const e = new Error(
+      "Права контейнера не изменились: привязка «все пользователи → " +
+        CONTAINER_INVOKER_ROLE +
+        "» осталась. Нужна роль с правом serverless-containers.containers.setAccessBindings (её даёт editor на каталог)."
+    );
+    e.status = 403;
+    throw e;
+  }
+  return { ok: true, already: false, bindings: after };
+}
+
 // Редактор контейнера: имя, описание, метки. updateMask перечисляет ТОЛЬКО те
 // поля, которые реально меняем: без него сервис сбросил бы остальные поля в
 // значения по умолчанию, то есть правка меток стирала бы описание.
@@ -1793,6 +1829,7 @@ module.exports = {
   containerInfo,
   listContainerAccessBindings,
   setContainerPublicAccess,
+  unsetContainerPublicAccess,
   normalizeRecordSet,
   findDnsZone,
   dnsZoneLine,

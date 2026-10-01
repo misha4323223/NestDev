@@ -114,6 +114,22 @@ const FAMILY_CHANNEL = {
   // Application Load Balancer: четыре ресурса (балансировщики, группы целей,
   // HTTP-роутеры и чтение групп бэкендов) — один канал, как у Managed-баз.
   alb: "yc:alb",
+  // Serverless-контейнеры: свой канал, потому что ресурс особый — контейнер
+  // задаётся РЕВИЗИЕЙ (образ, переменные окружения, ресурсы, тёплые экземпляры),
+  // а не одним набором полей. Канал зовёт те же функции, что агент и консоль.
+  serverlessContainers: "yc:container",
+  // База YDB: таблицы и записи через Document API — свой канал («yc:db»),
+  // потому что у сервиса свой протокол (X-Amz-Target, типизированные значения).
+  ydb: "yc:db",
+  // Object Storage: файлы бакета — свой канал («yc:storage»), потому что у сервиса
+  // свой протокол (S3-совместимый API, XML-ответы, IAM-токен без подписи AWS).
+  storage: "yc:storage",
+  // Группы логов: свой канал («yc:logGroups»), потому что у них свой REST того
+  // же хоста Cloud Logging, а записи читаются по gRPC (канал yc:logs).
+  logging: "yc:logGroups",
+  // API-шлюз: свой канал («yc:apigw»), потому что шлюз целиком задаётся
+  // OpenAPI-спецификацией, а изменяющие методы возвращают OPERATION.
+  apiGateway: "yc:apigw",
 };
 
 function section(channel) {
@@ -208,7 +224,7 @@ function main() {
         // что пометки не потерялись у тех действий, где за них платят или где
         // отменить уже нельзя.
         const mustPay = ["compute:create", "compute:snapshot", "compute:restoredisk", "vpc:reserve", "cdn:cdncreate", "certificateManager:cdncreate", "postgresql:create", "mysql:create", "clickhouse:create", "instanceGroups:create", "alb:lbnew"];
-        const mustDanger = ["compute:delete", "compute:delsnapshot", "vpc:delsubnet", "vpc:delgroup", "vpc:delrule", "vpc:release", "iam:delete", "iam:revoke", "iam:delkey", "cloudFunctions:delete", "cloudFunctions:delversion", "cloudFunctions:public", "cdn:cdndel", "certificateManager:certdel", "postgresql:delete", "mysql:delete", "clickhouse:delete", "dns:delete", "instanceGroups:delete", "alb:targetdel", "alb:routerdel", "alb:lbdel"];
+        const mustDanger = ["compute:delete", "compute:delsnapshot", "vpc:delsubnet", "vpc:delgroup", "vpc:delrule", "vpc:release", "iam:delete", "iam:revoke", "iam:delkey", "cloudFunctions:delete", "cloudFunctions:delversion", "cloudFunctions:public", "cdn:cdndel", "certificateManager:certdel", "postgresql:delete", "mysql:delete", "clickhouse:delete", "dns:delete", "instanceGroups:delete", "alb:targetdel", "alb:routerdel", "alb:lbdel", "apiGateway:delete"];
         const problems = [];
         const seen = new Set();
         for (const service of Object.keys(A.ACTIONS)) {

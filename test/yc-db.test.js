@@ -58,6 +58,9 @@ const plain = (v) => JSON.parse(JSON.stringify(v));
 const { createYcDb } = require(path.join(ROOT, "src", "yc-db.js"));
 const { createCloudTools } = require(path.join(ROOT, "src", "agent-tools-cloud.js"));
 const ycConsole = require(path.join(ROOT, "src", "yc-console.js"));
+const { createYcService } = require(path.join(ROOT, "src", "yc-service.js"));
+const { registerYcIpc } = require(path.join(ROOT, "src", "yc-ipc.js"));
+const grpcPb = require(path.join(ROOT, "src", "yc-grpc.js"));
 
 const SCHEMAS_SRC = read("src", "renderer", "tool-schemas.js");
 const CORE_SRC = read("src", "renderer", "agent-core.js");
@@ -246,6 +249,7 @@ function buildTool(over, settingsOver) {
     path: path,
     fs: fs,
     yandexCloud: cloud,
+    ycDb: over && over.__ycDb,
     resolvePath: (p) => (path.isAbsolute(String(p)) ? String(p) : path.join(work, String(p))),
     agentWorkDir: () => work,
     ycConfig: (s) => {
@@ -564,6 +568,197 @@ function buildTool(over, settingsOver) {
     assert.ok(/причину, а не пустой список/.test(out.error), "нет объяснения: " + String(out.error).slice(0, 160));
     assert.ok(/не нашлась/.test(out.error), "не сказано, что база не найдена");
     delete process.env.AI_AGENT_YC_BASE;
+  });
+
+  console.log("\n[7] Канал окна: yc:db зовёт тот же модуль, что и агент");
+
+  // Канал собираем с НАСТОЯЩИМ createYcDb и настоящим ycConfig/ycJsonArg из
+  // yc-service: иначе проверялся бы не канал, а его выдуманная копия.
+  function dbChannel(dbs, settingsOver, grpcOver) {
+    const handlers = new Map();
+    const ipcMain = { handle: (ch, fn) => handlers.set(ch, fn) };
+    const { cloud } = fakeCloud(dbs || []);
+    const settings = Object.assign(
+      { yandexOauthToken: "oauth-1", ycCloudId: "cloud-1", ycFolderId: "folder-1", ycFolderName: "prod" },
+      settingsOver || {}
+    );
+    const svc = createYcService({
+      app: { getPath: () => work },
+      path,
+      net: {},
+      secrets: {},
+      yandexCloud: cloud,
+      ycCli: {},
+      ycLogs: {},
+      ycEnsurePath: () => {},
+      loadSettings: () => settings,
+    });
+    const ycDbApi = createYcDb({
+      getIamToken: cloud.getIamToken,
+      fetchJson: cloud._fetchJson,
+      endpoint: cloud.endpoint,
+      listService: cloud.listService,
+      serviceByKey: cloud.serviceByKey,
+      hostOf: cloud.hostOf,
+      serviceError: cloud.serviceError,
+      isNetworkError: cloud.isNetworkError,
+      grpcCall: grpcOver,
+    });
+    registerYcIpc({ ipcMain, yandexCloud: cloud, ycDb: ycDbApi, loadSettings: () => settings, saveSettings: () => {}, svc });
+    assert.ok(handlers.has("yc:db"), "канал yc:db не зарегистрирован");
+    return (args) => handlers.get("yc:db")(null, args);
+  }
+
+  await test("yc:db: базы, таблицы, ключ, запись и ДВУХШАГОВОЕ удаление", async () => {
+    stub.reset();
+    const call = dbChannel([DB]);
+    const list = await call({ op: "list" });
+    assert.ok(list.ok && /app-db/.test(list.lines.join(" ")), "список баз не показал базу: " + JSON.stringify(list).slice(0, 200));
+
+    // Ключ приходит СТРОКОЙ JSON (ячейка формы) и разбирается каналом, а не окном.
+    const create = await call({ op: "create", table: "pets", keys: '{"species":"S","name":"S"}' });
+    assert.ok(create.ok && create.changed, "таблица не создана через канал: " + JSON.stringify(create).slice(0, 200));
+    assert.ok(/только ключ/.test(create.lines.join(" ")), "канал не сказал, что в колонках живёт только ключ");
+
+    const put = await call({ op: "put", table: "pets", item: '{"species":"cat","name":"Tom","price":10.5}' });
+    assert.ok(put.ok && /полей: 3/.test(put.lines.join(" ")), "запись не сохранена: " + JSON.stringify(put).slice(0, 200));
+    assert.ok(/ЦЕЛИКОМ/.test(put.lines.join(" ")), "канал не предупредил, что запись кладётся целиком");
+
+    const scan = await call({ op: "scan", table: "pets", limit: 5 });
+    assert.ok(scan.ok && /Tom/.test(scan.lines.join(" ")), "записи не показаны: " + JSON.stringify(scan).slice(0, 200));
+
+    const get = await call({ op: "get", table: "pets", key: '{"species":"cat","name":"Tom"}' });
+    assert.ok(get.ok && get.item && get.item.price === 10.5, "запись не прочитана: " + JSON.stringify(get).slice(0, 200));
+
+    // Удаление записи: без согласия канал обязан ОТКАЗАТЬ, а не выполнить.
+    const delNo = await call({ op: "delete", table: "pets", key: '{"species":"cat","name":"Tom"}' });
+    assert.strictEqual(delNo.ok, false, "запись удалена без согласия");
+    assert.strictEqual(delNo.needsConfirm, true, "нет требования согласия на удаление записи");
+    const del = await call({ op: "delete", table: "pets", key: '{"species":"cat","name":"Tom"}', confirmed: true });
+    assert.ok(del.ok && del.deleted, "запись не удалена с согласием");
+
+    // Удаление таблицы — та же двухшаговая проверка.
+    const dropNo = await call({ op: "drop", table: "pets" });
+    assert.strictEqual(dropNo.ok, false, "таблица удалена без согласия");
+    assert.strictEqual(dropNo.needsConfirm, true, "нет требования согласия на удаление таблицы");
+    const drop = await call({ op: "drop", table: "pets", confirmed: true });
+    assert.ok(drop.ok && drop.deleted, "таблица не удалена с согласием");
+  });
+
+  await test("yc:db: отказы честные — чужое действие, нет таблицы, мусор в ключе, база не выбрана", async () => {
+    const call = dbChannel([DB]);
+    const bad = await call({ op: "стереть" });
+    assert.strictEqual(bad.ok, false, "чужое действие выполнено");
+    assert.ok(/Доступно: list, tables, table, create, scan, get, put, delete, drop, query\./.test(bad.error), "отказ не назвал действия: " + bad.error);
+
+    const noTable = await call({ op: "scan" });
+    assert.ok(/Укажи таблицу/.test(noTable.error), "нет подсказки про таблицу: " + noTable.error);
+
+    // Мусор и массив ключом быть не могут: без разбора это ушло бы в облако.
+    const badKey = await call({ op: "get", table: "pets", key: "мусор" });
+    assert.ok(/Укажи key/.test(badKey.error), "мусор в ключе не отвергнут: " + badKey.error);
+    const arrKey = await call({ op: "get", table: "pets", key: "[1,2]" });
+    assert.ok(/Укажи key/.test(arrKey.error), "массив принят за ключ: " + arrKey.error);
+    const noKeys = await call({ op: "create", table: "pets", keys: "{} не json" });
+    assert.ok(/Укажи keys/.test(noKeys.error), "создание без ключа не отвергнуто: " + noKeys.error);
+
+    const none = dbChannel([])({ op: "tables" });
+    assert.ok(/Баз YDB в каталоге/.test((await none).error), "пустой каталог не объяснён");
+    const ambiguous = dbChannel([DB, { id: "etn2", name: "other-db", documentApiEndpoint: stub.base }])({ op: "tables" });
+    assert.ok(/Баз несколько/.test((await ambiguous).error), "неоднозначность не объяснена");
+    const chosen = await dbChannel([DB, { id: "etn2", name: "other-db", documentApiEndpoint: stub.base }])({ op: "tables", database: "other-db" });
+    assert.ok(chosen.ok, "база по имени не выбрана: " + JSON.stringify(chosen).slice(0, 200));
+  });
+
+  await test("yc:db: без подключения и без каталога отвечает честно", async () => {
+    const off = await dbChannel([DB], { yandexOauthToken: "" })({ op: "list" });
+    assert.ok(/не подключён/.test(off.error), "нет ответа про подключение: " + off.error);
+    const noFolder = await dbChannel([DB], { ycFolderId: "" })({ op: "list" });
+    assert.ok(/каталог/.test(noFolder.error), "нет ответа про каталог: " + noFolder.error);
+  });
+
+  console.log("\n[8] YQL (SQL): канал yc:db и инструмент ycDb — вторая половина базы");
+
+  // Подменённый транспорт Ydb.Query: сам протокол (типы, значения, поток
+  // частей) проверяется набором test/yc-yql.test.js, а здесь канал и инструмент
+  // получают готовые кадры ответа — чтобы не ходить в настоящее облако.
+  function yqlColumn(name, typeBuf) {
+    return Buffer.concat([grpcPb.pbString(1, name), grpcPb.pbMessage(2, typeBuf)]);
+  }
+  function yqlRow(cells) {
+    return Buffer.concat(cells.map((c) => grpcPb.pbMessage(12, c)));
+  }
+  function yqlPart(index, rs) {
+    return Buffer.concat([grpcPb.pbInt(1, 400000), grpcPb.pbInt(3, index), grpcPb.pbMessage(4, rs)]);
+  }
+  function yqlStub() {
+    const calls = [];
+    const grpcCall = async (origin, methodPath, headers) => {
+      calls.push({ origin: origin, methodPath: methodPath, headers: headers });
+      if (/\/CreateSession$/.test(methodPath)) {
+        return [Buffer.concat([grpcPb.pbInt(1, 400000), grpcPb.pbString(3, "sess-1")])];
+      }
+      if (/\/ExecuteQuery$/.test(methodPath)) {
+        const col = yqlColumn("name", grpcPb.pbInt(1, 0x1200)); // Utf8
+        const rs = Buffer.concat([grpcPb.pbMessage(1, col), grpcPb.pbMessage(2, yqlRow([grpcPb.pbString(9, "Tom")]))]);
+        return [yqlPart(0, rs)];
+      }
+      if (/\/DeleteSession$/.test(methodPath)) return [grpcPb.pbInt(1, 400000)];
+      return [];
+    };
+    return { calls: calls, grpcCall: grpcCall };
+  }
+
+  await test("yc:db query: SELECT идёт по gRPC, опасный запрос — только с согласием", async () => {
+    const g = yqlStub();
+    const call = dbChannel([DB], null, g.grpcCall);
+    const sel = await call({ op: "query", query: "SELECT * FROM pets LIMIT 5" });
+    assert.ok(sel.ok && sel.changed === false, "SELECT не выполнен: " + JSON.stringify(sel).slice(0, 300));
+    assert.ok(/Tom/.test(sel.lines.join(" ")), "строки не показаны: " + sel.lines.join(" | "));
+    assert.ok(/только чтение/.test(sel.lines.join(" ")), "вид запроса не назван");
+
+    // Строгость YDB: база и токен уходят ЗАГОЛОВКАМИ (соединение одно на хост).
+    const cs = g.calls.find((c) => /CreateSession$/.test(c.methodPath));
+    assert.strictEqual(cs.origin, "https://ydb.serverless.yandexcloud.net:2135", "неверный адрес gRPC: " + cs.origin);
+    assert.strictEqual(cs.headers["x-ydb-database"], "/ru-central1/b1g/etn1", "база не ушла заголовком");
+    assert.ok(String(cs.headers["x-ydb-auth-ticket"]).length > 0, "нет заголовка с токеном");
+    assert.ok(g.calls.some((c) => /DeleteSession$/.test(c.methodPath)), "сессия не закрыта");
+
+    // Необратимый запрос до согласия в облако НЕ уходит.
+    const g2 = yqlStub();
+    const call2 = dbChannel([DB], null, g2.grpcCall);
+    const no = await call2({ op: "query", query: "DROP TABLE pets" });
+    assert.strictEqual(no.ok, false, "DROP выполнен без согласия");
+    assert.strictEqual(no.needsConfirm, true, "нет требования согласия на необратимый запрос");
+    assert.strictEqual(g2.calls.length, 0, "запрос ушёл в облако до согласия");
+    const yes = await call2({ op: "query", query: "DROP TABLE pets", confirmed: true });
+    assert.ok(yes.ok, "DROP не выполнен с согласием: " + JSON.stringify(yes).slice(0, 200));
+    const empty = await call2({ op: "query", query: "   " });
+    assert.ok(/Пустой запрос/.test(empty.error), "пустой запрос не отвергнут: " + empty.error);
+  });
+
+  await test("ycDb query: инструмент — изменяющее под разрешением, необратимое под удалением", async () => {
+    const g = yqlStub();
+    const { cloud } = fakeCloud([DB]);
+    const ycDbApi = createYcDb({
+      getIamToken: cloud.getIamToken,
+      fetchJson: cloud._fetchJson,
+      endpoint: cloud.endpoint,
+      listService: cloud.listService,
+      serviceByKey: cloud.serviceByKey,
+      hostOf: cloud.hostOf,
+      serviceError: cloud.serviceError,
+      isNetworkError: cloud.isNetworkError,
+      grpcCall: g.grpcCall,
+    });
+    const read = await buildTool({ __dbs: [DB], __ycDb: ycDbApi }).tools.ycDb({ action: "query", query: "SELECT * FROM pets" }, {});
+    assert.ok(/Tom/.test(read), "инструмент не показал строки: " + String(read).slice(0, 200));
+    const deniedWrite = await buildTool({ __dbs: [DB], __ycDb: ycDbApi }).tools.ycDb({ action: "query", query: "CREATE TABLE t (id Uint64, PRIMARY KEY (id))" }, {});
+    assert.ok(/ЗАПРЕЩЕНО/.test(deniedWrite), "изменяющий запрос без разрешения: " + String(deniedWrite).slice(0, 200));
+    const deniedDrop = await buildTool({ __dbs: [DB], __ycDb: ycDbApi }).tools.ycDb({ action: "query", query: "DROP TABLE t" }, {});
+    assert.ok(/ЗАПРЕЩЕНО/.test(deniedDrop), "необратимый запрос без разрешения: " + String(deniedDrop).slice(0, 200));
+    const allowed = await buildTool({ __dbs: [DB], __ycDb: ycDbApi }, { ycAllowAgentCreate: true, ycAllowAgentDelete: true }).tools.ycDb({ action: "query", query: "DROP TABLE t" }, {});
+    assert.ok(!/ЗАПРЕЩЕНО/.test(String(allowed)), "запрос с разрешением всё равно отвергнут: " + String(allowed).slice(0, 200));
   });
 
   await new Promise((r) => stub.server.close(r));

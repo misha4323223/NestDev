@@ -47,6 +47,13 @@ const calls = { rollback: 0 };
 // Запросы Document API базы YDB: операция — в заголовке, не в пути.
 const docCalls = [];
 const created = []; // что реально ушло на создание (по имени сервиса)
+// Файлы бакета: список и содержимое живут на стенде, чтобы загрузка из окна
+// была видна на живом ответе, а не на воображении.
+let bucketObjects = [
+  { key: "index.html", size: 2048, lastModified: "2026-09-20T10:00:00.000Z" },
+  { key: "assets/app.js", size: 512, lastModified: "2026-09-21T10:00:00.000Z" },
+];
+const bucketBodies = { "index.html": "<h1>сайт</h1>", "assets/app.js": "console.log(1)" };
 
 function startFakeYc() {
   return http.createServer((req, res) => {
@@ -152,6 +159,44 @@ function startFakeYc() {
         docCalls.push({ target: target, auth: req.headers.authorization || "", path: p });
         if (target === "DynamoDB_20120810.ListTables") return json(200, { TableNames: ["pets", "orders"] });
         return json(200, {});
+      }
+      // Object Storage: бакет и его файлы. Сам бакет виден КОНСОЛЬНЫМ API
+      // (/storage/v1/buckets), а объекты живут в S3-совместимом API ТОГО ЖЕ
+      // хоста (хук AI_AGENT_YC_BASE уводит на стенд оба адреса): список — XML,
+      // запись и чтение — по ключу, а флагами публичности владеет консольный API.
+      if (p === "/storage/v1/buckets") {
+        return json(200, { buckets: [{ id: "b1", name: "site-bucket", folderId: "f1", createdAt: "2026-09-01T10:00:00Z" }] });
+      }
+      if (p === "/storage/v1/buckets/site-bucket") {
+        return json(200, { id: "b1", name: "site-bucket", folderId: "f1", createdAt: "2026-09-01T10:00:00Z",
+          anonymousAccessFlags: { read: false, list: false, configRead: false } });
+      }
+      if (p === "/site-bucket" && String(u.search || "").indexOf("list-type=2") >= 0) {
+        const rows = bucketObjects
+          .map((o) => "<Contents><Key>" + String(o.key).replace(/&/g, "&amp;") + "</Key><LastModified>" + o.lastModified + "</LastModified><Size>" + Number(o.size || 0) + "</Size></Contents>")
+          .join("");
+        res.writeHead(200, { "Content-Type": "application/xml" });
+        return res.end('<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>site-bucket</Name>' + rows + "<IsTruncated>false</IsTruncated></ListBucketResult>");
+      }
+      const objAt = /^\/site-bucket\/(.+)$/.exec(p);
+      if (objAt) {
+        const key = decodeURIComponent(objAt[1]);
+        if (req.method === "PUT") {
+          bucketObjects = bucketObjects.filter((o) => o.key !== key).concat([{ key: key, size: Buffer.byteLength(body), lastModified: "2026-10-01T10:00:00.000Z" }]);
+          res.writeHead(200, { "Content-Type": "application/xml", ETag: '"etag-live"' });
+          return res.end("");
+        }
+        if (req.method === "DELETE") {
+          bucketObjects = bucketObjects.filter((o) => o.key !== key);
+          res.writeHead(204);
+          return res.end();
+        }
+        if (bucketBodies[key] != null) {
+          res.writeHead(200, { "Content-Type": "text/plain", "Content-Length": String(Buffer.byteLength(bucketBodies[key])) });
+          return res.end(bucketBodies[key]);
+        }
+        res.writeHead(404, { "Content-Type": "application/xml" });
+        return res.end('<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>');
       }
       // Остальные сервисы дашборда: пустые списки (карточки без ошибок).
       if (req.method === "GET") return json(200, {});
@@ -573,7 +618,67 @@ function hasXvfb() {
     check("в панели назван путь запроса", /Document API/.test(ydb.path) && /ListTables/.test(ydb.path), ydb.path.slice(0, 80));
     check("в консольный API за таблицами не ходили", !seen.some((s) => /\/ydb\/v1\/databases\/etn1\/tables/.test(s)), "запросов: " + seen.filter((s) => /ydb/.test(s)).join(", ") || "нет");
 
-    console.log("\n[11] Ошибки страницы");
+    console.log("\n[11] Object Storage: файлы бакета из карточки");
+    // Настоящий файл на диске: канал читает его НАСТОЯЩИМ чтением, поэтому
+    // подкладываем реальный файл, а не строку «как будто файл».
+    const uploadPath = path.join(os.tmpdir(), "yc-live-upload-" + process.pid + ".html");
+    fs.writeFileSync(uploadPath, "<h1>загружено из окна</h1>", "utf8");
+    const bucketCard = await page.evaluate(async () => {
+      const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+      await window.YcConsole.open({ serviceKey: "storage", title: "Object Storage", item: { id: "b1", name: "site-bucket" }, folderId: "f1" });
+      await wait(1600);
+      const sections = [...document.querySelectorAll("#yc-console .ykc-section")].map((s) => s.textContent.trim());
+      const up = document.querySelector("#yc-console .ykc-bucket-upload");
+      const chip = [...document.querySelectorAll("#yc-console .ykc-rel")].find((c) => c.textContent.includes("Объекты"));
+      if (chip) chip.click();
+      await wait(1200);
+      const rows = [...document.querySelectorAll("#yc-console .ykc-table tbody tr")];
+      const get = document.querySelector("#yc-console .ykc-obj-get");
+      return {
+        sections: sections,
+        upText: up ? up.textContent.trim() : "",
+        upWired: !!(up && typeof up.onclick === "function"),
+        pickFile: typeof (window.api && window.api.pickCloudFile),
+        pickSave: typeof (window.api && window.api.pickCloudSave),
+        rows: rows.length,
+        rowText: rows[0] ? rows[0].textContent.replace(/\s+/g, " ").trim() : "",
+        getWired: !!(get && typeof get.onclick === "function"),
+      };
+    });
+    check("в карточке бакета есть раздел «Файлы»", bucketCard.sections.includes("Файлы"), bucketCard.sections.join(" · "));
+    check("кнопка «Загрузить файл в бакет» есть и подключена", /Загрузить файл в бакет/.test(bucketCard.upText) && bucketCard.upWired, bucketCard.upText + " · onclick: " + bucketCard.upWired);
+    check("выбор файла и места сохранения есть в мосте окна", bucketCard.pickFile === "function" && bucketCard.pickSave === "function", bucketCard.pickFile + " / " + bucketCard.pickSave);
+    check("в списке объектов есть подключённая кнопка «Скачать»", bucketCard.getWired, "строк: " + bucketCard.rows + " · " + bucketCard.rowText.slice(0, 70));
+
+    // Дальше — сам канал: карточка зовёт его теми же аргументами. Кнопку выбора
+    // файла в прогоне НЕ нажимаем: она открыла бы настоящее системное окно, и
+    // прогон повис бы на диалоге, которого никто не закроет. Что она подключена
+    // и что нужные методы есть в мосте — проверено выше.
+    const files = await page.evaluate(async (filePath) => {
+      const up = await window.api.ycStorage({ op: "upload", bucket: "site-bucket", file: filePath, key: "from-window.html", confirmed: true });
+      const list = await window.api.ycStorage({ op: "objects", bucket: "site-bucket" });
+      const url = await window.api.ycStorage({ op: "url", bucket: "site-bucket", key: "index.html" });
+      const noConfirm = await window.api.ycStorage({ op: "delete", bucket: "site-bucket", key: "from-window.html" });
+      const del = await window.api.ycStorage({ op: "delete", bucket: "site-bucket", key: "from-window.html", confirmed: true });
+      const to = filePath + ".out";
+      const down = await window.api.ycStorage({ op: "download", bucket: "site-bucket", key: "index.html", to: to });
+      return { up: up, listLines: (list.lines || []).join("\n"), url: url.url, urlLines: (url.lines || []).join("\n"), noConfirm: noConfirm, del: del, down: down, to: to };
+    }, uploadPath);
+    check("файл с диска ушёл в бакет", files.up.ok && files.up.key === "from-window.html", (files.up.error || files.up.key || "") + " · " + (files.up.size || 0) + " Б");
+    check("список объектов показывает загруженный файл", /from-window\.html/.test(files.listLines), files.listLines.split("\n").slice(0, 3).join(" / "));
+    check("загрузка ушла на S3-адрес бакета, а не в консольный API", seen.some((s) => s === "PUT /site-bucket/from-window.html"), seen.filter((s) => /site-bucket/.test(s)).join(", ") || "нет запросов");
+    check("ссылка на объект названа честно (закрытый бакет — 403)", /^https:\/\/storage\.yandexcloud\.net\/site-bucket\/index\.html$/.test(files.url) && /403/.test(files.urlLines), files.url);
+    check("удаление без согласия отклонено, с согласием — выполнено", files.noConfirm.ok === false && files.noConfirm.needsConfirm === true && files.del.ok === true, "без согласия: " + JSON.stringify(files.noConfirm.needsConfirm) + " · с согласием: " + files.del.ok);
+    const gotBytes = fs.existsSync(files.to) ? fs.readFileSync(files.to, "utf8") : "";
+    check("скачанный объект лёг на диск настоящими байтами", /сайт/.test(gotBytes), files.to + " → " + JSON.stringify(gotBytes.slice(0, 40)));
+    try {
+      fs.rmSync(uploadPath, { force: true });
+      fs.rmSync(files.to, { force: true });
+    } catch {
+      /* временные файлы — если уже удалены, это не ошибка */
+    }
+
+    console.log("\n[12] Ошибки страницы");
     const real = pageErrs.filter((e) => !/favicon|net::ERR_FILE_NOT_FOUND/i.test(e));
     check("нет ошибок JS и консоли", real.length === 0, real.slice(0, 3).join(" | ") || "чисто");
   } catch (e) {

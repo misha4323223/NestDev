@@ -1157,6 +1157,30 @@ const ycAlb = createYcAlb({
   waitOperation: yandexCloud.waitOperation,
   serviceError: yandexCloud.serviceError,
 });
+
+// База YDB: таблицы и записи через HTTP Document API (часть 91, заход 9) —
+// своим модулем, как остальные yc-*. Экземпляр здесь ОДИН на всё приложение:
+// его берут и канал окна («yc:db» в src/yc-ipc.js), и инструмент агента
+// (src/agent-tools-cloud.js), поэтому оба ходят с одним кэшем IAM-токена и
+// видят одну и ту же ошибку сети. Протокол (X-Amz-Target, типизированные
+// значения, адрес у самой базы) живёт в src/yc-db.js и только там.
+const { createYcDb } = require("./yc-db.js");
+const ycDb = createYcDb({
+  getIamToken: yandexCloud.getIamToken,
+  fetchJson: yandexCloud._fetchJson,
+  endpoint: yandexCloud.endpoint,
+  listService: yandexCloud.listService,
+  serviceByKey: yandexCloud.serviceByKey,
+  hostOf: yandexCloud.hostOf,
+  serviceError: yandexCloud.serviceError,
+  isNetworkError: yandexCloud.isNetworkError,
+});
+// API-шлюз (API Gateway): шлюз целиком задаётся OpenAPI-спецификацией (часть 91,
+// заход 12). Экземпляр здесь ОДИН на приложение — его берут и канал окна
+// («yc:apigw» в src/yc-ipc.js), и инструмент агента (src/agent-tools-cloud.js):
+// один кэш IAM-токена, одна и та же ошибка сети. REST-детали (операции, маска
+// полей, разбор спецификации) живут в src/yc-apigw.js и только там.
+const ycApiGw = require("./yc-apigw.js");
 const ycService = createYcService({ app, path, net, secrets, yandexCloud, ycCli, ycLogs, ycEnsurePath, loadSettings });
 const {
   ycConfig,
@@ -1173,7 +1197,22 @@ const {
 // ycAi — тот же экземпляр модуля, что у агента (один кэш IAM-токена); fs, path,
 // resolvePath и agentWorkDir нужны каналу «yc:ai»: снимки и записи он читает с
 // диска, а синтезированную речь кладёт в рабочую папку агента.
-registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, ycIg, ycAlb, fs, path, resolvePath, agentWorkDir, loadSettings, saveSettings, svc: ycService });
+registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, ycIg, ycAlb, ycDb, ycLogs, ycApiGw, fs, path, resolvePath, agentWorkDir, loadSettings, saveSettings, svc: ycService });
+
+// ── Файлы для облака: системные диалоги выбора файла и места сохранения ──────
+// У окна был ровно один системный диалог (dialog:pickDir — папка). Для бакета
+// нужно выбрать ФАЙЛ и назвать, КУДА сохранить скачанный объект, поэтому рядом —
+// свой маленький модуль (src/cloud-files-ipc.js): настройки держат ровно шесть
+// каналов, и это проверяется набором — подмешивать туда выбор файла нельзя.
+const { registerCloudFilesIpc } = require("./cloud-files-ipc.js");
+registerCloudFilesIpc({
+  ipcMain,
+  dialog,
+  path,
+  fs,
+  getWindow: () => mainWindow,
+  ipcGuard,
+});
 
 // Память диалогов: каналы дневника памяток и запись самой памятки при сжатии контекста
 // (её кладёт прогон через onMemo). Собирается ПОСЛЕ путей-и-git и миссий: зеркало
@@ -1430,6 +1469,8 @@ const { executeTool } = createToolRegistry({
   ycMdb,
   ycIg,
   ycAlb,
+  ycDb,
+  ycApiGw,
   readYcLogsText,
 
   ycCliStatus,

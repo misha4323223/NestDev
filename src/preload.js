@@ -29,6 +29,11 @@ contextBridge.exposeInMainWorld("api", {
   // подпись окна и папку, с которой начинается выбор: одна и та же папка выбирается
   // и для проекта, и для работы агента, а разным диалог быть обязан.
   pickDirectory: (kind) => ipcRenderer.invoke("dialog:pickDir", kind || ""),
+  // Файлы для облака: выбрать файл на диске и назвать, куда сохранить объект
+  // из бакета. Системные диалоги живут своим модулем (src/cloud-files-ipc.js):
+  // настройки держат ровно шесть каналов, и это проверяется набором.
+  pickCloudFile: (args) => ipcRenderer.invoke("cloud:pickFile", args || {}),
+  pickCloudSave: (args) => ipcRenderer.invoke("cloud:pickSave", args || {}),
   // Куда класть работу агента (миссии, прогоны и дела): текущий выбор и его сохранение.
   // Свои каналы, а не поле формы настроек — чтобы устаревший объект настроек не стёр выбор.
   setupState: () => ipcRenderer.invoke("setup:state"),
@@ -202,6 +207,26 @@ contextBridge.exposeInMainWorld("api", {
   // у плитки — не было. Канал один («yc:dns») и зовёт ТЕ ЖЕ функции Cloud DNS,
   // что агент и карточка: строгость API разобрана в src/yandex-cloud.js.
   ycDns: (args) => ipcRenderer.invoke("yc:dns", args || {}),
+  // Serverless-контейнеры: список, карточка, ревизии, новая ревизия (образ,
+  // переменные окружения, ресурсы, тёплые экземпляры minInstances), откат,
+  // переименование и публичный/закрытый доступ — канал «yc:container».
+  ycContainer: (args) => ipcRenderer.invoke("yc:container", args || {}),
+  // База YDB: базы, таблицы и записи (Document API). Таблицы умели агент и
+  // карточка базы, а у плитки действий не было вовсе. Канал «yc:db» зовёт ТОТ
+  // ЖЕ экземпляр src/yc-db.js, что и агент (один кэш IAM-токена).
+  ycDb: (args) => ipcRenderer.invoke("yc:db", args || {}),
+  // Object Storage: файлы бакета — список, загрузка с диска, скачивание,
+  // удаление, ссылка и публичный доступ. Канал «yc:storage» зовёт ТУ ЖЕ
+  // S3-часть src/yandex-cloud.js, что и агент (`ycStorage`).
+  ycStorage: (args) => ipcRenderer.invoke("yc:storage", args || {}),
+  // Группы логов Cloud Logging: список, подробности, создание, правка и
+  // удаление. Записи читаются по gRPC (канал yc:logs), а группы — обычный REST
+  // того же хоста; канал «yc:logGroups» зовёт тот же модуль src/yc-logs.js.
+  ycLogGroups: (args) => ipcRenderer.invoke("yc:logGroups", args || {}),
+  // API-шлюз (API Gateway): список, карточка, спецификация, создание ИЗ
+  // OpenAPI-спецификации, правка и удаление. Канал «yc:apigw» зовёт тот же
+  // модуль src/yc-apigw.js, что и агент.
+  ycApiGw: (args) => ipcRenderer.invoke("yc:apigw", args || {}),
   ycCosts: (serviceKey, params) => ipcRenderer.invoke("yc:costs", serviceKey, params || {}),
   ycCreate: (serviceKey, name, opts) => ipcRenderer.invoke("yc:create", serviceKey, name, opts || {}),
   ycDelete: (serviceKey, resourceId) => ipcRenderer.invoke("yc:delete", serviceKey, resourceId),

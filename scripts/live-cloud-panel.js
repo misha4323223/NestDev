@@ -142,8 +142,9 @@ ${STUBS}
 <script src="${BASE}src/renderer/yc-panel.js"></script>
 <script src="${BASE}src/renderer/yc-actions.js"></script>
 <script>
-  // Данные стенда: тринадцать сервисов (три managed-базы, группа машин и балансировщики), один
-  // отказал, есть ресурсы, деньги и хвосты.
+  // Данные стенда: семнадцать сервисов (три managed-базы, группа машин,
+  // балансировщики, группы логов и API-шлюз), один отказал, есть ресурсы,
+  // деньги и хвосты.
   const services = [
     { key: "storage", ru: "Объектное хранилище", title: "Object Storage", ok: true, count: 3, items: [{ id: "b1", name: "site-bucket" }, { id: "b2", name: "logs-archive" }, { id: "b3", name: "backups" }] },
     { key: "cloudFunctions", ru: "Функции", title: "Cloud Functions", ok: true, count: 2, items: [{ id: "f1", name: "tg-webhook" }, { id: "f2", name: "hourly-report" }] },
@@ -162,6 +163,20 @@ ${STUBS}
     // состав слушателей меняют ТОЧЕЧНО (listeneradd/listenerdel) и правят маской
     // полей (lbupdate).
     { key: "alb", ru: "Балансировщики", title: "Application Load Balancer", ok: true, count: 1, items: [{ id: "lb1", name: "web-lb" }] },
+    // Serverless-контейнеры: контейнер задаётся РЕВИЗИЕЙ (образ, переменные
+    // окружения, ресурсы, тёплые экземпляры). Своё семейство действий и свой
+    // канал yc:container (заход 8).
+    { key: "serverlessContainers", ru: "Serverless-контейнеры", title: "Serverless Containers", ok: true, count: 1, items: [{ id: "cnt1", name: "site" }] },
+    // База YDB: таблицы и записи через Document API. Своё семейство действий и
+    // свой канал yc:db (заход 9).
+    { key: "ydb", ru: "База YDB", title: "Managed Service for YDB", ok: true, count: 1, items: [{ id: "etn1", name: "app-db" }] },
+    // Группы логов Cloud Logging: сервис «Логи» был на полке и раньше, но только
+    // списком. Своё семейство действий и свой канал yc:logGroups (заход 11).
+    { key: "logging", ru: "Логи", title: "Cloud Logging", ok: true, count: 1, items: [{ id: "grp1", name: "app-logs" }] },
+    // API-шлюз: сервис был на полке только списком; теперь у плитки своё семейство
+    // действий (канал yc:apigw) — создать шлюз ИЗ OpenAPI-спецификации, показать
+    // её, поправить и удалить (заход 12).
+    { key: "apiGateway", ru: "API-шлюз", title: "API Gateway", ok: true, count: 1, items: [{ id: "gw1", name: "main-api" }] },
 
     // Managed-базы: три плитки у одного канала (yc:mdb). Какая это база, видно
     // только по полю engine, которое подставляет само семейство, — в этом весь
@@ -516,6 +531,275 @@ ${STUBS}
           lines: ["🗑 Запись удалена: A www.example.com. (значений было 1)", "Зона «example.com.» (dns-z1)"] };
       }
       return { ok: true, lines: ["готово: " + a.op], message: "готово: " + a.op };
+    },
+    // Serverless-контейнеры: та же форма ответа, что у настоящего src/yc-ipc.js —
+    // строки и предупреждение про тёплые экземпляры только когда minInstances > 0
+    // (сама ревизия не платная).
+    ycContainer: async (a) => {
+      window.__calls.push(["ycContainer", a]);
+      if (a.op === "list") {
+        return { ok: true, containers: [{ id: "cnt1", name: "site" }],
+          lines: ["• site — ACTIVE · сайт на контейнере · https://bba1.site.containers.yandexcloud.net"],
+          message: "Контейнеров: 1." };
+      }
+      if (a.op === "card") {
+        return { ok: true, container: { id: "cnt1", name: a.container },
+          lines: ["Контейнер «site» (cnt1)", "Статус: ACTIVE · сайт на контейнере", "Создан: 2026-09-01T10:00:00Z",
+            "Адрес вызова: https://bba1.site.containers.yandexcloud.net", "Ревизий: 2 · активная — rev2",
+            "Ревизия rev2 — ACTIVE · создана 2026-09-10T10:00:00Z", "Образ: cr.yandex/cr1/site:2",
+            "Ресурсы: 512 МБ памяти, 1 ядро(а), доля ядра 100%", "Мин. инстансов: 1 · лимит инстансов на зону: 3",
+            "Переменные окружения (2): PORT, MODE"],
+          message: "Контейнер «site» (cnt1)" };
+      }
+      if (a.op === "revisions") {
+        return { ok: true, revisions: [{ id: "rev2" }, { id: "rev1" }],
+          lines: ["Контейнер «site» (cnt1)", "Адрес вызова: https://bba1.site.containers.yandexcloud.net",
+            "• rev2 — ★ активна · 2026-09-10 10:00:00 · cr.yandex/cr1/site:2 · 512 МБ / 1 ядро · таймаут 30 с",
+            "• rev1 — ACTIVE · 2026-09-01 10:00:00 · cr.yandex/cr1/site:1 · 256 МБ / 1 ядро · таймаут 30 с"],
+          message: "Ревизий: 2." };
+      }
+      if (a.op === "newrev") {
+        return { ok: true, changed: true, container: { id: "cnt1", name: a.container },
+          lines: ["✅ Ревизия развёрнута (настройки взяты из активной ревизии rev2 (указанные поля переопределены)).",
+            "Адрес вызова: https://bba1.site.containers.yandexcloud.net", "Ревизия rev3 — ACTIVE · образ " + a.image],
+          warnings: (parseInt(a.minInstances, 10) || 0) > 0 ? ["Тёплые экземпляры (мин. инстансов " + a.minInstances + ") держат контейнер запущенным всегда — за них платят, даже когда запросов нет."] : [],
+          message: "Ревизия развёрнута." };
+      }
+      if (a.op === "rollback") {
+        return { ok: true, changed: true,
+          lines: ["✅ Контейнер откачен на ревизию " + a.revisionId + ".", "Активная ревизия теперь: " + a.revisionId + "."],
+          message: "Откат выполнен." };
+      }
+      if (a.op === "update") {
+        return { ok: true, changed: true, container: { name: a.newName || "site" },
+          lines: ["✅ Контейнер обновлён: «" + (a.newName || "site") + "»"],
+          message: "Контейнер обновлён." };
+      }
+      if (a.op === "public") {
+        return { ok: true, changed: true,
+          lines: ["⚠ Контейнер открыт для вызова из интернета.", "Адрес вызова: https://bba1.site.containers.yandexcloud.net"],
+          warnings: ["Любой человек из интернета сможет звать контейнер по адресу и увидеть то, что он отвечает. Если внутри есть пароли или личные данные — закрой контейнер обратно (действие «Закрыть от интернета»)."],
+          message: "Контейнер открыт." };
+      }
+      return { ok: true, changed: true, lines: ["🔒 Контейнер закрыт от интернета."], message: "Контейнер закрыт." };
+    },
+    // База YDB: та же форма ответа, что у настоящего src/yc-ipc.js — базы,
+    // таблицы, структура и записи. «Создать таблицу» спрашивает КЛЮЧ (в колонках
+    // документной таблицы живёт только он), а удаление таблицы необратимо.
+    ycDb: async (a) => {
+      window.__calls.push(["ycDb", a]);
+      const who = "База «app-db» (etn1)";
+      if (a.op === "list") {
+        return { ok: true, databases: [{ id: "etn1", name: "app-db" }],
+          lines: ["• app-db — RUNNING · grpcs://ydb.serverless.yandexcloud.net:2135 (etn1)"],
+          message: "Баз YDB: 1." };
+      }
+      if (a.op === "tables") {
+        return { ok: true, database: { id: "etn1", name: "app-db" }, tables: ["pets"],
+          lines: [who, "• pets", "Таблиц: 1. Записи — действием «Записи таблицы», структура — «Структура таблицы»."],
+          message: "Таблиц: 1." };
+      }
+      if (a.op === "table") {
+        return { ok: true, database: { id: "etn1", name: "app-db" },
+          tableInfo: { table: a.table, status: "ACTIVE", itemCount: 2, sizeBytes: 4096, keys: [{ name: "species", type: "HASH" }, { name: "name", type: "RANGE" }] },
+          lines: ["Таблица «" + a.table + "» · ACTIVE", who, "Записей: 2 · размер: 4096 Б", "Ключ: species [HASH], name [RANGE]",
+            "В колонках таблицы — ТОЛЬКО поля ключа; остальные поля хранятся в самих записях (так устроен Document API YDB)."],
+          message: "Структура таблицы «" + a.table + "»." };
+      }
+      if (a.op === "create") {
+        return { ok: true, changed: true, database: { id: "etn1", name: "app-db" },
+          lines: ["✅ Таблица создана: " + a.table + " (ключ: id)", who, "В колонках живёт только ключ; любые другие поля можно класть в записи — действием «Положить запись»."],
+          message: "Таблица создана." };
+      }
+      if (a.op === "scan") {
+        return { ok: true, database: { id: "etn1", name: "app-db" }, table: a.table, items: [{ species: "cat", name: "Tom", price: 10.5 }],
+          lines: ["Таблица «" + a.table + "»: записей 1", who, JSON.stringify([{ species: "cat", name: "Tom", price: 10.5 }], null, 2)],
+          message: "Записей: 1." };
+      }
+      if (a.op === "get") {
+        return { ok: true, database: { id: "etn1", name: "app-db" }, table: a.table, item: { species: "cat", name: "Tom" },
+          lines: ["Запись из «" + a.table + "»:", JSON.stringify({ species: "cat", name: "Tom" }), who],
+          message: "Запись прочитана." };
+      }
+      if (a.op === "put") {
+        return { ok: true, changed: true, database: { id: "etn1", name: "app-db" }, table: a.table,
+          lines: ["✅ Запись сохранена в «" + a.table + "» (полей: 3)", who, "Запись кладётся ЦЕЛИКОМ: если такая уже была, её прежние поля заменяются этим набором."],
+          message: "Запись сохранена." };
+      }
+      if (a.op === "delete") {
+        if (a.confirmed !== true) {
+          return { ok: false, needsConfirm: true,
+            error: "Удаление записи необратимо: вернуть её можно только заново заполнив поля.",
+            lines: ["Запись: " + JSON.stringify({ species: "cat", name: "Tom" }), who] };
+        }
+        return { ok: true, changed: true, deleted: true, database: { id: "etn1", name: "app-db" },
+          lines: ["🗑 Запись удалена из «" + a.table + "»", who], message: "Запись удалена." };
+      }
+      // YQL (SQL) — вторая половина базы: настоящие колонки и любые запросы.
+      // Необратимый запрос — тот же двухшаговый ответ, что у удалений.
+      if (a.op === "query") {
+        const text = String(a.query || "");
+        const read = /^\s*select\b/i.test(text);
+        if (!read && /(^|;)\s*(drop|delete|alter|truncate)\b/i.test(text) && a.confirmed !== true) {
+          return { ok: false, needsConfirm: true,
+            error: "Этот запрос необратим — он удаляет или меняет данные (DROP / DELETE / ALTER / TRUNCATE). Повтори с подтверждением, если это правда нужно.",
+            lines: [who, "Запрос: " + text] };
+        }
+        return { ok: true, changed: !read, database: { id: "etn1", name: "app-db" },
+          sets: [{ columns: [{ name: "name", type: { kind: "primitive", id: 0x1200 } }], rows: [["Tom"]] }], rowCount: 1,
+          lines: [who, "Запрос выполнен: строк 1 — " + (read ? "только чтение" : "меняет данные") + ".", "name Utf8", "name = Tom"],
+          message: "Запрос выполнен." };
+      }
+      // Удаление таблицы — та же двухшаговая проверка, что в src/yc-ipc.js:
+      // без явного согласия канал отвечает «нужно согласие», а не выполняет.
+      if (a.confirmed !== true) {
+        return { ok: false, needsConfirm: true,
+          error: "Удаление таблицы необратимо: она уйдёт ВМЕСТЕ со всеми записями, и вернуть данные из окна будет нельзя.",
+          lines: [who, "Таблица: " + a.table] };
+      }
+      return { ok: true, changed: true, deleted: true, database: { id: "etn1", name: "app-db" },
+        lines: ["🗑 Таблица удалена вместе со всеми записями: " + a.table, who], message: "Таблица удалена." };
+    },
+    // Файлы для облака. В приложении это СИСТЕМНЫЕ диалоги (src/cloud-files-ipc.js),
+    // а в стенде — заранее выбранный файл: так форма «Загрузить файл» проверяется
+    // целиком, без настоящего окна, которого в прогоне никто не закроет.
+    pickCloudFile: async (a) => {
+      window.__calls.push(["pickCloudFile", a]);
+      return { path: "/tmp/site-index.html", name: "index.html", size: 2048 };
+    },
+    pickCloudSave: async (a) => {
+      window.__calls.push(["pickCloudSave", a]);
+      return { path: "/tmp/saved-index.html", name: "saved-index.html" };
+    },
+    // Object Storage: та же форма ответа, что у настоящего src/yc-ipc.js —
+    // загрузка платная (объём) и ДВУХШАГОВАЯ, удаление и открытие бакета — тоже.
+    ycStorage: async (a) => {
+      window.__calls.push(["ycStorage", a]);
+      const who = "Бакет «site-bucket» (b1)";
+      if (a.op === "list") {
+        return { ok: true, buckets: [{ id: "b1", name: "site-bucket" }],
+          lines: ["• site-bucket — ACTIVE · класс standard (b1)"], message: "Бакетов: 1." };
+      }
+      if (a.op === "objects") {
+        return { ok: true, bucket: { id: "b1", name: "site-bucket" }, objects: [{ key: "index.html", size: 2048 }],
+          lines: [who, "• index.html · 2 КБ · 2026-09-20 10:00", "Объектов: 1. Открытый адрес — действием «Ссылка на объект»."],
+          message: "Объектов: 1." };
+      }
+      if (a.op === "upload") {
+        if (a.confirmed !== true) {
+          return { ok: false, needsConfirm: true,
+            error: "Объект в бакете занимает место и тарифицируется за объём (ГБ за месяц), пока его не удалят. Подтверди загрузку.",
+            lines: [who, "Ключ в бакете: " + a.key, "Файл: " + a.file] };
+        }
+        return { ok: true, changed: true, key: a.key, size: 2048,
+          url: "https://storage.yandexcloud.net/site-bucket/" + a.key,
+          lines: ["✅ Файл в облаке: " + a.key + " (2 КБ, text/html; charset=utf-8)", who,
+            "Открытый адрес: https://storage.yandexcloud.net/site-bucket/" + a.key],
+          message: "Файл загружен." };
+      }
+      if (a.op === "download") {
+        // Скачивание кладёт объект НА ДИСК: путь возвращается полем path, иначе
+        // форма не смогла бы сказать, куда легли байты.
+        return { ok: true, bucket: { id: "b1", name: "site-bucket" }, key: a.key, path: a.to || "/tmp/index.html", size: 2048,
+          lines: ["✅ Объект скачан: " + a.key + " → " + (a.to || "/tmp/index.html"), "Размер: 2 КБ · тип: text/html; charset=utf-8", who],
+          message: "Объект скачан." };
+      }
+      if (a.op === "url") {
+        return { ok: true, url: "https://storage.yandexcloud.net/site-bucket/index.html", public: false,
+          lines: [who, "Объект: index.html", "Открытый адрес: https://storage.yandexcloud.net/site-bucket/index.html",
+            "Бакет ЗАКРЫТ: ссылка вернёт 403, пока не включён публичный доступ (действие «Открыть бакет»)."],
+          message: "Ссылка на объект." };
+      }
+      if (a.op === "delete") {
+        if (a.confirmed !== true) {
+          return { ok: false, needsConfirm: true, error: "Удаление объекта необратимо: вернуть его можно только залив файл заново.",
+            lines: [who, "Объект: " + a.key] };
+        }
+        return { ok: true, changed: true, deleted: true, lines: ["🗑 Объект удалён: " + a.key, who], message: "Объект удалён." };
+      }
+      if (a.op === "public") {
+        if (a.confirmed !== true) {
+          return { ok: false, needsConfirm: true,
+            error: "Открытый бакет читает любой, кто знает ссылку, а содержимое становится видно ПОИСКОВИКАМ. Не открывай бакет с паролями, ключами и личными файлами.",
+            lines: [who] };
+        }
+        return { ok: true, changed: true, lines: ["⚠ Бакет открыт для чтения из интернета.", who],
+          warnings: ["Содержимое бакета видно поисковикам. Закрыть обратно — действие «Закрыть бакет»."], message: "Бакет открыт." };
+      }
+      if (a.op === "private") {
+        return { ok: true, changed: true, lines: ["🔒 Бакет закрыт: по ссылкам придёт отказ 403.", who], message: "Бакет закрыт." };
+      }
+      return { ok: true, lines: [who, "Анонимное чтение выкл: по ссылке придёт отказ 403 — это нормально для закрытого бакета.",
+        "Перечисление содержимого анонимно: выкл."], message: "Бакет закрытый." };
+    },
+    // Группы логов: та же форма ответа, что у настоящего src/yc-ipc.js — список,
+    // карточка, создание, правка МАСКОЙ и удаление, которое ДВУХШАГОВОЕ.
+    ycLogGroups: async (a) => {
+      window.__calls.push(["ycLogGroups", a]);
+      const who = "Лог-группа «app-logs» (grp1)";
+      if (a.op === "list") {
+        return { ok: true, groups: [{ id: "grp1", name: "app-logs", status: "ACTIVE", retentionPeriod: "720h" }],
+          lines: ["• app-logs — ACTIVE · хранение 720h (grp1)"], message: "Лог-групп: 1." };
+      }
+      if (a.op === "group") {
+        return { ok: true, group: { id: "grp1", name: "app-logs", description: "Логи приложения", retentionPeriod: "720h", labels: { env: "prod" } },
+          lines: [who, "Описание: Логи приложения", "Метки: env=prod", "Хранение: 720h", "Создана: 2026-09-01 10:00:00"],
+          message: "Лог-группа." };
+      }
+      if (a.op === "create") {
+        const ret = a.retention ? a.retention + "h" : "";
+        return { ok: true, changed: true, id: "grp2", name: a.name, group: { id: "grp2", name: a.name, retentionPeriod: ret },
+          lines: ["✅ Лог-группа создана: " + a.name + " (grp2)", "Хранение: " + (ret || "без срока"),
+            "Дальше: направь в неё журнал балансировщика или логи ревизии контейнера."],
+          message: "Лог-группа создана." };
+      }
+      if (a.op === "update") {
+        return { ok: true, changed: true, group: { id: "grp1", name: "app-logs", description: a.description },
+          lines: ["✅ Лог-группа изменена.", "• app-logs — ACTIVE"], message: "Лог-группа изменена." };
+      }
+      if (a.op === "delete") {
+        if (a.confirmed !== true) {
+          return { ok: false, needsConfirm: true, error: "Удаление лог-группы необратимо: её настройки пропадут, а направленные в неё журналы больше не сохраняются. Подтверди удаление.", lines: [who] };
+        }
+        return { ok: true, changed: true, deleted: true, lines: ["🗑 Лог-группа удалена: app-logs", "Логи, что в неё собирались, дальше не сохраняются."], message: "Лог-группа удалена." };
+      }
+      return { ok: false, error: "Неизвестное действие групп логов: " + a.op + ". Доступно: list, group, create, update, delete." };
+    },
+    // API-шлюз (API Gateway): та же форма ответа, что у настоящего src/yc-ipc.js —
+    // список, карточка, спецификация, создание ИЗ спецификации и удаление, которое
+    // ДВУХШАГОВОЕ.
+    ycApiGw: async (a) => {
+      window.__calls.push(["ycApiGw", a]);
+      const who = "API-шлюз «main-api» (gw1)";
+      if (a.op === "list") {
+        return { ok: true, gateways: [{ id: "gw1", name: "main-api", status: "ACTIVE", domain: "gw1.apigw.yandexcloud.net" }],
+          lines: ["• main-api — работает · https://gw1.apigw.yandexcloud.net (gw1)"], message: "API-шлюзов: 1." };
+      }
+      if (a.op === "gateway") {
+        return { ok: true, gateway: { id: "gw1", name: "main-api", url: "https://gw1.apigw.yandexcloud.net", description: "Основной шлюз", labels: { env: "prod" } },
+          lines: [who, "Адрес: https://gw1.apigw.yandexcloud.net", "Описание: Основной шлюз", "Метки: env=prod"], message: "API-шлюз." };
+      }
+      if (a.op === "spec") {
+        return { ok: true, format: "YAML", paths: ["/hello", "/bye"],
+          lines: ["Спецификация API-шлюза «main-api» (YAML, путей 2):", "  /hello", "  /bye", "", "openapi: 3.0.0"],
+          message: "Спецификация шлюза." };
+      }
+      if (a.op === "create") {
+        return { ok: true, changed: true, id: "gw2", name: a.name, gateway: { id: "gw2", name: a.name, url: "https://gw2.apigw.yandexcloud.net" },
+          lines: ["✅ API-шлюз создан: " + a.name + " (gw2)", "Адрес по умолчанию: https://gw2.apigw.yandexcloud.net", "Путей в спецификации: 2 · интеграций: 2"],
+          message: "API-шлюз создан." };
+      }
+      if (a.op === "update") {
+        return { ok: true, changed: true, gateway: { id: "gw1", name: "main-api", description: a.description },
+          lines: ["✅ API-шлюз изменён.", "• main-api — работает · https://gw1.apigw.yandexcloud.net (gw1)"], message: "API-шлюз изменён." };
+      }
+      if (a.op === "delete") {
+        if (a.confirmed !== true) {
+          return { ok: false, needsConfirm: true, error: "Удаление API-шлюза необратимо: его адрес <id>.apigw.yandexcloud.net перестанет отвечать. Подтверди удаление.", lines: [who] };
+        }
+        return { ok: true, changed: true, deleted: true, lines: ["🗑 API-шлюз удалён: main-api", "https://gw1.apigw.yandexcloud.net больше не отвечает."], message: "API-шлюз удалён." };
+      }
+      return { ok: false, error: "Неизвестное действие API-шлюза: " + a.op + ". Доступно: list, gateway, spec, create, update, delete." };
     }
   };
   // Модуль действий (как yc-console) берёт каналы из window.api — в приложении их
@@ -578,8 +862,8 @@ fs.writeFileSync(SHOT, PAGE, "utf8");
           .slice(0, 6),
       };
     });
-    ok(info.tiles === 13, "плиток столько же, сколько сервисов (тринадцать)", String(info.tiles));
-    ok(info.icons === 13, "у каждой плитки своя официальная иконка", String(info.icons));
+    ok(info.tiles === 17, "плиток столько же, сколько сервисов (семнадцать)", String(info.tiles));
+    ok(info.icons === 17, "у каждой плитки своя официальная иконка", String(info.icons));
     ok(info.columns === 2, "полка в две колонки при ширине панели 460px", "колонок: " + info.columns);
     ok(
       info.logo && Math.round(info.logo.width) === 32 && Math.round(info.logo.height) === 32,
@@ -1763,6 +2047,480 @@ fs.writeFileSync(SHOT, PAGE, "utf8");
     ok(albLbExtrasRun.args && albLbExtrasRun.args.lb === "web-lb" && albLbExtrasRun.args.logGroup === "lg-web" && albLbExtrasRun.args.minZoneSize === 3 && albLbExtrasRun.args.maxSize === 0 && albLbExtrasRun.args.allowZonalShift === "да", "форма правки собрала логи, авто-масштаб и допуск", JSON.stringify(albLbExtrasRun.args));
     ok(albLbExtrasRun.args && albLbExtrasRun.args.noLogs === false, "снятая галочка «выключить логи» ушла значением, а не пропала", JSON.stringify(albLbExtrasRun.args));
     ok(/доступ-логи → группа «lg-web»/.test(albLbExtrasRun.text) && /авто-масштаб 3\/0/.test(albLbExtrasRun.text) && /допуск к сдвигу зоны: да/.test(albLbExtrasRun.text), "ответ назвал логи, авто-масштаб и допуск", albLbExtrasRun.text.slice(0, 320));
+
+    // ── Serverless-контейнеры в панели (часть 91, заход 8) ─────────────────
+    // Контейнер задаётся РЕВИЗИЕЙ: образ, переменные окружения, ресурсы и тёплые
+    // экземпляры. Окно обязано выкатить новую ревизию, откатить на ревизию,
+    // переименовать и открыть/закрыть контейнер. Платность честная: ревизия не
+    // платная, предупреждение — только про тёплые экземпляры (minInstances > 0),
+    // а публикация в интернет — опасное действие с окном подтверждения.
+    section("[15] Serverless-контейнеры: плитка действий, новая ревизия и публичный доступ");
+    const scTile = await page.evaluate(async () => {
+      const tile = [...document.querySelectorAll("#yc-dash .yc-tile")].find((t) => /Serverless-контейнеры/.test(t.textContent));
+      const btn = tile && [...tile.querySelectorAll("button")].find((b) => /Действия/.test(b.textContent));
+      if (btn) btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const box = document.getElementById("yc-actions");
+      const title = box ? (box.querySelector(".yc-act-title") || {}).textContent : "";
+      const listed = box ? [...box.querySelectorAll(".yc-act-btn")].map((b) => b.textContent.trim()) : [];
+      const listBtn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /^Контейнеры и их состояние/.test(b.textContent.trim()));
+      if (listBtn) listBtn.click();
+      await new Promise((r) => setTimeout(r, 70));
+      const sent = window.__calls.filter((c) => c[0] === "ycContainer" && c[1].op === "list").slice(-1)[0];
+      return { btn: !!btn, title: title, listed: listed, called: !!sent, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(scTile.btn && /Serverless-контейнеры/.test(scTile.title || ""), "у плитки «Serverless-контейнеры» есть кнопка действий", JSON.stringify({ btn: scTile.btn, title: scTile.title }));
+    ok(scTile.listed.length === 9, "в семействе девять действий: " + scTile.listed.length + " (" + scTile.listed.join(", ") + ")");
+    ok(
+      scTile.listed.some((t) => /Новая ревизия/.test(t)) && scTile.listed.some((t) => /Ревизии/.test(t)) && scTile.listed.some((t) => /Открыть всему интернету/.test(t)) && scTile.listed.some((t) => /Закрыть от интернета/.test(t)),
+      "список называет ревизии и публичный доступ: " + scTile.listed.join(", ")
+    );
+    ok(scTile.called && /site/.test(scTile.text), "действие «Контейнеры и их состояние» позвало канал и показало контейнер", scTile.text.slice(0, 200));
+
+    const scNewRev = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Новая ревизия/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Контейнер/.test(label)) input.value = "site";
+        if (/^Образ/.test(label)) input.value = "cr.yandex/cr1/site:3";
+        if (/^Тёплых экземпляров/.test(label)) input.value = "1";
+        if (/^Переменные окружения/.test(label)) input.value = "{\"MODE\":\"prod\"}";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycContainer" && c[1].op === "newrev").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(scNewRev.args && scNewRev.args.container === "site" && scNewRev.args.image === "cr.yandex/cr1/site:3" && scNewRev.args.minInstances === 1, "форма новой ревизии собрала контейнер, образ и тёплые экземпляры", JSON.stringify(scNewRev.args));
+    ok(/Тёплые экземпляры \(мин. инстансов 1\)/.test(scNewRev.text) && /Ревизия развёрнута/.test(scNewRev.text), "ответ назвал тёплые экземпляры и успех", scNewRev.text.slice(0, 240));
+
+    const scPublic = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      const btn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /Открыть всему интернету/.test(b.textContent));
+      const danger = btn ? btn.classList.contains("danger") : false;
+      btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /^Контейнер/.test(label)) input.value = "site";
+      }
+      const before = window.__confirmCalls;
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycContainer" && c[1].op === "public").slice(-1)[0] || null;
+      return { danger: danger, asked: window.__confirmCalls > before, args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(scPublic.danger && scPublic.asked, "«Открыть всему интернету» помечено опасным и спросило человека", JSON.stringify({ danger: scPublic.danger, asked: scPublic.asked }));
+    ok(scPublic.args && scPublic.args.container === "site", "форма публичного доступа ушла с контейнером", JSON.stringify(scPublic.args));
+    ok(/открыт для вызова из интернета/.test(scPublic.text) && /Любой человек из интернета/.test(scPublic.text), "ответ предупредил про публикацию в интернет", scPublic.text.slice(0, 240));
+
+    // ── База YDB в панели (часть 91, заход 9) ──────────────────────────────
+    // Таблицы и записи YDB живут в Document API: в КОЛОНКАХ таблицы хранится
+    // только первичный ключ, остальные поля лежат в самих записях — форма обязана
+    // спрашивать ключ, а не колонки. Окно показывает базы, таблицы, структуру и
+    // записи, кладёт запись и ОТДЕЛЬНО спрашивает человека перед необратимым
+    // удалением таблицы (вместе с записями).
+    section("[16] База YDB: таблицы, записи и опасное удаление");
+    const ydbTile = await page.evaluate(async () => {
+      const tile = [...document.querySelectorAll("#yc-dash .yc-tile")].find((t) => /YDB/.test(t.textContent));
+      const btn = tile && [...tile.querySelectorAll("button")].find((b) => /Действия/.test(b.textContent));
+      if (btn) btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const box = document.getElementById("yc-actions");
+      const title = box ? (box.querySelector(".yc-act-title") || {}).textContent : "";
+      const listed = box ? [...box.querySelectorAll(".yc-act-btn")].map((b) => b.textContent.trim()) : [];
+      const listBtn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /^Базы YDB и их состояние/.test(b.textContent.trim()));
+      if (listBtn) listBtn.click();
+      await new Promise((r) => setTimeout(r, 70));
+      const sent = window.__calls.filter((c) => c[0] === "ycDb" && c[1].op === "list").slice(-1)[0];
+      return { btn: !!btn, title: title, listed: listed, called: !!sent, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(ydbTile.btn && /YDB/.test(ydbTile.title || ""), "у плитки «База YDB» есть кнопка действий", JSON.stringify({ btn: ydbTile.btn, title: ydbTile.title }));
+    ok(ydbTile.listed.length === 10, "в семействе десять действий: " + ydbTile.listed.length + " (" + ydbTile.listed.join(", ") + ")");
+    ok(
+      ydbTile.listed.some((t) => /Создать таблицу/.test(t)) && ydbTile.listed.some((t) => /Положить запись/.test(t)) && ydbTile.listed.some((t) => /Удалить таблицу/.test(t)),
+      "список называет создание таблицы, запись и удаление: " + ydbTile.listed.join(", ")
+    );
+    ok(ydbTile.called && /app-db/.test(ydbTile.text), "действие «Базы YDB и их состояние» позвало канал и показало базу", ydbTile.text.slice(0, 200));
+
+    const ydbCreate = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Создать таблицу/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^База/.test(label)) input.value = "app-db";
+        if (/^Таблица/.test(label)) input.value = "pets";
+        if (/^Поля первичного ключа/.test(label)) input.value = '{"species":"S","name":"S"}';
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycDb" && c[1].op === "create").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(ydbCreate.args && ydbCreate.args.database === "app-db" && ydbCreate.args.table === "pets" && /species/.test(String(ydbCreate.args.keys)), "форма создания таблицы собрала базу, таблицу и ключ", JSON.stringify(ydbCreate.args));
+    ok(/Таблица создана/.test(ydbCreate.text) && /только ключ/.test(ydbCreate.text), "ответ объяснил, что в колонках живёт только ключ", ydbCreate.text.slice(0, 240));
+
+    // Заход 13: YQL (SQL) — вторая половина базы. SELECT уходит БЕЗ согласия и
+    // возвращает настоящие строки; необратимый запрос — двухшаговый.
+    const ydbQuery = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      const btn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /Выполнить запрос YQL/.test(b.textContent));
+      if (btn) btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^База/.test(label)) input.value = "app-db";
+        if (/^Запрос YQL/.test(label)) input.value = "SELECT * FROM pets";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycDb" && c[1].op === "query").slice(-1)[0] || null;
+      return { ok: !!btn, args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(ydbQuery.ok && ydbQuery.args && /SELECT/.test(String(ydbQuery.args.query)), "действие YQL собрало запрос", JSON.stringify(ydbQuery.args));
+    ok(ydbQuery.args && ydbQuery.args.confirmed === undefined, "SELECT ушёл БЕЗ согласия — оно нужно только необратимым", JSON.stringify(ydbQuery.args));
+    ok(/Запрос выполнен/.test(ydbQuery.text) && /Tom/.test(ydbQuery.text), "ответ YQL показал строки", ydbQuery.text.slice(0, 240));
+
+    const ydbDrop = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      const btn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /Удалить таблицу/.test(b.textContent));
+      const danger = btn ? btn.classList.contains("danger") : false;
+      btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^База/.test(label)) input.value = "app-db";
+        if (/^Таблица/.test(label)) input.value = "pets";
+      }
+      const before = window.__confirmCalls;
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const first = window.__calls.filter((c) => c[0] === "ycDb" && c[1].op === "drop").slice(-1)[0] || null;
+      // Второй шаг: канал ответил «нужно согласие», окно показало кнопку —
+      // согласие уходит ТОЛЬКО со вторым вызовом.
+      const out = document.getElementById("yc-act-out");
+      const go = [...out.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Подтвердить/.test(b.textContent));
+      if (go) go.click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycDb" && c[1].op === "drop").slice(-1)[0] || null;
+      return { danger: danger, asked: window.__confirmCalls > before, go: !!go, first: first ? first[1] : null, args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(ydbDrop.danger && ydbDrop.asked, "«Удалить таблицу» помечено опасным и спросило человека", JSON.stringify({ danger: ydbDrop.danger, asked: ydbDrop.asked }));
+    ok(ydbDrop.first && ydbDrop.first.confirmed === undefined, "первый запрос ушёл БЕЗ согласия — канал сам его требует", JSON.stringify(ydbDrop.first));
+    ok(ydbDrop.go && ydbDrop.args && ydbDrop.args.table === "pets" && ydbDrop.args.confirmed === true, "удаление ушло с явным согласием после второго шага", JSON.stringify(ydbDrop.args));
+    ok(/Таблица удалена вместе со всеми записями/.test(ydbDrop.text), "ответ назвал, что таблица ушла вместе с записями", ydbDrop.text.slice(0, 240));
+
+    // ── Object Storage в панели (часть 91, заход 10) ─────────────────────────
+    // Файл выбирает СИСТЕМНЫЙ диалог (src/cloud-files-ipc.js), а байты читает и
+    // кладёт канал тем же S3-кодом, что и агент. Загрузка платная (за ОБЪЁМ, а
+    // не за штуку файлов), поэтому она двухшаговая: первый запрос уходит без
+    // согласия, второй — уже с ним; открытие бакета необратимо (danger).
+    section("[17] Object Storage: загрузка файла, скачивание и опасные действия");
+    const stTile = await page.evaluate(async () => {
+      const tile = [...document.querySelectorAll("#yc-dash .yc-tile")].find((t) => /Объектное хранилище/.test(t.textContent));
+      const btn = tile && [...tile.querySelectorAll("button")].find((b) => /Действия/.test(b.textContent));
+      if (btn) btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const box = document.getElementById("yc-actions");
+      const title = box ? (box.querySelector(".yc-act-title") || {}).textContent : "";
+      const listed = box ? [...box.querySelectorAll(".yc-act-btn")].map((b) => b.textContent.trim()) : [];
+      const listBtn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /^Бакеты и их состояние/.test(b.textContent.trim()));
+      if (listBtn) listBtn.click();
+      await new Promise((r) => setTimeout(r, 70));
+      const sent = window.__calls.filter((c) => c[0] === "ycStorage" && c[1].op === "list").slice(-1)[0];
+      return { btn: !!btn, title: title, listed: listed, called: !!sent, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(stTile.btn && /Object Storage/.test(stTile.title || ""), "у плитки «Объектное хранилище» есть кнопка действий", JSON.stringify({ btn: stTile.btn, title: stTile.title }));
+    ok(stTile.listed.length === 9, "в семействе девять действий: " + stTile.listed.length + " (" + stTile.listed.join(", ") + ")");
+    ok(
+      stTile.listed.some((t) => /Загрузить файл/.test(t)) && stTile.listed.some((t) => /Скачать объект/.test(t)) && stTile.listed.some((t) => /Удалить объект/.test(t)),
+      "список называет загрузку, скачивание и удаление: " + stTile.listed.join(", ")
+    );
+    ok(stTile.called && /site-bucket/.test(stTile.text), "действие «Бакеты и их состояние» позвало канал и показало бакет", stTile.text.slice(0, 200));
+
+    // Загрузка: файл выбирается кнопкой «Выбрать…» (в стенде — подстановка),
+    // поле-файл readOnly, а выбранное имя само подставляется в ключ бакета.
+    const stUpload = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Загрузить файл/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      let fileInput = null, keyInput = null;
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Файл на ПК/.test(label)) fileInput = input;
+        if (/^Ключ в бакете/.test(label)) keyInput = input;
+        if (/^Бакет/.test(label)) input.value = "site-bucket";
+      }
+      const readOnly = fileInput ? fileInput.readOnly === true : false;
+      const pick = form.querySelector(".yc-act-pick");
+      if (pick) pick.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const picked = window.__calls.filter((c) => c[0] === "pickCloudFile").slice(-1)[0] || null;
+      const filled = { path: fileInput ? fileInput.value : "", key: keyInput ? keyInput.value : "" };
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const first = window.__calls.filter((c) => c[0] === "ycStorage" && c[1].op === "upload").slice(-1)[0] || null;
+      const out = document.getElementById("yc-act-out");
+      const firstText = out.textContent;
+      const go = [...out.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Подтвердить/.test(b.textContent));
+      const needsConfirm = /Нужно согласие/.test(firstText);
+      if (go) go.click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycStorage" && c[1].op === "upload").slice(-1)[0] || null;
+      return { readOnly: readOnly, picked: !!picked, filled: filled, first: first ? first[1] : null, needsConfirm: needsConfirm, firstText: firstText, go: !!go, args: sent ? sent[1] : null, text: out.textContent };
+    });
+    ok(stUpload.readOnly, "поле «Файл на ПК» только для чтения — путь выбирает системное окно, а не клавиатура");
+    ok(stUpload.picked, "кнопка «Выбрать…» позвала pickCloudFile");
+    ok(stUpload.filled.path === "/tmp/site-index.html" && stUpload.filled.key === "index.html", "выбранный файл подставил путь и имя в ключ бакета", JSON.stringify(stUpload.filled));
+    ok(stUpload.first && stUpload.first.confirmed === undefined && stUpload.needsConfirm, "первый запрос ушёл БЕЗ согласия и канал потребовал его", JSON.stringify(stUpload.first));
+    ok(stUpload.args && stUpload.args.confirmed === true && stUpload.args.file === "/tmp/site-index.html" && stUpload.args.key === "index.html", "загрузка ушла с файлом, ключом и явным согласием", JSON.stringify(stUpload.args));
+    ok(/тарифицируется за объём/.test(stUpload.firstText), "первый ответ объяснил плату за объём, а не за штуку файлов", stUpload.firstText.slice(0, 260));
+    ok(/Файл в облаке/.test(stUpload.text) && /index\.html/.test(stUpload.text), "ответ назвал загруженный файл", stUpload.text.slice(0, 260));
+
+    // Скачивание: путь на диск выбирает системный диалог сохранения.
+    const stDownload = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Скачать объект/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      let toInput = null;
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Ключ в бакете/.test(label)) input.value = "index.html";
+        if (/^Куда сохранить/.test(label)) toInput = input;
+        if (/^Бакет/.test(label)) input.value = "site-bucket";
+      }
+      const pick = form.querySelector(".yc-act-pick");
+      if (pick) pick.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const picked = window.__calls.filter((c) => c[0] === "pickCloudSave").slice(-1)[0] || null;
+      const path = toInput ? toInput.value : "";
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycStorage" && c[1].op === "download").slice(-1)[0] || null;
+      return { picked: !!picked, path: path, args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(stDownload.picked && stDownload.path === "/tmp/saved-index.html", "«Выбрать…» позвала диалог сохранения и подставила путь", JSON.stringify({ picked: stDownload.picked, path: stDownload.path }));
+    ok(stDownload.args && stDownload.args.key === "index.html" && stDownload.args.to === "/tmp/saved-index.html", "скачивание ушло с ключом и путём на диск", JSON.stringify(stDownload.args));
+    ok(/Объект скачан/.test(stDownload.text), "ответ назвал скачанный объект", stDownload.text.slice(0, 240));
+
+    // Открытие бакета: опасное действие — спрашивает человека ДО запроса.
+    const stPublic = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      const btn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /Открыть бакет для всех/.test(b.textContent));
+      const danger = btn ? btn.classList.contains("danger") : false;
+      btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /^Бакет/.test(label)) input.value = "site-bucket";
+      }
+      const before = window.__confirmCalls;
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const out = document.getElementById("yc-act-out");
+      const go = [...out.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Подтвердить/.test(b.textContent));
+      if (go) go.click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycStorage" && c[1].op === "public").slice(-1)[0] || null;
+      return { danger: danger, asked: window.__confirmCalls > before, args: sent ? sent[1] : null, text: out.textContent };
+    });
+    ok(stPublic.danger && stPublic.asked, "«Открыть бакет для всех» помечено опасным и спросило человека", JSON.stringify({ danger: stPublic.danger, asked: stPublic.asked }));
+    ok(stPublic.args && stPublic.args.bucket === "site-bucket" && stPublic.args.confirmed === true, "открытие бакета ушло с согласием", JSON.stringify(stPublic.args));
+    ok(/открыт для чтения из интернета/.test(stPublic.text) && /поисковик/i.test(stPublic.text), "ответ предупредил про публикацию и поисковики", stPublic.text.slice(0, 240));
+
+    // ── Группы логов в панели (часть 91, заход 11) ─────────────────────────
+    // Группа — это «куда собирать логи»: без неё некуда направить ни журнал
+    // балансировщика, ни ревизию контейнера. Сервис «Логи» был на полке только
+    // списком; теперь у плитки есть действия, правка уходит МАСКОЙ полей, а
+    // удаление необратимо и спрашивается дважды (окно и канал).
+    section("[18] Группы логов: плитка, создание, правка и опасное удаление");
+    const lgTile = await page.evaluate(async () => {
+      const tile = [...document.querySelectorAll("#yc-dash .yc-tile")].find((t) => /Логи/.test(t.textContent));
+      const btn = tile && [...tile.querySelectorAll("button")].find((b) => /Действия/.test(b.textContent));
+      if (btn) btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const box = document.getElementById("yc-actions");
+      const title = box ? (box.querySelector(".yc-act-title") || {}).textContent : "";
+      const listed = box ? [...box.querySelectorAll(".yc-act-btn")].map((b) => b.textContent.trim()) : [];
+      const listBtn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /^Лог-группы и их состояние/.test(b.textContent.trim()));
+      if (listBtn) listBtn.click();
+      await new Promise((r) => setTimeout(r, 70));
+      const sent = window.__calls.filter((c) => c[0] === "ycLogGroups" && c[1].op === "list").slice(-1)[0];
+      return { btn: !!btn, title: title, listed: listed, called: !!sent, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(lgTile.btn && /Логи/.test(lgTile.title || ""), "у плитки «Логи» есть кнопка действий", JSON.stringify({ btn: lgTile.btn, title: lgTile.title }));
+    ok(lgTile.listed.length === 5, "в семействе пять действий: " + lgTile.listed.length + " (" + lgTile.listed.join(", ") + ")");
+    ok(
+      lgTile.listed.some((t) => /Создать лог-группу/.test(t)) && lgTile.listed.some((t) => /Править лог-группу/.test(t)) && lgTile.listed.some((t) => /Удалить лог-группу/.test(t)),
+      "список называет создание, правку и удаление: " + lgTile.listed.join(", ")
+    );
+    ok(lgTile.called && /app-logs/.test(lgTile.text), "действие «Лог-группы и их состояние» позвало канал и показало группу", lgTile.text.slice(0, 200));
+
+    const lgCreate = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Создать лог-группу/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Имя лог-группы/.test(label)) input.value = "win-logs";
+        if (/^Хранение/.test(label)) input.value = "24";
+        if (/^Метки/.test(label)) input.value = '{"env":"staging"}';
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycLogGroups" && c[1].op === "create").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(lgCreate.args && lgCreate.args.name === "win-logs" && lgCreate.args.retention === 24, "форма создания собрала имя и срок", JSON.stringify(lgCreate.args));
+    ok(/Лог-группа создана/.test(lgCreate.text), "ответ назвал создание группы", lgCreate.text.slice(0, 240));
+
+    const lgDelete = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      const btn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /Удалить лог-группу/.test(b.textContent));
+      const danger = btn ? btn.classList.contains("danger") : false;
+      btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /^Лог-группа/.test(label)) input.value = "app-logs";
+      }
+      const before = window.__confirmCalls;
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const out = document.getElementById("yc-act-out");
+      const go = [...out.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Подтвердить/.test(b.textContent));
+      if (go) go.click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycLogGroups" && c[1].op === "delete").slice(-1)[0] || null;
+      return { danger: danger, asked: window.__confirmCalls > before, args: sent ? sent[1] : null, text: out.textContent };
+    });
+    ok(lgDelete.danger && lgDelete.asked, "«Удалить лог-группу» помечено опасным и спросило человека", JSON.stringify({ danger: lgDelete.danger, asked: lgDelete.asked }));
+    ok(lgDelete.args && lgDelete.args.group === "app-logs" && lgDelete.args.confirmed === true, "удаление ушло с группой и согласием", JSON.stringify(lgDelete.args));
+    ok(/Лог-группа удалена/.test(lgDelete.text), "ответ назвал удаление группы", lgDelete.text.slice(0, 240));
+
+    // ── API-шлюз (часть 91, заход 12) ───────────────────────────────────────
+    // Шлюз целиком задаётся OpenAPI-спецификацией: её и спрашиваем при создании,
+    // отдельным действием показываем, а удаление необратимо (адрес перестанет
+    // отвечать) и спрашивается дважды (окно и канал).
+    section("[19] API-шлюз: плитка, создание из спецификации и опасное удаление");
+    const gwTile = await page.evaluate(async () => {
+      const tile = [...document.querySelectorAll("#yc-dash .yc-tile")].find((t) => /API-шлюз/.test(t.textContent));
+      const btn = tile && [...tile.querySelectorAll("button")].find((b) => /Действия/.test(b.textContent));
+      if (btn) btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const box = document.getElementById("yc-actions");
+      const title = box ? (box.querySelector(".yc-act-title") || {}).textContent : "";
+      const listed = box ? [...box.querySelectorAll(".yc-act-btn")].map((b) => b.textContent.trim()) : [];
+      const listBtn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /^API-шлюзы и их состояние/.test(b.textContent.trim()));
+      if (listBtn) listBtn.click();
+      await new Promise((r) => setTimeout(r, 70));
+      const sent = window.__calls.filter((c) => c[0] === "ycApiGw" && c[1].op === "list").slice(-1)[0];
+      return { btn: !!btn, title: title, listed: listed, called: !!sent, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(gwTile.btn && /API-шлюз/.test(gwTile.title || ""), "у плитки «API-шлюз» есть кнопка действий", JSON.stringify({ btn: gwTile.btn, title: gwTile.title }));
+    ok(gwTile.listed.length === 6, "в семействе шесть действий: " + gwTile.listed.length + " (" + gwTile.listed.join(", ") + ")");
+    ok(
+      gwTile.listed.some((t) => /Создать шлюз из спецификации/.test(t)) && gwTile.listed.some((t) => /Спецификация шлюза/.test(t)) && gwTile.listed.some((t) => /Удалить шлюз/.test(t)),
+      "список называет создание, спецификацию и удаление: " + gwTile.listed.join(", ")
+    );
+    ok(gwTile.called && /main-api/.test(gwTile.text), "действие «API-шлюзы и их состояние» позвало канал и показало шлюз", gwTile.text.slice(0, 200));
+
+    const gwCreate = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Создать шлюз из спецификации/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Имя шлюза/.test(label)) input.value = "win-api";
+        if (/^OpenAPI-спецификация/.test(label)) input.value = "openapi: 3.0.0\ninfo:\n  title: x\npaths: {}";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycApiGw" && c[1].op === "create").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(gwCreate.args && gwCreate.args.name === "win-api" && /openapi/.test(String(gwCreate.args.spec || "")), "форма создания собрала имя и спецификацию", JSON.stringify(gwCreate.args && { name: gwCreate.args.name }));
+    ok(/API-шлюз создан/.test(gwCreate.text), "ответ назвал создание шлюза", gwCreate.text.slice(0, 240));
+
+    const gwDelete = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      const btn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /Удалить шлюз/.test(b.textContent));
+      const danger = btn ? btn.classList.contains("danger") : false;
+      btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /^Шлюз/.test(label)) input.value = "main-api";
+      }
+      const before = window.__confirmCalls;
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const out = document.getElementById("yc-act-out");
+      const go = [...out.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Подтвердить/.test(b.textContent));
+      if (go) go.click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycApiGw" && c[1].op === "delete").slice(-1)[0] || null;
+      return { danger: danger, asked: window.__confirmCalls > before, args: sent ? sent[1] : null, text: out.textContent };
+    });
+    ok(gwDelete.danger && gwDelete.asked, "«Удалить шлюз» помечено опасным и спросило человека", JSON.stringify({ danger: gwDelete.danger, asked: gwDelete.asked }));
+    ok(gwDelete.args && gwDelete.args.gateway === "main-api" && gwDelete.args.confirmed === true, "удаление ушло со шлюзом и согласием", JSON.stringify(gwDelete.args));
+    ok(/API-шлюз удалён/.test(gwDelete.text), "ответ назвал удаление шлюза", gwDelete.text.slice(0, 240));
 
   } finally {
     await browser.close();

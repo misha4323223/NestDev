@@ -234,6 +234,11 @@
     if (state.serviceKey === "storage" && item.name) {
       box.appendChild(sectionTitle("Публичный доступ"));
       box.appendChild(bucketAccessBox());
+      // Файлы: положить файл в бакет наконец можно и отсюда. Список, скачивание
+      // и удаление живут в связи «Объекты» — здесь только то, чего там нет и не
+      // может быть: выбрать файл на ПК и отправить его.
+      box.appendChild(sectionTitle("Файлы"));
+      box.appendChild(bucketFilesBox());
     }
 
     // Публичный доступ к бакету: показать состояние и переключить его. Переключение
@@ -290,6 +295,58 @@
       else if (window.confirm(title + " " + text)) go();
     };
     wrap.appendChild(line);
+    wrap.appendChild(btn);
+    return wrap;
+  }
+
+  // Загрузка файла в бакет из карточки. Файл выбирает СИСТЕМНОЕ окно (его
+  // каналы — в src/cloud-files-ipc.js), а байты читает и кладёт канал
+  // `yc:storage` тем же S3-кодом, что и агент. Согласие спрашиваем потому, что
+  // объём бакета тарифицируется — но прямо говорим, что платят за объём.
+  function bucketFilesBox() {
+    const wrap = el("div", "ykc-access");
+    const bucket = (state.item && state.item.name) || "";
+    wrap.appendChild(el("div", "ykc-hint",
+      "Файл ложится в бакет под своим именем. Папка внутри бакета (site/index.html) и тип содержимого задаются в «⚙ Действия» у плитки «Объектное хранилище»."));
+    if (!bucket) return wrap;
+    const btn = el("button", "btn btn-small ykc-bucket-upload", "⬆ Загрузить файл в бакет");
+    btn.title = "Выбрать файл на ПК и положить его в бакет «" + bucket + "»";
+    btn.onclick = () => {
+      const pick = window.api && window.api.pickCloudFile;
+      const say = window.uiToast || function () {};
+      if (typeof pick !== "function") {
+        say("Загрузка файла доступна в приложении на ПК (desktop).");
+        return;
+      }
+      Promise.resolve(pick({}))
+        .then((f) => {
+          if (typeof f === "string") {
+            say("❌ " + f);
+            return;
+          }
+          if (!f || !f.path) return; // отмена выбора — ничего не меняется
+          const key = String(f.name || f.path.split(/[\\/]/).pop() || "");
+          const sizeMb = f.size ? Math.round((f.size / 1048576) * 10) / 10 : 0;
+          const go = async () => {
+            btn.disabled = true;
+            const prev = btn.textContent;
+            btn.textContent = "…";
+            const r = await apiCall("ycStorage", { op: "upload", bucket: bucket, file: f.path, key: key, confirmed: true });
+            btn.disabled = false;
+            btn.textContent = prev;
+            say(r && r.ok ? "✅ Файл в бакете: " + (r.key || key) : "❌ " + ((r && r.error) || "не удалось загрузить файл"));
+            if (r && r.ok) {
+              // Объектов стало больше — следующее открытие списка прочитает его заново.
+              state.relationData = null;
+            }
+          };
+          const text = "Файл «" + key + "» ляжет в бакет «" + bucket + "»" + (sizeMb ? " (" + sizeMb + " МБ)" : "") +
+            ". Объём бакета тарифицируется — платят за хранимое, а не за число файлов. Удалить его потом можно из списка «Объекты».";
+          if (typeof window.uiConfirm === "function") window.uiConfirm("⬆ Загрузить файл в бакет?", text, go, false);
+          else go();
+        })
+        .catch(() => {});
+    };
     wrap.appendChild(btn);
     return wrap;
   }
@@ -610,6 +667,42 @@
       if (canDeleteObject) {
         const raw = (d.items || [])[i] || {};
         const td = el("td", "ykc-actions");
+        // Скачать объект к себе: файлы бакета человек забирал только в консоли
+        // облака, а забрать надо ровно то, что там лежит (бэкап, лог, сборку).
+        const get = el("button", "btn btn-small ykc-obj-get", "⬇ Скачать");
+        get.title = "Скачать объект на ПК: " + (raw.key || "");
+        get.onclick = () => {
+          const key = raw.key || "";
+          const name = String(key).split("/").pop() || key;
+          const pick = window.api && window.api.pickCloudSave;
+          const say = window.uiToast || function () {};
+          if (typeof pick !== "function") {
+            say("Скачивание доступно в приложении на ПК (desktop).");
+            return;
+          }
+          Promise.resolve(pick({ name: name }))
+            .then(async (p) => {
+              if (typeof p === "string") {
+                say("❌ " + p);
+                return;
+              }
+              if (!p || !p.path) return; // отмена выбора места — ничего не меняется
+              get.disabled = true;
+              const prev = get.textContent;
+              get.textContent = "…";
+              const r = await apiCall("ycStorage", {
+                op: "download",
+                bucket: (state.item && state.item.name) || "",
+                key: key,
+                to: p.path,
+              });
+              get.disabled = false;
+              get.textContent = prev;
+              say(r && r.ok ? "✅ Объект скачан: " + (r.path || p.path) : "❌ " + ((r && r.error) || "не удалось скачать объект"));
+            })
+            .catch(() => {});
+        };
+        td.appendChild(get);
         const btn = el("button", "btn btn-danger btn-small ykc-obj-del", "🗑 Удалить");
         btn.title = "Удалить объект из бакета: " + (raw.key || "");
         btn.onclick = () => {

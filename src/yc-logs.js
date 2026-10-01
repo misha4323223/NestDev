@@ -303,6 +303,137 @@ async function listLogGroups(iamToken, baseUrl, folderId, fetchImpl) {
   return groups.map((g) => ({ id: g.id, name: g.name || "", createdAt: g.createdAt || "" }));
 }
 
+// ── REST: одна лог-группа, создание, правка и удаление ────────────────────
+// Лог-группы, в отличие от ЗАПИСЕЙ, у облака целиком REST-овые: тот же хост
+// logging.api.cloud.yandex.net и тот же /logging/v1/logGroups. Изменяющие методы
+// возвращают OPERATION, поэтому их результат ждёт вызывающий (waitOperation).
+// Валидация имени и «нечего менять» отбиваются ДО сети: это не отказ облака.
+function restBase(baseUrl) {
+  return String(baseUrl || "").replace(/\/+$/, "");
+}
+
+async function restJson(iamToken, url, method, body, fetchImpl) {
+  const f = fetchImpl || (typeof fetch === "function" ? fetch : null);
+  if (!f) throw new Error("нет доступа к сети (fetch недоступен)");
+  const init = { method: method || "GET", headers: { Authorization: "Bearer " + iamToken }, redirect: "follow" };
+  if (body !== undefined && body !== null) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  const res = await f(url, init);
+  const text = await res.text().catch(() => "");
+  if (!res.ok) throw new Error("лог-группа: HTTP " + res.status + " " + String(text).slice(0, 200));
+  let j = null;
+  try {
+    j = text ? JSON.parse(text) : null;
+  } catch {
+    j = null;
+  }
+  return j || null;
+}
+
+// Срок хранения у облака — длительность ("720h"); пусто/ноль значит «без срока».
+function retentionOf(v) {
+  if (v === undefined || v === null || v === "") return "";
+  if (typeof v === "number" || /^\d+$/.test(String(v).trim())) {
+    const h = Math.round(Number(v));
+    return h > 0 ? h + "h" : "";
+  }
+  return String(v).trim();
+}
+
+function logGroupInfo(g) {
+  const x = g || {};
+  return {
+    id: x.id || "",
+    folderId: x.folderId || "",
+    name: x.name || "",
+    description: x.description || "",
+    status: x.status || "",
+    createdAt: x.createdAt || "",
+    retentionPeriod: x.retentionPeriod || "",
+    dataStream: x.dataStream || "",
+    labels: x.labels && typeof x.labels === "object" ? x.labels : {},
+  };
+}
+
+function logGroupLine(g) {
+  const x = logGroupInfo(g);
+  return (
+    "• " + (x.name || x.id) +
+    (x.status ? " — " + x.status : "") +
+    (x.retentionPeriod ? " · хранение " + x.retentionPeriod : " · хранение без срока") +
+    (x.dataStream ? " · поток " + x.dataStream : "") +
+    " (" + x.id + ")"
+  );
+}
+
+async function getLogGroup(iamToken, baseUrl, logGroupId, fetchImpl) {
+  const id = String(logGroupId || "").trim();
+  if (!id) throw new Error("не задан id лог-группы");
+  const url = restBase(baseUrl) + "/logging/v1/logGroups/" + encodeURIComponent(id);
+  const j = await restJson(iamToken, url, "GET", null, fetchImpl);
+  return logGroupInfo(j);
+}
+
+async function createLogGroup(iamToken, baseUrl, opts, fetchImpl) {
+  const o = opts || {};
+  const folderId = String(o.folderId || "").trim();
+  if (!folderId) throw new Error("не выбран каталог (folder)");
+  const name = String(o.name || "").trim();
+  if (!name) throw new Error("укажи name — имя лог-группы, например app-logs");
+  if (!/^[a-z]([-a-z0-9]{1,61}[a-z0-9])?$/.test(name)) {
+    throw new Error("имя лог-группы может состоять только из строчной латиницы, цифр и дефиса (2–63 символа), начинаться с буквы и заканчиваться буквой или цифрой");
+  }
+  const body = { folderId: folderId, name: name };
+  if (o.description) body.description = String(o.description);
+  if (o.labels && typeof o.labels === "object") body.labels = o.labels;
+  const ret = retentionOf(o.retentionPeriod);
+  if (ret) body.retentionPeriod = ret;
+  if (o.dataStream) body.dataStream = String(o.dataStream);
+  const url = restBase(baseUrl) + "/logging/v1/logGroups";
+  return (await restJson(iamToken, url, "POST", body, fetchImpl)) || {};
+}
+
+async function updateLogGroup(iamToken, baseUrl, logGroupId, opts, fetchImpl) {
+  const id = String(logGroupId || "").trim();
+  if (!id) throw new Error("не задан id лог-группы");
+  const o = opts || {};
+  const body = {};
+  const mask = [];
+  if (o.name != null && String(o.name).trim()) {
+    body.name = String(o.name).trim();
+    mask.push("name");
+  }
+  if (o.description != null) {
+    body.description = String(o.description);
+    mask.push("description");
+  }
+  if (o.retentionPeriod != null) {
+    body.retentionPeriod = retentionOf(o.retentionPeriod);
+    mask.push("retention_period");
+  }
+  if (o.dataStream != null) {
+    body.dataStream = String(o.dataStream);
+    mask.push("data_stream");
+  }
+  if (o.labels != null && typeof o.labels === "object") {
+    body.labels = o.labels;
+    mask.push("labels");
+  }
+  if (!mask.length) throw new Error("нечего менять: назови описание, метки, срок хранения или поток данных");
+  body.updateMask = mask.join(",");
+  const url = restBase(baseUrl) + "/logging/v1/logGroups/" + encodeURIComponent(id);
+  return (await restJson(iamToken, url, "PATCH", body, fetchImpl)) || {};
+}
+
+async function deleteLogGroup(iamToken, baseUrl, logGroupId, fetchImpl) {
+  const id = String(logGroupId || "").trim();
+  if (!id) throw new Error("не задан id лог-группы");
+  const url = restBase(baseUrl) + "/logging/v1/logGroups/" + encodeURIComponent(id);
+  return (await restJson(iamToken, url, "DELETE", null, fetchImpl)) || {};
+}
+
 // ── Чтение записей: критерий + gRPC ────────────────────────────────────────
 function buildReadRequest({ logGroupId, resourceIds, resourceTypes, sinceMs, untilMs, pageSize, filter }) {
   let criteria = Buffer.concat([pbString(1, logGroupId)]);
@@ -409,6 +540,14 @@ module.exports = {
   grpcFrames,
   grpcCall,
   listLogGroups,
+  restBase,
+  retentionOf,
+  logGroupInfo,
+  logGroupLine,
+  getLogGroup,
+  createLogGroup,
+  updateLogGroup,
+  deleteLogGroup,
   buildReadRequest,
   readLogs,
   formatEntries,

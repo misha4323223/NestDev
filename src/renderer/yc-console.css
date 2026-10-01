@@ -61,6 +61,9 @@
   max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ykc-table tr:hover td { background: var(--bg-hover); }
 .ykc-actions { white-space: nowrap; }
+/* Две кнопки в одной ячейке (скачать и удалить) — с воздухом между ними,
+   иначе они слипаются в одно слово. */
+.ykc-actions .btn + .btn { margin-left: 6px; }
 
 /* Секрет Lockbox: новая версия — пары «ключ → значение» */
 .ykc-secret { display: flex; flex-direction: column; gap: 7px; background: var(--bg-card);
@@ -100,6 +103,7 @@
 .ykc-access { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
 .ykc-access .ykc-warn { align-self: stretch; }
 .ykc-bucket-access { font-size: 12px; }
+.ykc-bucket-upload { font-size: 12px; }
 
 @media (max-width: 900px) {
   .ykc-field { flex-direction: column; gap: 2px; }

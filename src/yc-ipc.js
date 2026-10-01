@@ -19,7 +19,7 @@
    каналов когда-то расползлись по оболочке. Тела запросов живут в модулях, здесь — выбор действия и отказ. */
 
 function registerYcIpc(deps) {
-  const { ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, ycIg, ycAlb, loadSettings, saveSettings, svc, fs, path: nodePath, resolvePath, agentWorkDir } = deps;
+  const { ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, ycIg, ycAlb, ycDb, ycLogs, ycApiGw, loadSettings, saveSettings, svc, fs, path: nodePath, resolvePath, agentWorkDir } = deps;
   const {
     YANDEX_OAUTH_URL,
     ycConfig,
@@ -27,6 +27,14 @@ function registerYcIpc(deps) {
     readYcLogsText,
     ycCliStatus,
     ycCliInstall,
+    // Контейнер и его ревизии — те же помощники, что у агента и облачной
+    // консоли (src/yc-service.js): искать по имени/id, читать активную ревизию и
+    // показывать её словами. Одни и те же — значит окно и агент видят одно.
+    ycFindContainerByRef,
+    ycActiveRevision,
+    ycJsonArg,
+    ycRevisionLine,
+    ycRevisionDetails,
   } = svc;
 
 ipcMain.handle("yc:status", async () => {
@@ -405,6 +413,103 @@ ipcMain.handle("yc:logs", async (_e, serviceKey, resourceId) => {
     return { ok: true, logs: text.split("\n").slice(1), raw: text };
   } catch (e) {
     return { ok: false, error: "Логи: " + ((e && e.message) || String(e)) };
+  }
+});
+
+// ── Группы логов Cloud Logging: посмотреть, создать, поправить, удалить ──────
+// Лог-группа — это «куда собирать логи». Без неё ни ревизия контейнера, ни
+// разбор запросов балансировщика некуда направить, а создать её из окна было
+// нечем: сервис «Логи» на полке показывал только список. Записи читаются по
+// gRPC (канал yc:logs), а сами группы — обычный REST того же хоста, и изменяющие
+// методы возвращают OPERATION, поэтому их результат ждёт waitOperation.
+// Права агента здесь НЕ спрашиваем: галочки «Разрешить АГЕНТУ…» ограничивают
+// модель, а здесь действует человек в своём окне — как у записей DNS и объектов
+// бакета.
+ipcMain.handle("yc:logGroups", async (_e, args) => {
+  const cfg = ycConfig();
+  const a = args || {};
+  const op = String(a.op || a.action || "list").trim().toLowerCase();
+  const ALL = ["list", "group", "create", "update", "delete"];
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках (Настройки → «☁️ Yandex Cloud»)." };
+  if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
+  if (!ycLogs) return { ok: false, error: "Модуль логов не подключён к приложению (src/yc-logs.js)." };
+  if (ALL.indexOf(op) === -1) return { ok: false, error: "Неизвестное действие групп логов: " + op + ". Доступно: " + ALL.join(", ") + "." };
+  try {
+    const base = (await yandexCloud.endpoint("logging")) || "https://logging.api.cloud.yandex.net";
+    const iam = await yandexCloud.getIamToken(cfg.oauth);
+    const groups = await ycLogs.listLogGroups(iam, base, cfg.folderId);
+    if (op === "list") {
+      return {
+        ok: true,
+        folder: { id: cfg.folderId, name: cfg.folderName },
+        groups: groups,
+        lines: groups.length ? groups.map((g) => ycLogs.logGroupLine(g)) : ["Лог-групп в каталоге нет. Создать — действием «＋ Создать лог-группу»."],
+        message: "Лог-групп: " + groups.length + ".",
+      };
+    }
+    const ref = String(a.group || a.logGroupId || a.name || "").trim();
+    const found = ref ? groups.find((g) => g.id === ref) || groups.find((g) => g.name === ref) : groups.length === 1 ? groups[0] : null;
+    if (op === "group") {
+      if (!found) return { ok: false, error: "Не нашёл лог-группу «" + ref + "»" + (ref ? "." : " — групп несколько, выбери поле «Группа».") + " В каталоге: " + groups.map((g) => g.name).join(", ") + "." };
+      const g = await ycLogs.getLogGroup(iam, base, found.id);
+      return {
+        ok: true,
+        group: g,
+        lines: [ycLogs.logGroupLine(g), "Описание: " + (g.description || "—"),
+          "Метки: " + (Object.keys(g.labels || {}).length ? JSON.stringify(g.labels) : "нет"),
+          "Хранение: " + (g.retentionPeriod || "без срока") + (g.dataStream ? " · поток данных: " + g.dataStream : ""),
+          "Создана: " + (g.createdAt || "—")],
+        message: "Лог-группа.",
+      };
+    }
+    if (op === "create") {
+      const name = String(a.name || "").trim();
+      if (!name) return { ok: false, error: "Укажи имя лог-группы (name): строчная латиница, цифры и дефис, 2–63 символа." };
+      const o = await ycLogs.createLogGroup(iam, base, {
+        folderId: cfg.folderId,
+        name: name,
+        description: a.description,
+        labels: ycJsonArg(a.labels),
+        retentionPeriod: a.retention != null ? a.retention : a.retentionPeriod,
+        dataStream: a.dataStream,
+      });
+      const done = await yandexCloud.waitOperation(cfg.oauth, o && o.id, 120000);
+      const made = (done && done.response) || {};
+      return {
+        ok: true,
+        changed: true,
+        id: made.id || "",
+        name: made.name || name,
+        group: made,
+        lines: ["✅ Лог-группа создана: " + (made.name || name) + (made.id ? " (" + made.id + ")" : ""),
+          "Хранение: " + (made.retentionPeriod || "без срока") + (made.dataStream ? " · поток " + made.dataStream : ""),
+          "Дальше: направь в неё журнал балансировщика (действие «Правка балансировщика» → «Группа логов») или логи ревизии контейнера."],
+        message: "Лог-группа создана.",
+      };
+    }
+    if (op === "update") {
+      if (!found) return { ok: false, error: "Не нашёл лог-группу «" + ref + "» — назови поле «Группа»." };
+      const o = await ycLogs.updateLogGroup(iam, base, found.id, {
+        name: a.newName,
+        description: a.description,
+        retentionPeriod: a.retention != null ? a.retention : a.retentionPeriod,
+        dataStream: a.dataStream,
+        labels: a.labels != null ? ycJsonArg(a.labels) : undefined,
+      });
+      await yandexCloud.waitOperation(cfg.oauth, o && o.id, 120000);
+      const g = await ycLogs.getLogGroup(iam, base, found.id);
+      return { ok: true, changed: true, group: g, lines: ["✅ Лог-группа изменена.", ycLogs.logGroupLine(g)], message: "Лог-группа изменена." };
+    }
+    // delete — единственное оставшееся действие; необратимо, поэтому требует согласия.
+    if (a.confirmed !== true) {
+      return { ok: false, needsConfirm: true, error: "Удаление лог-группы необратимо: её настройки пропадут, а направленные в неё журналы больше не сохраняются. Подтверди удаление.", lines: found ? [ycLogs.logGroupLine(found)] : [] };
+    }
+    if (!found) return { ok: false, error: "Не нашёл лог-группу «" + ref + "» — назови поле «Группа»." };
+    const o = await ycLogs.deleteLogGroup(iam, base, found.id);
+    await yandexCloud.waitOperation(cfg.oauth, o && o.id, 120000);
+    return { ok: true, changed: true, deleted: true, id: found.id, lines: ["🗑 Лог-группа удалена: " + (found.name || found.id), "Логи, что в неё собирались, дальше не сохраняются."], message: "Лог-группа удалена." };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
   }
 });
 
@@ -2580,6 +2685,739 @@ ipcMain.handle("yc:dns", async (_e, args) => {
   }
 });
 
+// ── Serverless Containers: правка и ревизии из окна (часть 91, заход 8) ────────
+// До этого захода окно умело только список, создание пустого контейнера,
+// удаление, логи и откат из карточки консоли. Новая ревизия (а с ней — образ,
+// переменные окружения, ресурсы и тёплые экземпляры minInstances),
+// переименование и публичный доступ жили ТОЛЬКО у агента (ycContainer). Канал
+// зовёт те же функции, что агент и облачная консоль (src/yandex-cloud.js),
+// поэтому поведение окна и агента — одно и то же.
+//
+// Про деньги. Сама ревизия не тарифицируется: платят за вызовы и за ТЁПЛЫЕ
+// экземпляры (minInstances > 0), которые держат контейнер запущенным всегда.
+// Поэтому «новая ревизия» не просит согласия (как «создать машину»), но честно
+// предупреждает, когда тёплые экземпляры заданы, а публикация в интернет —
+// необратимо-опасное действие и помечено в интерфейсе как таковое.
+ipcMain.handle("yc:container", async (_e, args) => {
+  const cfg = ycConfig();
+  const a = args || {};
+  const op = String(a.op || a.action || "list").trim().toLowerCase();
+  const ALL = ["list", "card", "revisions", "revision", "newrev", "rollback", "update", "public", "private"];
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках (Настройки → «☁️ Yandex Cloud»)." };
+  if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
+  if (ALL.indexOf(op) === -1) return { ok: false, error: "Неизвестное действие Serverless Containers: " + op + ". Доступно: " + ALL.join(", ") + "." };
+  try {
+    if (op === "list") {
+      const items = (await yandexCloud.listService(cfg.oauth, cfg.folderId, yandexCloud.serviceByKey("serverlessContainers"))).items || [];
+      return {
+        ok: true,
+        containers: items,
+        lines: items.length
+          ? items.map((c) => "• " + (c.name || c.id) + " — " + (c.status || "—") + (c.description ? " · " + c.description : "") + (c.url ? " · " + c.url : " · адрес вызова не показан"))
+          : ["Контейнеров в каталоге нет — их можно создать кнопкой «＋ Создать» у плитки «Serverless-контейнеры»."],
+        message: "Контейнеров: " + items.length + ".",
+      };
+    }
+    const ref = String(a.container || a.id || a.name || "").trim();
+    if (!ref) return { ok: false, error: "Укажи контейнер — имя или id (список: действие list)." };
+    const cont = await ycFindContainerByRef(cfg, ref);
+    const who = "Контейнер «" + (cont.name || cont.id) + "» (" + cont.id + ")";
+    const urlLine = "Адрес вызова: " + (cont.url || "— (нет адреса: включи публичный доступ действием «Открыть всему интернету»)");
+    if (op === "card") {
+      const { revs, active } = await ycActiveRevision(cfg, cont.id);
+      const lines = [
+        who,
+        "Статус: " + (cont.status || "—") + (cont.description ? " · " + cont.description : ""),
+        "Создан: " + (cont.createdAt || "—"),
+        urlLine,
+      ];
+      if (!revs.length) {
+        lines.push("Ревизий нет: контейнер создан, но ни разу не выкатывался. Новая ревизия — действием «Новая ревизия» (нужен образ вида cr.yandex/<registry-id>/<image>:tag).");
+      } else {
+        lines.push("Ревизий: " + revs.length + " · активная — " + (active ? active.id : "—"));
+        lines.push(ycRevisionDetails(yandexCloud.revisionSummary(active || {})));
+      }
+      lines.push("Образ, переменные окружения и ресурсы задаются ТОЛЬКО новой ревизией: «правка» меняет имя и описание.");
+      return { ok: true, container: cont, revision: active ? yandexCloud.revisionSummary(active) : null, lines: lines, message: who };
+    }
+    if (op === "revisions") {
+      const revs = await yandexCloud.listRevisions(cfg.oauth, { containerId: cont.id, pageSize: 100, filter: a.filter ? String(a.filter) : undefined });
+      const activeId = (revs.find((r) => r.status === "ACTIVE") || revs[0] || {}).id || "";
+      const lines = [who, urlLine];
+      if (!revs.length) lines.push("Ревизий нет.");
+      else for (const r of revs) lines.push(ycRevisionLine(yandexCloud.revisionSummary(r), r.id === activeId));
+      return { ok: true, container: cont, revisions: revs, lines: lines, message: "Ревизий: " + revs.length + "." };
+    }
+    if (op === "revision") {
+      const rid = String(a.revisionId || a.revision || "").trim();
+      if (!rid) return { ok: false, error: "Укажи revisionId — id виден в действии «Ревизии»." };
+      const rev = await yandexCloud.getRevision(cfg.oauth, rid);
+      return {
+        ok: true,
+        container: cont,
+        revision: yandexCloud.revisionSummary(rev),
+        lines: [who, ycRevisionDetails(yandexCloud.revisionSummary(rev))],
+        message: "Ревизия " + rid + ".",
+      };
+    }
+    if (op === "newrev") {
+      const { active } = await ycActiveRevision(cfg, cont.id);
+      const opts = yandexCloud.revisionToDeployOpts(active, {
+        imageUrl: a.image || a.imageUrl,
+        memoryMb: a.memoryMb,
+        cores: a.cores,
+        coreFraction: a.coreFraction,
+        timeoutSec: a.timeoutSec,
+        concurrency: a.concurrency,
+        minInstances: a.minInstances,
+        networkId: a.networkId,
+        serviceAccountId: a.serviceAccountId,
+        runtime: a.runtime,
+        logGroupId: a.logGroupId,
+        env: ycJsonArg(a.env),
+        envReplace: a.envReplace === true,
+        description: a.description,
+        folderId: cfg.folderId,
+      });
+      if (!opts.imageUrl) {
+        return { ok: false, error: "У новой ревизии нет образа. Контейнер ещё не выкатывался — укажи образ вручную, например cr.yandex/<registry-id>/<image>:latest (реестр: плитка «Реестр образов»)." };
+      }
+      await yandexCloud.deployContainerRevision(cfg.oauth, Object.assign({ containerId: cont.id }, opts));
+      const after = await ycActiveRevision(cfg, cont.id);
+      const src = active ? "настройки взяты из активной ревизии " + active.id + " (указанные поля переопределены)" : "первая ревизия контейнера";
+      return {
+        ok: true,
+        changed: true,
+        container: cont,
+        revision: after.active ? yandexCloud.revisionSummary(after.active) : null,
+        lines: ["✅ Ревизия развёрнута (" + src + ").", urlLine, ycRevisionDetails(yandexCloud.revisionSummary(after.active || {}))],
+        warnings: (parseInt(a.minInstances, 10) || 0) > 0
+          ? ["Тёплые экземпляры (мин. инстансов " + a.minInstances + ") держат контейнер запущенным всегда — за них платят, даже когда запросов нет."]
+          : [],
+        message: "Ревизия развёрнута.",
+      };
+    }
+    if (op === "rollback") {
+      const rid = String(a.revisionId || a.revision || "").trim();
+      if (!rid) return { ok: false, error: "Укажи revisionId, на которую откатить (список: действие «Ревизии»)." };
+      await yandexCloud.rollbackContainer(cfg.oauth, cont.id, rid);
+      const after = await ycActiveRevision(cfg, cont.id);
+      return {
+        ok: true,
+        changed: true,
+        container: cont,
+        lines: ["✅ Контейнер откачен на ревизию " + rid + ".", "Активная ревизия теперь: " + ((after.active && after.active.id) || "—") + ".", urlLine],
+        message: "Откат выполнен.",
+      };
+    }
+    if (op === "update") {
+      const patch = {};
+      if (a.newName != null && String(a.newName).trim()) patch.name = String(a.newName).trim();
+      if (a.description != null) patch.description = String(a.description);
+      const updated = await yandexCloud.updateContainer(cfg.oauth, cont.id, patch);
+      const labelKeys = Object.keys(updated.labels || {});
+      return {
+        ok: true,
+        changed: true,
+        container: updated,
+        lines: [
+          "✅ Контейнер обновлён: «" + (updated.name || cont.name) + "»" + (updated.description ? " — " + updated.description : "") +
+            (labelKeys.length ? "\nМетки: " + labelKeys.map((k) => k + "=" + updated.labels[k]).join(", ") : ""),
+          "Образ, переменные окружения и ресурсы правятся ТОЛЬКО новой ревизией (действие «Новая ревизия»).",
+        ],
+        message: "Контейнер обновлён.",
+      };
+    }
+    if (op === "public") {
+      const r = await yandexCloud.setContainerPublicAccess(cfg.oauth, cont.id);
+      return {
+        ok: true,
+        changed: !r.already,
+        container: cont,
+        lines: [(r.already ? "ℹ Контейнер уже открыт для вызова из интернета." : "⚠ Контейнер открыт для вызова из интернета."), urlLine, "Привязка «все пользователи → serverless.containers.invoker» выдана на сам контейнер."],
+        warnings: ["Любой человек из интернета сможет звать контейнер по адресу и увидеть то, что он отвечает. Если внутри есть пароли или личные данные — закрой контейнер обратно (действие «Закрыть от интернета»)."],
+        message: r.already ? "Контейнер уже был открыт." : "Контейнер открыт.",
+      };
+    }
+    // private — единственное оставшееся действие (список ALL сверен выше).
+    const r2 = await yandexCloud.unsetContainerPublicAccess(cfg.oauth, cont.id);
+    return {
+      ok: true,
+      changed: !r2.already,
+      container: cont,
+      lines: [r2.already ? "ℹ Контейнер и так закрыт: привязки «все пользователи» на нём нет." : "🔒 Контейнер закрыт от интернета: привязка «все пользователи → invoker» снята.", urlLine],
+      message: r2.already ? "Контейнер уже был закрыт." : "Контейнер закрыт.",
+    };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
+// ── Object Storage: файлы бакета из окна (часть 91, заход 10) ──────────────
+// Бакет создаётся «для файлов и статики», а положить в него файл из окна было
+// нечем: объекты умел только агент (`ycStorage`), а карточка бакета — лишь
+// показывать список и удалять по одному. Тела запросов лежат в
+// src/yandex-cloud.js (S3-совместимый API, XML-ответы, IAM-токен БЕЗ подписи
+// AWS, предел одного запроса S3_MAX_BYTES) — здесь выбор действия и отказ.
+//
+// Платность честная: САМ файл бесплатен, платят за объём (ГБ·месяц), поэтому
+// «Загрузить файл» помечено платным и спрашивает согласие — но в тексте сказано
+// именно про объём, а не выдуманная цена за штуку.
+ipcMain.handle("yc:storage", async (_e, args) => {
+  const cfg = ycConfig();
+  const a = args || {};
+  const op = String(a.op || a.action || "list").trim().toLowerCase();
+  const ALL = ["list", "objects", "upload", "download", "delete", "url", "access", "public", "private"];
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках (Настройки → «☁️ Yandex Cloud»)." };
+  if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
+  if (ALL.indexOf(op) === -1) return { ok: false, error: "Неизвестное действие Object Storage: " + op + ". Доступно: " + ALL.join(", ") + "." };
+  const humanSize = (n) => {
+    const v = Number(n) || 0;
+    if (v >= 1073741824) return (Math.round((v / 1073741824) * 10) / 10) + " ГБ";
+    if (v >= 1048576) return (Math.round((v / 1048576) * 10) / 10) + " МБ";
+    if (v >= 1024) return Math.round(v / 1024) + " КБ";
+    return v + " Б";
+  };
+  try {
+    const buckets = (await yandexCloud.listService(cfg.oauth, cfg.folderId, yandexCloud.serviceByKey("storage"))).items || [];
+    if (!buckets.length) {
+      return { ok: false, error: "Бакетов в каталоге «" + (cfg.folderName || cfg.folderId) + "» нет. Создай бакет кнопкой «＋ Создать» у плитки «Объектное хранилище»." };
+    }
+    if (op === "list") {
+      return {
+        ok: true,
+        buckets: buckets,
+        lines: buckets.map((b) => "• " + (b.name || b.id) + " — " + (b.status || "—") + (b.defaultStorageClass ? " · класс " + b.defaultStorageClass : "") + " (" + b.id + ")"),
+        message: "Бакетов: " + buckets.length + ".",
+      };
+    }
+    const ref = String(a.bucket || a.name || "").trim();
+    const bucket = ref ? buckets.find((b) => b.id === ref) || buckets.find((b) => b.name === ref) : buckets.length === 1 ? buckets[0] : null;
+    if (!bucket) {
+      return { ok: false, error: "Не нашёл бакет «" + ref + "»" + (ref ? "." : " — бакетов несколько, выбери «Бакет» полем.") + " В каталоге: " + buckets.map((b) => b.name).join(", ") + "." };
+    }
+    const who = "Бакет «" + bucket.name + "» (" + bucket.id + ")";
+    const key = String(a.key || a.object || "").replace(/^\/+/, "");
+    const objNeeded = op === "objects" || op === "upload" || op === "download" || op === "delete" || op === "url";
+    if (objNeeded && op !== "objects" && !key) {
+      return { ok: false, error: "Укажи key — путь объекта в бакете, например site/index.html (что уже лежит: действие «Объекты бакета»)." };
+    }
+
+    if (op === "objects") {
+      const prefix = String(a.prefix || "").replace(/^\/+/, "");
+      const r = await yandexCloud.listBucketObjects(cfg.oauth, { bucket: bucket.name, prefix: prefix, limit: a.limit });
+      const lines = [who];
+      if (!r.items.length) {
+        lines.push(prefix ? "По префиксу «" + prefix + "» пусто." : "В бакете нет ни одного объекта.");
+        lines.push("Положить файл — действием «Загрузить файл»: он спросит файл на диске и ключ в бакете.");
+      } else {
+        for (const it of r.items) lines.push("• " + it.key + (it.size ? " · " + humanSize(it.size) : "") + (it.lastModified ? " · " + String(it.lastModified).slice(0, 16).replace("T", " ") : ""));
+        lines.push("Объектов: " + r.count + (r.truncated ? " (показаны первые — сузь префиксом)" : "") + ". Открытый адрес — действием «Ссылка на объект».");
+      }
+      return { ok: true, bucket: bucket, objects: r.items, lines: lines, message: "Объектов: " + r.count + "." };
+    }
+
+    if (op === "access") {
+      const r = await yandexCloud.getBucketAccess(cfg.oauth, bucket.name);
+      return {
+        ok: true,
+        bucket: bucket,
+        flags: r.flags,
+        public: !!r.flags.read,
+        lines: [who, r.flags.read ? "Анонимное чтение ВКЛ: объекты открываются по ссылке у любого." : "Анонимное чтение выкл: по ссылке придёт отказ 403 — это нормально для закрытого бакета.", "Перечисление содержимого анонимно: " + (r.flags.list ? "ВКЛ" : "выкл") + "."],
+        message: r.flags.read ? "Бакет публичный." : "Бакет закрытый.",
+      };
+    }
+
+    if (op === "url") {
+      const acc = await yandexCloud.getBucketAccess(cfg.oauth, bucket.name);
+      const url = yandexCloud.objectPublicUrl(bucket.name, key);
+      const open = !!acc.flags.read;
+      return {
+        ok: true,
+        bucket: bucket,
+        key: key,
+        url: url,
+        public: open,
+        lines: [who, "Объект: " + key, "Открытый адрес: " + url, open ? "Бакет открыт на чтение — ссылка работает у любого, кто её знает (и её видят поисковики)." : "Бакет ЗАКРЫТ: ссылка вернёт 403, пока не включён публичный доступ (действие «Открыть бакет»)."],
+        warnings: open ? [] : ["Чтобы файл открывался по ссылке у других, у бакета должно быть разрешено анонимное чтение — тогда файлы станут видны всем, кто знает ссылку."],
+        message: "Ссылка на объект.",
+      };
+    }
+
+    if (op === "upload") {
+      const fromFile = String(a.file || a.from || "").trim();
+      const content = a.content != null ? String(a.content) : null;
+      if (!fromFile && content == null) {
+        return { ok: false, error: "Для загрузки нужен либо файл на диске (поле «Файл на ПК» — его выбирает системный диалог), либо содержимое текстом." };
+      }
+      if (a.confirmed !== true) {
+        let size = 0;
+        if (fromFile) {
+          const p = resolvePath(fromFile, loadSettings());
+          try {
+            size = fs.statSync(p).size;
+          } catch {
+            return { ok: false, error: "Файла «" + fromFile + "» нет. Проверь путь: " + p };
+          }
+        }
+        return {
+          ok: false,
+          needsConfirm: true,
+          error: "Объект в бакете занимает место и тарифицируется за объём (ГБ за месяц), пока его не удалят. Подтверди загрузку.",
+          lines: [who, "Ключ в бакете: " + key + (fromFile ? "\nФайл: " + fromFile + (size ? " (" + humanSize(size) + ")" : "") : "\nСодержимое задано текстом")],
+        };
+      }
+      let body = null;
+      if (fromFile) {
+        const p = resolvePath(fromFile, loadSettings());
+        if (!fs.existsSync(p) || !fs.statSync(p).isFile()) return { ok: false, error: "Файла «" + fromFile + "» нет (путь от рабочей папки). Проверь: " + p };
+        if (fs.statSync(p).size > yandexCloud.S3_MAX_BYTES) {
+          return { ok: false, error: "Файл больше " + Math.round(yandexCloud.S3_MAX_BYTES / 1048576) + " МБ — одним запросом такое не залить. Сожми его или положи частями." };
+        }
+        body = fs.readFileSync(p);
+      } else {
+        body = Buffer.from(content, "utf8");
+      }
+      const r = await yandexCloud.putBucketObject(cfg.oauth, { bucket: bucket.name, key: key, body: body, contentType: a.contentType });
+      return {
+        ok: true,
+        changed: true,
+        bucket: bucket,
+        key: r.key,
+        size: r.size,
+        url: r.url,
+        lines: [
+          "✅ Файл в облаке: " + r.key + " (" + humanSize(r.size) + ", " + yandexCloud.contentTypeFor(r.key) + ")",
+          who,
+          "Открытый адрес: " + r.url,
+          "Ссылка откроется у других, только если у бакета разрешено анонимное чтение — включает действие «Открыть бакет» (и файлы станут видны поисковикам).",
+        ],
+        message: "Файл загружен.",
+      };
+    }
+
+    if (op === "download") {
+      const obj = await yandexCloud.getBucketObject(cfg.oauth, { bucket: bucket.name, key: key });
+      const to = String(a.to || a.saveAs || "").trim();
+      const p = to ? resolvePath(to, loadSettings()) : nodePath.join(agentWorkDir(loadSettings()), nodePath.basename(obj.key));
+      fs.mkdirSync(nodePath.dirname(p), { recursive: true });
+      fs.writeFileSync(p, obj.body);
+      return {
+        ok: true,
+        bucket: bucket,
+        key: obj.key,
+        path: p,
+        size: obj.size,
+        lines: ["✅ Объект скачан: " + obj.key + " → " + p, "Размер: " + humanSize(obj.size) + " · тип: " + obj.contentType, who],
+        message: "Объект скачан.",
+      };
+    }
+
+    if (op === "delete") {
+      if (a.confirmed !== true) {
+        return {
+          ok: false,
+          needsConfirm: true,
+          error: "Удаление объекта необратимо: вернуть его можно только залив файл заново.",
+          lines: [who, "Объект: " + key],
+        };
+      }
+      const r = await yandexCloud.deleteBucketObject(cfg.oauth, { bucket: bucket.name, key: key });
+      return { ok: true, changed: true, deleted: true, bucket: bucket, lines: ["🗑 Объект удалён: " + r.key, who], message: "Объект удалён." };
+    }
+
+    if (op === "public") {
+      if (a.confirmed !== true) {
+        return {
+          ok: false,
+          needsConfirm: true,
+          error: "Открытый бакет читает любой, кто знает ссылку, а содержимое становится видно ПОИСКОВИКАМ. Не открывай бакет с паролями, ключами и личными файлами — для закрытого хранения есть Lockbox.",
+          lines: [who],
+        };
+      }
+      const r = await yandexCloud.setBucketPublicAccess(cfg.oauth, bucket.name, true);
+      return {
+        ok: true,
+        changed: true,
+        bucket: bucket,
+        flags: r.flags,
+        lines: ["⚠ Бакет открыт для чтения из интернета.", who, "Объекты откроются у любого, кто знает ссылку; перечисление содержимого анонимно осталось выключено."],
+        warnings: ["Содержимое бакета видно поисковикам. Закрыть обратно — действие «Закрыть бакет»."],
+        message: "Бакет открыт.",
+      };
+    }
+    // private — единственное оставшееся действие (список ALL сверен выше).
+    const r2 = await yandexCloud.setBucketPublicAccess(cfg.oauth, bucket.name, false);
+    return {
+      ok: true,
+      changed: true,
+      bucket: bucket,
+      flags: r2.flags,
+      lines: ["🔒 Бакет закрыт: по ссылкам придёт отказ 403.", who, "Сами файлы на месте — вернуть доступ можно действием «Открыть бакет»."],
+      message: "Бакет закрыт.",
+    };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
+// ── База YDB: таблицы и записи (часть 91, заход 9) ─────────────────────────
+// Таблицы YDB живут в HTTP Document API, и у него СВОЙ протокол: операция
+// задаётся заголовком X-Amz-Target, значения атрибутов типизированы, а запрос
+// всегда идёт в корень адреса самой базы. Всё это (и разбор значений, и адрес)
+// живёт в src/yc-db.js и больше нигде; здесь — выбор действия, отказ и перевод
+// ответа на русский.
+//
+// Честность, без которой кнопки врут: в КОЛОНКАХ документной таблицы YDB
+// хранятся только поля первичного ключа, остальные поля лежат в самих записях.
+// Поэтому «создать таблицу» спрашивает ключ, а не список колонок, и обещает
+// ровно это. Произвольные колонки (YQL-таблицы) — ДРУГОЙ протокол (Ydb.Query по
+// gRPC), и он живёт здесь же отдельным действием «query»: там настоящие колонки,
+// SELECT, CREATE TABLE и всё, что умеет YQL. Протокол — в src/yc-yql.js, канал
+// только выбирает действие и переводит ответ.
+ipcMain.handle("yc:db", async (_e, args) => {
+  const cfg = ycConfig();
+  const a = args || {};
+  const op = String(a.op || a.action || "list").trim().toLowerCase();
+  const ALL = ["list", "tables", "table", "create", "scan", "get", "put", "delete", "drop", "query"];
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках (Настройки → «☁️ Yandex Cloud»)." };
+  if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
+  if (ALL.indexOf(op) === -1) return { ok: false, error: "Неизвестное действие YDB: " + op + ". Доступно: " + ALL.join(", ") + "." };
+  // Ячейка формы приходит строкой JSON, поэтому разбираем её общей ycJsonArg, а
+  // массив отвергаем: и ключ, и запись — это НАБОР ПОЛЕЙ, а не список значений.
+  const obj = (v) => {
+    const j = ycJsonArg(v);
+    return j && typeof j === "object" && !Array.isArray(j) ? j : null;
+  };
+  try {
+    const found = await ycDb.findDatabase(cfg.oauth, cfg.folderId, a.database || a.db);
+    const dbs = found.list || [];
+    if (op === "list") {
+      return {
+        ok: true,
+        databases: dbs,
+        lines: dbs.length
+          ? dbs.map((d) => "• " + (d.name || d.id) + " — " + (d.status || "—") + (d.endpoint ? " · " + d.endpoint : "") + " (" + d.id + ")")
+          : ["Баз YDB в каталоге нет — их можно создать кнопкой «＋ Создать» у плитки «YDB»."],
+        message: "Баз YDB: " + dbs.length + ".",
+      };
+    }
+    if (!dbs.length) {
+      return { ok: false, error: "Баз YDB в каталоге «" + (cfg.folderName || cfg.folderId) + "» нет. Сначала создай базу кнопкой «＋ Создать» у плитки «YDB»." };
+    }
+    const db = found.db;
+    if (!db) {
+      return { ok: false, error: "Баз несколько — выбери «Базу» полем (имя или id). В каталоге: " + dbs.map((d) => d.name + " (" + d.id + ")").join(", ") + "." };
+    }
+    const who = "База «" + (db.name || db.id) + "» (" + db.id + ")";
+
+    // YQL (SQL): настоящие таблицы и любые запросы — gRPC Ydb.Query (src/yc-yql.js).
+    // Опасные запросы (DROP/DELETE/ALTER/TRUNCATE) необратимы, поэтому
+    // спрашиваются ДВАЖДЫ — окном и каналом (`a.confirmed`), как и удаления выше.
+    if (op === "query") {
+      const text = String(a.query || a.sql || "").trim();
+      if (!text) return { ok: false, error: "Пустой запрос: напиши текст на YQL, например SELECT * FROM pets LIMIT 10." };
+      const kind = ycDb.queryKind(text);
+      const kindRu = kind === "destructive" ? "меняет данные необратимо" : kind === "write" ? "меняет данные" : "только чтение";
+      if (kind === "destructive" && a.confirmed !== true) {
+        return {
+          ok: false,
+          needsConfirm: true,
+          error: "Этот запрос необратим — он удаляет или меняет данные (DROP / DELETE / ALTER / TRUNCATE). Повтори с подтверждением, если это правда нужно.",
+          lines: [who, "Запрос: " + text.split("\n")[0].slice(0, 200)],
+        };
+      }
+      const r = await ycDb.yql(cfg.oauth, db, { query: text });
+      const lines = [who, "Запрос выполнен" + (r.rowCount ? ": строк " + r.rowCount : " (данных не вернул)") + " — " + kindRu + "."];
+      for (const l of ycDb.formatSets(r.sets, { maxRows: a.maxRows || 50 })) lines.push(l);
+      if (!r.sets.length) lines.push("Для CREATE / INSERT / UPDATE это нормально: команда выполнена, таблиц ответ не содержит.");
+      if (r.issues && r.issues.length) lines.push("Замечания: " + r.issues.join("; "));
+      return { ok: true, changed: kind !== "read", database: db, kind: kind, sets: r.sets, rowCount: r.rowCount, lines: lines, message: kind === "read" ? "Запрос выполнен." : "Запрос выполнен, данные изменены." };
+    }
+
+    const table = String(a.table || "").trim();
+
+    if (op === "tables") {
+      const r = await ycDb.listDocumentTables(cfg.oauth, db);
+      const lines = [who];
+      if (!r.tables.length) {
+        lines.push("Таблиц нет — база пустая.");
+        lines.push("Создать — действием «＋ Создать таблицу». В колонках таблицы хранится только ключ, остальные поля лежат в самих записях.");
+      } else {
+        for (const t of r.tables) lines.push("• " + t);
+        lines.push("Таблиц: " + r.tables.length + ". Записи — действием «Записи таблицы», структура — «Структура таблицы».");
+      }
+      return { ok: true, database: db, tables: r.tables, lines: lines, message: "Таблиц: " + r.tables.length + "." };
+    }
+
+    if (!table) return { ok: false, error: "Укажи таблицу (table) — имя видно в действии «Таблицы базы»." };
+
+    if (op === "table") {
+      const d = await ycDb.describeDocumentTable(cfg.oauth, db, table);
+      const keyText = d.keys.map((k) => k.name + " [" + k.type + "]").join(", ") || "—";
+      return {
+        ok: true,
+        database: db,
+        tableInfo: d,
+        lines: [
+          "Таблица «" + d.table + "»" + (d.status ? " · " + d.status : ""),
+          who,
+          "Записей: " + d.itemCount + " · размер: " + d.sizeBytes + " Б",
+          "Ключ: " + keyText,
+          "В колонках таблицы — ТОЛЬКО поля ключа; остальные поля хранятся в самих записях (так устроен Document API YDB).",
+        ],
+        message: "Структура таблицы «" + d.table + "».",
+      };
+    }
+
+    if (op === "create") {
+      const keys = obj(a.keys);
+      if (!keys) {
+        return { ok: false, error: "Укажи keys — поля первичного ключа JSON-объектом, например {\"id\":\"S\"} или {\"species\":\"S\",\"name\":\"S\"}. Первый ключ — ключ поиска (HASH), остальные — сортировки (RANGE). Тип ключа: S — строка, N — число, B — байты." };
+      }
+      const r = await ycDb.createDocumentTable(cfg.oauth, db, { table: table, keys: keys });
+      return {
+        ok: true,
+        changed: true,
+        database: db,
+        lines: [
+          "✅ Таблица создана: " + r.table + " (ключ: " + r.keys.join(", ") + ")",
+          who,
+          "В колонках живёт только ключ; любые другие поля можно класть в записи — действием «Положить запись».",
+        ],
+        message: "Таблица создана.",
+      };
+    }
+
+    if (op === "scan") {
+      const r = await ycDb.scanDocumentTable(cfg.oauth, db, { table: table, limit: a.limit });
+      if (!r.items.length) {
+        return {
+          ok: true,
+          database: db,
+          table: r.table,
+          items: [],
+          lines: ["В таблице «" + r.table + "» пусто.", who, "Положить запись — действием «Положить запись»: поля ключа в ней обязательны."],
+          message: "Записей нет.",
+        };
+      }
+      return {
+        ok: true,
+        database: db,
+        table: r.table,
+        items: r.items,
+        lines: [
+          "Таблица «" + r.table + "»: записей " + r.count + (r.count >= r.limit ? " (показаны первые " + r.limit + ")" : ""),
+          who,
+          JSON.stringify(r.items, null, 2),
+          "Одна запись — действием «Прочитать запись», структура — «Структура таблицы».",
+        ],
+        message: "Записей: " + r.count + ".",
+      };
+    }
+
+    if (op === "get") {
+      const key = obj(a.key);
+      if (!key) return { ok: false, error: "Укажи key — поля первичного ключа записи JSON-объектом, например {\"id\":\"1\"} (ключ виден в действии «Структура таблицы»)." };
+      const r = await ycDb.getDocumentItem(cfg.oauth, db, { table: table, key: key });
+      if (!r.item) return { ok: false, error: "Записи с таким ключом в таблице «" + r.table + "» нет.", lines: [who, "Что есть — действие «Записи таблицы»."] };
+      return {
+        ok: true,
+        database: db,
+        table: r.table,
+        item: r.item,
+        lines: ["Запись из «" + r.table + "»:", JSON.stringify(r.item, null, 2), who],
+        message: "Запись прочитана.",
+      };
+    }
+
+    if (op === "put") {
+      const item = obj(a.item);
+      if (!item) return { ok: false, error: "Укажи item — запись JSON-объектом, например {\"id\":\"1\",\"name\":\"Tom\"}. Поля первичного ключа в ней обязательны (ключ виден в действии «Структура таблицы»)." };
+      const r = await ycDb.putDocumentItem(cfg.oauth, db, { table: table, item: item });
+      return {
+        ok: true,
+        changed: true,
+        database: db,
+        table: r.table,
+        lines: [
+          "✅ Запись сохранена в «" + r.table + "» (полей: " + r.fields.length + ")",
+          who,
+          "Запись кладётся ЦЕЛИКОМ: если такая уже была, её прежние поля заменяются этим набором.",
+        ],
+        message: "Запись сохранена.",
+      };
+    }
+
+    if (op === "delete") {
+      const key = obj(a.key);
+      if (!key) return { ok: false, error: "Укажи key — поля первичного ключа записи JSON-объектом (ключ виден в действии «Структура таблицы»)." };
+      if (a.confirmed !== true) {
+        const existing = await ycDb.getDocumentItem(cfg.oauth, db, { table: table, key: key }).catch(() => ({ item: null }));
+        if (!existing.item) return { ok: false, error: "Записи с таким ключом в таблице «" + table + "» нет — удалять нечего." };
+        return {
+          ok: false,
+          needsConfirm: true,
+          error: "Удаление записи необратимо: вернуть её можно только заново заполнив поля.",
+          lines: ["Запись: " + JSON.stringify(existing.item), who],
+        };
+      }
+      await ycDb.deleteDocumentItem(cfg.oauth, db, { table: table, key: key });
+      return { ok: true, changed: true, deleted: true, database: db, lines: ["🗑 Запись удалена из «" + table + "»", who], message: "Запись удалена." };
+    }
+
+    // drop — последнее оставшееся действие (список ALL сверен выше).
+    if (a.confirmed !== true) {
+      return {
+        ok: false,
+        needsConfirm: true,
+        error: "Удаление таблицы необратимо: она уйдёт ВМЕСТЕ со всеми записями, и вернуть данные из окна будет нельзя.",
+        lines: [who, "Таблица: " + table],
+      };
+    }
+    await ycDb.deleteDocumentTable(cfg.oauth, db, table);
+    return { ok: true, changed: true, deleted: true, database: db, lines: ["🗑 Таблица удалена вместе со всеми записями: " + table, who], message: "Таблица удалена." };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
+// ── API-шлюз (API Gateway): шлюз целиком — из OpenAPI-спецификации ──────────
+// API-шлюз — это «вход» в приложение: он принимает запросы по адресу
+// `<id>.apigw.yandexcloud.net`, разбирает их по спецификации и уводит в
+// интеграции. У сервиса была только плитка-список и общее создание пустого
+// ресурса, а создать шлюз ИЗ СПЕЦИФИКАЦИИ, показать её, поправить и удалить было
+// нечем — ни человеку, ни агенту. Тела запросов живут в src/yc-apigw.js; здесь
+// выбор действия и понятный отказ. Изменяющие методы возвращают OPERATION,
+// поэтому их результат ждёт waitOperation, а готовый шлюз читается ПЕРЕЧИТЫВАНИЕМ.
+// Права агента здесь НЕ спрашиваем: галочки «Разрешить АГЕНТУ…» ограничивают
+// модель, а здесь действует человек в своём окне — как у лог-групп и файлов бакета.
+ipcMain.handle("yc:apigw", async (_e, args) => {
+  const cfg = ycConfig();
+  const a = args || {};
+  const op = String(a.op || a.action || "list").trim().toLowerCase();
+  const ALL = ["list", "gateway", "spec", "create", "update", "delete"];
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках (Настройки → «☁️ Yandex Cloud»)." };
+  if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
+  if (!ycApiGw) return { ok: false, error: "Модуль API-шлюза не подключён к приложению (src/yc-apigw.js)." };
+  if (ALL.indexOf(op) === -1) return { ok: false, error: "Неизвестное действие API-шлюза: " + op + ". Доступно: " + ALL.join(", ") + "." };
+  try {
+    const base = (await yandexCloud.endpoint("serverless-apigateway")) || ycApiGw.APIGW_FALLBACK;
+    const iam = await yandexCloud.getIamToken(cfg.oauth);
+    const gateways = await ycApiGw.listGateways(iam, base, cfg.folderId);
+    if (op === "list") {
+      return {
+        ok: true,
+        folder: { id: cfg.folderId, name: cfg.folderName },
+        gateways: gateways,
+        lines: gateways.length ? gateways.map((g) => ycApiGw.gatewayLine(g)) : ["API-шлюзов в каталоге нет. Создать — действием «＋ Создать шлюз из спецификации»."],
+        message: "API-шлюзов: " + gateways.length + ".",
+      };
+    }
+    // Создание стоит ДО поиска шлюза: у нового шлюза ещё нет записи в каталоге, и
+    // поиск по имени отбил бы создание «не нашёл».
+    if (op === "create") {
+      const name = String(a.name || "").trim();
+      if (!name) return { ok: false, error: "Укажи имя шлюза (name): строчные латинские буквы, цифры и дефис, 2–63 символа." };
+      const spec = a.spec != null ? a.spec : a.openapiSpec;
+      const o = await ycApiGw.createGateway(iam, base, {
+        folderId: cfg.folderId,
+        name: name,
+        spec: spec,
+        description: a.description,
+        labels: ycJsonArg(a.labels),
+        executionTimeout: a.executionTimeout,
+      });
+      const done = await yandexCloud.waitOperation(cfg.oauth, o && o.id, 180000);
+      const made = (done && done.response) || {};
+      const g = made.id ? await ycApiGw.getGateway(iam, base, made.id).catch(() => null) : null;
+      const info = g || ycApiGw.gatewayInfo(made);
+      const brief = ycApiGw.specBrief(spec);
+      return {
+        ok: true,
+        changed: true,
+        id: info.id || made.id || "",
+        name: info.name || name,
+        gateway: info,
+        lines: [
+          "✅ API-шлюз создан: " + (info.name || name) + (info.id ? " (" + info.id + ")" : ""),
+          info.url ? "Адрес по умолчанию: " + info.url : "Адрес появится через несколько секунд — обнови список.",
+          "Путей в спецификации: " + brief.pathCount + (brief.integrations ? " · интеграций: " + brief.integrations : ""),
+          "Дальше: спецификацию видно действием «Спецификация шлюза», меняется — «✎ Править шлюз».",
+        ],
+        message: "API-шлюз создан.",
+      };
+    }
+    const ref = String(a.gateway || a.apiGatewayId || a.apiGateway || a.id || a.name || "").trim();
+    const found = ycApiGw.matchGateway(gateways, ref);
+    const missing = { ok: false, error: "Не нашёл API-шлюз «" + ref + "»" + (ref ? "." : " — шлюзов несколько, выбери поле «Шлюз».") + " В каталоге: " + gateways.map((g) => g.name).join(", ") + "." };
+    if (op === "gateway") {
+      if (!found) return missing;
+      const g = await ycApiGw.getGateway(iam, base, found.id);
+      return {
+        ok: true,
+        gateway: g,
+        lines: [
+          ycApiGw.gatewayLine(g),
+          "Адрес: " + (g.url || "—"),
+          "Описание: " + (g.description || "—"),
+          "Метки: " + (Object.keys(g.labels || {}).length ? JSON.stringify(g.labels) : "нет"),
+          "Время выполнения: " + (g.executionTimeout || "по умолчанию"),
+          "Группа логов: " + (g.logGroupId || "—"),
+          "Создан: " + (g.createdAt || "—"),
+        ],
+        message: "API-шлюз.",
+      };
+    }
+    if (op === "spec") {
+      if (!found) return missing;
+      const s = await ycApiGw.getSpec(iam, base, found.id, a.format);
+      const brief = ycApiGw.specBrief(s.openapiSpec);
+      return {
+        ok: true,
+        gateway: found,
+        format: brief.format,
+        paths: brief.paths,
+        spec: s.openapiSpec,
+        lines: ["Спецификация API-шлюза «" + found.name + "» (" + (brief.format || "—") + ", путей " + brief.pathCount + "):"].concat(
+          brief.paths.length ? brief.paths.map((p) => "  " + p) : ["  (путей в спецификации не нашлось)"],
+          ["", s.openapiSpec]
+        ),
+        message: "Спецификация шлюза.",
+      };
+    }
+    if (op === "update") {
+      if (!found) return missing;
+      const spec = a.spec != null ? a.spec : a.openapiSpec;
+      const o = await ycApiGw.updateGateway(iam, base, found.id, {
+        name: a.newName,
+        description: a.description,
+        labels: a.labels != null ? ycJsonArg(a.labels) : undefined,
+        spec: spec,
+        executionTimeout: a.executionTimeout,
+      });
+      await yandexCloud.waitOperation(cfg.oauth, o && o.id, 180000);
+      const g = await ycApiGw.getGateway(iam, base, found.id);
+      return { ok: true, changed: true, gateway: g, lines: ["✅ API-шлюз изменён.", ycApiGw.gatewayLine(g)], message: "API-шлюз изменён." };
+    }
+    // delete — единственное оставшееся действие; необратимо, поэтому требует согласия.
+    if (a.confirmed !== true) {
+      return {
+        ok: false,
+        needsConfirm: true,
+        error: "Удаление API-шлюза необратимо: его адрес <id>.apigw.yandexcloud.net перестанет отвечать, а всё, что на него ссылалось (DNS, сайт, бот), получит ошибку. Подтверди удаление.",
+        lines: found ? [ycApiGw.gatewayLine(found)] : [],
+      };
+    }
+    if (!found) return missing;
+    const o = await ycApiGw.deleteGateway(iam, base, found.id);
+    await yandexCloud.waitOperation(cfg.oauth, o && o.id, 120000);
+    return { ok: true, changed: true, deleted: true, id: found.id, lines: ["🗑 API-шлюз удалён: " + (found.name || found.id), (found.url || "Адрес") + " больше не отвечает."], message: "API-шлюз удалён." };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
 
 }
 

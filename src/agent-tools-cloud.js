@@ -63,6 +63,7 @@ function createCloudTools(deps) {
     ycMdb,
     ycIg,
     ycAlb,
+    ycApiGw,
     readYcLogsText,
     ycCliStatus,
     ycCliInstall,
@@ -77,7 +78,11 @@ function createCloudTools(deps) {
   // Собираем защитно: стенды, у которых облако не нужно (например буфер обмена),
   // присылают deps без yandexCloud — они не должны падать на сборке.
   const ycApi = yandexCloud || {};
-  const ycDbApi = createYcDb({
+  // Экземпляр берём готовый, если его дали снаружи (main.js собирает ОДИН на
+  // приложение — им же пользуется канал окна «yc:db»). Сборка «с нуля» остаётся
+  // для стендов: они вызывают createCloudTools напрямую и присылают deps без
+  // ycDb — падать на этом они не должны.
+  const ycDbApi = deps.ycDb || createYcDb({
     getIamToken: ycApi.getIamToken,
     fetchJson: ycApi._fetchJson,
     endpoint: ycApi.endpoint,
@@ -1757,16 +1762,204 @@ function createCloudTools(deps) {
           return "Yandex Cloud (ycStorage, action=" + action + "): " + ((e && e.message) || String(e));
         }
     },
+    // Логи ресурса И группы логов. Чтение — внутренним API (REST для групп +
+    // gRPC для записей), а группы у облака целиком REST-овые, поэтому их
+    // создаёт/правит/удаляет тот же инструмент: без лог-группы некуда направить
+    // ни журнал балансировщика (ycAlb logGroup), ни ревизию контейнера. Изменять
+    // даёт только при включённых разрешениях облака — как у остальных ресурсов.
     "ycLogs": async (args, settings) => {
         const cfg = ycConfig(loadSettings());
-        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → Yandex Cloud.";
+        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
         if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud.";
+        // Действия зовутся в camelCase (createGroup), а модель присылает их как
+        // угодно — сверяем без учёта регистра, а в ответе называем канонично.
+        const raw = String(args.action || "logs").trim();
+        const ALL = ["logs", "groups", "group", "createGroup", "updateGroup", "deleteGroup"];
+        const action = ALL.find((x) => x.toLowerCase() === raw.toLowerCase()) || "";
+        if (!action) {
+          return "Ошибка: неизвестное действие ycLogs «" + raw + "». Доступно: " + ALL.join(", ") + ".";
+        }
+        if (action === "createGroup" && !cfg.allowCreate) {
+          return "⛔ Создавать лог-группы агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту создавать ресурсы». Посмотреть, что уже есть: ycLogs { action: \"groups\" }.";
+        }
+        if (action === "updateGroup" && !cfg.allowUpdate) {
+          return "⛔ Править лог-группы агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту менять ресурсы». Посмотреть: ycLogs { action: \"groups\" }.";
+        }
+        if (action === "deleteGroup" && !cfg.allowDelete) {
+          return "⛔ Удалять лог-группы агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту удалять ресурсы». Посмотреть: ycLogs { action: \"groups\" }.";
+        }
+        // ── Группы логов ────────────────────────────────────────────────────
+        if (action !== "logs") {
+          try {
+            const base = (await yandexCloud.endpoint("logging")) || "https://logging.api.cloud.yandex.net";
+            const iam = await yandexCloud.getIamToken(cfg.oauth);
+            const groups = await ycLogs.listLogGroups(iam, base, cfg.folderId);
+            if (action === "groups") {
+              if (!groups.length) {
+                return "Лог-групп в каталоге «" + (cfg.folderName || cfg.folderId) + "» нет. Создать: ycLogs { action: \"createGroup\", name: \"app-logs\" } — она нужна, чтобы собирать логи ревизий контейнера и разбор запросов балансировщика (ycAlb logGroup).";
+              }
+              return "Лог-группы каталога «" + (cfg.folderName || cfg.folderId) + "» (" + groups.length + "):\n" +
+                groups.map((g) => ycLogs.logGroupLine(g)).join("\n") +
+                "\n\nПодробнее: ycLogs { action: \"group\", group: \"имя-или-id\" }.";
+            }
+            // Создание стоит ДО поиска группы: у новой группы ещё нет записи в
+            // каталоге, и поиск по имени отбил бы создание «не нашёл».
+            if (action === "createGroup") {
+              const name = String(args.name || "").trim();
+              if (!name) return "Ошибка: укажи name — имя новой лог-группы, например app-logs.";
+              const op = await ycLogs.createLogGroup(iam, base, {
+                folderId: cfg.folderId,
+                name: name,
+                description: args.description,
+                labels: ycJsonArg(args.labels),
+                retentionPeriod: args.retention != null ? args.retention : args.retentionPeriod,
+                dataStream: args.dataStream,
+              });
+              const done = await yandexCloud.waitOperation(cfg.oauth, op && op.id, 120000);
+              const made = (done && done.response) || {};
+              return "✅ Лог-группа создана: " + (made.name || name) + " (" + (made.id || "id — в консоли") + ")\n" +
+                "Хранение: " + (made.retentionPeriod || "без срока") + "\n" +
+                "Дальше: направь в неё журнал балансировщика — ycAlb { action: \"lbupdate\", logGroup: \"" + (made.name || name) + "\" } — или ревизию контейнера.";
+            }
+            const ref = String(args.group || args.logGroupId || args.name || "").trim();
+            const found = ref ? groups.find((g) => g.id === ref) || groups.find((g) => g.name === ref) : groups.length === 1 ? groups[0] : null;
+            if (!found) {
+              return "Не нашёл лог-группу «" + ref + "»." + (ref ? "" : " Групп несколько — укажи group.") + "\nВ каталоге: " + groups.map((g) => g.name + " (" + g.id + ")").join(", ");
+            }
+            const who = "Лог-группа «" + found.name + "» (" + found.id + ")";
+            if (action === "group") {
+              const g = await ycLogs.getLogGroup(iam, base, found.id);
+              return ycLogs.logGroupLine(g) + "\n" +
+                "Описание: " + (g.description || "—") + "\n" +
+                "Метки: " + (Object.keys(g.labels).length ? JSON.stringify(g.labels) : "нет") + "\n" +
+                "Хранение: " + (g.retentionPeriod || "без срока") + (g.dataStream ? " · поток данных: " + g.dataStream : "") + "\n" +
+                "Создана: " + (g.createdAt || "—");
+            }
+            if (action === "updateGroup") {
+              const labels = args.labels != null ? ycJsonArg(args.labels) : undefined;
+              const op = await ycLogs.updateLogGroup(iam, base, found.id, {
+                name: args.newName,
+                description: args.description,
+                retentionPeriod: args.retention != null ? args.retention : args.retentionPeriod,
+                dataStream: args.dataStream,
+                labels: labels,
+              });
+              await yandexCloud.waitOperation(cfg.oauth, op && op.id, 120000);
+              const g = await ycLogs.getLogGroup(iam, base, found.id);
+              return "✅ Лог-группа изменена: " + who + "\n" + ycLogs.logGroupLine(g);
+            }
+            const op = await ycLogs.deleteLogGroup(iam, base, found.id);
+            await yandexCloud.waitOperation(cfg.oauth, op && op.id, 120000);
+            return "🗑 Лог-группа удалена: " + who + "\nЛоги, что в неё собирались, дальше не сохраняются. Осталось: ycLogs { action: \"groups\" }.";
+          } catch (e) {
+            return "Логи (ycLogs, action=" + action + "): " + ((e && e.message) || String(e));
+          }
+        }
         const id = String(args.id || args.resourceId || "").trim();
-        if (!id) return "Ошибка: укажи id ресурса (виден в ycList).";
+        if (!id) return "Ошибка: укажи id ресурса (виден в ycList) — или действие по лог-группам: action: groups / group / createGroup / updateGroup / deleteGroup.";
         try {
           return await readYcLogsText(cfg, String(args.service || "").trim(), id, args);
         } catch (e) {
           return "Логи (" + (args.service || "ресурс") + "): " + ((e && e.message) || String(e));
+        }
+    },
+    // API Gateway. Шлюз — «вход» в приложение: он принимает запросы по адресу
+    // `<id>.apigw.yandexcloud.net`, разбирает их по OpenAPI-спецификации и уводит
+    // в интеграции (dummy, cloud-functions, container, object-storage). Раньше
+    // шлюз был виден только плиткой-списком: создать ИЗ СПЕЦИФИКАЦИИ, показать её,
+    // поправить и удалить было нечем. Изменяющие действия идут только при
+    // включённых разрешениях облака — как у остальных ресурсов.
+    "ycApiGw": async (args, settings) => {
+        const cfg = ycConfig(loadSettings());
+        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
+        if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud.";
+        const raw = String(args.action || "list").trim();
+        const ALL = ["list", "gateway", "spec", "create", "update", "delete"];
+        const action = ALL.find((x) => x.toLowerCase() === raw.toLowerCase()) || "";
+        if (!action) {
+          return "Ошибка: неизвестное действие ycApiGw «" + raw + "». Доступно: " + ALL.join(", ") + ".";
+        }
+        if (action === "create" && !cfg.allowCreate) {
+          return "⛔ Создавать API-шлюзы агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту создавать ресурсы». Посмотреть, что уже есть: ycApiGw { action: \"list\" }.";
+        }
+        if (action === "update" && !cfg.allowUpdate) {
+          return "⛔ Править API-шлюзы агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту менять ресурсы». Посмотреть: ycApiGw { action: \"list\" }.";
+        }
+        if (action === "delete" && !cfg.allowDelete) {
+          return "⛔ Удалять API-шлюзы агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту удалять ресурсы». Посмотреть: ycApiGw { action: \"list\" }.";
+        }
+        try {
+          const base = (await yandexCloud.endpoint("serverless-apigateway")) || ycApiGw.APIGW_FALLBACK;
+          const iam = await yandexCloud.getIamToken(cfg.oauth);
+          const gateways = await ycApiGw.listGateways(iam, base, cfg.folderId);
+          if (action === "list") {
+            if (!gateways.length) {
+              return "API-шлюзов в каталоге «" + (cfg.folderName || cfg.folderId) + "» нет. Создать: ycApiGw { action: \"create\", name: \"my-api\", spec: \"<OpenAPI>\" } — спецификация обязательна, без неё шлюз нечего обслуживать.";
+            }
+            return "API-шлюзы каталога «" + (cfg.folderName || cfg.folderId) + "» (" + gateways.length + "):\n" +
+              gateways.map((g) => ycApiGw.gatewayLine(g)).join("\n") +
+              "\n\nПодробнее: ycApiGw { action: \"gateway\", gateway: \"имя-или-id\" }. Спецификация: ycApiGw { action: \"spec\", gateway: \"имя-или-id\" }.";
+          }
+          // Создание стоит ДО поиска: у нового шлюза ещё нет записи в каталоге.
+          if (action === "create") {
+            const name = String(args.name || "").trim();
+            if (!name) return "Ошибка: укажи name — имя API-шлюза, например my-api.";
+            const spec = args.spec != null ? args.spec : args.openapiSpec;
+            const op = await ycApiGw.createGateway(iam, base, {
+              folderId: cfg.folderId,
+              name: name,
+              spec: spec,
+              description: args.description,
+              labels: ycJsonArg(args.labels),
+              executionTimeout: args.executionTimeout,
+            });
+            const done = await yandexCloud.waitOperation(cfg.oauth, op && op.id, 180000);
+            const made = (done && done.response) || {};
+            const brief = ycApiGw.specBrief(spec);
+            return "✅ API-шлюз создан: " + (made.name || name) + " (" + (made.id || "id — в списке") + ")\n" +
+              (made.domain ? "Адрес по умолчанию: https://" + made.domain + "\n" : "Адрес появится через несколько секунд — обнови список.\n") +
+              "Путей в спецификации: " + brief.pathCount + (brief.integrations ? " · интеграций: " + brief.integrations : "") + "\n" +
+              "Дальше: покажи её через ycApiGw { action: \"spec\", gateway: \"" + (made.name || name) + "\" } или правь спецификацию действием update.";
+          }
+          const ref = String(args.gateway || args.apiGatewayId || args.id || args.name || "").trim();
+          const found = ycApiGw.matchGateway(gateways, ref);
+          if (!found) {
+            return "Не нашёл API-шлюз «" + ref + "»." + (ref ? "" : " Шлюзов несколько — укажи gateway.") + "\nВ каталоге: " + gateways.map((g) => g.name + " (" + g.id + ")").join(", ");
+          }
+          const who = "API-шлюз «" + found.name + "» (" + found.id + ")";
+          if (action === "gateway") {
+            const g = await ycApiGw.getGateway(iam, base, found.id);
+            return ycApiGw.gatewayLine(g) + "\n" +
+              "Адрес: " + (g.url || "—") + "\n" +
+              "Описание: " + (g.description || "—") + "\n" +
+              "Время выполнения: " + (g.executionTimeout || "по умолчанию") + "\n" +
+              "Группа логов: " + (g.logGroupId || "—") + "\n" +
+              "Создан: " + (g.createdAt || "—");
+          }
+          if (action === "spec") {
+            const s = await ycApiGw.getSpec(iam, base, found.id, args.format);
+            const brief = ycApiGw.specBrief(s.openapiSpec);
+            return "Спецификация «" + found.name + "» (" + (brief.format || "—") + ", путей " + brief.pathCount + "):\n" +
+              s.openapiSpec;
+          }
+          if (action === "update") {
+            const spec = args.spec != null ? args.spec : args.openapiSpec;
+            const op = await ycApiGw.updateGateway(iam, base, found.id, {
+              name: args.newName,
+              description: args.description,
+              labels: args.labels != null ? ycJsonArg(args.labels) : undefined,
+              spec: spec,
+              executionTimeout: args.executionTimeout,
+            });
+            await yandexCloud.waitOperation(cfg.oauth, op && op.id, 180000);
+            const g = await ycApiGw.getGateway(iam, base, found.id);
+            return "✅ API-шлюз изменён: " + who + "\n" + ycApiGw.gatewayLine(g);
+          }
+          const op = await ycApiGw.deleteGateway(iam, base, found.id);
+          await yandexCloud.waitOperation(cfg.oauth, op && op.id, 120000);
+          return "🗑 API-шлюз удалён: " + who + "\n" + (found.url || "Его адрес") + " больше не отвечает. Осталось: ycApiGw { action: \"list\" }.";
+        } catch (e) {
+          return "API-шлюз (ycApiGw, action=" + action + "): " + ((e && e.message) || String(e));
         }
     },
     "ycInstall": async (args, settings) => {
@@ -1801,9 +1994,23 @@ function createCloudTools(deps) {
         if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
         if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud.";
         const action = String(args.action || "tables").trim().toLowerCase();
-        const known = ["tables", "create", "describe", "put", "get", "scan", "delete", "drop"];
+        const known = ["tables", "create", "describe", "put", "get", "scan", "delete", "drop", "query"];
         if (known.indexOf(action) === -1) {
-          return "Ошибка: неизвестное действие ycDb «" + action + "». Доступно: tables, create, describe, put, get, scan, delete, drop.";
+          return "Ошибка: неизвестное действие ycDb «" + action + "». Доступно: tables, create, describe, put, get, scan, delete, drop, query.";
+        }
+        // YQL (action query) — вторая половина YDB: настоящие колонки и SELECT,
+        // а не документные таблицы. Опасные запросы — это удаление, остальные
+        // изменяющие — создание: разрешения те же, что у прочих ресурсов.
+        if (action === "query") {
+          const text = String(args.query || args.sql || "").trim();
+          if (!text) return "Ошибка: пустой запрос. Напиши текст на YQL, например SELECT * FROM pets LIMIT 10.";
+          const kind = ycDbApi.queryKind(text);
+          if (kind === "destructive" && !cfg.allowDelete) {
+            return "⛔ Выполнять необратимые запросы (DROP / DELETE / ALTER / TRUNCATE) агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту удалять ресурсы». Показать данные можно и так: ycDb { action: \"query\", query: \"SELECT …\" }.";
+          }
+          if (kind === "write" && !cfg.allowCreate) {
+            return "⛔ Создавать и менять данные запросом агенту ЗАПРЕЩЕНО. Скажи пользователю включить чекбокс «Разрешить агенту создавать ресурсы». Прочитать данные можно и так: ycDb { action: \"query\", query: \"SELECT …\" }.";
+          }
         }
         // Наполнять базу данными — это создание, стирать — удаление: разрешения
         // те же и называются так же, как у остальных ресурсов каталога.
@@ -1832,7 +2039,21 @@ function createCloudTools(deps) {
               return who + "\n\nТаблиц нет — база пустая. Создать: ycDb { action: \"create\", table: \"pets\", keys: { \"species\": \"S\", \"name\": \"S\" } } (первый ключ — ключ поиска, остальные — сортировки).";
             }
             return who + "\n\nТаблицы (" + r.tables.length + "):\n" + r.tables.map((t) => "• " + t).join("\n") +
-              "\n\nЗаписи: ycDb { action: \"scan\", table: \"…\" }. Одна запись: action \"get\" с key. Структура таблицы: action \"describe\".";
+              "\n\nЗаписи: ycDb { action: \"scan\", table: \"…\" }. Одна запись: action \"get\" с key. Структура таблицы: action \"describe\". Таблицы с колонками и любые SQL-запросы — action \"query\".";
+          }
+
+          // YQL: обычные таблицы и любые запросы. Здесь живут настоящие колонки
+          // (CREATE TABLE … (id Uint64, …)) — их в Document API не создать.
+          if (action === "query") {
+            const text = String(args.query || args.sql || "").trim();
+            const r = await ycDbApi.yql(cfg.oauth, db, { query: text });
+            const rows = ycDbApi.formatSets(r.sets, { maxRows: args.maxRows || 50 });
+            return (
+              "YQL на базе «" + (db.name || db.id) + "»" +
+              (r.rowCount ? ": строк " + r.rowCount : " — выполнено (таблиц ответ не содержит)") + "\n" + who +
+              "\n\n" + (rows.length ? rows.join("\n") : "Запрос вернул пустой результат.") +
+              (r.issues && r.issues.length ? "\n\nЗамечания: " + r.issues.join("; ") : "")
+            );
           }
 
           if (!table) return "Ошибка: укажи table — имя таблицы (что уже есть: ycDb { action: \"tables\" }).";

@@ -64,6 +64,32 @@
     // Application Load Balancer (часть 91, заход 2): балансировщики, группы
     // целей, HTTP-роутеры и чтение групп бэкендов — один канал «yc:alb».
     alb: "ycAlb",
+    // Serverless-контейнеры (часть 91, заход 8): у сервиса уже был список,
+    // создание пустого контейнера и откат из карточки, а новая ревизия, тёплые
+    // экземпляры и публичный доступ — только у агента. Канал «yc:container»
+    // зовёт те же функции (src/yandex-cloud.js).
+    serverlessContainers: "ycContainer",
+    // База YDB (часть 91, заход 9): таблицы и записи через Document API. До этого
+    // у сервиса были только создание базы и ПРОСМОТР таблиц в карточке, а у
+    // плитки действий — ничего. Канал «yc:db» зовёт тот же экземпляр
+    // src/yc-db.js, что и агент (один кэш IAM-токена, одна ошибка сети).
+    ydb: "ycDb",
+    // Object Storage (часть 91, заход 10): файлы бакета. До этого объекты умел
+    // только агент (`ycStorage`), а карточка бакета — лишь показывать список и
+    // удалять по одному файлу. Канал «yc:storage» зовёт ту же S3-часть
+    // src/yandex-cloud.js, что и агент (IAM-токен БЕЗ подписи AWS, XML-ответы,
+    // предел одного запроса).
+    storage: "ycStorage",
+    // Группы логов (часть 91, заход 11): группа — это «куда собирать логи», и
+    // без неё ни ревизия контейнера, ни разбор запросов балансировщика некуда
+    // направить. Записи читаются по gRPC (канал yc:logs), а сами группы — обычный
+    // REST того же хоста: канал «yc:logGroups» зовёт тот же src/yc-logs.js.
+    logging: "ycLogGroups",
+    // API-шлюз (часть 91, заход 12): у сервиса была только плитка-список и
+    // общее создание пустого ресурса, а шлюз целиком задаётся OpenAPI-
+    // спецификацией. Канал «yc:apigw» зовёт тот же src/yc-apigw.js, что и агент:
+    // создать из спецификации, показать её, поправить и удалить.
+    apiGateway: "ycApiGw",
   };
 
   // Допустимые действия каждого канала. Сверяется с отказами в src/yc-ipc.js.
@@ -82,6 +108,11 @@
     dns: ["zones", "card", "records", "add", "delete"],
     instanceGroups: ["list", "card", "instances", "operations", "create", "start", "stop", "delete"],
     alb: ["list", "card", "targets", "routers", "backends", "health", "targetnew", "tgupdate", "targetadd", "targetremove", "targetdel", "routernew", "routerupd", "routerdel", "backnew", "backupd", "backdel", "listeneradd", "listenerupd", "listenerdel", "lbupdate", "lbnew", "lbstart", "lbstop", "lbdel"],
+    serverlessContainers: ["list", "card", "revisions", "revision", "newrev", "rollback", "update", "public", "private"],
+    ydb: ["list", "tables", "table", "create", "scan", "get", "put", "delete", "drop", "query"],
+    storage: ["list", "objects", "upload", "download", "delete", "url", "access", "public", "private"],
+    logging: ["list", "group", "create", "update", "delete"],
+    apiGateway: ["list", "gateway", "spec", "create", "update", "delete"],
   };
 
   const FAMILIES = {
@@ -106,6 +137,17 @@
     dns: { title: "DNS-зоны", ru: "запись" },
     instanceGroups: { title: "Группы машин", ru: "группа" },
     alb: { title: "Application Load Balancer", ru: "балансировщик" },
+    serverlessContainers: { title: "Serverless-контейнеры", ru: "контейнер" },
+    // «База», а не «таблица»: кнопка стоит на плитке «YDB», а таблиц внутри базы
+    // может быть много — спрашивают именно базу.
+    ydb: { title: "YDB", ru: "база" },
+    storage: { title: "Object Storage", ru: "бакет" },
+    // «Лог-группа», а не «лог»: плитка спрашивает про группу — место, куда
+    // собираются логи, а не про сами записи.
+    logging: { title: "Логи", ru: "лог-группа" },
+    // «Шлюз», а не «ресурс»: кнопка стоит на плитке «API-шлюз» и спрашивает
+    // про шлюз — тот, что отвечает на запросы по своему адресу.
+    apiGateway: { title: "API-шлюзы", ru: "шлюз" },
   };
 
   // Действия управляемой базы. Одна форма на три базы: набор полей у PostgreSQL,
@@ -163,6 +205,192 @@
   // Подсказки-варианты берутся у облака (наборы, подсети, зоны, языки). Не
   // пришли — поле остаётся обычным текстом: действие всё равно выполнимо.
   const from = (channel, op, pick, args) => ({ channel: channel, op: op, pick: pick, args: args || null });
+
+  // ── База YDB: таблицы и записи ──────────────────────────────────────────
+  // Таблицы умели агент и read-only карточка базы, а у плитки действий не было
+  // ни таблиц, ни записи, ни удаления. Работа идёт через Document API, и он
+  // диктует честную форму: «создать таблицу» спрашивает КЛЮЧ, а не колонки — в
+  // колонках документной таблицы живёт ровно ключ, остальные поля лежат в самих
+  // записях. Произвольные колонки (YQL-таблицы) — другой протокол, и кнопки,
+  // которая за него ничего не делает, здесь нет.
+  //
+  // «Удалить таблицу» и «Удалить запись» помечены опасными и спрашивают дважды
+  // (окно и канал): данные из окна вернуть нечем.
+  // ── Object Storage: файлы бакета ────────────────────────────────────────
+  // Бакет создаётся «для файлов и статики», а положить в него файл из окна было
+  // нечем: объекты умел только агент, а карточка — лишь показывать список и
+  // удалять по одному. Файл выбирает СИСТЕМНЫЙ диалог (его каналы — в
+  // src/cloud-files-ipc.js), а байты читает и кладёт канал тем же S3-кодом, что
+  // и агент: так у предела одного запроса одна копия.
+  // Платность честная: платят за ОБЪЁМ (ГБ·месяц), а не за штуку файлов,
+  // поэтому «Загрузить файл» помечено платным и говорит про объём, а не про
+  // выдуманную цену за файл. Открытие бакета и оба удаления необратимы (danger).
+  function storageActions() {
+    const needBucket = fld("bucket", "Бакет (имя или id)", {
+      required: true,
+      hint: "Имя из действия «Бакеты и их состояние»; подсказка подставит список.",
+      options: from("storage", "list", (r) => (r.buckets || []).map((b) => b.name)),
+    });
+    const needKey = fld("key", "Ключ в бакете (путь файла)", { required: true, placeholder: "site/index.html", hint: "Слеши делают «папки»: site/assets/app.js. Список — действием «Объекты бакета»." });
+    return [
+      { id: "list", ru: "Бакеты и их состояние", op: "list", view: "lines" },
+      { id: "objects", ru: "Объекты бакета", op: "objects", view: "lines", target: needBucket,
+        fields: [
+          fld("prefix", "Префикс (папка в бакете)", { placeholder: "site/" }),
+          fld("limit", "Сколько показать", { type: "number", value: "50" }),
+        ] },
+      { id: "upload", ru: "⬆ Загрузить файл", op: "upload", view: "lines", paid: true, confirmArg: "confirmed", target: needBucket,
+        fields: [
+          fld("file", "Файл на ПК", { type: "pick", required: true, pickApi: "pickCloudFile", fill: "key", hint: "Файл выбирается системным окном; его имя подставится в ключ бакета." }),
+          needKey,
+          fld("contentType", "Тип содержимого", { hint: "Пусто — определится по расширению. Для статики это важно: с неверным типом браузер скачает файл вместо того, чтобы показать." }),
+        ] },
+      { id: "download", ru: "⬇ Скачать объект", op: "download", view: "lines", target: needBucket,
+        fields: [
+          needKey,
+          fld("to", "Куда сохранить", { type: "pick", pickApi: "pickCloudSave", pickArgs: (v) => ({ name: v && v.key ? String(v.key).split("/").pop() : "" }), hint: "Пусто — файл ляжет в рабочую папку агента под именем объекта." }),
+        ] },
+      { id: "url", ru: "🔗 Ссылка на объект", op: "url", view: "lines", target: needBucket,
+        fields: [needKey] },
+      { id: "access", ru: "Публичный доступ бакета", op: "access", view: "lines", target: needBucket },
+      { id: "public", ru: "⚠ Открыть бакет для всех", op: "public", view: "lines", danger: true, confirmArg: "confirmed", target: needBucket },
+      { id: "private", ru: "🔒 Закрыть бакет", op: "private", view: "lines", target: needBucket },
+      { id: "delete", ru: "🗑 Удалить объект", op: "delete", view: "lines", danger: true, confirmArg: "confirmed", target: needBucket,
+        fields: [needKey] },
+    ];
+  }
+
+  // ── Группы логов Cloud Logging ────────────────────────────────────────────
+  // Группа логов — «куда собирать логи». До захода её можно было только
+  // ПОСМОТРЕТЬ списком на полке (сервис «Логи» уже был), а создать, переименовать
+  // или удалить — только в консоли облака. Между тем без неё ни ревизия
+  // контейнера, ни разбор запросов балансировщика некуда направить. Формы
+  // честные: срок хранения — в часах (пусто/0 — без срока), метки — JSON, а
+  // удаление необратимо и спрашивает подтверждение ДВАЖДЫ (окно и канал).
+  function loggingActions() {
+    const needGroup = fld("group", "Лог-группа (имя или id)", {
+      required: true,
+      hint: "Имя из действия «Лог-группы и их состояние»; подсказка подставит список.",
+      options: from("logging", "list", (r) => (r.groups || []).map((g) => g.name)),
+    });
+    return [
+      { id: "list", ru: "Лог-группы и их состояние", op: "list", view: "lines" },
+      { id: "group", ru: "Подробности лог-группы", op: "group", view: "lines", target: needGroup },
+      { id: "create", ru: "＋ Создать лог-группу", op: "create", view: "lines",
+        fields: [
+          fld("name", "Имя лог-группы", { required: true, placeholder: "app-logs", hint: "Строчная латиница, цифры и дефис, 2–63 символа; имя уникально в каталоге." }),
+          fld("description", "Описание", { hint: "До 256 символов. Для чего группа — это единственная память о замысле." }),
+          fld("retention", "Хранение, часов", { type: "number", hint: "Пусто или 0 — без срока. Хранение логов платное за объём." }),
+          fld("dataStream", "Поток данных", { hint: "Необязательное имя потока (до 512 символов) для выгрузки в Data Streams." }),
+          fld("labels", "Метки (JSON)", { type: "textarea", placeholder: '{"env":"prod"}', hint: "Ключ — строчная латиница/цифры/дефис, значение — до 64 символов." }),
+        ] },
+      { id: "update", ru: "✎ Править лог-группу", op: "update", view: "lines", target: needGroup,
+        fields: [
+          fld("newName", "Новое имя", { hint: "Пусто — имя не меняется." }),
+          fld("description", "Описание", { hint: "Пусто — не меняется." }),
+          fld("retention", "Хранение, часов", { type: "number", hint: "Пусто — не меняется; 0 — без срока." }),
+          fld("dataStream", "Поток данных", { hint: "Пусто — не меняется." }),
+          fld("labels", "Метки (JSON)", { type: "textarea", placeholder: '{"env":"prod"}', hint: "Пусто — метки не меняются." }),
+        ] },
+      { id: "delete", ru: "🗑 Удалить лог-группу", op: "delete", view: "lines", danger: true, confirmArg: "confirmed", target: needGroup },
+    ];
+  }
+
+  // ── API-шлюз (API Gateway) ────────────────────────────────────────────────
+  // Шлюз целиком задаётся OpenAPI-спецификацией: её и спрашиваем при создании.
+  // «Посмотреть спецификацию» — отдельное действие: источников у шлюза нет
+  // отдельным полем, всё живёт в тексте (интеграции x-yc-apigateway-integration).
+  // Правка уходит МАСКОЙ (меняется только то, что заполнено), а удаление
+  // необратимо: адрес <id>.apigw.yandexcloud.net перестанет отвечать — поэтому
+  // оно опасное и спрашивает подтверждение дважды (окно и канал).
+  function apigwActions() {
+    const needGw = fld("gateway", "Шлюз (имя, id или адрес)", {
+      required: true,
+      hint: "Имя из действия «API-шлюзы и их состояние»; подсказка подставит список.",
+      options: from("apiGateway", "list", (r) => (r.gateways || []).map((g) => g.name)),
+    });
+    const specField = (label) =>
+      fld("spec", label, {
+        type: "textarea",
+        placeholder: "openapi: 3.0.0\ninfo:\n  title: my-api\npaths:\n  /hello:\n    get:\n      x-yc-apigateway-integration:\n        type: dummy",
+        hint: "Текст OpenAPI (JSON или YAML). Куда уводить запрос, говорит интеграция x-yc-apigateway-integration внутри метода: dummy — ответ без ресурсов, cloud-functions — функция, container — контейнер, object-storage — файл бакета.",
+      });
+    return [
+      { id: "list", ru: "API-шлюзы и их состояние", op: "list", view: "lines" },
+      { id: "gateway", ru: "Подробности шлюза", op: "gateway", view: "lines", target: needGw },
+      { id: "spec", ru: "Спецификация шлюза", op: "spec", view: "lines", target: needGw,
+        fields: [fld("format", "Формат (YAML или JSON)", { hint: "Пусто — тот формат, в котором спецификацию задали." })] },
+      { id: "create", ru: "＋ Создать шлюз из спецификации", op: "create", view: "lines",
+        fields: [
+          fld("name", "Имя шлюза", { required: true, placeholder: "my-api", hint: "Строчная латиница, цифры и дефис, 2–63 символа; имя уникально в каталоге." }),
+          Object.assign(specField("OpenAPI-спецификация"), { required: true }),
+          fld("description", "Описание", { hint: "До 256 символов. Для чего шлюз — это единственная память о замысле." }),
+          fld("executionTimeout", "Время выполнения, секунд", { type: "number", hint: "Пусто — по умолчанию. Сколько максимум может считаться один вызов." }),
+          fld("labels", "Метки (JSON)", { type: "textarea", placeholder: '{"env":"prod"}', hint: "Ключ — строчная латиница/цифры/дефис, значение — до 64 символов." }),
+        ] },
+      { id: "update", ru: "✎ Править шлюз", op: "update", view: "lines", target: needGw,
+        fields: [
+          fld("newName", "Новое имя", { hint: "Пусто — имя не меняется." }),
+          fld("description", "Описание", { hint: "Пусто — не меняется." }),
+          specField("Новая спецификация (пусто — не меняется)"),
+          fld("executionTimeout", "Время выполнения, секунд", { type: "number", hint: "Пусто — не меняется." }),
+          fld("labels", "Метки (JSON)", { type: "textarea", placeholder: '{"env":"prod"}', hint: "Метки ЗАМЕНЯЮТСЯ целиком: пусто — не меняются." }),
+        ] },
+      { id: "delete", ru: "🗑 Удалить шлюз", op: "delete", view: "lines", danger: true, confirmArg: "confirmed", target: needGw },
+    ];
+  }
+
+  // «Опасный» YQL-запрос определяем по ПЕРВОМУ слову каждого оператора (до «;») —
+  // так SELECT с колонкой delete не пугает, а «SELECT 1; DROP TABLE x» — да. Это
+  // ТОЛЬКО предварительный вопрос окна; канал (src/yc-yql.js) проверяет то же САМ
+  // и отвечает needsConfirm — канал зовут не только кнопкой.
+  function isDangerousQuery(text) {
+    const kw = String(text || "")
+      .replace(/\/\*[\s\S]*?\*\//g, " ")
+      .replace(/--[^\n]*/g, " ")
+      .split(";")
+      .map((p) => ((/[A-Za-z]+/.exec(p) || [""])[0] + "").toUpperCase());
+    return kw.some((k) => k === "DROP" || k === "TRUNCATE" || k === "ALTER" || k === "DELETE");
+  }
+
+  function ydbActions() {
+    const needDb = fld("database", "База (имя или id)", {
+      hint: "Пусто — единственная база каталога; если баз несколько, выбери тут.",
+      options: from("ydb", "list", (r) => (r.databases || []).map((d) => d.name)),
+    });
+    const needTable = fld("table", "Таблица", { required: true, hint: "Имя таблицы — список в действии «Таблицы базы»." });
+    return [
+      { id: "list", ru: "Базы YDB и их состояние", op: "list", view: "lines" },
+      { id: "tables", ru: "Таблицы базы", op: "tables", view: "lines", target: needDb },
+      { id: "table", ru: "Структура таблицы (ключ и размер)", op: "table", view: "lines", target: needDb,
+        fields: [needTable] },
+      { id: "create", ru: "＋ Создать таблицу", op: "create", view: "lines", target: needDb,
+        fields: [
+          needTable,
+          fld("keys", "Поля первичного ключа (JSON)", { type: "textarea", required: true, placeholder: '{"id":"S"}', hint: "Первый ключ — ключ поиска (HASH), остальные — сортировки (RANGE). Тип: S — строка, N — число, B — байты. В колонках таблицы живёт только ключ." }),
+        ] },
+      { id: "scan", ru: "Записи таблицы", op: "scan", view: "lines", target: needDb,
+        fields: [needTable, fld("limit", "Сколько записей", { type: "number", value: "20" })] },
+      { id: "get", ru: "Прочитать запись по ключу", op: "get", view: "lines", target: needDb,
+        fields: [needTable, fld("key", "Поля ключа (JSON)", { type: "textarea", required: true, placeholder: '{"id":"1"}', hint: "Значения полей первичного ключа — ключ виден в действии «Структура таблицы»." })] },
+      { id: "put", ru: "↑ Положить запись", op: "put", view: "lines", target: needDb,
+        fields: [needTable, fld("item", "Запись (JSON)", { type: "textarea", required: true, placeholder: '{"id":"1","name":"Tom","price":10.5}', hint: "Запись кладётся целиком: прежние поля такой же записи заменяются этим набором. Поля ключа в ней обязательны." })] },
+      { id: "delete", ru: "🗑 Удалить запись", op: "delete", view: "lines", danger: true, confirmArg: "confirmed", target: needDb,
+        fields: [needTable, fld("key", "Поля ключа (JSON)", { type: "textarea", required: true, placeholder: '{"id":"1"}' })] },
+      { id: "drop", ru: "🗑 Удалить таблицу (вместе с записями)", op: "drop", view: "lines", danger: true, confirmArg: "confirmed", target: needDb,
+        fields: [needTable] },
+      // YQL — вторая половина YDB: в Document API выше в колонках живёт только
+      // ключ, а настоящие колонки и SELECT — это YQL по gRPC (src/yc-yql.js).
+      // Помечено опасным (вдруг запрос необратим) и спрашивает подтверждение
+      // ПО ТЕКСТУ запроса: SELECT проходит без вопроса, DROP — с ним.
+      { id: "query", ru: "Выполнить запрос YQL (SQL)", op: "query", view: "lines", danger: true, confirmArg: "confirmed",
+        dangerIf: (v) => isDangerousQuery(v && v.query), target: needDb,
+        fields: [
+          fld("query", "Запрос YQL", { type: "textarea", required: true, placeholder: "SELECT * FROM pets LIMIT 10", hint: "YQL — язык YDB (тот же, что в консоли облака). Здесь настоящие колонки и таблицы: CREATE TABLE pets (id Uint64, name Utf8, PRIMARY KEY (id)). Опасные запросы (DROP, DELETE, ALTER, TRUNCATE) спросят подтверждение." }),
+          fld("maxRows", "Сколько строк показать", { type: "number", value: "50" }),
+        ] },
+    ];
+  }
 
   const ACTIONS = {
     // ── Виртуальные машины ──
@@ -650,6 +878,57 @@
       { id: "lbdel", ru: "🗑 Удалить балансировщик", op: "lbdel", view: "lines", danger: true, confirmArg: "confirm", target: target("Балансировщик (имя или id)", "lb") },
     ],
 
+    // ── Serverless-контейнеры ──
+    // Контейнер — это образ с настройками, то есть РЕВИЗИЯ. Имя и описание живут
+    // на самом контейнере, а образ, переменные окружения и ресурсы — только в
+    // ревизии. Поэтому «правка» и «новая ревизия» здесь разные действия, как в
+    // консоли облака. Платность честная: сама ревизия бесплатна, платят за
+    // вызовы и за ТЁПЛЫЕ экземпляры (minInstances > 0) — о них предупреждает
+    // поле и ответ, а не ложная пометка «платно» на всей выкатке.
+    serverlessContainers: [
+      { id: "list", ru: "Контейнеры и их состояние", op: "list", view: "lines" },
+      { id: "card", ru: "Карточка: активная ревизия и настройки", op: "card", view: "lines", target: target("Контейнер (имя или id)", "container") },
+      { id: "revisions", ru: "Ревизии (образ и ресурсы)", op: "revisions", view: "lines", target: target("Контейнер (имя или id)", "container") },
+      { id: "revision", ru: "Одна ревизия подробно", op: "revision", view: "lines", target: target("Контейнер (имя или id)", "container"),
+        fields: [fld("revisionId", "Id ревизии", { required: true })] },
+      { id: "newrev", ru: "↑ Новая ревизия (образ, переменные, ресурсы)", op: "newrev", view: "lines", target: target("Контейнер (имя или id)", "container"),
+        fields: [
+          fld("image", "Образ", { required: true, placeholder: "cr.yandex/<registry-id>/<image>:latest", hint: "Образ лежит в Container Registry (плитка «Реестр образов»)." }),
+          fld("env", "Переменные окружения (JSON)", { type: "textarea", placeholder: '{"KEY":"value","PORT":"8080"}', hint: "Добавляются к переменным активной ревизии. Пусто — остаются как были." }),
+          fld("memoryMb", "Память, МБ", { type: "number", value: "256" }),
+          fld("cores", "Ядра", { type: "number", value: "1" }),
+          fld("timeoutSec", "Таймаут, с", { type: "number", value: "30" }),
+          fld("minInstances", "Тёплых экземпляров (minInstances)", { type: "number", value: "0", hint: "0 — контейнер запускается только под запрос. Больше нуля — платные экземпляры, которые держат контейнер готовым всегда." }),
+          fld("networkId", "Сеть (id сети VPC)", { hint: "Без сети контейнер не видит ни VPC, ни управляемые базы. Пусто — как у активной ревизии." }),
+          fld("serviceAccountId", "Сервисный аккаунт (id)", { hint: "Нужен для доступа к секретам Lockbox и облачным сервисам." }),
+          fld("runtime", "Режим запуска", { type: "select", options: ["http", "task"], value: "http", hint: "http — внутри контейнера HTTP-сервер; task — процесс запускается на каждый запрос." }),
+          fld("logGroupId", "Лог-группа (id)", { hint: "Пусто — логи каталога по умолчанию." }),
+          fld("description", "Описание ревизии"),
+        ] },
+      { id: "rollback", ru: "↩ Сделать ревизию активной (откат)", op: "rollback", view: "lines", target: target("Контейнер (имя или id)", "container"),
+        fields: [fld("revisionId", "Id ревизии", { required: true, hint: "Список и id — действием «Ревизии»." })] },
+      { id: "update", ru: "Переименовать / описание", op: "update", view: "lines", target: target("Контейнер (имя или id)", "container"),
+        fields: [fld("newName", "Новое имя"), fld("description", "Описание")] },
+      { id: "public", ru: "⚠ Открыть всему интернету", op: "public", view: "lines", danger: true, target: target("Контейнер (имя или id)", "container") },
+      { id: "private", ru: "🔒 Закрыть от интернета", op: "private", view: "lines", target: target("Контейнер (имя или id)", "container") },
+    ],
+
+    // ── База YDB: таблицы и записи ──
+    // Действия собираются функцией: ключ, запись и ключ поиска повторяются в
+    // шести действиях, и одна копия на всех — единственный способ не разойтись.
+    ydb: ydbActions(),
+
+    // ── Object Storage: файлы бакета ──
+    // Действия собираются функцией: бакет и ключ повторяются почти в каждом —
+    // одна копия на всех, чтобы подписи и подсказки не разошлись.
+    storage: storageActions(),
+
+    // ── Группы логов Cloud Logging ──
+    logging: loggingActions(),
+
+    // ── API-шлюз (API Gateway) ──
+    apiGateway: apigwActions(),
+
     // ── Managed-базы: PostgreSQL, MySQL и ClickHouse ──
     // Три семейства в трёх плитках, но один канал и одна форма: набор действий
     // у баз одинаков (список, классы, карточка, создание, хосты, базы,
@@ -1007,6 +1286,9 @@
       } else {
         input = el("input", "yc-act-input");
         input.type = f.type === "number" ? "text" : "text";
+        // Поле-файл: путь выбирает системное окно, руками его не печатают —
+        // иначе опечатка в пути выглядела бы как «файла нет» в облаке.
+        if (f.type === "pick") input.readOnly = true;
       }
       if (f.type === "check") {
         input.checked = f.value === true;
@@ -1019,6 +1301,7 @@
         if (action.target && f.key === action.target.key && state.target) input.value = state.target;
         else if (f.value != null) input.value = String(f.value);
         row.appendChild(input);
+        if (f.type === "pick") row.appendChild(pickButton(f, inputs, input));
       }
       if (f.hint) row.appendChild(el("span", "yc-act-hint", f.hint));
       form.appendChild(row);
@@ -1049,7 +1332,7 @@
     }
 
     const actionsRow = el("div", "yc-act-actionsrow");
-    const run = el("button", "btn btn-primary btn-small", action.danger ? "Выполнить (спросит подтверждение)" : "Выполнить");
+    const run = el("button", "btn btn-primary btn-small", action.danger && !action.dangerIf ? "Выполнить (спросит подтверждение)" : "Выполнить");
     run.type = "button";
     run.onclick = () => {
       const values = {};
@@ -1063,7 +1346,10 @@
         return;
       }
       state.values = values;
-      if (action.danger) {
+      // `dangerIf` уточняет пометку по САМОМУ запросу: кнопка одна, а опасность
+      // зависит от текста (SELECT — нет, DROP — да). Канал всё равно проверит сам.
+      const dangerNow = typeof action.dangerIf === "function" ? !!action.dangerIf(values) : !!action.danger;
+      if (dangerNow) {
         askConfirm("Подтверди действие", action.ru + (state.target ? " («" + state.target + "»)" : "") + ": отменить это будет нельзя.", () => runAction(false), true);
       } else {
         runAction(false);
@@ -1084,6 +1370,45 @@
 
     const first = form.querySelector("input, select, textarea");
     if (first && first.focus) first.focus();
+  }
+
+  // Кнопка «Выбрать…» рядом с полем-файлом. Открывает системное окно (его каналы
+  // живут в src/cloud-files-ipc.js) и кладёт выбранный путь в поле. Выбранное имя
+  // подставляется ещё и в поле, названное `fill` (обычно это ключ бакета):
+  // печатать имя файла второй раз незачем. Отмена ничего не меняет.
+  function pickButton(f, inputs, input) {
+    const btn = el("button", "btn btn-ghost btn-small yc-act-pick", "Выбрать…");
+    btn.type = "button";
+    btn.onclick = () => {
+      const api = window.api;
+      const name = String(f.pickApi || "");
+      if (!api || typeof api[name] !== "function") {
+        say("Выбор файла доступен в приложении на ПК (desktop).");
+        return;
+      }
+      const values = {};
+      for (const k of Object.keys(inputs)) {
+        const inp = inputs[k];
+        values[k] = inp.type === "checkbox" ? !!inp.checked : inp.value;
+      }
+      const args = typeof f.pickArgs === "function" ? f.pickArgs(values) || {} : f.pickArgs || {};
+      btn.disabled = true;
+      Promise.resolve(api[name](args))
+        .then((r) => {
+          btn.disabled = false;
+          if (typeof r === "string") {
+            say("❌ " + r);
+            return;
+          }
+          if (!r || !r.path) return; // отмена диалога — ничего не меняется
+          input.value = r.path;
+          if (f.fill && inputs[f.fill]) inputs[f.fill].value = r.name || "";
+        })
+        .catch(() => {
+          btn.disabled = false;
+        });
+    };
+    return btn;
   }
 
   function startAction(id) {
@@ -1222,6 +1547,8 @@
     forService: (service) => (ACTIONS[service] || []).map((a) => a.id),
     actionsFor: (service) => (ACTIONS[service] || []).slice(),
     channels: () => Object.keys(CHANNELS).map((k) => CHANNELS[k]),
+    // Классификация YQL-запроса — точки для проверок (та же, что у канала).
+    isDangerousQuery: isDangerousQuery,
     request: request,
     summarize: summarize,
     open: open,

@@ -1632,7 +1632,7 @@ const section = (src, channel) => {
     const table = ycConsole.buildTable("alb", "targets", [{ name: "web-targets", targetCount: 2, age: "1 дн" }], Date.now());
     assert.deepStrictEqual(table.columns.map((c) => c.key), ["name", "targetCount", "age"], "колонки групп целей: " + table.columns.map((c) => c.key).join(", "));
     assert.ok(SMOKE_SRC.indexOf('"yc:alb"') > 0, "сторож smoke не знает канал yc:alb");
-    assert.ok(/каналов в мосте должно быть 33/.test(SMOKE_SRC), "сторож каналов не пересчитан");
+    assert.ok(/каналов в мосте должно быть 38/.test(SMOKE_SRC), "сторож каналов не пересчитан");
     assert.ok(SMOKE_SRC.indexOf('"ycAlb"') > 0, "сторож smoke не знает инструмент ycAlb");
   });
 
