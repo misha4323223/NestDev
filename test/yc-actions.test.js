@@ -130,6 +130,12 @@ const FAMILY_CHANNEL = {
   // API-шлюз: свой канал («yc:apigw»), потому что шлюз целиком задаётся
   // OpenAPI-спецификацией, а изменяющие методы возвращают OPERATION.
   apiGateway: "yc:apigw",
+  // Lockbox (часть 91, заход 14): у сервиса была плитка-список, а действия —
+  // впервые. Канал «yc:lockbox» зовёт тела запросов из src/yandex-cloud.js.
+  lockbox: "yc:lockbox",
+  // Container Registry (часть 91, заход 14): реестр и его образы. Канал
+  // «yc:registry» зовёт src/yandex-cloud.js и src/yc-registry.js.
+  containerRegistry: "yc:registry",
 };
 
 function section(channel) {
@@ -224,7 +230,7 @@ function main() {
         // что пометки не потерялись у тех действий, где за них платят или где
         // отменить уже нельзя.
         const mustPay = ["compute:create", "compute:snapshot", "compute:restoredisk", "vpc:reserve", "cdn:cdncreate", "certificateManager:cdncreate", "postgresql:create", "mysql:create", "clickhouse:create", "instanceGroups:create", "alb:lbnew"];
-        const mustDanger = ["compute:delete", "compute:delsnapshot", "vpc:delsubnet", "vpc:delgroup", "vpc:delrule", "vpc:release", "iam:delete", "iam:revoke", "iam:delkey", "cloudFunctions:delete", "cloudFunctions:delversion", "cloudFunctions:public", "cdn:cdndel", "certificateManager:certdel", "postgresql:delete", "mysql:delete", "clickhouse:delete", "dns:delete", "instanceGroups:delete", "alb:targetdel", "alb:routerdel", "alb:lbdel", "apiGateway:delete"];
+        const mustDanger = ["compute:delete", "compute:delsnapshot", "vpc:delsubnet", "vpc:delgroup", "vpc:delrule", "vpc:release", "iam:delete", "iam:revoke", "iam:delkey", "cloudFunctions:delete", "cloudFunctions:delversion", "cloudFunctions:public", "cdn:cdndel", "certificateManager:certdel", "postgresql:delete", "mysql:delete", "clickhouse:delete", "dns:delete", "instanceGroups:delete", "alb:targetdel", "alb:routerdel", "alb:lbdel", "apiGateway:delete", "lockbox:delete", "containerRegistry:delimage", "containerRegistry:clean", "containerRegistry:delete"];
         const problems = [];
         const seen = new Set();
         for (const service of Object.keys(A.ACTIONS)) {

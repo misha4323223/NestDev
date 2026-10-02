@@ -90,6 +90,15 @@
     // спецификацией. Канал «yc:apigw» зовёт тот же src/yc-apigw.js, что и агент:
     // создать из спецификации, показать её, поправить и удалить.
     apiGateway: "ycApiGw",
+    // Lockbox (часть 91, заход 14): у сервиса была плитка-список, а посмотреть
+    // секрет и версии, выдать доступ и удалить — только в консоли облака. Канал
+    // «yc:lockbox» зовёт тела запросов из src/yandex-cloud.js, проверки — из
+    // src/yc-lockbox.js.
+    lockbox: "ycLockbox",
+    // Container Registry (часть 91, заход 14): реестр был списком, образы — в
+    // карточке; создать реестр, посмотреть образы, убрать их пачкой — впервые.
+    // Канал «yc:registry» зовёт src/yandex-cloud.js и src/yc-registry.js.
+    containerRegistry: "ycRegistry",
   };
 
   // Допустимые действия каждого канала. Сверяется с отказами в src/yc-ipc.js.
@@ -113,6 +122,8 @@
     storage: ["list", "objects", "upload", "download", "delete", "url", "access", "public", "private"],
     logging: ["list", "group", "create", "update", "delete"],
     apiGateway: ["list", "gateway", "spec", "create", "update", "delete"],
+    lockbox: ["list", "secret", "versions", "create", "putversion", "grant", "delete"],
+    containerRegistry: ["list", "images", "create", "delimage", "clean", "delete"],
   };
 
   const FAMILIES = {
@@ -148,6 +159,12 @@
     // «Шлюз», а не «ресурс»: кнопка стоит на плитке «API-шлюз» и спрашивает
     // про шлюз — тот, что отвечает на запросы по своему адресу.
     apiGateway: { title: "API-шлюзы", ru: "шлюз" },
+    // «Секрет», а не «ресурс»: кнопка стоит на плитке «Секреты» и спрашивает про
+    // секрет — место, где живёт ключ или пароль.
+    lockbox: { title: "Секреты", ru: "секрет" },
+    // «Реестр», а не «образ»: кнопка стоит на плитке «Реестр образов» и
+    // спрашивает про сам реестр, а образы — уже внутри него.
+    containerRegistry: { title: "Реестр образов", ru: "реестр" },
   };
 
   // Действия управляемой базы. Одна форма на три базы: набор полей у PostgreSQL,
@@ -337,6 +354,60 @@
           fld("labels", "Метки (JSON)", { type: "textarea", placeholder: '{"env":"prod"}', hint: "Метки ЗАМЕНЯЮТСЯ целиком: пусто — не меняются." }),
         ] },
       { id: "delete", ru: "🗑 Удалить шлюз", op: "delete", view: "lines", danger: true, confirmArg: "confirmed", target: needGw },
+    ];
+  }
+
+  // ── Секреты Lockbox ────────────────────────────────────────────────────
+  // Секрет — место, где живёт ключ или пароль; значение подставляет само облако,
+  // а ревизия получает только ссылку. У плитки действий этого не было вовсе.
+  // «Новая версия» принимает пары «ключ → значение»: значения уходят в облако и
+  // обратно НИКОГДА не читаются — второй раз их не покажут, поэтому подсказка об
+  // этом прямо в поле. Выдача доступа — это ПРАВО, а не чтение: роль по умолчанию
+  // ровно та, что нужна ревизии. Удаление необратимо и спрашивает дважды.
+  function lockboxActions() {
+    const needSecret = fld("secret", "Секрет (имя или id)", {
+      required: true,
+      hint: "Имя из действия «Секреты и их состояние»; подсказка подставит список.",
+      options: from("lockbox", "list", (r) => (r.secrets || []).map((s) => s.name)),
+    });
+    return [
+      { id: "list", ru: "Секреты и их состояние", op: "list", view: "lines" },
+      { id: "secret", ru: "Карточка секрета", op: "secret", view: "lines", target: needSecret },
+      { id: "versions", ru: "Версии и имена ключей", op: "versions", view: "lines", target: needSecret },
+      { id: "create", ru: "＋ Создать секрет", op: "create", view: "lines",
+        fields: [fld("name", "Имя секрета", { required: true, placeholder: "app-env", hint: "Строчная латиница, цифры и дефис, 2–63 символа; имя уникально в каталоге." })] },
+      { id: "putversion", ru: "↑ Новая версия (ключи и значения)", op: "putversion", view: "lines", target: needSecret,
+        fields: [fld("entries", "Пары «ключ → значение» (JSON)", { type: "textarea", required: true, placeholder: '{"API_KEY":"…","DB_URL":"…"}', hint: "Значения уходят в облако и обратно не читаются — второй раз их не покажут. Ключ — латиница, цифры и знаки - _ . / \\ @." })] },
+      { id: "grant", ru: "🔑 Выдать доступ сервисному аккаунту", op: "grant", view: "lines", target: needSecret,
+        fields: [
+          fld("serviceAccountId", "Сервисный аккаунт (id)", { required: true, hint: "Кому читать секрет — обычно сервисный аккаунт ревизии (плитка «Сервисные аккаунты»)." }),
+          fld("role", "Роль", { value: "lockbox.payloadViewer", hint: "Ровно то, что нужно ревизии, чтобы прочитать значения. Без нужды не расширяй." }),
+        ] },
+      { id: "delete", ru: "🗑 Удалить секрет", op: "delete", view: "lines", danger: true, confirmArg: "confirmed", target: needSecret },
+    ];
+  }
+
+  // ── Реестр образов Container Registry ──────────────────────────────────
+  // Реестр копит образы с каждой выкаткой, а они занимают ПЛАТНОЕ хранилище.
+  // «Убрать образы» берёт все или только старше N дней — так реестр чистят, не
+  // удаляя по одному. Облако НЕ удаляет непустой реестр: удаление честно говорит
+  // об этом, а не падает с 400. Оба удаления необратимы и спрашивают дважды.
+  function registryActions() {
+    const needReg = fld("registry", "Реестр (имя или id)", {
+      required: true,
+      hint: "Имя из действия «Реестры и их состояние»; подсказка подставит список.",
+      options: from("containerRegistry", "list", (r) => (r.registries || []).map((x) => x.name)),
+    });
+    return [
+      { id: "list", ru: "Реестры и их состояние", op: "list", view: "lines" },
+      { id: "images", ru: "Образы реестра", op: "images", view: "lines", target: needReg },
+      { id: "create", ru: "＋ Создать реестр", op: "create", view: "lines",
+        fields: [fld("name", "Имя реестра", { required: true, placeholder: "app", hint: "Строчная латиница, цифры и дефис, 2–63 символа; имя уникально в каталоге. Адрес образов: cr.yandex/<id>/<образ>:<тег>." })] },
+      { id: "delimage", ru: "🗑 Удалить образ", op: "delimage", view: "lines", danger: true, confirmArg: "confirmed", target: needReg,
+        fields: [fld("image", "Образ (id или тег)", { required: true, hint: "Список и id — действием «Образы реестра». Удаление забирает ВСЕ теги образа; вернуть его нельзя." })] },
+      { id: "clean", ru: "🧹 Убрать образы (все или старше N дней)", op: "clean", view: "lines", danger: true, confirmArg: "confirmed", target: needReg,
+        fields: [fld("olderThanDays", "Старше, дней", { type: "number", hint: "Пусто или 0 — убрать ВСЕ образы реестра. Больше нуля — только старше N дней." })] },
+      { id: "delete", ru: "🗑 Удалить реестр", op: "delete", view: "lines", danger: true, confirmArg: "confirmed", target: needReg },
     ];
   }
 
@@ -928,6 +999,12 @@
 
     // ── API-шлюз (API Gateway) ──
     apiGateway: apigwActions(),
+
+    // ── Секреты Lockbox ──
+    lockbox: lockboxActions(),
+
+    // ── Реестр образов Container Registry ──
+    containerRegistry: registryActions(),
 
     // ── Managed-базы: PostgreSQL, MySQL и ClickHouse ──
     // Три семейства в трёх плитках, но один канал и одна форма: набор действий

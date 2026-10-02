@@ -381,12 +381,19 @@ function createCloudTools(deps) {
         const ref = String(args.secret || args.id || args.name || "").trim();
         // Разбор действия — ДО проверок имени: на «стирай» честнее ответить
         // «нет такого действия», чем требовать у секрета имя.
-        if (["list", "versions", "putversion"].indexOf(action) === -1) {
-          return "Ошибка: неизвестное действие ycSecret «" + action + "». Доступно: list, versions, putversion.";
+        if (["list", "card", "versions", "putversion", "grant", "delete"].indexOf(action) === -1) {
+          return "Ошибка: неизвестное действие ycSecret «" + action + "». Доступно: list, card, versions, putversion, grant, delete.";
         }
         // Новая версия меняет то, что получит ревизия, — это создание, а не чтение.
         if (action === "putversion" && !cfg.allowCreate) {
           return "⛔ Добавлять версии секретов агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту создавать ресурсы». Посмотреть секреты и версии можно и сейчас: action list / versions.";
+        }
+        // Выдача доступа к секрету — это ПРАВО (как выдача роли аккаунту).
+        if (action === "grant" && !cfg.allowUpdate) {
+          return "⛔ Выдавать доступ к секретам агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту менять ресурсы». Посмотреть секреты и версии можно и сейчас: action list / versions.";
+        }
+        if (action === "delete" && !cfg.allowDelete) {
+          return "⛔ Удалять секреты агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту удалять ресурсы». Посмотреть секреты можно и сейчас: action list.";
         }
         try {
           if (action === "list") {
@@ -416,13 +423,40 @@ function createCloudTools(deps) {
               "\n\nЗначения секретов API не отдаёт — видны только имена ключей. Их и подставляй в ревизию: ycContainer { action: \"deploy\", container: \"…\", secrets: [{ id: \"" + found.id + "\", key: \"КЛЮЧ\", environmentVariable: \"КЛЮЧ\" }] }.";
           }
 
+          if (action === "card") {
+            const full = await yandexCloud.getSecret(cfg.oauth, found.id);
+            const versions = await yandexCloud.listSecretVersions(cfg.oauth, found.id);
+            const keys = versions[0] && Array.isArray(versions[0].payloadEntryKeys) ? versions[0].payloadEntryKeys : [];
+            return who + "\n" +
+              "Описание: " + (full.description || "—") + "\n" +
+              "Статус: " + (full.status || "—") + "\n" +
+              "Текущая версия: " + ((full.currentVersion && full.currentVersion.id) || "—") + "\n" +
+              "Версий всего: " + versions.length + (keys.length ? " (ключи в свежей: " + keys.join(", ") + ")" : "") + "\n" +
+              "Защита от удаления: " + (full.deletionProtection ? "включена" : "нет") + "\n" +
+              "Создан: " + (full.createdAt || "—") + "\n\n" +
+              "Версии: ycSecret { action: \"versions\", secret: \"" + (found.name || ref) + "\" }. Новые ключи: action \"putversion\". Доступ сервисному аккаунту: action \"grant\".";
+          }
+
           if (action === "putversion") {
             const r = await yandexCloud.putSecretVersion(cfg.oauth, found.id, args.entries || args.payload || args.values);
             return "✅ Новая версия секрета «" + (found.name || ref) + "»: " + r.versionId + "\nКлючи: " + (r.keys.join(", ") || "—") +
               "\n\nЗначения в ответе не показываю: они ушли в облако и обратно не читаются. Подставить ключ в ревизию: ycContainer { action: \"deploy\", container: \"…\", secrets: [{ id: \"" + found.id + "\", key: \"" + (r.keys[0] || "КЛЮЧ") + "\", environmentVariable: \"" + (r.keys[0] || "КЛЮЧ") + "\" }] }. Версии: ycSecret { action: \"versions\", secret: \"" + (found.name || ref) + "\" }.";
           }
 
-          return "Ошибка: неизвестное действие ycSecret «" + action + "». Доступно: list, versions, putversion.";
+          if (action === "grant") {
+            const saId = String(args.serviceAccountId || args.saId || args.account || "").trim();
+            if (!saId) return "Ошибка: укажи serviceAccountId — сервисный аккаунт, которому выдаём доступ к секрету (его id: ycIam { action: \"list\" }).";
+            const role = String(args.role || args.roleId || "").trim() || "lockbox.payloadViewer";
+            await yandexCloud.grantSecretAccess(cfg.oauth, found.id, saId, role);
+            return "✅ Доступ к секрету «" + (found.name || ref) + "» выдан сервисному аккаунту " + saId + " (роль " + role + ").\nТеперь ревизия контейнера может прочитать значения из этого секрета: ycContainer { action: \"deploy\", container: \"…\", secrets: [{ id: \"" + found.id + "\", key: \"КЛЮЧ\", environmentVariable: \"КЛЮЧ\" }] }.";
+          }
+
+          if (action === "delete") {
+            await yandexCloud.deleteResource(cfg.oauth, "lockbox", found.id);
+            return "🗑 Секрет удалён: " + who + "\nВсе его версии и значения больше не вернуть; ревизии, которые на него ссылались, перестанут стартовать. Осталось: ycSecret { action: \"list\" }.";
+          }
+
+          return "Ошибка: неизвестное действие ycSecret «" + action + "». Доступно: list, card, versions, putversion, grant, delete.";
         } catch (e) {
           return "Yandex Cloud (ycSecret, action=" + action + "): " + ((e && e.message) || String(e));
         }
@@ -1576,10 +1610,13 @@ function createCloudTools(deps) {
         if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
         if (!cfg.folderId) return "Ошибка: выбери каталог (folder) в Настройках → Yandex Cloud.";
         const action = String(args.action || "images").trim().toLowerCase();
-        if (["images", "delete"].indexOf(action) === -1) {
-          return "Ошибка: неизвестное действие ycRegistry «" + action + "». Доступно: images, delete.";
+        if (["list", "images", "create", "delete", "clean"].indexOf(action) === -1) {
+          return "Ошибка: неизвестное действие ycRegistry «" + action + "». Доступно: list, images, create, delete, clean.";
         }
-        if (action === "delete" && !cfg.allowDelete) {
+        if (action === "create" && !cfg.allowCreate) {
+          return "⛔ Создавать реестры агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту создавать ресурсы». Посмотреть реестры: action list.";
+        }
+        if ((action === "delete" || action === "clean") && !cfg.allowDelete) {
           return "⛔ Удалять образы агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту удалять ресурсы». Посмотреть образы можно и сейчас: action images.";
         }
         const imageRef = String(args.image || args.imageId || args.tag || "").trim();
@@ -1589,6 +1626,20 @@ function createCloudTools(deps) {
         try {
           const regs = await yandexCloud.listService(cfg.oauth, cfg.folderId, yandexCloud.serviceByKey("containerRegistry"));
           const list = regs.items || [];
+          if (action === "list") {
+            const rows = list.map((r) => "• " + (r.name || "—") + " — " + r.id);
+            return "Реестры Container Registry · каталог «" + (cfg.folderName || cfg.folderId) + "» (" + list.length + "):\n" +
+              (list.length ? rows.join("\n") : "(реестров нет — создать: ycRegistry { action: \"create\", name: \"app\" })") +
+              "\n\nОбразы: ycRegistry { action: \"images\", registry: \"<имя>\" }. Уборка пачкой: action \"clean\".";
+          }
+          if (action === "create") {
+            const name = String(args.name || "").trim();
+            if (!name) return "Ошибка: укажи name — имя реестра, например app.";
+            await yandexCloud.ensureRegistry(cfg.oauth, cfg.folderId, name);
+            const made = await yandexCloud.findRegistry(cfg.oauth, cfg.folderId, name);
+            return "✅ Реестр создан: " + name + (made && made.id ? " (" + made.id + ")" : "") +
+              "\nАдрес образов: cr.yandex/" + ((made && made.id) || "<id>") + "/<образ>:<тег>. Класть образы — выкаткой (dockerBuild).";
+          }
           if (!list.length) {
             return "Реестров в каталоге «" + (cfg.folderName || cfg.folderId) + "» нет. Создать: ycCreate { service: \"containerRegistry\", name: \"app\" } — реестр нужен один раз, дальше в него кладут образы (dockerBuild), а лишние убираются через ycRegistry { action: \"delete\" }.";
           }
@@ -1612,6 +1663,34 @@ function createCloudTools(deps) {
             });
             return who + "\n\nОбразы (" + images.length + "):\n" + rows.join("\n") +
               "\n\nУдалить образ вместе с его тегами: ycRegistry { action: \"delete\", registry: \"" + reg.name + "\", image: \"<id или тег>\" }. Удаление необратимо и забирает все теги образа: если на тег ссылается контейнер, следующая выкатка его не соберёт.";
+          }
+
+          if (action === "clean") {
+            const images = await yandexCloud.listRegistryImages(cfg.oauth, reg.id);
+            if (!images.length) return who + "\n\nОбразов нет — реестр уже пуст.";
+            const older = Number(args.olderThanDays || args.days || 0);
+            let targets = images;
+            if (older > 0) {
+              const cut = Date.now() - older * 86400000;
+              targets = images.filter((i) => {
+                const t = Date.parse((i && i.createdAt) || "");
+                return !isNaN(t) && t < cut;
+              });
+            }
+            if (!targets.length) return who + "\n\nОбразов старше " + older + " дн. нет — убирать нечего.";
+            let done = 0;
+            const failed = [];
+            for (const img of targets) {
+              try {
+                await yandexCloud.deleteRegistryImage(cfg.oauth, img.id);
+                done++;
+              } catch (e) {
+                failed.push((img.name || img.id) + ": " + ((e && e.message) || e));
+              }
+            }
+            return "🧹 Убрано образов: " + done + " из " + targets.length + ".\n" + who +
+              (failed.length ? "\nНе удалось убрать: " + failed.join("; ") : "") +
+              "\n\nЧто осталось: ycRegistry { action: \"images\", registry: \"" + reg.name + "\" }.";
           }
 
           const img = await yandexCloud.findRegistryImage(cfg.oauth, reg.id, imageRef);

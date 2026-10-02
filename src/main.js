@@ -1181,6 +1181,13 @@ const ycDb = createYcDb({
 // один кэш IAM-токена, одна и та же ошибка сети. REST-детали (операции, маска
 // полей, разбор спецификации) живут в src/yc-apigw.js и только там.
 const ycApiGw = require("./yc-apigw.js");
+// Секреты Lockbox и реестр образов (часть 91, заход 14): у обоих сервисов была
+// только плитка-список (и карточка), а формы ДЕЙСТВИЙ — впервые. Экземпляры
+// модулей здесь ОДИН на приложение: их берёт канал окна («yc:lockbox»,
+// «yc:registry»), а тела запросов живут в src/yandex-cloud.js. В src/yc-lockbox.js
+// и src/yc-registry.js — только проверки и человеческие слова.
+const ycLockbox = require("./yc-lockbox.js");
+const ycRegistry = require("./yc-registry.js");
 const ycService = createYcService({ app, path, net, secrets, yandexCloud, ycCli, ycLogs, ycEnsurePath, loadSettings });
 const {
   ycConfig,
@@ -1197,7 +1204,7 @@ const {
 // ycAi — тот же экземпляр модуля, что у агента (один кэш IAM-токена); fs, path,
 // resolvePath и agentWorkDir нужны каналу «yc:ai»: снимки и записи он читает с
 // диска, а синтезированную речь кладёт в рабочую папку агента.
-registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, ycIg, ycAlb, ycDb, ycLogs, ycApiGw, fs, path, resolvePath, agentWorkDir, loadSettings, saveSettings, svc: ycService });
+registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, ycIg, ycAlb, ycDb, ycLogs, ycApiGw, ycLockbox, ycRegistry, fs, path, resolvePath, agentWorkDir, loadSettings, saveSettings, svc: ycService });
 
 // ── Файлы для облака: системные диалоги выбора файла и места сохранения ──────
 // У окна был ровно один системный диалог (dialog:pickDir — папка). Для бакета

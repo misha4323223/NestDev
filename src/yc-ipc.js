@@ -19,7 +19,7 @@
    каналов когда-то расползлись по оболочке. Тела запросов живут в модулях, здесь — выбор действия и отказ. */
 
 function registerYcIpc(deps) {
-  const { ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, ycIg, ycAlb, ycDb, ycLogs, ycApiGw, loadSettings, saveSettings, svc, fs, path: nodePath, resolvePath, agentWorkDir } = deps;
+  const { ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, ycIg, ycAlb, ycDb, ycLogs, ycApiGw, ycLockbox, ycRegistry, loadSettings, saveSettings, svc, fs, path: nodePath, resolvePath, agentWorkDir } = deps;
   const {
     YANDEX_OAUTH_URL,
     ycConfig,
@@ -3414,6 +3414,273 @@ ipcMain.handle("yc:apigw", async (_e, args) => {
     const o = await ycApiGw.deleteGateway(iam, base, found.id);
     await yandexCloud.waitOperation(cfg.oauth, o && o.id, 120000);
     return { ok: true, changed: true, deleted: true, id: found.id, lines: ["🗑 API-шлюз удалён: " + (found.name || found.id), (found.url || "Адрес") + " больше не отвечает."], message: "API-шлюз удалён." };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
+// ── Lockbox: секреты и их версии ────────────────────────────────────────────
+// Секрет — это «место для ключей и паролей»: значение подставляет само облако,
+// поэтому в приложении ценность секрета — версии (ключи) и выданный доступ. У
+// сервиса была плитка-список и добавление версии из карточки, а посмотреть
+// секрет, выдать роль сервисному аккаунту или удалить его было нечем. Тела
+// запросов живут в src/yandex-cloud.js, проверки и слова — в src/yc-lockbox.js,
+// здесь — выбор действия и понятный отказ. Значения секретов НИКОГДА не читаются
+// обратно: API их не отдаёт, и ответ содержит только имена ключей.
+// Права агента здесь НЕ спрашиваем: галочки ограничивают модель, а в своём окне
+// человек действует сам — как у лог-групп, файлов бакета и API-шлюза.
+ipcMain.handle("yc:lockbox", async (_e, args) => {
+  const cfg = ycConfig();
+  const a = args || {};
+  const op = String(a.op || a.action || "list").trim().toLowerCase();
+  const ALL = ["list", "secret", "versions", "create", "putversion", "grant", "delete"];
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках (Настройки → «☁️ Yandex Cloud»)." };
+  if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
+  if (!ycLockbox) return { ok: false, error: "Модуль секретов не подключён к приложению (src/yc-lockbox.js)." };
+  if (ALL.indexOf(op) === -1) return { ok: false, error: "Неизвестное действие секретов: " + op + ". Доступно: " + ALL.join(", ") + "." };
+  try {
+    const secrets = await yandexCloud.listSecrets(cfg.oauth, cfg.folderId);
+    if (op === "list") {
+      return {
+        ok: true,
+        folder: { id: cfg.folderId, name: cfg.folderName },
+        secrets: secrets,
+        lines: secrets.length ? secrets.map((s) => ycLockbox.secretLine(s)) : ["Секретов в каталоге нет. Создать — действием «＋ Создать секрет»."],
+        message: "Секретов: " + secrets.length + ".",
+      };
+    }
+    // Создание стоит ДО поиска секрета: у нового секрета ещё нет записи в списке.
+    if (op === "create") {
+      const name = ycLockbox.checkName(a.name);
+      const made = await yandexCloud.createResource(cfg.oauth, cfg.folderId, "lockbox", name);
+      const made2 = await yandexCloud.findSecret(cfg.oauth, cfg.folderId, (made && made.name) || name);
+      const info = made2 ? ycLockbox.secretInfo(made2) : { id: (made && made.resourceId) || "", name: name };
+      return {
+        ok: true,
+        changed: true,
+        id: info.id || "",
+        name: info.name || name,
+        secret: info,
+        lines: [
+          "✅ Секрет создан: " + (info.name || name) + (info.id ? " (" + info.id + ")" : ""),
+          "Пустой секрет бесполезен — добавь версию действием «↑ Новая версия» (пары «ключ → значение»).",
+        ],
+        message: "Секрет создан.",
+      };
+    }
+    const ref = String(a.secret || a.id || a.name || "").trim();
+    const found = ycLockbox.matchSecret(secrets, ref);
+    const missing = { ok: false, error: "Не нашёл секрет «" + ref + "»" + (ref ? "." : " — секретов несколько, выбери поле «Секрет».") + " В каталоге: " + secrets.map((s) => s.name).join(", ") + "." };
+    if (op === "secret") {
+      if (!found) return missing;
+      const full = await yandexCloud.getSecret(cfg.oauth, found.id);
+      const versions = await yandexCloud.listSecretVersions(cfg.oauth, found.id);
+      const info = ycLockbox.secretInfo(full);
+      return {
+        ok: true,
+        secret: info,
+        lines: [
+          ycLockbox.secretLine(full),
+          "Описание: " + (info.description || "—"),
+          "Статус: " + info.statusHuman,
+          "Текущая версия: " + (info.currentVersionId || "—"),
+          "Версий всего: " + versions.length,
+          "Защита от удаления: " + (info.deletionProtection ? "включена" : "нет"),
+          "Создан: " + (info.createdAt || "—"),
+        ],
+        message: "Секрет.",
+      };
+    }
+    if (op === "versions") {
+      if (!found) return missing;
+      const versions = await yandexCloud.listSecretVersions(cfg.oauth, found.id);
+      return {
+        ok: true,
+        secret: ycLockbox.secretInfo(found),
+        versions: versions,
+        lines: ["Версии секрета «" + (found.name || ref) + "» (свежие сверху), всего " + versions.length + ":"].concat(
+          versions.length ? versions.map((v) => ycLockbox.versionLine(v)) : ["  (версий нет — секрет пуст)"],
+          ["", "Значения секретов API не отдаёт — видны только имена ключей."]
+        ),
+        message: "Версии секрета.",
+      };
+    }
+    if (!found) return missing;
+    if (op === "putversion") {
+      const entries = ycLockbox.checkEntries(a.entries != null ? a.entries : (a.payload != null ? a.payload : a.values));
+      const r = await yandexCloud.putSecretVersion(cfg.oauth, found.id, entries);
+      return {
+        ok: true,
+        changed: true,
+        id: found.id,
+        versionId: r.versionId,
+        lines: [
+          "✅ Новая версия секрета «" + (found.name || ref) + "»: " + r.versionId,
+          "Ключи: " + (r.keys.join(", ") || "—"),
+          "Значения в ответе не показываю: они ушли в облако и обратно не читаются.",
+        ],
+        message: "Версия секрета добавлена.",
+      };
+    }
+    if (op === "grant") {
+      const saId = String(a.serviceAccountId || a.saId || a.account || "").trim();
+      if (!saId) return { ok: false, error: "Укажи serviceAccountId — сервисный аккаунт, которому выдаём доступ к секрету (список: плитка «Сервисные аккаунты»)." };
+      const role = String(a.role || a.roleId || "").trim() || ycLockbox.DEFAULT_ROLE;
+      await yandexCloud.grantSecretAccess(cfg.oauth, found.id, saId, role);
+      return {
+        ok: true,
+        changed: true,
+        id: found.id,
+        lines: [
+          "✅ Доступ к секрету «" + (found.name || ref) + "» выдан сервисному аккаунту " + saId + " (роль " + role + ").",
+          "Теперь ревизия контейнера может прочитать значения из этого секрета.",
+        ],
+        message: "Доступ к секрету выдан.",
+      };
+    }
+    // delete — единственное оставшееся действие; необратимо, поэтому требует согласия.
+    if (a.confirmed !== true) {
+      return {
+        ok: false,
+        needsConfirm: true,
+        error: "Удаление секрета необратимо: все его версии и значения исчезнут, а ревизии, которые на него ссылаются, перестанут стартовать. Подтверди удаление.",
+        lines: found ? [ycLockbox.secretLine(found)] : [],
+      };
+    }
+    await yandexCloud.deleteResource(cfg.oauth, "lockbox", found.id);
+    return { ok: true, changed: true, deleted: true, id: found.id, lines: ["🗑 Секрет удалён: " + (found.name || found.id), "Все его версии и значения больше не вернуть."], message: "Секрет удалён." };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+
+// ── Container Registry: реестр и его образы ─────────────────────────────────
+// Реестр образов копит образы с каждой выкаткой, а они занимают ПЛАТНОЕ
+// хранилище и живут, пока их не уберут. В окне реестр был только плиткой-списком,
+// а образы — лишь в карточке (список и удаление по одному): создать реестр,
+// посмотреть образы, убрать их пачкой и удалить сам реестр было нечем. Тела
+// запросов — в src/yandex-cloud.js, проверки и слова — в src/yc-registry.js,
+// здесь — выбор действия и понятный отказ. Облако НЕ удаляет непустой реестр:
+// поэтому удаление честно говорит «сначала убери образы», а не падает с 400.
+ipcMain.handle("yc:registry", async (_e, args) => {
+  const cfg = ycConfig();
+  const a = args || {};
+  const op = String(a.op || a.action || "list").trim().toLowerCase();
+  const ALL = ["list", "images", "create", "delimage", "clean", "delete"];
+  if (!cfg.oauth) return { ok: false, error: "Yandex Cloud не подключён — вставь OAuth-токен в настройках (Настройки → «☁️ Yandex Cloud»)." };
+  if (!cfg.folderId) return { ok: false, error: "Не выбран каталог (folder). Открой Настройки → «☁️ Yandex Cloud» и выбери каталог." };
+  if (!ycRegistry) return { ok: false, error: "Модуль реестра не подключён к приложению (src/yc-registry.js)." };
+  if (ALL.indexOf(op) === -1) return { ok: false, error: "Неизвестное действие реестра: " + op + ". Доступно: " + ALL.join(", ") + "." };
+  try {
+    const svcDef = yandexCloud.serviceByKey("containerRegistry");
+    const regs = ((await yandexCloud.listService(cfg.oauth, cfg.folderId, svcDef)).items) || [];
+    if (op === "list") {
+      return {
+        ok: true,
+        folder: { id: cfg.folderId, name: cfg.folderName },
+        registries: regs,
+        lines: regs.length ? regs.map((r) => ycRegistry.registryLine(r)) : ["Реестров в каталоге нет. Создать — действием «＋ Создать реестр»."],
+        message: "Реестров: " + regs.length + ".",
+      };
+    }
+    // Создание стоит ДО поиска реестра: у нового реестра ещё нет записи в списке.
+    if (op === "create") {
+      const name = ycRegistry.checkName(a.name);
+      await yandexCloud.ensureRegistry(cfg.oauth, cfg.folderId, name);
+      const made = await yandexCloud.findRegistry(cfg.oauth, cfg.folderId, name);
+      const info = made ? ycRegistry.registryInfo(made) : { id: "", name: name };
+      return {
+        ok: true,
+        changed: true,
+        id: info.id || "",
+        name: name,
+        lines: [
+          "✅ Реестр создан: " + name + (info.id ? " (" + info.id + ")" : ""),
+          "Адрес образов: cr.yandex/" + (info.id || "<id>") + "/<образ>:<тег>. Класть образы — выкаткой.",
+        ],
+        message: "Реестр создан.",
+      };
+    }
+    const ref = String(a.registry || a.registryId || a.registryName || "").trim();
+    const found = ycRegistry.matchRegistry(regs, ref);
+    const missing = { ok: false, error: "Не нашёл реестр «" + ref + "»" + (ref ? "." : " — реестров несколько, выбери поле «Реестр».") + " В каталоге: " + regs.map((r) => r.name).join(", ") + "." };
+    if (op === "images") {
+      if (!found) return missing;
+      const images = await yandexCloud.listRegistryImages(cfg.oauth, found.id);
+      return {
+        ok: true,
+        registry: ycRegistry.registryInfo(found),
+        images: images,
+        lines: ["Образы реестра «" + found.name + "», всего " + images.length + ":"].concat(
+          images.length ? images.map((i) => ycRegistry.imageLine(i)) : ["  (образов нет — реестр пуст)"]
+        ),
+        message: "Образов: " + images.length + ".",
+      };
+    }
+    if (!found) return missing;
+    if (op === "delimage") {
+      const imageRef = String(a.image || a.imageId || a.tag || "").trim();
+      if (!imageRef) return { ok: false, error: "Укажи образ (image) — id или тег. Список: действие «Образы реестра»." };
+      const img = ycRegistry.matchImage(await yandexCloud.listRegistryImages(cfg.oauth, found.id), imageRef);
+      if (!img) return { ok: false, error: "В реестре «" + found.name + "» нет образа «" + imageRef + "» — возможно, его уже удалили." };
+      const info = ycRegistry.imageInfo(img);
+      if (a.confirmed !== true) {
+        return { ok: false, needsConfirm: true, error: "Удаление образа необратимо: его теги исчезнут вместе с ним, и вернуть образ будет нельзя. Если на тег ссылается контейнер, следующая выкатка его не соберёт. Подтверди удаление.", lines: [ycRegistry.imageLine(img)] };
+      }
+      await yandexCloud.deleteRegistryImage(cfg.oauth, img.id);
+      return { ok: true, changed: true, deleted: true, id: img.id, lines: ["🗑 Образ удалён: " + (info.name || info.id) + " (теги: " + info.tagText + ")", "Вернуть образ нельзя; теги больше на него не указывают."], message: "Образ удалён." };
+    }
+    if (op === "clean") {
+      const images = await yandexCloud.listRegistryImages(cfg.oauth, found.id);
+      const olderDays = Number(a.olderThanDays || a.days || 0);
+      let targets = images;
+      if (olderDays > 0) {
+        const cut = Date.now() - olderDays * 86400000;
+        targets = images.filter((i) => {
+          const t = Date.parse((i && i.createdAt) || "");
+          return !isNaN(t) && t < cut;
+        });
+      }
+      if (!targets.length) {
+        return { ok: true, changed: false, cleared: 0, lines: ["Убирать нечего: " + (olderDays > 0 ? "образов старше " + olderDays + " дн. в реестре нет." : "в реестре нет образов.")], message: "Убирать нечего." };
+      }
+      if (a.confirmed !== true) {
+        return {
+          ok: false,
+          needsConfirm: true,
+          error: "Убрать образы из реестра «" + found.name + "» — необратимо: их и их теги не вернуть, собрать заново можно только новой выкаткой. Готов удалить " + targets.length + " образ(ов)? Подтверди уборку.",
+          lines: targets.slice(0, 20).map((i) => ycRegistry.imageLine(i)).concat(targets.length > 20 ? ["… и ещё " + (targets.length - 20)] : []),
+        };
+      }
+      let done = 0;
+      const failed = [];
+      for (const img of targets) {
+        try {
+          await yandexCloud.deleteRegistryImage(cfg.oauth, img.id);
+          done++;
+        } catch (e) {
+          failed.push((img.name || img.id) + ": " + ((e && e.message) || e));
+        }
+      }
+      return {
+        ok: true,
+        changed: done > 0,
+        cleared: done,
+        lines: ["🧹 Убрано образов: " + done + " из " + targets.length + "."].concat(failed.length ? ["Не удалось убрать: " + failed.join("; ")] : []),
+        message: "Убрано образов: " + done + ".",
+      };
+    }
+    // delete — реестр необратим, и облако НЕ удаляет непустой реестр: говорим об
+    // этом словами, а не отдаём 400 из сети.
+    const imagesLeft = await yandexCloud.listRegistryImages(cfg.oauth, found.id);
+    if (imagesLeft.length) {
+      return { ok: false, error: "Реестр «" + found.name + "» не пуст: в нём " + imagesLeft.length + " образ(ов). Облако не удаляет непустой реестр — сначала убери образы действием «🧹 Убрать все образы», потом повтори удаление." };
+    }
+    if (a.confirmed !== true) {
+      return { ok: false, needsConfirm: true, error: "Удаление реестра необратимо: адрес cr.yandex/" + found.id + " перестанет существовать. Подтверди удаление.", lines: [ycRegistry.registryLine(found)] };
+    }
+    await yandexCloud.deleteResource(cfg.oauth, "containerRegistry", found.id);
+    return { ok: true, changed: true, deleted: true, id: found.id, lines: ["🗑 Реестр удалён: " + found.name, "Его адрес cr.yandex/" + found.id + " больше не существует."], message: "Реестр удалён." };
   } catch (e) {
     return { ok: false, error: (e && e.message) || String(e) };
   }

@@ -451,7 +451,7 @@ let stub = null;
   await test("yc:apigw: канал, мост окна, оболочка и семейство apiGateway на месте", () => {
     assert.ok(/ipcMain\.handle\("yc:apigw"/.test(IPC_SRC), "канала нет в yc-ipc.js");
     const found = [...IPC_SRC.matchAll(/ipcMain\.handle\("(yc:[^"]+)"/g)].map((m) => m[1]);
-    assert.strictEqual(found.length, 38, "каналов в мосте должно быть 38: " + found.length);
+    assert.strictEqual(found.length, 40, "каналов в мосте должно быть 40: " + found.length);
     assert.ok(/ycApiGw: \(args\) => ipcRenderer\.invoke\("yc:apigw"/.test(PRELOAD_SRC), "нет моста ycApiGw");
     assert.ok(/\bycApiGw\b/.test(MAIN_SRC) && /require\("\.\/yc-apigw\.js"\)/.test(MAIN_SRC), "оболочка не подключает модуль API-шлюза");
     assert.ok(/apiGateway: "ycApiGw"/.test(ACTIONS_SRC), "семейство apiGateway не знает свой канал");
@@ -476,7 +476,7 @@ let stub = null;
 
   await test("yc:apigw: сторож каналов и цепочка npm test знают шлюз", () => {
     assert.ok(SMOKE_SRC.indexOf('"yc:apigw"') >= 0, "список каналов в smoke не знает yc:apigw");
-    assert.ok(/каналов в мосте должно быть 38/.test(SMOKE_SRC), "сторож каналов не пересчитан");
+    assert.ok(/каналов в мосте должно быть 40/.test(SMOKE_SRC), "сторож каналов не пересчитан");
     assert.ok(PKG.scripts.test.indexOf("test/yc-apigw.test.js") >= 0, "набор не в цепочке npm test");
   });
 

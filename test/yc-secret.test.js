@@ -327,7 +327,7 @@ function buildTools(over, settingsOver) {
   await test("ycSecret: схема, группа облака, промпт и права знают инструмент", () => {
     assert.ok(SCHEMAS_SRC.includes('name: "ycSecret"'), "нет схемы инструмента в tool-schemas");
     const at = SCHEMAS_SRC.indexOf('name: "ycSecret"');
-    const schema = SCHEMAS_SRC.slice(at, at + 1800);
+    const schema = SCHEMAS_SRC.slice(at, at + 2600); // окно шире: заход 14 добавил действия card/grant/delete и поля serviceAccountId/role
     for (const part of ["action", "secret", "entries", "required: [\"action\"]"]) {
       assert.ok(schema.includes(part), "в схеме нет " + part);
     }

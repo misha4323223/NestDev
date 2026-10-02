@@ -1481,6 +1481,8 @@ async function testYcSplit() {
       "yc:cliStatus", "yc:installCli",      "yc:vpc", "yc:compute", "yc:iam", "yc:functions", "yc:billing", "yc:cdn", "yc:ai", "yc:mdb", "yc:ig", "yc:alb", "yc:dns", "yc:container",
       // Заходы 9–12 части 91: таблицы базы YDB, файлы бакета, группы логов и API-шлюз в окне.
       "yc:db", "yc:storage", "yc:logGroups", "yc:apigw",
+      // Заход 14 части 91: секреты Lockbox и реестр образов Container Registry в окне.
+      "yc:lockbox", "yc:registry",
     ];
     for (const ch of channels) {
       assert.ok(!main.includes('ipcMain.handle("' + ch + '"'), "канал остался в main.js: " + ch);
@@ -1496,7 +1498,7 @@ async function testYcSplit() {
     assert.ok(main.includes('require("./yc-service.js")') && main.includes('require("./yc-ipc.js")'), "main.js не подключает вынесенные модули");
     assert.ok(/registerYcIpc\(\{ ipcMain/.test(main), "IPC-мост не регистрируется");
     const found = [...ipcSrc.matchAll(/ipcMain\.handle\("(yc:[^"]+)"/g)].map((m) => m[1]);
-    assert.strictEqual(found.length, 38, "каналов в мосте должно быть 38 (yc:deploy остаётся мостом деплоя): " + found.length);
+    assert.strictEqual(found.length, 40, "каналов в мосте должно быть 40 (yc:deploy остаётся мостом деплоя): " + found.length);
   });
 
   await test("Yandex Cloud: служебный слой работает сам, без main.js", () => {

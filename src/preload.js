@@ -227,6 +227,16 @@ contextBridge.exposeInMainWorld("api", {
   // OpenAPI-спецификации, правка и удаление. Канал «yc:apigw» зовёт тот же
   // модуль src/yc-apigw.js, что и агент.
   ycApiGw: (args) => ipcRenderer.invoke("yc:apigw", args || {}),
+  // Lockbox: секреты и их версии — список, карточка, версии, создание, новая
+  // версия (значения секретов НИКОГДА не читаются обратно), выдача доступа и
+  // удаление. Канал «yc:lockbox» зовёт тела запросов из src/yandex-cloud.js, а
+  // проверки и слова — из src/yc-lockbox.js.
+  ycLockbox: (args) => ipcRenderer.invoke("yc:lockbox", args || {}),
+  // Container Registry: реестр и его образы — список, образы, создание,
+  // удаление образа, уборка образов пачкой и удаление реестра (непустой реестр
+  // облако не удаляет). Канал «yc:registry» зовёт src/yandex-cloud.js и
+  // src/yc-registry.js.
+  ycRegistry: (args) => ipcRenderer.invoke("yc:registry", args || {}),
   ycCosts: (serviceKey, params) => ipcRenderer.invoke("yc:costs", serviceKey, params || {}),
   ycCreate: (serviceKey, name, opts) => ipcRenderer.invoke("yc:create", serviceKey, name, opts || {}),
   ycDelete: (serviceKey, resourceId) => ipcRenderer.invoke("yc:delete", serviceKey, resourceId),

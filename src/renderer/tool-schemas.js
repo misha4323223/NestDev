@@ -2411,13 +2411,15 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "ycSecret",
       description:
-        "Yandex Cloud: секреты Lockbox — список, версии и наполнение. action: list (секреты каталога) | versions (версии секрета: id, дата и ИМЕНА ключей) | putversion (новая версия со значениями). secret — имя или id секрета (список: action list). putversion требует разрешения «Разрешить агенту создавать ресурсы» и явной просьбы пользователя. Значения секретов обратно не читаются — наружу уходят только имена ключей. Секрет без версии бесполезен: ревизия контейнера ссылается на ключ, которого нет, поэтому сначала putversion, а потом ycContainer (action deploy) с полем secrets — id, key, environmentVariable.",
+        "Yandex Cloud: секреты Lockbox — список, карточка, версии, наполнение, доступ и удаление. action: list (секреты каталога) | card (карточка: описание, статус, текущая версия, число версий) | versions (версии секрета: id, дата и ИМЕНА ключей) | putversion (новая версия со значениями) | grant (выдать доступ к секрету сервисному аккаунту) | delete (удалить секрет вместе с версиями, необратимо). secret — имя или id секрета (список: action list). putversion требует разрешения «Разрешить агенту создавать ресурсы», grant — «…менять ресурсы», delete — «…удалять ресурсы», и все — явной просьбы пользователя. Значения секретов обратно не читаются — наружу уходят только имена ключей. Секрет без версии бесполезен: ревизия контейнера ссылается на ключ, которого нет, поэтому сначала putversion, потом grant сервисному аккаунту ревизии (роль lockbox.payloadViewer на сам секрет), а потом ycContainer (action deploy) с полем secrets — id, key, environmentVariable.",
       parameters: {
         type: "object",
         properties: {
-          action: { type: "string", description: "list | versions | putversion" },
-          secret: { type: "string", description: "Имя или id секрета (для action versions и putversion)" },
+          action: { type: "string", description: "list | card | versions | putversion | grant | delete" },
+          secret: { type: "string", description: "Имя или id секрета (для action card, versions, putversion, grant и delete)" },
           entries: { type: "object", description: "Пары «ключ → значение» для новой версии: { API_KEY: значение, DB_URL: значение }. Можно списком объектов: [{ key: API_KEY, value: значение }]. Ключ — латиница, цифры и знаки - _ . / и @" },
+          serviceAccountId: { type: "string", description: "Для grant: id сервисного аккаунта, которому выдаём доступ к секрету (его id: ycIam action list)" },
+          role: { type: "string", description: "Для grant: роль, по умолчанию lockbox.payloadViewer (ровно то, что нужно ревизии)" },
         },
         required: ["action"],
       },
@@ -2829,13 +2831,15 @@ const TOOL_DEFINITIONS = [
     function: {
       name: "ycRegistry",
       description:
-        "Yandex Cloud: образы Container Registry — посмотреть и почистить. action: images (образы реестра: имя, теги, размер, id) | delete (удалить образ ВМЕСТЕ со всеми его тегами). registry — имя или id реестра (список: ycList service containerRegistry); без registry работает, только если реестр в каталоге один. image — id образа (из action images) или его тег. Образы копятся с каждой выкаткой и занимают платное хранилище, но delete необратим: спрашивай пользователя перед удалением и не удаляй тег, на который ссылается работающий контейнер. delete требует чекбокса «Разрешить агенту удалять ресурсы».",
+        "Yandex Cloud: Container Registry — реестры и их образы. action: list (реестры каталога: имя, id) | create (создать реестр) | images (образы реестра: имя, теги, размер, id) | delete (удалить образ ВМЕСТЕ со всеми его тегами) | clean (убрать образы пачкой — все или старше olderThanDays дней). registry — имя или id реестра (список: action list); без registry работает, только если реестр в каталоге один. image — id образа (из action images) или его тег. Образы копятся с каждой выкаткой и занимают платное хранилище, но delete и clean необратимы: спрашивай пользователя перед удалением и не удаляй тег, на который ссылается работающий контейнер. create требует чекбокса «Разрешить агенту создавать ресурсы», delete и clean — «…удалять ресурсы». Удаление САМОГО реестра требует освободить его: облако не удаляет непустой реестр — сначала clean.",
       parameters: {
         type: "object",
         properties: {
-          action: { type: "string", description: "images | delete" },
+          action: { type: "string", description: "list | create | images | delete | clean" },
+          name: { type: "string", description: "Для create: имя нового реестра (строчные латинские буквы, цифры и дефис)" },
           registry: { type: "string", description: "Имя или id реестра (необязательно, если в каталоге один реестр)" },
           image: { type: "string", description: "id образа или его тег (можно также imageId или tag)" },
+          olderThanDays: { type: "integer", description: "Для clean: убирать только образы старше N дней (0 или пусто — все образы)" },
         },
         required: ["action"],
       },
