@@ -75,7 +75,7 @@ async function testYcDiagnosis() {
       const f = makeFetch((url) => {
         if (url.includes("/endpoints")) return { body: {} }; // нет списка эндпоинтов → фолбэк
         if (url.includes("/iam/v1/tokens")) return { body: iamBody() };
-        return { body: { Identities: [] } };
+        return { body: { EmailIdentities: [] } };
       });
       global.fetch = f;
       yc.resetIamCache();
@@ -831,10 +831,10 @@ async function testYandexCloud() {
   await test("yc: Postbox спрашивается как SES v2 (путь, заголовок, диагностика 403)", async () => {
     const pb = yc.serviceByKey("postbox");
     assert.strictEqual(pb.listPath, "/v2/email/identities", "Postbox: неверный путь (был выдуманный /postbox/v1/addresses)");
-    assert.strictEqual(pb.listKey, "Identities");
+    assert.strictEqual(pb.listKey, "EmailIdentities");
     assert.strictEqual(pb.auth, "subject");
     assert.strictEqual(pb.query, "ses");
-    assert.strictEqual(yc.serviceQuery(pb, "folder1"), "?PageSize=100", "SES не понимает folderId/pageSize");
+    assert.strictEqual(yc.serviceQuery(pb, "folder1"), "?PageSize=1000", "SES не понимает folderId/pageSize");
 
     const realFetch = global.fetch;
     try {
@@ -846,13 +846,15 @@ async function testYandexCloud() {
         if (url.includes("/iam/v1/tokens")) return { body: iamJson() };
         seenUrl = String(url);
         seenHeaders = (opts && opts.headers) || {};
-        return { body: { Identities: ["mail.example.ru"] } };
+        return { body: { EmailIdentities: [{ IdentityName: "mail.example.ru", IdentityType: "DOMAIN", VerificationStatus: "SUCCESS", SendingEnabled: true }] } };
       });
       yc.resetIamCache();
       const r = await yc.listService("oauth", "folder1", pb);
       assert.strictEqual(r.count, 1, "адреса Postbox не разобрались: " + JSON.stringify(r.items));
-      assert.strictEqual(r.items[0], "mail.example.ru");
-      assert.ok(/^https:\/\/postbox\.cloud\.yandex\.net\/v2\/email\/identities\?PageSize=100$/.test(seenUrl), "URL: " + seenUrl);
+      // SES-ответ называет адрес полем IdentityName — окно и агент ждут имя и id:
+      assert.strictEqual(r.items[0].name, "mail.example.ru", "имя адреса потерялось: " + JSON.stringify(r.items[0]));
+      assert.strictEqual(r.items[0].id, "mail.example.ru");
+      assert.ok(/^https:\/\/postbox\.cloud\.yandex\.net\/v2\/email\/identities\?PageSize=1000$/.test(seenUrl), "URL: " + seenUrl);
       assert.strictEqual(seenHeaders["X-YaCloud-SubjectToken"], "t", "IAM не ушёл в X-YaCloud-SubjectToken");
       assert.ok(!seenHeaders.Authorization, "Postbox не принимает Authorization");
 
@@ -1483,6 +1485,8 @@ async function testYcSplit() {
       "yc:db", "yc:storage", "yc:logGroups", "yc:apigw",
       // Заход 14 части 91: секреты Lockbox и реестр образов Container Registry в окне.
       "yc:lockbox", "yc:registry",
+      // Заход 15 части 91: адреса Cloud Postbox (SES-совместимый сервис).
+      "yc:postbox",
     ];
     for (const ch of channels) {
       assert.ok(!main.includes('ipcMain.handle("' + ch + '"'), "канал остался в main.js: " + ch);
@@ -1498,7 +1502,7 @@ async function testYcSplit() {
     assert.ok(main.includes('require("./yc-service.js")') && main.includes('require("./yc-ipc.js")'), "main.js не подключает вынесенные модули");
     assert.ok(/registerYcIpc\(\{ ipcMain/.test(main), "IPC-мост не регистрируется");
     const found = [...ipcSrc.matchAll(/ipcMain\.handle\("(yc:[^"]+)"/g)].map((m) => m[1]);
-    assert.strictEqual(found.length, 40, "каналов в мосте должно быть 40 (yc:deploy остаётся мостом деплоя): " + found.length);
+    assert.strictEqual(found.length, 41, "каналов в мосте должно быть 41 (yc:deploy остаётся мостом деплоя): " + found.length);
   });
 
   await test("Yandex Cloud: служебный слой работает сам, без main.js", () => {

@@ -1357,6 +1357,13 @@
               </div>
               <div class="hint-block" style="margin-top:6px">Токен и каталог подставляются в команды агента автоматически (YC_IAM_TOKEN — свежий IAM, YC_CLOUD_ID, YC_FOLDER_ID) — <b>yc init не нужен</b>. Логи (<b>ycLogs</b>) читаются внутренним API, yc CLI для них не требуется.</div>
             </div>
+            <div class="field">
+              <label>Ключ сервисного аккаунта для Postbox <span class="hint">(JSON-ключ из консоли Yandex Cloud. Нужен ТОЛЬКО Cloud Postbox — остальное облако работает по OAuth-токену. Хранится зашифрованно.)</span></label>
+              <div class="input-row">
+                <textarea id="s-yc-sa-key" class="input" rows="3" placeholder='{ "id": "aje…", "service_account_id": "aje…", "private_key": "-----BEGIN PRIVATE KEY-----…" }' spellcheck="false" autocomplete="off"></textarea>
+              </div>
+              <div class="hint-block">Cloud Postbox — SES-совместимый сервис: пользовательский токен он не принимает и каталог берёт из самого сервисного аккаунта. Создай сервисный аккаунт с ролью <b>postbox.viewer</b> (для отправки писем — ещё <b>postbox.sender</b>), выпусти ему ключ кнопкой «Создать новый ключ» → «Создать JSON» и вставь сюда весь файл. По этому ключу мы сами получаем IAM-токен (заголовок X-YaCloud-SubjectToken).</div>
+            </div>
             <div id="yc-settings-msg" class="hint-block"></div>
           </div>
         </div>

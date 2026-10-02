@@ -1211,7 +1211,7 @@
         "миграц", "дамп",
         "группа машин", "группы машин", "instance group", "автомасштаб",
         "балансировщик", "балансировщика", "application load balancer", "load balancer", "слушатель", "группа целей", "http-роутер", "вход в приложение"],
-      names: ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycVpc", "ycCompute", "ycIam", "ycFunctions", "ycBilling", "ycCdn", "ycDb", "ycAi", "ycMonitor", "ycMdb", "ycIg", "ycAlb", "ycApiGw", "ycCosts", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"],
+      names: ["ycStatus", "ycList", "ycContainer", "ycSecret", "ycDns", "ycRegistry", "ycStorage", "ycVpc", "ycCompute", "ycIam", "ycFunctions", "ycBilling", "ycCdn", "ycDb", "ycAi", "ycMonitor", "ycMdb", "ycIg", "ycAlb", "ycApiGw", "ycPostbox", "ycCosts", "ycCreate", "ycDelete", "ycDeploy", "ycLogs", "ycInstall"],
     },
     {
       id: "sheets",

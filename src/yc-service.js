@@ -34,6 +34,10 @@ function ycConfig(s) {
   s = s || loadSettings();
   return {
     oauth: String(s.yandexOauthToken || "").trim(),
+    // JSON-ключ СЕРВИСНОГО аккаунта: он нужен только Cloud Postbox — обычный
+    // OAuth-токен этот SES-совместимый API не принимает (src/yc-sa.js меняет
+    // ключ на IAM-токен, заголовок X-YaCloud-SubjectToken).
+    saKey: String(s.yandexServiceAccount || "").trim(),
     cloudId: String(s.ycCloudId || "").trim(),
     folderId: String(s.ycFolderId || "").trim(),
     folderName: String(s.ycFolderName || "").trim(),

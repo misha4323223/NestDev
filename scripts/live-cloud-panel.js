@@ -142,9 +142,9 @@ ${STUBS}
 <script src="${BASE}src/renderer/yc-panel.js"></script>
 <script src="${BASE}src/renderer/yc-actions.js"></script>
 <script>
-  // Данные стенда: семнадцать сервисов (три managed-базы, группа машин,
-  // балансировщики, группы логов и API-шлюз), один отказал, есть ресурсы,
-  // деньги и хвосты.
+  // Данные стенда: девятнадцать сервисов (три managed-базы, группа машин,
+  // балансировщики, группы логов, API-шлюз и реестр образов), один отказал,
+  // есть ресурсы, деньги и хвосты.
   const services = [
     { key: "storage", ru: "Объектное хранилище", title: "Object Storage", ok: true, count: 3, items: [{ id: "b1", name: "site-bucket" }, { id: "b2", name: "logs-archive" }, { id: "b3", name: "backups" }] },
     { key: "cloudFunctions", ru: "Функции", title: "Cloud Functions", ok: true, count: 2, items: [{ id: "f1", name: "tg-webhook" }, { id: "f2", name: "hourly-report" }] },
@@ -183,7 +183,19 @@ ${STUBS}
     // смысл проверки [10].
     { key: "postgresql", ru: "База PostgreSQL", title: "Managed Service for PostgreSQL", ok: true, count: 2, items: [{ id: "pg1", name: "pg-1" }, { id: "pg2", name: "pg-prot" }] },
     { key: "mysql", ru: "База MySQL", title: "Managed Service for MySQL", ok: true, count: 1, items: [{ id: "my1", name: "my-1" }] },
-    { key: "clickhouse", ru: "База ClickHouse", title: "Managed Service for ClickHouse", ok: true, count: 1, items: [{ id: "ch1", name: "ch-1" }] }
+    { key: "clickhouse", ru: "База ClickHouse", title: "Managed Service for ClickHouse", ok: true, count: 1, items: [{ id: "ch1", name: "ch-1" }] },
+
+    // Реестр образов Container Registry: на полке был списком, а действий у
+    // плитки не было. Своё семейство и свой канал ycRegistry — список, образы,
+    // создание, удаление образа, уборка пачкой и удаление реестра, которое
+    // облако не делает, пока в реестре есть образы (заход 14).
+    { key: "containerRegistry", ru: "Реестр образов", title: "Container Registry", ok: true, count: 1, items: [{ id: "reg1", name: "app-registry" }] },
+
+    // Почта Cloud Postbox: на полке был только счётчик адресов, а действий у
+    // плитки не было. Своё семейство и свой канал ycPostbox — адреса (домены),
+    // карточка с записями DNS, создание, подпись DKIM и удаление, которое вместе
+    // с выключением подписи спрашивает человека (заход 15).
+    { key: "postbox", ru: "Почта", title: "Cloud Postbox", ok: true, count: 1, items: [{ id: "mail.example.ru", name: "mail.example.ru" }] }
   ];
   // Журнал вызовов каналов: по нему видно, ЧТО именно ушло в облако.
   window.__calls = [];
@@ -192,9 +204,15 @@ ${STUBS}
   window.__confirmCalls = 0;
   window.uiConfirm = (title, text, go) => { window.__confirmCalls++; go(); };
   window.uiToast = () => {};
+  // Состояние реестра для уборки: «Удалить образ» и «Убрать образы» меняют его,
+  // поэтому удаление реестра честно спотыкается о непустой реестр — как облако.
+  let regImages = [
+    { id: "img1", name: "app", tags: ["v1.2", "latest"], digest: "sha256:aaa1", size: 20971520, createdAt: "2026-09-01T10:00:00Z" },
+    { id: "img2", name: "app", tags: ["v1.1"], digest: "sha256:bbb2", size: 10485760, createdAt: "2026-08-01T10:00:00Z" }
+  ];
   const api = {
     ycStatus: async () => ({ loggedIn: true, iamOk: true, folderId: "b1g", folderName: "prod-web" }),
-    ycResources: async () => ({ ok: true, services, total: 18, activeServices: 10 }),
+    ycResources: async () => ({ ok: true, services, total: 19, activeServices: 10 }),
     ycBilling: async () => ({
       ok: true,
       account: { id: "acc", name: "Облако", currency: "RUB", balance: 1234.56, balanceHuman: "1 234,56 ₽", active: true },
@@ -800,6 +818,186 @@ ${STUBS}
         return { ok: true, changed: true, deleted: true, lines: ["🗑 API-шлюз удалён: main-api", "https://gw1.apigw.yandexcloud.net больше не отвечает."], message: "API-шлюз удалён." };
       }
       return { ok: false, error: "Неизвестное действие API-шлюза: " + a.op + ". Доступно: list, gateway, spec, create, update, delete." };
+    },
+    // Секреты Lockbox: та же форма ответа, что у настоящего src/yc-ipc.js —
+    // список, карточка, версии (значения не отдаются — видны только имена
+    // ключей), заведение версии, выдача роли сервисному аккаунту и удаление,
+    // которое ДВУХШАГОВОЕ.
+    ycLockbox: async (a) => {
+      window.__calls.push(["ycLockbox", a]);
+      const who = "Секрет «app-env» (sec1)";
+      const secrets = [{ id: "sec1", name: "app-env", status: "ACTIVE", currentVersion: { id: "ver2" }, createdAt: "2026-09-10T10:00:00Z" }];
+      if (a.op === "list") {
+        return { ok: true, folder: { id: "b1g", name: "prod-web" }, secrets: secrets,
+          lines: ["• app-env — готов · версия ver2 (sec1)"], message: "Секретов: 1." };
+      }
+      if (a.op === "secret") {
+        return { ok: true, secret: { id: "sec1", name: "app-env" },
+          lines: [who, "Описание: —", "Статус: готов", "Текущая версия: ver2", "Версий всего: 2", "Защита от удаления: нет", "Создан: 2026-09-10"],
+          message: "Секрет." };
+      }
+      if (a.op === "versions") {
+        return { ok: true, secret: { id: "sec1", name: "app-env" },
+          versions: [{ id: "ver2" }, { id: "ver1" }],
+          lines: ["Версии секрета «app-env» (свежие сверху), всего 2:", "• ver2 — создана 2026-09-20 10:00 · ключи: API_KEY, DB_URL", "• ver1 — создана 2026-09-10 10:00 · ключи: API_KEY",
+            "", "Значения секретов API не отдаёт — видны только имена ключей."],
+          message: "Версии секрета." };
+      }
+      if (a.op === "create") {
+        return { ok: true, changed: true, id: "sec2", name: a.name, secret: { id: "sec2", name: a.name },
+          lines: ["✅ Секрет создан: " + a.name + " (sec2)", "Пустой секрет бесполезен — добавь версию действием «↑ Новая версия (ключи и значения)»."],
+          message: "Секрет создан." };
+      }
+      if (a.op === "putversion") {
+        return { ok: true, changed: true, id: "sec1", versionId: "ver3",
+          lines: ["✅ Новая версия секрета «app-env»: ver3", "Ключи: API_KEY", "Значения в ответе не показываю: они ушли в облако и обратно не читаются."],
+          message: "Версия секрета добавлена." };
+      }
+      if (a.op === "grant") {
+        return { ok: true, changed: true, id: "sec1",
+          lines: ["✅ Доступ к секрету «app-env» выдан сервисному аккаунту " + a.serviceAccountId + " (роль " + a.role + ").",
+            "Теперь ревизия контейнера может прочитать значения из этого секрета."],
+          message: "Доступ к секрету выдан." };
+      }
+      if (a.op === "delete") {
+        if (a.confirmed !== true) {
+          return { ok: false, needsConfirm: true,
+            error: "Удаление секрета необратимо: все его версии и значения исчезнут, а ревизии, которые на него ссылаются, перестанут стартовать. Подтверди удаление.",
+            lines: [who] };
+        }
+        return { ok: true, changed: true, deleted: true, lines: ["🗑 Секрет удалён: app-env", "Все его версии и значения больше не вернуть."], message: "Секрет удалён." };
+      }
+      return { ok: false, error: "Неизвестное действие секретов: " + a.op + ". Доступно: list, secret, versions, create, putversion, grant, delete." };
+    },
+    // Реестр образов Container Registry: та же форма ответа, что у настоящего
+    // src/yc-ipc.js — список, образы, создание, удаление образа, уборка пачкой и
+    // удаление реестра, которое облако НЕ делает, пока в реестре есть образы.
+    ycRegistry: async (a) => {
+      window.__calls.push(["ycRegistry", a]);
+      const regs = [{ id: "reg1", name: "app-registry", status: "ACTIVE", createdAt: "2026-09-01T10:00:00Z" }];
+      const who = "Реестр «app-registry» (reg1)";
+      if (a.op === "list") {
+        return { ok: true, registries: regs, lines: ["• app-registry — готов (reg1) · создан 2026-09-01"], message: "Реестров: 1." };
+      }
+      if (a.op === "create") {
+        return { ok: true, changed: true, id: "reg2", name: a.name,
+          lines: ["✅ Реестр создан: " + a.name + " (reg2)", "Адрес образов: cr.yandex/reg2/<образ>:<тег>. Класть образы — выкаткой."],
+          message: "Реестр создан." };
+      }
+      const found = a.registry === "app-registry" || a.registry === "reg1";
+      const missing = { ok: false, error: "Не нашёл реестр «" + a.registry + "». В каталоге: app-registry." };
+      if (a.op === "images") {
+        if (!found) return missing;
+        return { ok: true, registry: { id: "reg1", name: "app-registry" }, images: regImages,
+          lines: ["Образы реестра «app-registry», всего " + regImages.length + ":"].concat(
+            regImages.length ? regImages.map((i) => "• " + i.name + " — теги: " + i.tags.join(", ") + " · " + (i.size >= 1048576 ? (Math.round(i.size / 1048576 * 10) / 10) + " МБ" : Math.round(i.size / 1024) + " КБ") + " · id " + i.id) : ["  (образов нет — реестр пуст)"]
+          ),
+          message: "Образов: " + regImages.length + "." };
+      }
+      if (!found) return missing;
+      if (a.op === "delimage") {
+        const img = regImages.find((i) => i.id === a.image || i.tags.indexOf(a.image) >= 0);
+        if (!img) return { ok: false, error: "В реестре «app-registry» нет образа «" + a.image + "» — возможно, его уже удалили." };
+        if (a.confirmed !== true) {
+          return { ok: false, needsConfirm: true,
+            error: "Удаление образа необратимо: его теги исчезнут вместе с ним, и вернуть образ будет нельзя. Если на тег ссылается контейнер, следующая выкатка его не соберёт. Подтверди удаление.",
+            lines: ["• " + img.name + " — теги: " + img.tags.join(", ") + " · id " + img.id] };
+        }
+        regImages = regImages.filter((i) => i !== img);
+        return { ok: true, changed: true, deleted: true, id: img.id, lines: ["🗑 Образ удалён: " + img.name + " (теги: " + img.tags.join(", ") + ")", "Вернуть образ нельзя; теги больше на него не указывают."], message: "Образ удалён." };
+      }
+      if (a.op === "clean") {
+        const older = Number(a.olderThanDays || 0);
+        let targets = regImages;
+        if (older > 0) targets = regImages.filter((i) => Date.parse(i.createdAt) < Date.now() - older * 86400000);
+        if (!targets.length) {
+          return { ok: true, changed: false, cleared: 0, lines: ["Убирать нечего: " + (older > 0 ? "образов старше " + older + " дн. в реестре нет." : "в реестре нет образов.")], message: "Убирать нечего." };
+        }
+        if (a.confirmed !== true) {
+          return { ok: false, needsConfirm: true,
+            error: "Убрать образы из реестра «app-registry» — необратимо: их и их теги не вернуть, собрать заново можно только новой выкаткой. Готов удалить " + targets.length + " образ(ов)? Подтверди уборку.",
+            lines: targets.map((i) => "• " + i.name + " — теги: " + i.tags.join(", ") + " · id " + i.id) };
+        }
+        const done = targets.length;
+        regImages = regImages.filter((i) => targets.indexOf(i) === -1);
+        return { ok: true, changed: true, cleared: done, lines: ["🧹 Убрано образов: " + done + " из " + targets.length + "."], message: "Убрано образов: " + done + "." };
+      }
+      if (a.op === "delete") {
+        if (regImages.length) {
+          return { ok: false, error: "Реестр «app-registry» не пуст: в нём " + regImages.length + " образ(ов). Облако не удаляет непустой реестр — сначала убери образы действием «🧹 Убрать образы (все или старше N дней)», потом повтори удаление." };
+        }
+        if (a.confirmed !== true) {
+          return { ok: false, needsConfirm: true, error: "Удаление реестра необратимо: адрес cr.yandex/reg1 перестанет существовать. Подтверди удаление.", lines: [who] };
+        }
+        return { ok: true, changed: true, deleted: true, id: "reg1", lines: ["🗑 Реестр удалён: app-registry", "Его адрес cr.yandex/reg1 больше не существует."], message: "Реестр удалён." };
+      }
+      return { ok: false, error: "Неизвестное действие реестра: " + a.op + ". Доступно: list, images, create, delimage, clean, delete." };
+    },
+    // Почта Cloud Postbox: та же форма ответа, что у настоящего src/yc-ipc.js —
+    // список адресов (ДОМЕНОВ), карточка с записями DNS, создание, подпись DKIM и
+    // удаление; выключение подписи и удаление — ДВУХШАГОВЫЕ, а ответ про DKIM
+    // честно говорит, что значение CNAME облако не отдаёт.
+    ycPostbox: async (a) => {
+      window.__calls.push(["ycPostbox", a]);
+      const addr = "mail.example.ru";
+      const who = "• " + addr + " — подтверждён · письма разрешены · DKIM: включена · запись в DNS: найдена в DNS";
+      if (a.op === "list") {
+        return { ok: true, count: 1, identities: [{ id: addr, name: addr }],
+          lines: [who], message: "Адресов: 1." };
+      }
+      if (a.op === "create") {
+        if (/@/.test(String(a.name || ""))) {
+          return { ok: false, error: "«" + a.name + "» — это ящик, а Postbox заводит ДОМЕН, с которого шлют письма. Подойдёт, например, «example.ru» или «mail.example.ru»." };
+        }
+        return { ok: true, changed: true, address: a.name,
+          lines: ["✅ Адрес создан: " + a.name, "Проверка владения доменом: проверяется · подпись DKIM: ищется в DNS",
+            "Осталось подтвердить владение доменом: добавь в DNS записи из раздела «Настройка подписи писем (DKIM)» на странице адреса — две CNAME-записи (Simple), имя — <селектор>._domainkey.<адрес>."],
+          message: "Адрес создан." };
+      }
+      if (a.address !== addr) {
+        return { ok: false, error: "Не нашёл адрес «" + (a.address || "") + "». В каталоге: mail.example.ru." };
+      }
+      if (a.op === "card") {
+        return { ok: true, address: addr,
+          lines: ["Адрес «" + addr + "» · тип: domain", "Проверка владения доменом: подтверждён", "Письма: разрешены",
+            "Оповещения о доставке: выключены",
+            "Подпись DKIM: включена · запись в DNS: найдена в DNS · настройка: простая (ключи создаёт облако), ключ 2048 бит",
+            "Селекторы: sel1, sel2", "", "Записи для подтверждения владения доменом (DNS):",
+            "  CNAME sel1._domainkey." + addr + " — значение (целевой хост) облако показывает в разделе «Настройка подписи писем (DKIM)» на странице адреса",
+            "  Обе CNAME-записи обязательны: они нужны и для автоматической смены ключей DKIM."],
+          message: "Адрес." };
+      }
+      if (a.op === "dkim") {
+        return { ok: true, address: addr, dkim: { enabled: true, statusHuman: "найдена в DNS", tokens: ["sel1", "sel2"] },
+          lines: ["Подпись DKIM адреса «" + addr + "»: включена", "Запись в DNS: найдена в DNS · настройка: простая (ключи создаёт облако), ключ 2048 бит", "",
+            "Записи для подтверждения владения доменом (DNS):",
+            "  CNAME sel1._domainkey." + addr + " — значение (целевой хост) облако показывает в разделе «Настройка подписи писем (DKIM)» на странице адреса",
+            "", "Включить или выключить подпись: действия «✍ Включить подпись DKIM» и «🔒 Выключить подпись DKIM»."],
+          message: "Подпись DKIM." };
+      }
+      if (a.op === "dkimon" || a.op === "dkimoff") {
+        const on = a.op === "dkimon";
+        if (!on && a.confirmed !== true) {
+          return { ok: false, needsConfirm: true,
+            error: "Выключение подписи DKIM рушит доставляемость: письма без подписи чаще попадают в спам и хуже проверяются почтовыми службами. Подтверди выключение.",
+            lines: [who] };
+        }
+        return { ok: true, changed: true, address: addr, dkim: { enabled: on },
+          lines: [(on ? "✍ Подпись DKIM включена: " : "🔒 Подпись DKIM выключена: ") + addr,
+            "Запись в DNS: " + (on ? "найдена в DNS" : "ищется в DNS")],
+          message: on ? "Подпись DKIM включена." : "Подпись DKIM выключена." };
+      }
+      if (a.op === "delete") {
+        if (a.confirmed !== true) {
+          return { ok: false, needsConfirm: true,
+            error: "Удаление адреса необратимо: с него перестанут уходить письма, а его DNS-записи (DKIM) перестанут работать. Подтверди удаление.",
+            lines: [who] };
+        }
+        return { ok: true, changed: true, deleted: true, address: addr,
+          lines: ["🗑 Адрес удалён: " + addr, "Письма с него больше не уйдут; вернуть адрес можно только создав его заново."],
+          message: "Адрес удалён." };
+      }
+      return { ok: false, error: "Неизвестное действие почты: " + a.op + ". Доступно: list, card, create, dkim, dkimon, dkimoff, delete." };
     }
   };
   // Модуль действий (как yc-console) берёт каналы из window.api — в приложении их
@@ -862,8 +1060,8 @@ fs.writeFileSync(SHOT, PAGE, "utf8");
           .slice(0, 6),
       };
     });
-    ok(info.tiles === 17, "плиток столько же, сколько сервисов (семнадцать)", String(info.tiles));
-    ok(info.icons === 17, "у каждой плитки своя официальная иконка", String(info.icons));
+    ok(info.tiles === 19, "плиток столько же, сколько сервисов (девятнадцать)", String(info.tiles));
+    ok(info.icons === 19, "у каждой плитки своя официальная иконка", String(info.icons));
     ok(info.columns === 2, "полка в две колонки при ширине панели 460px", "колонок: " + info.columns);
     ok(
       info.logo && Math.round(info.logo.width) === 32 && Math.round(info.logo.height) === 32,
@@ -2521,6 +2719,392 @@ fs.writeFileSync(SHOT, PAGE, "utf8");
     ok(gwDelete.danger && gwDelete.asked, "«Удалить шлюз» помечено опасным и спросило человека", JSON.stringify({ danger: gwDelete.danger, asked: gwDelete.asked }));
     ok(gwDelete.args && gwDelete.args.gateway === "main-api" && gwDelete.args.confirmed === true, "удаление ушло со шлюзом и согласием", JSON.stringify(gwDelete.args));
     ok(/API-шлюз удалён/.test(gwDelete.text), "ответ назвал удаление шлюза", gwDelete.text.slice(0, 240));
+
+    // ── Секреты Lockbox и реестр образов (часть 91, заход 14) ─────────────────
+    // У обеих плиток своё семейство действий. У секретов это то, чего в окне
+    // не было: версии (значения облако не отдаёт — видны только имена ключей),
+    // выдача роли сервисному аккаунту и удаление. У реестра — образы, создание
+    // и уборка пачкой; удаление реестра облако не делает, пока в нём есть
+    // образы, и окно обязано сказать это словами, а не упасть с 400.
+    section("[20] Секреты Lockbox и реестр образов: формы, роли и опасные действия");
+    const lbTile = await page.evaluate(async () => {
+      const tile = [...document.querySelectorAll("#yc-dash .yc-tile")].find((t) => /Секреты/.test(t.textContent));
+      const btn = tile && [...tile.querySelectorAll("button")].find((b) => /Действия/.test(b.textContent));
+      if (btn) btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const box = document.getElementById("yc-actions");
+      const title = box ? (box.querySelector(".yc-act-title") || {}).textContent : "";
+      const listed = box ? [...box.querySelectorAll(".yc-act-btn")].map((b) => b.textContent.trim()) : [];
+      const listBtn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /^Секреты и их состояние/.test(b.textContent.trim()));
+      if (listBtn) listBtn.click();
+      await new Promise((r) => setTimeout(r, 70));
+      const sent = window.__calls.filter((c) => c[0] === "ycLockbox" && c[1].op === "list").slice(-1)[0];
+      return { btn: !!btn, title: title, listed: listed, called: !!sent, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(lbTile.btn && /Секреты/.test(lbTile.title || ""), "у плитки «Секреты» есть кнопка действий", JSON.stringify({ btn: lbTile.btn, title: lbTile.title }));
+    ok(lbTile.listed.length === 7, "в семействе семь действий: " + lbTile.listed.length + " (" + lbTile.listed.join(", ") + ")");
+    ok(
+      lbTile.listed.some((t) => /Создать секрет/.test(t)) && lbTile.listed.some((t) => /Версии и имена ключей/.test(t)) && lbTile.listed.some((t) => /Выдать доступ/.test(t)) && lbTile.listed.some((t) => /Удалить секрет/.test(t)),
+      "список называет версии, выдачу доступа и удаление: " + lbTile.listed.join(", ")
+    );
+    ok(lbTile.called && /app-env/.test(lbTile.text), "действие «Секреты и их состояние» позвало канал и показало секрет", lbTile.text.slice(0, 200));
+
+    const lbVersions = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Версии и имена ключей/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /^Секрет/.test(label)) input.value = "app-env";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycLockbox" && c[1].op === "versions").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(lbVersions.args && lbVersions.args.secret === "app-env" && /ver2/.test(lbVersions.text), "форма собрала секрет, а ответ показал версии", lbVersions.text.slice(0, 200));
+    ok(/не отдаёт/.test(lbVersions.text), "ответ честно говорит, что значений секрета API не отдаёт", lbVersions.text.slice(0, 240));
+
+    const lbGrant = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Выдать доступ/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      let role = "";
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Секрет/.test(label)) input.value = "app-env";
+        if (/^Сервисный аккаунт/.test(label)) input.value = "aje1deploybot";
+        if (/^Роль/.test(label)) role = input.value;
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycLockbox" && c[1].op === "grant").slice(-1)[0] || null;
+      return { role: role, args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(lbGrant.role === "lockbox.payloadViewer", "роль по умолчанию — ровно та, что нужна ревизии: " + lbGrant.role);
+    ok(
+      lbGrant.args && lbGrant.args.serviceAccountId === "aje1deploybot" && lbGrant.args.role === "lockbox.payloadViewer",
+      "выдача доступа ушла сервисному аккаунту с ролью",
+      JSON.stringify(lbGrant.args && { sa: lbGrant.args.serviceAccountId, role: lbGrant.args.role })
+    );
+    ok(/Доступ к секрету/.test(lbGrant.text) && /выдан/.test(lbGrant.text), "ответ назвал выданный доступ", lbGrant.text.slice(0, 240));
+
+    const lbDelete = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      const btn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /Удалить секрет/.test(b.textContent));
+      const danger = btn ? btn.classList.contains("danger") : false;
+      btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /^Секрет/.test(label)) input.value = "app-env";
+      }
+      const before = window.__confirmCalls;
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const out = document.getElementById("yc-act-out");
+      const go = [...out.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Подтвердить/.test(b.textContent));
+      if (go) go.click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycLockbox" && c[1].op === "delete").slice(-1)[0] || null;
+      return { danger: danger, asked: window.__confirmCalls > before, args: sent ? sent[1] : null, text: out.textContent };
+    });
+    ok(lbDelete.danger && lbDelete.asked, "«Удалить секрет» помечено опасным и спросило человека", JSON.stringify({ danger: lbDelete.danger, asked: lbDelete.asked }));
+    ok(lbDelete.args && lbDelete.args.secret === "app-env" && lbDelete.args.confirmed === true, "удаление ушло с секретом и согласием", JSON.stringify(lbDelete.args));
+    ok(/Секрет удалён/.test(lbDelete.text), "ответ назвал удаление секрета", lbDelete.text.slice(0, 240));
+
+    const regTile = await page.evaluate(async () => {
+      const tile = [...document.querySelectorAll("#yc-dash .yc-tile")].find((t) => /Реестр образов/.test(t.textContent));
+      const btn = tile && [...tile.querySelectorAll("button")].find((b) => /Действия/.test(b.textContent));
+      if (btn) btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const box = document.getElementById("yc-actions");
+      const title = box ? (box.querySelector(".yc-act-title") || {}).textContent : "";
+      const listed = box ? [...box.querySelectorAll(".yc-act-btn")].map((b) => b.textContent.trim()) : [];
+      const listBtn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /^Реестры и их состояние/.test(b.textContent.trim()));
+      if (listBtn) listBtn.click();
+      await new Promise((r) => setTimeout(r, 70));
+      const sent = window.__calls.filter((c) => c[0] === "ycRegistry" && c[1].op === "list").slice(-1)[0];
+      return { btn: !!btn, title: title, listed: listed, called: !!sent, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(regTile.btn && /Реестр образов/.test(regTile.title || ""), "у плитки «Реестр образов» есть кнопка действий", JSON.stringify({ btn: regTile.btn, title: regTile.title }));
+    ok(regTile.listed.length === 6, "в семействе шесть действий: " + regTile.listed.length + " (" + regTile.listed.join(", ") + ")");
+    ok(
+      regTile.listed.some((t) => /Создать реестр/.test(t)) && regTile.listed.some((t) => /Удалить образ/.test(t)) && regTile.listed.some((t) => /Убрать образы/.test(t)) && regTile.listed.some((t) => /Удалить реестр/.test(t)),
+      "список называет образы, уборку и удаление реестра: " + regTile.listed.join(", ")
+    );
+    ok(regTile.called && /app-registry/.test(regTile.text), "действие «Реестры и их состояние» позвало канал и показало реестр", regTile.text.slice(0, 200));
+
+    const regImagesOut = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /^Образы реестра/.test(b.textContent.trim())).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /^Реестр/.test(label)) input.value = "app-registry";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycRegistry" && c[1].op === "images").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(
+      regImagesOut.args && regImagesOut.args.registry === "app-registry" && /v1\.2/.test(regImagesOut.text) && /img1/.test(regImagesOut.text),
+      "форма собрала реестр, а ответ показал образы с тегами и id",
+      regImagesOut.text.slice(0, 240)
+    );
+
+    const regCreate = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Создать реестр/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /^Имя реестра/.test(label)) input.value = "win-reg";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycRegistry" && c[1].op === "create").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(regCreate.args && regCreate.args.name === "win-reg", "форма создания собрала имя реестра", JSON.stringify(regCreate.args && { name: regCreate.args.name }));
+    ok(/Реестр создан/.test(regCreate.text), "ответ назвал создание реестра", regCreate.text.slice(0, 240));
+
+    const regImageDelete = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      const btn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /^🗑 Удалить образ/.test(b.textContent.trim()));
+      const danger = btn ? btn.classList.contains("danger") : false;
+      btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (!input) continue;
+        if (/^Реестр/.test(label)) input.value = "app-registry";
+        if (/^Образ/.test(label)) input.value = "v1.2";
+      }
+      const before = window.__confirmCalls;
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const out = document.getElementById("yc-act-out");
+      const go = [...out.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Подтвердить/.test(b.textContent));
+      if (go) go.click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycRegistry" && c[1].op === "delimage").slice(-1)[0] || null;
+      return { danger: danger, asked: window.__confirmCalls > before, args: sent ? sent[1] : null, text: out.textContent };
+    });
+    ok(regImageDelete.danger && regImageDelete.asked, "«Удалить образ» помечено опасным и спросило человека", JSON.stringify({ danger: regImageDelete.danger, asked: regImageDelete.asked }));
+    ok(
+      regImageDelete.args && regImageDelete.args.registry === "app-registry" && regImageDelete.args.image === "v1.2" && regImageDelete.args.confirmed === true,
+      "удаление образа ушло реестром, тегом и согласием",
+      JSON.stringify(regImageDelete.args)
+    );
+    ok(/Образ удалён/.test(regImageDelete.text), "ответ назвал удаление образа", regImageDelete.text.slice(0, 240));
+
+    const regNotEmpty = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Удалить реестр/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /^Реестр/.test(label)) input.value = "app-registry";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      return { text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(
+      /не пуст/.test(regNotEmpty.text) && /сначала убери образы/.test(regNotEmpty.text),
+      "непустой реестр удалить нельзя — окно сказало это словами",
+      regNotEmpty.text.slice(0, 240)
+    );
+
+    const regClean = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /Убрать образы/.test(b.textContent)).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /^Реестр/.test(label)) input.value = "app-registry";
+      }
+      const before = window.__confirmCalls;
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const out = document.getElementById("yc-act-out");
+      const go = [...out.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Подтвердить/.test(b.textContent));
+      if (go) go.click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycRegistry" && c[1].op === "clean").slice(-1)[0] || null;
+      return { asked: window.__confirmCalls > before, args: sent ? sent[1] : null, text: out.textContent };
+    });
+    ok(regClean.asked && regClean.args && regClean.args.registry === "app-registry" && regClean.args.confirmed === true, "уборка образов спросила человека и ушла с согласием", JSON.stringify(regClean.args));
+    ok(/Убрано образов: 1 из 1/.test(regClean.text), "ответ назвал уборку пачкой", regClean.text.slice(0, 240));
+
+    const regDelete = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      const btn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /Удалить реестр/.test(b.textContent));
+      const danger = btn ? btn.classList.contains("danger") : false;
+      btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /^Реестр/.test(label)) input.value = "app-registry";
+      }
+      const before = window.__confirmCalls;
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const out = document.getElementById("yc-act-out");
+      const go = [...out.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Подтвердить/.test(b.textContent));
+      if (go) go.click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycRegistry" && c[1].op === "delete").slice(-1)[0] || null;
+      return { danger: danger, asked: window.__confirmCalls > before, args: sent ? sent[1] : null, text: out.textContent };
+    });
+    ok(regDelete.danger && regDelete.asked, "«Удалить реестр» помечено опасным и спросило человека", JSON.stringify({ danger: regDelete.danger, asked: regDelete.asked }));
+    ok(regDelete.args && regDelete.args.registry === "app-registry" && regDelete.args.confirmed === true, "удаление реестра ушло с согласием", JSON.stringify(regDelete.args));
+    ok(/Реестр удалён/.test(regDelete.text), "ответ назвал удаление реестра", regDelete.text.slice(0, 240));
+
+    section("[21] Почта Cloud Postbox: плитка, записи DNS и опасные действия");
+    const pbTile = await page.evaluate(async () => {
+      const tile = [...document.querySelectorAll("#yc-dash .yc-tile")].find((t) => /Почта/.test(t.textContent));
+      const btn = tile && [...tile.querySelectorAll("button")].find((b) => /Действия/.test(b.textContent));
+      if (btn) btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const box = document.getElementById("yc-actions");
+      const title = box ? (box.querySelector(".yc-act-title") || {}).textContent : "";
+      const listed = box ? [...box.querySelectorAll(".yc-act-btn")].map((b) => b.textContent.trim()) : [];
+      const listBtn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /^Адреса и их состояние/.test(b.textContent.trim()));
+      if (listBtn) listBtn.click();
+      await new Promise((r) => setTimeout(r, 70));
+      const sent = window.__calls.filter((c) => c[0] === "ycPostbox" && c[1].op === "list").slice(-1)[0];
+      return { btn: !!btn, title: title, listed: listed, called: !!sent, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(pbTile.btn && /Почта/.test(pbTile.title || ""), "у плитки «Почта» есть кнопка действий", JSON.stringify({ btn: pbTile.btn, title: pbTile.title }));
+    ok(pbTile.listed.length === 7, "в семействе семь действий: " + pbTile.listed.length + " (" + pbTile.listed.join(", ") + ")");
+    ok(
+      pbTile.listed.some((t) => /Создать адрес/.test(t)) && pbTile.listed.some((t) => /✍ Включить подпись/.test(t)) && pbTile.listed.some((t) => /🔒 Выключить подпись/.test(t)) && pbTile.listed.some((t) => /Удалить адрес/.test(t)),
+      "список называет подпись, выключение и удаление: " + pbTile.listed.join(", ")
+    );
+    ok(pbTile.called && /mail\.example\.ru/.test(pbTile.text) && /подтверждён/.test(pbTile.text), "действие «Адреса и их состояние» позвало канал и показало адрес", pbTile.text.slice(0, 200));
+
+    const pbCard = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      [...box.querySelectorAll(".yc-act-btn")].find((b) => /^Карточка адреса/.test(b.textContent.trim())).click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /^Адрес/.test(label)) input.value = "mail.example.ru";
+      }
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycPostbox" && c[1].op === "card").slice(-1)[0] || null;
+      return { args: sent ? sent[1] : null, text: document.getElementById("yc-act-out").textContent };
+    });
+    ok(pbCard.args && pbCard.args.address === "mail.example.ru" && /Проверка владения доменом/.test(pbCard.text), "форма собрала адрес, а ответ показал карточку", pbCard.text.slice(0, 240));
+    ok(/CNAME sel1\._domainkey\.mail\.example\.ru/.test(pbCard.text) && /облако показывает/.test(pbCard.text), "ответ назвал записи DNS и честно сказал про целевой хост", pbCard.text.slice(0, 240));
+
+    const pbDkimOff = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      const btn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /^🔒 Выключить подпись DKIM/.test(b.textContent.trim()));
+      const danger = btn ? btn.classList.contains("danger") : false;
+      btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /^Адрес/.test(label)) input.value = "mail.example.ru";
+      }
+      const before = window.__confirmCalls;
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const out = document.getElementById("yc-act-out");
+      const go = [...out.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Подтвердить/.test(b.textContent));
+      if (go) go.click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycPostbox" && c[1].op === "dkimoff").slice(-1)[0] || null;
+      return { danger: danger, asked: window.__confirmCalls > before, args: sent ? sent[1] : null, text: out.textContent };
+    });
+    ok(pbDkimOff.danger && pbDkimOff.asked, "«Выключить подпись DKIM» помечено опасным и спросило человека", JSON.stringify({ danger: pbDkimOff.danger, asked: pbDkimOff.asked }));
+    ok(
+      pbDkimOff.args && pbDkimOff.args.address === "mail.example.ru" && pbDkimOff.args.confirmed === true,
+      "выключение подписи ушло с адресом и согласием",
+      JSON.stringify(pbDkimOff.args)
+    );
+    ok(/Подпись DKIM выключена/.test(pbDkimOff.text), "ответ назвал выключение подписи", pbDkimOff.text.slice(0, 240));
+
+    const pbDelete = await page.evaluate(async () => {
+      const box = document.getElementById("yc-actions");
+      const cancel = [...box.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Отмена/.test(b.textContent));
+      if (cancel) cancel.click();
+      await new Promise((r) => setTimeout(r, 30));
+      const btn = [...box.querySelectorAll(".yc-act-btn")].find((b) => /^🗑 Удалить адрес/.test(b.textContent.trim()));
+      const danger = btn ? btn.classList.contains("danger") : false;
+      btn.click();
+      await new Promise((r) => setTimeout(r, 40));
+      const form = box.querySelector(".yc-act-form");
+      for (const row of form.querySelectorAll(".yc-act-field")) {
+        const label = (row.querySelector(".yc-act-label") || {}).textContent || "";
+        const input = row.querySelector("input, select, textarea");
+        if (input && /^Адрес/.test(label)) input.value = "mail.example.ru";
+      }
+      const before = window.__confirmCalls;
+      form.querySelector(".yc-act-actionsrow button").click();
+      await new Promise((r) => setTimeout(r, 90));
+      const out = document.getElementById("yc-act-out");
+      const go = [...out.querySelectorAll(".yc-act-actionsrow button")].find((b) => /Подтвердить/.test(b.textContent));
+      if (go) go.click();
+      await new Promise((r) => setTimeout(r, 90));
+      const sent = window.__calls.filter((c) => c[0] === "ycPostbox" && c[1].op === "delete").slice(-1)[0] || null;
+      return { danger: danger, asked: window.__confirmCalls > before, args: sent ? sent[1] : null, text: out.textContent };
+    });
+    ok(pbDelete.danger && pbDelete.asked, "«Удалить адрес» помечено опасным и спросило человека", JSON.stringify({ danger: pbDelete.danger, asked: pbDelete.asked }));
+    ok(pbDelete.args && pbDelete.args.address === "mail.example.ru" && pbDelete.args.confirmed === true, "удаление адреса ушло с адресом и согласием", JSON.stringify(pbDelete.args));
+    ok(/Адрес удалён/.test(pbDelete.text), "ответ назвал удаление адреса", pbDelete.text.slice(0, 240));
 
   } finally {
     await browser.close();

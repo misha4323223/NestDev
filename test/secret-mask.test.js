@@ -61,6 +61,7 @@ const SETTINGS = () => ({
   yandexOauthToken: "y0-токен",
   mailPassword: "пароль-почты",
   googleServiceAccount: '{"client_email":"a@b.iam.gserviceaccount.com","private_key":"ключ"}',
+  yandexServiceAccount: '{"service_account_id":"aje1","private_key":"ключ"}', // JSON ключа сервисного аккаунта Yandex Cloud (Postbox)
   mobilePin: "482913",
   agentEnv: { TOKEN: "значение-переменной", CITY: "Москва" },
   agentEnvScopes: { TOKEN: ["terminal"] },

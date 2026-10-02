@@ -136,6 +136,10 @@ const FAMILY_CHANNEL = {
   // Container Registry (часть 91, заход 14): реестр и его образы. Канал
   // «yc:registry» зовёт src/yandex-cloud.js и src/yc-registry.js.
   containerRegistry: "yc:registry",
+  // Cloud Postbox (часть 91, заход 15): адреса (домены), с которых уходят письма.
+  // Канал «yc:postbox» меняет ключ сервисного аккаунта на IAM-токен (src/yc-sa.js),
+  // потому что SES-совместимый сервис пользовательский токен не принимает.
+  postbox: "yc:postbox",
 };
 
 function section(channel) {
@@ -230,7 +234,7 @@ function main() {
         // что пометки не потерялись у тех действий, где за них платят или где
         // отменить уже нельзя.
         const mustPay = ["compute:create", "compute:snapshot", "compute:restoredisk", "vpc:reserve", "cdn:cdncreate", "certificateManager:cdncreate", "postgresql:create", "mysql:create", "clickhouse:create", "instanceGroups:create", "alb:lbnew"];
-        const mustDanger = ["compute:delete", "compute:delsnapshot", "vpc:delsubnet", "vpc:delgroup", "vpc:delrule", "vpc:release", "iam:delete", "iam:revoke", "iam:delkey", "cloudFunctions:delete", "cloudFunctions:delversion", "cloudFunctions:public", "cdn:cdndel", "certificateManager:certdel", "postgresql:delete", "mysql:delete", "clickhouse:delete", "dns:delete", "instanceGroups:delete", "alb:targetdel", "alb:routerdel", "alb:lbdel", "apiGateway:delete", "lockbox:delete", "containerRegistry:delimage", "containerRegistry:clean", "containerRegistry:delete"];
+        const mustDanger = ["compute:delete", "compute:delsnapshot", "vpc:delsubnet", "vpc:delgroup", "vpc:delrule", "vpc:release", "iam:delete", "iam:revoke", "iam:delkey", "cloudFunctions:delete", "cloudFunctions:delversion", "cloudFunctions:public", "cdn:cdndel", "certificateManager:certdel", "postgresql:delete", "mysql:delete", "clickhouse:delete", "dns:delete", "instanceGroups:delete", "alb:targetdel", "alb:routerdel", "alb:lbdel", "apiGateway:delete", "lockbox:delete", "containerRegistry:delimage", "containerRegistry:clean", "containerRegistry:delete", "postbox:dkimoff", "postbox:delete"];
         const problems = [];
         const seen = new Set();
         for (const service of Object.keys(A.ACTIONS)) {

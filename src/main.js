@@ -1188,6 +1188,12 @@ const ycApiGw = require("./yc-apigw.js");
 // и src/yc-registry.js — только проверки и человеческие слова.
 const ycLockbox = require("./yc-lockbox.js");
 const ycRegistry = require("./yc-registry.js");
+// Cloud Postbox (часть 91, заход 15): SES-совместимый сервис принимает только
+// IAM-токен СЕРВИСНОГО аккаунта, поэтому рядом живёт модуль ключа (src/yc-sa.js):
+// он подписывает JWT (PS256) и меняет его на IAM-токен. Канал окна («yc:postbox»)
+// и инструмент агента берут ОДИН экземпляр у обоих — значит, и кэш токена один.
+const ycPostbox = require("./yc-postbox.js");
+const ycSa = require("./yc-sa.js");
 const ycService = createYcService({ app, path, net, secrets, yandexCloud, ycCli, ycLogs, ycEnsurePath, loadSettings });
 const {
   ycConfig,
@@ -1204,7 +1210,7 @@ const {
 // ycAi — тот же экземпляр модуля, что у агента (один кэш IAM-токена); fs, path,
 // resolvePath и agentWorkDir нужны каналу «yc:ai»: снимки и записи он читает с
 // диска, а синтезированную речь кладёт в рабочую папку агента.
-registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, ycIg, ycAlb, ycDb, ycLogs, ycApiGw, ycLockbox, ycRegistry, fs, path, resolvePath, agentWorkDir, loadSettings, saveSettings, svc: ycService });
+registerYcIpc({ ipcMain, yandexCloud, ycConsole, ycCosts, ycVpc, ycCompute, ycIam, ycFunctions, ycBilling, ycCdn, ycMonitoring, ycAi, ycMdb, ycIg, ycAlb, ycDb, ycLogs, ycApiGw, ycLockbox, ycRegistry, ycPostbox, ycSa, fs, path, resolvePath, agentWorkDir, loadSettings, saveSettings, svc: ycService });
 
 // ── Файлы для облака: системные диалоги выбора файла и места сохранения ──────
 // У окна был ровно один системный диалог (dialog:pickDir — папка). Для бакета

@@ -213,6 +213,7 @@
     $("s-vision-key").value = getSettings().visionKey || "";
     $("s-serper-key").value = getSettings().serperApiKey || "";
     if ($("s-gsheet-key")) $("s-gsheet-key").value = getSettings().googleServiceAccount || "";
+    if ($("s-yc-sa-key")) $("s-yc-sa-key").value = getSettings().yandexServiceAccount || "";
     $("s-vision-model").value = getSettings().visionModel || "";
     $("s-image-model").value = getSettings().imageModel || "";
     renderVisionDetect();
@@ -285,6 +286,7 @@
     getSettings().visionKey = $("s-vision-key").value.trim();
     getSettings().serperApiKey = $("s-serper-key").value.trim();
     if ($("s-gsheet-key")) getSettings().googleServiceAccount = $("s-gsheet-key").value.trim();
+    if ($("s-yc-sa-key")) getSettings().yandexServiceAccount = $("s-yc-sa-key").value.trim();
     getSettings().mailAddress = $("s-mail-address").value.trim();
     getSettings().mailFromName = $("s-mail-from-name").value.trim();
     getSettings().mailPassword = $("s-mail-pass").value.trim();

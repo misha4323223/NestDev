@@ -361,9 +361,10 @@ const SERVICES = [
   { key: "logging", ru: "Логи", title: "Cloud Logging", icon: "📜", svc: "logging", listPath: "/logging/v1/logGroups", listKey: "groups" },
   // Cloud Postbox — это SES-совместимый API (Amazon SES v2), а НЕ обычный REST
   // каталога: путь /postbox/v1/addresses не существует (проверено — быстрый 404),
-  // список адресов — GET /v2/email/identities, авторизация — X-YaCloud-SubjectToken
+  // список адресов — GET /v2/email/identities (ответ EmailIdentities: [{ IdentityName,
+  // VerificationStatus, SendingEnabled }]), авторизация — X-YaCloud-SubjectToken
   // с IAM-токеном СЕРВИСНОГО аккаунта (роль postbox.viewer), Authorization не нужен.
-  { key: "postbox", ru: "Почта", title: "Cloud Postbox", icon: "📮", svc: "postbox", listPath: "/v2/email/identities", listKey: "Identities", auth: "subject", query: "ses" },
+  { key: "postbox", ru: "Почта", title: "Cloud Postbox", icon: "📮", svc: "postbox", listPath: "/v2/email/identities", listKey: "EmailIdentities", auth: "subject", query: "ses" },
   { key: "containerRegistry", ru: "Реестр образов", title: "Container Registry", icon: "📦", svc: "container-registry", listPath: "/container-registry/v1/registries", listKey: "registries" },
   { key: "iam", ru: "Сервисные аккаунты", title: "Identity and Access Management", icon: "🗝️", svc: "iam", listPath: "/iam/v1/serviceAccounts", listKey: "serviceAccounts" },
   { key: "lockbox", ru: "Секреты", title: "Lockbox", icon: "🔒", svc: "lockbox", listPath: "/lockbox/v1/secrets", listKey: "secrets" },
@@ -407,9 +408,10 @@ function serviceHeaders(svcDef, token) {
     : { Authorization: "Bearer " + token };
 }
 
-// Строка запроса. SES живёт по своим правилам (PageSize вместо folderId/pageSize).
+// Строка запроса. SES живёт по своим правилам (PageSize вместо folderId/pageSize),
+// и максимум, который он принимает за раз, — 1000 адресов.
 function serviceQuery(svcDef, folderId) {
-  if (svcDef && svcDef.query === "ses") return "?PageSize=100";
+  if (svcDef && svcDef.query === "ses") return "?PageSize=1000";
   // Monitoring принимает только folderId: pageSize ему неизвестен, и лишний
   // параметр превратил бы живую плитку полки в отказ сервиса.
   if (svcDef && svcDef.query === "monitoring") {
@@ -420,7 +422,7 @@ function serviceQuery(svcDef, folderId) {
 }
 
 // Массив ресурсов из ответа: точное имя поля, затем то же имя в другом регистре
-// (SES отдаёт Identities, каталог — lowercase), затем сам ответ, если это массив.
+// (SES отдаёт EmailIdentities, каталог — lowercase), затем сам ответ, если это массив.
 function pickList(body, key) {
   if (Array.isArray(body)) return body;
   if (!body || typeof body !== "object") return [];
@@ -430,6 +432,19 @@ function pickList(body, key) {
     if (k.toLowerCase() === lower && Array.isArray(body[k])) return body[k];
   }
   return [];
+}
+
+// Ресурсы сервисов выглядят по-разному: каталог отдаёт { id, name }, а Postbox
+// (SES) — { IdentityName, VerificationStatus, … } или просто строку адреса. Окно
+// и агент хотят одно — имя и id, — поэтому приводим здесь, в одном месте: иначе
+// каждая новая SES-совместимая вещь ломала бы плитку в окне.
+function normalizeItem(it) {
+  if (it == null) return it;
+  if (typeof it === "string") return { id: it, name: it };
+  if (it.id || it.name) return it;
+  const nm = String(it.IdentityName || it.identityName || "").trim();
+  if (nm) return Object.assign({}, it, { id: nm, name: nm });
+  return it;
 }
 
 // Почему 403 у SES-сервиса: пользовательский OAuth-токен такой API не принимает,
@@ -446,7 +461,10 @@ function serviceForbidden(svcDef, e) {
 // Список всех ресурсов каталога по одному сервису. Возвращает { count, items }.
 async function listService(oauthToken, folderId, svcDef, opts) {
   const o = opts || {};
-  const token = await getIamToken(oauthToken);
+  let token = await getIamToken(oauthToken);
+  // SES-совместимые сервисы (Postbox) пользовательский токен не принимают: если
+  // вызывающий добыл токен СЕРВИСНОГО аккаунта (src/yc-sa.js), идём с ним.
+  if (svcDef.auth === "subject" && o.subjectToken) token = o.subjectToken;
   const base = (await endpoint(svcDef.svc)) || KNOWN_ENDPOINTS[svcDef.svc];
   if (!base) throw new Error("Эндпоинт сервиса «" + svcDef.title + "» не найден.");
   const url = base + svcDef.listPath + serviceQuery(svcDef, folderId);
@@ -456,7 +474,7 @@ async function listService(oauthToken, folderId, svcDef, opts) {
   for (let i = 0; i < tries; i++) {
     try {
       const j = await fetchJson(url, { headers }, o.timeoutMs || 25000);
-      const items = pickList(j, svcDef.listKey);
+      const items = pickList(j, svcDef.listKey).map((it) => normalizeItem(it));
       return { count: items.length, items };
     } catch (e) {
       lastErr = e;
@@ -467,6 +485,55 @@ async function listService(oauthToken, folderId, svcDef, opts) {
     }
   }
   throw new Error(serviceForbidden(svcDef, lastErr) || serviceError(lastErr, base, svcDef.listPath));
+}
+
+// ── Cloud Postbox (SES v2): адреса и их подпись ─────────────────────────────
+// Postbox — не обычный REST каталога: запросы идут токеном СЕРВИСНОГО аккаунта
+// в заголовке X-YaCloud-SubjectToken, а каталог сервис берёт из самого аккаунта
+// (folderId в адресах не участвует). Список и счётчик уже даёт listService;
+// здесь — карточка, создание, удаление и переключатель подписи DKIM. Пути и
+// поля — SES v2 (документация Cloud Postbox, сверено 02.10.2026):
+//   GET/POST /v2/email/identities, GET/DELETE /v2/email/identities/{адрес},
+//   PUT /v2/email/identities/{адрес}/dkim { SigningEnabled }.
+async function sesCall(token, method, path, body) {
+  const svcDef = serviceByKey("postbox");
+  // Адрес — как у остального облака (endpoint уважает стенд AI_AGENT_YC_BASE):
+  // иначе подменённый тестами и живой прогон панели уходили бы в настоящее
+  // облако со стендовым токеном и получали 403.
+  const base = (await endpoint(svcDef.svc)) || KNOWN_ENDPOINTS[svcDef.svc];
+  const headers = Object.assign(serviceHeaders(svcDef, token), { "Content-Type": "application/json; charset=utf-8" });
+  try {
+    return await fetchJson(base + path, { method: method, headers: headers, body: body === undefined ? undefined : JSON.stringify(body) }, 25000);
+  } catch (e) {
+    // 403 у SES объясняется по-своему (нужен сервисный аккаунт) — как у полки.
+    throw new Error(serviceForbidden(svcDef, e) || serviceError(e, base, path));
+  }
+}
+
+function sesIdentityPath(address, suffix) {
+  return "/v2/email/identities/" + encodeURIComponent(String(address == null ? "" : address)) + (suffix || "");
+}
+
+async function listEmailIdentities(token) {
+  const j = await sesCall(token, "GET", "/v2/email/identities?PageSize=1000");
+  const items = pickList(j, "EmailIdentities").map((it) => normalizeItem(it));
+  return { count: items.length, items: items };
+}
+
+async function getEmailIdentity(token, address) {
+  return await sesCall(token, "GET", sesIdentityPath(address));
+}
+
+async function createEmailIdentity(token, address) {
+  return await sesCall(token, "POST", "/v2/email/identities", { EmailIdentity: String(address == null ? "" : address) });
+}
+
+async function deleteEmailIdentity(token, address) {
+  return await sesCall(token, "DELETE", sesIdentityPath(address));
+}
+
+async function setEmailDkimSigning(token, address, enabled) {
+  return await sesCall(token, "PUT", sesIdentityPath(address, "/dkim"), { SigningEnabled: enabled === true });
 }
 
 // Дашборд: все сервисы разом (каждый независимо). Возвращает массив
@@ -1812,6 +1879,12 @@ module.exports = {
   listService,
   resourcesStatus,
   pickList,
+  normalizeItem,
+  listEmailIdentities,
+  getEmailIdentity,
+  createEmailIdentity,
+  deleteEmailIdentity,
+  setEmailDkimSigning,
   serviceHeaders,
   serviceQuery,
   isNetworkError,

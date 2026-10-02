@@ -99,6 +99,11 @@
     // карточке; создать реестр, посмотреть образы, убрать их пачкой — впервые.
     // Канал «yc:registry» зовёт src/yandex-cloud.js и src/yc-registry.js.
     containerRegistry: "ycRegistry",
+    // Cloud Postbox (часть 91, заход 15): адреса (домены), с которых уходят
+    // письма. Канал «yc:postbox» меняет ключ сервисного аккаунта на IAM-токен
+    // (SES-совместимый сервис пользовательский токен не принимает), тела
+    // запросов — в src/yandex-cloud.js, проверки и слова — в src/yc-postbox.js.
+    postbox: "ycPostbox",
   };
 
   // Допустимые действия каждого канала. Сверяется с отказами в src/yc-ipc.js.
@@ -124,6 +129,7 @@
     apiGateway: ["list", "gateway", "spec", "create", "update", "delete"],
     lockbox: ["list", "secret", "versions", "create", "putversion", "grant", "delete"],
     containerRegistry: ["list", "images", "create", "delimage", "clean", "delete"],
+    postbox: ["list", "card", "create", "dkim", "dkimon", "dkimoff", "delete"],
   };
 
   const FAMILIES = {
@@ -165,6 +171,9 @@
     // «Реестр», а не «образ»: кнопка стоит на плитке «Реестр образов» и
     // спрашивает про сам реестр, а образы — уже внутри него.
     containerRegistry: { title: "Реестр образов", ru: "реестр" },
+    // «Адрес», а не «письмо»: кнопка стоит на плитке «Почта», а Postbox заводит
+    // адрес (домен), с которого уходят письма, — самого письма здесь не бывает.
+    postbox: { title: "Почта", ru: "адрес" },
   };
 
   // Действия управляемой базы. Одна форма на три базы: набор полей у PostgreSQL,
@@ -408,6 +417,32 @@
       { id: "clean", ru: "🧹 Убрать образы (все или старше N дней)", op: "clean", view: "lines", danger: true, confirmArg: "confirmed", target: needReg,
         fields: [fld("olderThanDays", "Старше, дней", { type: "number", hint: "Пусто или 0 — убрать ВСЕ образы реестра. Больше нуля — только старше N дней." })] },
       { id: "delete", ru: "🗑 Удалить реестр", op: "delete", view: "lines", danger: true, confirmArg: "confirmed", target: needReg },
+    ];
+  }
+
+  // ── Адреса Cloud Postbox ───────────────────────────────────────────────
+  // Postbox — SES-совместимый сервис: каталог он берёт из САМОГО СЕРВИСНОГО
+  // аккаунта, а в заголовке ждёт его IAM-токен (пользовательский OAuth-токен
+  // сервис не принимает). Ключ сервисного аккаунта лежит в Настройках, поэтому
+  // у действий нет ни одного поля с токеном — только адрес. Адрес здесь — ДОМЕН,
+  // а не ящик. Подтверждение владения доменом идёт записями DKIM; выключение
+  // подписи необратимым не является, но рушит доставляемость — потому и с
+  // подтверждением, как у опасных действий.
+  function postboxActions() {
+    const needAddr = fld("address", "Адрес (домен)", {
+      required: true,
+      hint: "Домен из действия «Адреса и их состояние»; подсказка подставит список.",
+      options: from("postbox", "list", (r) => (r.identities || []).map((x) => x.name)),
+    });
+    return [
+      { id: "list", ru: "Адреса и их состояние", op: "list", view: "lines" },
+      { id: "card", ru: "Карточка адреса", op: "card", view: "lines", target: needAddr },
+      { id: "dkim", ru: "Подпись DKIM и записи DNS", op: "dkim", view: "lines", target: needAddr },
+      { id: "dkimon", ru: "✍ Включить подпись DKIM", op: "dkimon", view: "lines", target: needAddr },
+      { id: "dkimoff", ru: "🔒 Выключить подпись DKIM", op: "dkimoff", view: "lines", danger: true, confirmArg: "confirmed", target: needAddr },
+      { id: "create", ru: "＋ Создать адрес", op: "create", view: "lines",
+        fields: [fld("name", "Адрес (домен)", { required: true, placeholder: "mail.example.ru", hint: "Домен, с которого шлём письма (не ящик): строчная латиница, цифры, дефис и точки. Потом подтверди владение доменом CNAME-записями — они видны в карточке адреса." })] },
+      { id: "delete", ru: "🗑 Удалить адрес", op: "delete", view: "lines", danger: true, confirmArg: "confirmed", target: needAddr },
     ];
   }
 
@@ -1005,6 +1040,9 @@
 
     // ── Реестр образов Container Registry ──
     containerRegistry: registryActions(),
+
+    // ── Адреса Cloud Postbox ──
+    postbox: postboxActions(),
 
     // ── Managed-базы: PostgreSQL, MySQL и ClickHouse ──
     // Три семейства в трёх плитках, но один канал и одна форма: набор действий

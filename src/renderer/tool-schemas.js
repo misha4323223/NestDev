@@ -2848,6 +2848,23 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "ycPostbox",
+      description:
+        "Yandex Cloud: Cloud Postbox — адреса (домены), с которых уходят письма. Postbox — SES-совместимый сервис: он работает через СЕРВИСНЫЙ аккаунт (роль postbox.viewer, для отправки писем — ещё postbox.sender), а каталог берёт из самого сервисного аккаунта. Перед первым вызовом человек должен вставить JSON-ключ сервисного аккаунта в Настройки → «☁️ Yandex Cloud» → «Ключ сервисного аккаунта для Postbox» — без него сервис отвечает 403, и инструмент скажет об этом. action: list (адреса каталога: домен, подтверждён ли, что с DKIM) | card (карточка адреса: проверка владения доменом, подпись DKIM и CNAME-записи для DNS) | create (завести адрес; нужно разрешение на создание) | dkim (подпись DKIM и записи DNS) | dkimon (включить подпись; нужно разрешение на правку) | dkimoff (выключить подпись — она бережёт доставляемость) | delete (удалить адрес вместе с его DNS-записями; нужно разрешение на удаление). address — домен адреса (список: action list); без него работает, только если адрес один. Письма не уходят, пока владение доменом не подтверждено: облако само проверяет CNAME-записи в DNS (имя записи — <селектор>._domainkey.<домен>, значение облако показывает в консоли на странице адреса).",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "list | card | create | dkim | dkimon | dkimoff | delete" },
+          name: { type: "string", description: "Для create: домен нового адреса (например mail.example.ru — без @ и без ящика)" },
+          address: { type: "string", description: "Домен адреса для card/dkim/dkimon/dkimoff/delete (можно также identity)" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "ycDb",
       description:
         "Yandex Cloud: таблицы и записи базы YDB (создать базу: ycCreate service ydb). Две половины. ДОКУМЕНТНЫЕ таблицы (Document API, DynamoDB-совместимый): action: tables (список таблиц) | create (создать таблицу) | describe (структура и число записей) | put (положить запись) | get (одна запись по key) | scan (показать записи) | delete (убрать запись) | drop (удалить таблицу вместе с записями, необратимо). В этих таблицах в колонках живёт ТОЛЬКО первичный ключ: keys — поля ключа, например { \"id\": \"S\" } (первый — ключ поиска, остальные — сортировки, тип S/N/B), item и key — обычные пары «поле → значение», типы API ставит сам. ОБЫЧНЫЕ таблицы и любые запросы — action query с полем query (YQL, тот же язык, что в консоли облака): SELECT, CREATE TABLE с настоящими колонками, INSERT, UPSERT и т.д. (например query: \"CREATE TABLE pets (id Uint64, name Utf8, PRIMARY KEY (id))\" или \"SELECT * FROM pets LIMIT 10\"). database — имя или id базы (без него работает, только если база в каталоге одна). create, put и изменяющие query (CREATE/INSERT/UPSERT/UPDATE) требуют чекбокса «Разрешить агенту создавать ресурсы»; delete, drop и необратимые query (DROP/DELETE/ALTER/TRUNCATE) — «…удалять ресурсы». YQL идёт по gRPC (Ydb.Query) — интернетом и токеном, внешний yc-клиент не нужен.",

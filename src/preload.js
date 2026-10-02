@@ -237,6 +237,12 @@ contextBridge.exposeInMainWorld("api", {
   // облако не удаляет). Канал «yc:registry» зовёт src/yandex-cloud.js и
   // src/yc-registry.js.
   ycRegistry: (args) => ipcRenderer.invoke("yc:registry", args || {}),
+  // Cloud Postbox: адреса (домены), с которых шлют письма — список, карточка,
+  // создание, подпись DKIM и удаление. Канал «yc:postbox» меняет JSON-ключ
+  // сервисного аккаунта на IAM-токен (src/yc-sa.js), потому что SES-совместимый
+  // Postbox пользовательский токен не принимает; тела запросов — в
+  // src/yandex-cloud.js, проверки и слова — в src/yc-postbox.js.
+  ycPostbox: (args) => ipcRenderer.invoke("yc:postbox", args || {}),
   ycCosts: (serviceKey, params) => ipcRenderer.invoke("yc:costs", serviceKey, params || {}),
   ycCreate: (serviceKey, name, opts) => ipcRenderer.invoke("yc:create", serviceKey, name, opts || {}),
   ycDelete: (serviceKey, resourceId) => ipcRenderer.invoke("yc:delete", serviceKey, resourceId),

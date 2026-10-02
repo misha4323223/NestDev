@@ -1102,7 +1102,7 @@ const urlOf = (c) => String(c.url).split("?")[0];
     assert.ok(/HTTPS-сайт из бакета/.test(GUIDE_SRC), "в справочнике нет раздела про HTTPS-сайт");
     // Сторож smoke: канал в списке, счёт каналов, инструмент и место набора в цепочке.
     assert.ok(SMOKE_SRC.indexOf('"yc:billing", "yc:cdn"') >= 0, "сторож не знает канал yc:cdn");
-    assert.ok(/каналов в мосте должно быть 40/.test(SMOKE_SRC), "сторож не пересчитал каналы");
+    assert.ok(/каналов в мосте должно быть 41/.test(SMOKE_SRC), "сторож не пересчитал каналы");
     assert.ok(/["']ycCdn["']/.test(SMOKE_SRC), "сторож не знает инструмент ycCdn");
     assert.ok(String(PKG.scripts.test || "").indexOf("test/yc-cdn.test.js") >= 0, "набора нет в цепочке npm test");
   });

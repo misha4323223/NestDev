@@ -403,7 +403,7 @@ let stub = null;
   await test("yc:logGroups: канал, мост окна и семейство logging в окне на месте", () => {
     assert.ok(/ipcMain\.handle\("yc:logGroups"/.test(IPC_SRC), "канала нет в yc-ipc.js");
     const found = [...IPC_SRC.matchAll(/ipcMain\.handle\("(yc:[^"]+)"/g)].map((m) => m[1]);
-    assert.strictEqual(found.length, 40, "каналов в мосте должно быть 40: " + found.length);
+    assert.strictEqual(found.length, 41, "каналов в мосте должно быть 41: " + found.length);
     assert.ok(/ycLogGroups: \(args\) => ipcRenderer\.invoke\("yc:logGroups"/.test(PRELOAD_SRC), "нет моста ycLogGroups");
     assert.ok(/logging: "ycLogGroups"/.test(ACTIONS_SRC), "семейство logging не знает свой канал");
     assert.ok(/logging: \["list", "group", "create", "update", "delete"\]/.test(ACTIONS_SRC), "OPS семейства logging не совпадают");
@@ -421,7 +421,7 @@ let stub = null;
 
   await test("yc:logGroups: сторож каналов и цепочка npm test знают группу логов", () => {
     assert.ok(SMOKE_SRC.indexOf('"yc:logGroups"') >= 0, "список каналов в smoke не знает yc:logGroups");
-    assert.ok(/каналов в мосте должно быть 40/.test(SMOKE_SRC), "сторож каналов не пересчитан");
+    assert.ok(/каналов в мосте должно быть 41/.test(SMOKE_SRC), "сторож каналов не пересчитан");
     assert.ok(PKG.scripts.test.indexOf("test/yc-log-groups.test.js") >= 0, "набор не в цепочке npm test");
   });
 

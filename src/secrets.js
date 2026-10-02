@@ -29,6 +29,7 @@ const SECRET_KEYS = [
   "yandexOauthToken", // OAuth-токен Yandex (для Yandex Cloud REST API)
   "serperApiKey", // API-ключ Serper (усиленный Google-поиск для агента)
   "googleServiceAccount", // JSON ключа service account Google — доступ агента к Google Sheets по API
+  "yandexServiceAccount", // JSON ключа сервисного аккаунта Yandex Cloud — Cloud Postbox (SES) без него не работает
   "sitePasswords", // пароли сайтов для агента (менеджер паролей) — шифруются как ключи
   "mailPassword", // пароль приложения для почты (SMTP/IMAP) — шифруется
 ];

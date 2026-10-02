@@ -1,6 +1,8 @@
 "use strict";
 
 const { createYcDb } = require("./yc-db.js"); // таблицы и записи базы YDB
+const ycPostbox = require("./yc-postbox.js"); // проверки и слова Cloud Postbox
+const ycSa = require("./yc-sa.js"); // ключ сервисного аккаунта → IAM-токен (Postbox)
 
 /* ─── Облачные инструменты агента: Yandex Cloud ─────────────────────────────
    Вынесены из agent-tools.js своим модулем (этап «дробление крупных модулей»,
@@ -1703,6 +1705,94 @@ function createCloudTools(deps) {
             "\n\nЧто осталось: ycRegistry { action: \"images\", registry: \"" + reg.name + "\" }.";
         } catch (e) {
           return "Yandex Cloud (ycRegistry, action=" + action + "): " + ((e && e.message) || String(e));
+        }
+    },
+    // ── Cloud Postbox: адреса (домены), с которых шлют письма ──────────────
+    // Postbox — SES-совместимый API: он не принимает пользовательский OAuth-токен
+    // и берёт каталог из САМОГО СЕРВИСНОГО АККАУНТА, поэтому инструмент сначала
+    // меняет JSON-ключ из настроек на IAM-токен (src/yc-sa.js), а потом говорит с
+    // облаком заголовком X-YaCloud-SubjectToken. Без ключа он не молчит: говорит,
+    // где взять ключ и какие роли нужны (postbox.viewer — читать, postbox.sender —
+    // отправлять). Создание адреса — СОЗДАНИЕ, подпись DKIM — ПРАВКА, удаление —
+    // УДАЛЕНИЕ: у каждого своё разрешение агента.
+    "ycPostbox": async (args, settings) => {
+        const cfg = ycConfig(loadSettings());
+        if (!cfg.oauth) return "Yandex Cloud не подключён — Настройки → «☁️ Yandex Cloud».";
+        const action = String(args.action || "list").trim().toLowerCase();
+        const ALL = ["list", "card", "create", "dkim", "dkimon", "dkimoff", "delete"];
+        if (ALL.indexOf(action) === -1) {
+          return "Ошибка: неизвестное действие ycPostbox «" + action + "». Доступно: list, card, create, dkim, dkimon, dkimoff, delete.";
+        }
+        if (action === "create" && !cfg.allowCreate) {
+          return "⛔ Заводить адреса Postbox агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту создавать ресурсы». Посмотреть адреса можно и сейчас: action list.";
+        }
+        if ((action === "dkimon" || action === "dkimoff") && !cfg.allowUpdate) {
+          return "⛔ Менять подпись DKIM агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту менять ресурсы». Посмотреть подпись можно и сейчас: action dkim.";
+        }
+        if (action === "delete" && !cfg.allowDelete) {
+          return "⛔ Удалять адреса Postbox агентом ЗАПРЕЩЕНО. Скажи пользователю включить в Настройках → «☁️ Yandex Cloud» чекбокс «Разрешить агенту удалять ресурсы». Посмотреть адреса можно и сейчас: action list.";
+        }
+        // Ключа нет — это не поломка, а нехватка настройки: объясняем, что именно вставить.
+        const key = ycSa.parseServiceAccount(cfg.saKey);
+        if (!key) {
+          return (
+            "Postbox работает только с СЕРВИСНЫМ аккаунтом: пользовательский OAuth-токен этот API не принимает (403). " +
+            "Создай в консоли Yandex Cloud сервисный аккаунт с ролью postbox.viewer (для отправки писем — ещё postbox.sender), выпусти ему ключ в формате JSON " +
+            "и вставь его в Настройки → «☁️ Yandex Cloud» → «Ключ сервисного аккаунта для Postbox». Каталог Postbox берёт из самого сервисного аккаунта."
+          );
+        }
+        try {
+          const token = await ycSa.getIamToken(key);
+          const all = await yandexCloud.listEmailIdentities(token);
+          if (action === "list") {
+            if (!all.count) return "Адресов Postbox в каталоге сервисного аккаунта нет. Завести: ycPostbox { action: \"create\", name: \"example.ru\" } — потом подтвердить домен по DNS-записям (карточка адреса).";
+            const rows = all.items.map((it) => ycPostbox.identityLine(it));
+            return "Адреса Cloud Postbox (" + all.count + "):\n" + rows.join("\n") +
+              "\n\nКарточка адреса (проверка домена, подпись DKIM, записи DNS): ycPostbox { action: \"card\", address: \"<домен>\" }.";
+          }
+          if (action === "create") {
+            const addr = ycPostbox.checkAddress(args.name || args.address || args.identity);
+            const made = await yandexCloud.createEmailIdentity(token, addr);
+            const info = ycPostbox.identityInfo(made);
+            return "✅ Адрес Postbox создан: " + addr + "\nПроверка владения доменом: " + info.statusHuman +
+              (info.dkim.present ? " · подпись DKIM: " + info.dkim.statusHuman : "") +
+              "\n\nОсталось подтвердить владение доменом: добавь в DNS записи из раздела «Настройка подписи писем (DKIM)» на странице адреса консоли (две CNAME-записи Simple, имя — <селектор>._domainkey.<адрес>). Письма без подтверждения не уходят. Посмотреть подпись: ycPostbox { action: \"dkim\", address: \"" + addr + "\" }.";
+          }
+          const ref = String(args.address || args.identity || args.name || "").trim();
+          const found = ycPostbox.matchIdentity(all.items, ref);
+          if (!found) {
+            return "Не нашёл адрес «" + ref + "»" + (ref ? "." : " — адресов несколько, укажи address.") + " В каталоге: " + all.items.map((x) => x.name).join(", ") + ".";
+          }
+          if (action === "card") {
+            const full = await yandexCloud.getEmailIdentity(token, found.name);
+            return "Адрес Cloud Postbox:\n" + ycPostbox.cardLines(full).join("\n");
+          }
+          if (action === "dkim") {
+            const full = await yandexCloud.getEmailIdentity(token, found.name);
+            const d = ycPostbox.identityInfo(full).dkim;
+            if (!d.present) return "У адреса «" + found.name + "» данных о подписи DKIM нет — облако их не отдало.";
+            const lines = [
+              "Подпись DKIM адреса «" + found.name + "»: " + (d.enabled ? "включена" : "выключена"),
+              "Запись в DNS: " + d.statusHuman + (d.originHuman ? " · настройка: " + d.originHuman : "") + (d.currentKeyHuman ? " · ключ " + d.currentKeyHuman : ""),
+            ];
+            const recs = ycPostbox.dnsRecordLines(found.name, d);
+            if (recs.length) lines.push("", ...recs);
+            else lines.push("", "Селекторов у подписи нет — облако их не отдало.");
+            lines.push("", "Включить: ycPostbox { action: \"dkimon\", address: \"" + found.name + "\" }; выключить: action \"dkimoff\" (нужно разрешение на правку).");
+            return lines.join("\n");
+          }
+          if (action === "dkimon" || action === "dkimoff") {
+            const on = action === "dkimon";
+            await yandexCloud.setEmailDkimSigning(token, found.name, on);
+            const full = await yandexCloud.getEmailIdentity(token, found.name);
+            const d = ycPostbox.identityInfo(full).dkim;
+            return (on ? "✍ Подпись DKIM включена: " : "🔒 Подпись DKIM выключена: ") + found.name + "\nЗапись в DNS: " + d.statusHuman +
+              (on ? "" : "\nПисьма без подписи чаще попадают в спам — включи обратно, если это была ошибка: ycPostbox { action: \"dkimon\", address: \"" + found.name + "\" }.");
+          }
+          await yandexCloud.deleteEmailIdentity(token, found.name);
+          return "🗑 Адрес Postbox удалён: " + found.name + "\nПисьма с него больше не уйдут; его DNS-записи (DKIM) перестанут работать. Вернуть адрес можно только созданием заново: ycPostbox { action: \"create\", name: \"" + found.name + "\" }.";
+        } catch (e) {
+          return "Yandex Cloud (ycPostbox, action=" + action + "): " + ((e && e.message) || String(e));
         }
     },
     // ── Object Storage: файлы в бакете ─────────────────────────────────────
